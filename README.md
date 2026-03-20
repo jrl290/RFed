@@ -76,7 +76,7 @@ See the [Specification](SPEC.md#13-configuration) for all options.
 
 ## Channels Are Reticulum Destinations
 
-A channel is not just a name — it is a **full Reticulum identity** with its own X25519 encryption key and Ed25519 signing key, deterministically derived from the channel name. Anyone who knows the name independently derives the same keypair and the same 16-byte destination hash:
+A channel is a **full Reticulum identity** with its own X25519 encryption key and Ed25519 signing key, deterministically derived from the channel name. Anyone who knows the name independently derives the same keypair and the same 16-byte destination hash:
 
 ```
 "public.news.tech"
@@ -97,6 +97,14 @@ A channel is not just a name — it is a **full Reticulum identity** with its ow
 **Possession of the channel name = possession of the private keys = ability to decrypt.**
 
 RFed nodes only ever see the 16-byte `channel_hash`. They store and route opaque blobs encrypted to the channel's public key. The nodes are **cryptographically blind** — they cannot decrypt any message content.
+
+### Channels Are Virtual — Not Announced, Not Routed
+
+Although a channel hash is derived using the same cryptographic primitives as a Reticulum identity (X25519 + Ed25519 → destination hash), **channels are never announced or routed on the Reticulum network**. No Reticulum destination is registered for a channel, and no packets are addressed *to* the channel hash as a transport destination.
+
+Instead, a channel only comes into existence when a sender publishes a blob to the rfed node's `rfed.channel` destination with the channel hash embedded in the payload. The node treats the hash as an opaque storage key — it has no awareness that the hash corresponds to a keypair, only that blobs should be filed under it and fanned out to matching subscribers.
+
+This is directly analogous to how LXMF propagation works: an LXMF propagation node stores messages keyed by the recipient's destination hash without that recipient being registered or announced on the node itself. The node is a mailbox, not a router. RFed applies the same principle to channels.
 
 ### Channel Hash Utilities
 
