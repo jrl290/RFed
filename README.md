@@ -1,6 +1,6 @@
 # RFed — Reticulum Federation Node
 
-A subscriber federation node for the [Reticulum](https://reticulum.network) network. RFed provides named **channel** messaging with offline delivery, cross-node synchronisation, mobile push wake-ups, and subscriber backup failover — all running over Reticulum's encrypted transport layer.
+A subscriber federation node for the [Reticulum](https://reticulum.network) network. RFed provides named **channel** messaging with offline delivery, cross-node synchronisation, notify wake-ups, and subscriber backup failover — all running over Reticulum's encrypted transport layer.
 
 > **AI-Assisted Development**: This project was developed with significant
 > assistance from AI language models. Architecture, implementation, code review,
@@ -11,7 +11,7 @@ A subscriber federation node for the [Reticulum](https://reticulum.network) netw
 RFed's core transport is modelled directly on the [LXMF](https://github.com/markqvist/LXMF) (Lightweight Extensible Message Format) store-and-forward architecture. The following mechanisms are carried over from LXMF and adapted for channel-based messaging:
 
 | Mechanism | LXMF Origin | RFed Adaptation |
-|-----------|------------|-----------------|
+|-----------|-------------|-----------------|
 | **Propagation node model** | Messages stored by destination hash, retrieved by recipients on demand | Blobs stored by channel hash, fanned out to subscribers |
 | **OFFER / GET sync protocol** | Peer sends manifest of IDs → gap computed → missing blobs fetched | Identical wire protocol (`/rfed/offer`, `/rfed/get`), filtered to channels with local subscribers |
 | **Proof-of-work stamps** | Sender stamps validated at configurable bit difficulty (msg / PN / peering tiers) | Reuses LXMF stamp validation via `lxmf_rust`; same cost/flexibility model |
@@ -28,9 +28,9 @@ RFed extends beyond LXMF with **named channels**, **explicit subscriptions**, **
 - **Subscriber delivery** — blobs are stored on disk and delivered to subscribers when they come online
 - **Federation sync** — manifest-based gap-pull protocol between peer nodes (LXMF OFFER/GET)
 - **Deferred delivery** — offline subscribers receive queued blobs on reconnect or explicit pull
-- **Notify relays** — lightweight wake packets enable mobile push without exposing message content
+- **Notify relays** — lightweight wake packets to registered relays; can be used for mobile push notifications (APNs, FCM, UnifiedPush) without exposing message content
 - **Backup failover** — chain-of-custody handoff when a primary node goes silent
-- **LXMF propagation** — optional inbound LXMF acceptance for push-notification wake-ups
+- **LXMF propagation** — optional inbound LXMF acceptance for notify wake-ups
 - **Proof-of-work stamps** — configurable PoW difficulty per subscriber tier (default / VIP)
 - **Double-envelope encryption** — node never sees inner blob content; encrypted end-to-end
 
@@ -115,7 +115,18 @@ let kp = ChannelKeypair::from_name("public.news.tech");
 let hash: Vec<u8> = kp.hash();
 ```
 
-See [SPEC.md §1](SPEC.md#1-channel-hash-derivation) for the full algorithm and naming conventions.
+### Naming Conventions
+
+| Pattern | Visibility | Example |
+|---------|-----------|--------|
+| `public.<segments>` | Discoverable by name | `public.news.tech` |
+| `<hash>.<segments>` | Private; hash acts as access control | `a1b2c3d4e5f6.team.ops` |
+
+For **public** channels the first segment is the literal string `"public"`. Anyone who learns the name can subscribe and decrypt.
+
+For **private** channels, use a cryptographically random hex string (e.g. 32+ characters from a CSPRNG) as the first segment. Possession of the full channel name equals membership — the random prefix makes it computationally infeasible to guess. Distribute the name out-of-band to intended members only.
+
+See [SPEC.md §1](SPEC.md#1-channel-hash-derivation) for the full derivation algorithm.
 
 ## Architecture: Message Journey
 
