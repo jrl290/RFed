@@ -124,10 +124,12 @@ pub struct NodeConfig {
     /// considers the primary offline and starts delivering. Default: 90.
     pub owner_offline_secs: f64,
 
-    // ── LXMF propagation (notify-receive) ─────────────────────────────
+    // ── LXMF propagation notification ────────────────────────────────
     /// When true, rfed announces `lxmf.propagation` and accepts inbound
-    /// LXMF PUTs, but only stores/fires notify for registered destinations.
-    pub lxmf_propagation_enabled: bool,
+    /// LXMF PUTs, but only fires notify for registered destinations.
+    /// This is NOT full LXMF propagation — messages are never stored or
+    /// forwarded; they are used solely to trigger notify wake-ups.
+    pub lxmf_propagation_notification_enabled: bool,
 
 }
 

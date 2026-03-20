@@ -49,7 +49,7 @@ fn decode_msgpack_bin(data: &[u8]) -> Vec<u8> {
 use crate::config::NodeConfig;
 use crate::deferred_queue::DeferredQueue;
 use crate::fanout;
-use crate::lxmf_propagation::LxmfPropagation;
+use crate::lxmf_propagation_notification::LxmfPropagation;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
 use crate::subscription::SubscriptionTable;
 use crate::sync::{FedSync, OFFER_PATH, MESSAGE_GET_PATH, BACKUP_PUSH_PATH};
@@ -1278,8 +1278,8 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             rmpv::Value::Boolean(cfg.default_policy.allow_notify_registration),
         ));
         caps.push((
-            rmpv::Value::String("lxmf_propagation".into()),
-            rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
+            rmpv::Value::String("lxmf_propagation_notification".into()),
+            rmpv::Value::Boolean(cfg.lxmf_propagation_notification_enabled),
         ));
         caps.push((
             rmpv::Value::String("backup".into()),

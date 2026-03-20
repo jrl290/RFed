@@ -10,7 +10,7 @@
 name                      = "my-federation-node"
 announce_interval_minutes = 120        # re-announce every 2 hours (default: 360)
 announce_at_start         = true       # announce immediately on startup
-# lxmf_propagation        = false      # set true to accept LXMF PUTs for push-registered destinations
+# lxmf_propagation_notification = false # set true to accept LXMF PUTs solely for notify wake-ups (not full propagation)
 
 # ── Storage limits ───────────────────────────────────────────────────────────
 

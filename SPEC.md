@@ -457,11 +457,14 @@ relay_hash = "aabbccdd..."   # 32-char hex, rfed.notify dest of relay
 
 ---
 
-## 10. LXMF Propagation
+## 10. LXMF Propagation Notification
 
-When `lxmf_propagation = true`, rfed announces an `lxmf.propagation`
-destination and accepts inbound LXMF messages. This allows mobile clients
-(e.g. Sideband) to send LXMF messages that trigger notify wake-ups.
+When `lxmf_propagation_notification = true`, rfed announces an
+`lxmf.propagation` destination and accepts inbound LXMF messages **solely
+for triggering notify wake-ups**.  This is NOT full LXMF propagation —
+messages are never stored, forwarded, or made available for download.
+This allows mobile clients (e.g. Sideband) to send LXMF messages that
+trigger notify wake-ups.
 
 ### Behaviour
 
@@ -579,7 +582,7 @@ sample is written on first run.
 name                      = "rfed"           # human-readable node name
 announce_interval_minutes = 360              # re-announce period
 announce_at_start         = true             # announce immediately on startup
-lxmf_propagation          = false            # accept LXMF for notify
+lxmf_propagation_notification = false         # accept LXMF solely for notify wake-ups
 
 [storage]
 limit_mb          = 2000                     # max blob storage (MB)
@@ -718,7 +721,7 @@ this node.  Any caller may issue the request; the payload is ignored.
 | `display_name` | String | Human-readable node name from config. |
 | `subscription` | Boolean | Whether the default policy allows subscription. |
 | `notify` | Boolean | Whether the default policy allows notify registration. |
-| `lxmf_propagation` | Boolean | Whether the node announces `lxmf.propagation`. |
+| `lxmf_propagation_notification` | Boolean | Whether the node accepts LXMF solely for notify wake-ups (not full propagation). |
 | `backup` | Boolean | Whether backup failover is configured (primary or secondary nodes set). |
 | `stamp_cost` | Integer / Nil | Required PoW leading-zero bits, or Nil if stamping is disabled. |
 
@@ -734,7 +737,7 @@ or feature-specific sub-maps.
   "display_name": "my-rfed-node",
   "subscription": true,
   "notify": true,
-  "lxmf_propagation": false,
+  "lxmf_propagation_notification": false,
   "backup": true,
   "stamp_cost": 16
 }

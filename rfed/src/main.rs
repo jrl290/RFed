@@ -53,7 +53,7 @@ mod fanout;
 mod sync;
 mod toml_config;
 mod destinations;
-mod lxmf_propagation;
+mod lxmf_propagation_notification;
 pub mod notify;
 
 use config::{NodeConfig, TierPolicy};
@@ -280,11 +280,13 @@ fn main() -> Result<(), String> {
         has_flag(&args, "--from-static-only")
         || toml_peering.and_then(|p| p.from_static_only).unwrap_or(false);
 
-    // ── LXMF propagation (notify-receive) ─────────────────────────────
+    // ── LXMF propagation notification ─────────────────────────────────
 
     // The node operator enables this; clients self-register notify relay hashes.
-    let lxmf_propagation_enabled: bool =
-        toml_node.and_then(|n| n.lxmf_propagation).unwrap_or(false);
+    // This is NOT full LXMF propagation — inbound LXMF messages only trigger
+    // notify wake-ups and are immediately discarded.
+    let lxmf_propagation_notification_enabled: bool =
+        toml_node.and_then(|n| n.lxmf_propagation_notification).unwrap_or(false);
 
     // ── Print banner ─────────────────────────────────────────────────
     eprintln!("┌──────────────────────────────────────────────────────┐");
@@ -298,7 +300,7 @@ fn main() -> Result<(), String> {
     eprintln!("│  VIP subs       : {:<34}│", vip_subscribers.len());
     eprintln!("│  Stamp cost     : {:<34}│",
         default_stamp_cost.map(|c| c.to_string()).as_deref().unwrap_or("disabled"));
-    eprintln!("│  lxmf.prop.     : {:<34}│", if lxmf_propagation_enabled { "yes" } else { "no" });
+    eprintln!("│  lxmf.prop.notif: {:<34}│", if lxmf_propagation_notification_enabled { "yes" } else { "no" });
     eprintln!("└──────────────────────────────────────────────────────┘");
 
     // ── Ensure directories exist ─────────────────────────────────────
@@ -397,7 +399,7 @@ fn main() -> Result<(), String> {
         primary_node,
         secondary_nodes,
         owner_offline_secs,
-        lxmf_propagation_enabled,
+        lxmf_propagation_notification_enabled,
     };
 
     // ── Federation Node ──────────────────────────────────────────────
@@ -411,17 +413,17 @@ fn main() -> Result<(), String> {
     destinations::enable(Arc::clone(&node))?;
     eprintln!("[rfed] Federation Node active");
 
-    // ── Optional lxmf.propagation service ───────────────────────────
-    if lxmf_propagation_enabled {
+    // ── Optional lxmf.propagation notification service ──────────────
+    if lxmf_propagation_notification_enabled {
         let notify_reg = node.lock().map_err(|_| "lock")?.notify_registry.clone();
         let node_config = node.lock().map_err(|_| "lock")?.config.clone();
         // Use the node identity (clone required; identity is non-Copy).
         let prop_identity = node.lock().map_err(|_| "lock")?.identity.clone();
-        let prop = lxmf_propagation::LxmfPropagation::new(prop_identity, &node_config, notify_reg)?;
-        lxmf_propagation::LxmfPropagation::wire(&prop)?;
-        lxmf_propagation::LxmfPropagation::announce(&prop);
+        let prop = lxmf_propagation_notification::LxmfPropagation::new(prop_identity, &node_config, notify_reg)?;
+        lxmf_propagation_notification::LxmfPropagation::wire(&prop)?;
+        lxmf_propagation_notification::LxmfPropagation::announce(&prop);
         node.lock().map_err(|_| "lock")?.lxmf_propagation = Some(prop);
-        eprintln!("[rfed] lxmf.propagation active (push-receive mode)");
+        eprintln!("[rfed] lxmf.propagation notification active (notify-only mode)");
     }
 
     // ── Initial announce ─────────────────────────────────────────────

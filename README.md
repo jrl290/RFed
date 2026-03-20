@@ -30,7 +30,7 @@ RFed extends beyond LXMF with **named channels**, **explicit subscriptions**, **
 - **Deferred delivery** — offline subscribers receive queued blobs on reconnect or explicit pull
 - **Notify relays** — lightweight wake packets to registered relays; can be used for mobile push notifications (APNs, FCM, UnifiedPush) without exposing message content
 - **Backup failover** — chain-of-custody handoff when a primary node goes silent
-- **LXMF propagation** — optional inbound LXMF acceptance for notify wake-ups
+- **LXMF propagation notification** — optional inbound LXMF acceptance solely for triggering notify wake-ups (not full propagation)
 - **Proof-of-work stamps** — configurable PoW difficulty per subscriber tier (default / VIP)
 - **Double-envelope encryption** — node never sees inner blob content; encrypted end-to-end
 

@@ -20,9 +20,9 @@ pub struct TomlNode {
     pub name: Option<String>,
     pub announce_interval_minutes: Option<u64>,
     pub announce_at_start: Option<bool>,
-    /// Run an `lxmf.propagation` node that accepts messages only for
-    /// notify-registered destinations (required for notify to work end-to-end).
-    pub lxmf_propagation: Option<bool>,
+    /// Accept inbound LXMF messages solely for triggering notify wake-ups.
+    /// This is NOT full LXMF propagation — messages are never stored or forwarded.
+    pub lxmf_propagation_notification: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -122,7 +122,7 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed.toml — Reticulum Federation Node con
 # name                      = "rfed"
 # announce_interval_minutes = 360
 # announce_at_start         = true
-# lxmf_propagation          = false  # set true to accept LXMF PUTs for notify-registered destinations
+# lxmf_propagation_notification = false  # set true to accept LXMF PUTs solely for notify wake-ups (not full propagation)
 
 [storage]
 # limit_mb          = 2000

@@ -213,9 +213,9 @@ impl Default for HookRegistry {
 
 /// Send a push wake-up for `reg` via the RNS adapter.
 ///
-/// Called by `lxmf_propagation::on_packet` when a message arrives for a
-/// push-registered destination.  Dispatch is fire-and-forget; the adapter
-/// MUST NOT block the calling thread.
+/// Called by `lxmf_propagation_notification::on_packet` when a message arrives
+/// for a push-registered destination.  Dispatch is fire-and-forget; the
+/// adapter MUST NOT block the calling thread.
 pub fn dispatch_push(reg: &PushRegistration) {
     rns::dispatch(reg);
 }
