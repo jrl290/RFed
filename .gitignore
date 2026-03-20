@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+rfed/target/
+
+# Cargo lock is committed for binary crates
+# (uncomment the next line for library crates)
+# Cargo.lock
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Runtime data & debug files
+*.txt
+*.log
+blobs/
+identity
+subscriptions.rmp
+notify_registrations.rmp
+deferred_delivery.rmp
+peers.rmp

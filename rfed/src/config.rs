@@ -1,0 +1,161 @@
+use std::path::PathBuf;
+
+// ── TierPolicy ────────────────────────────────────────────────────────────────
+
+/// Per-subscriber-tier delivery and anti-spam parameters.
+///
+/// Two tiers are maintained: `default_policy` (everyone) and `vip_policy`
+/// (subscribers listed in `NodeConfig::vip_subscribers`).  Use
+/// `NodeConfig::policy_for` to select the right tier for a given hash.
+///
+/// # Stamp and sender anonymity
+///
+/// `stamp_cost` on the channel SEND packet path applies node-wide via the
+/// default policy because fire-and-forget channel SEND packets carry no
+/// sender identity.  Per-VIP stamp bypass requires a future authenticated
+/// `/rfed/send` request path where `caller: Option<&Identity>` is available.
+#[derive(Clone, Debug)]
+pub struct TierPolicy {
+    /// Required PoW leading-zero bits for incoming blobs (None = disabled).
+    pub stamp_cost: Option<u32>,
+    /// Accept stamps down to `stamp_cost - stamp_flexibility`.
+    pub stamp_flexibility: Option<u32>,
+    /// Maximum blobs held in the deferred delivery queue for a subscriber
+    /// on this tier while they are offline.
+    pub deferred_queue_limit: usize,
+    /// Whether subscribers on this tier may register for notify relays.
+    pub allow_notify_registration: bool,
+    /// Whether subscribers on this tier may subscribe to channels.
+    pub allow_subscription: bool,
+    /// When true, nominated backup nodes must appear in
+    /// `NodeConfig::trusted_backup_peers`.
+    pub trusted_backup_only: bool,
+}
+
+impl Default for TierPolicy {
+    fn default() -> Self {
+        TierPolicy {
+            stamp_cost: Some(16),
+            stamp_flexibility: Some(3),
+            deferred_queue_limit: 256,
+            allow_notify_registration: true,
+            allow_subscription: true,
+            trusted_backup_only: false,
+        }
+    }
+}
+
+impl TierPolicy {
+    /// A relaxed VIP policy: lower stamp cost, larger deferred queue.
+    pub fn vip_default() -> Self {
+        TierPolicy {
+            stamp_cost: Some(8),
+            stamp_flexibility: Some(2),
+            deferred_queue_limit: 1024,
+            allow_notify_registration: true,
+            allow_subscription: true,
+            trusted_backup_only: false,
+        }
+    }
+}
+
+// ── NodeConfig ────────────────────────────────────────────────────────────────
+
+/// Full runtime configuration for an rfed node.
+#[derive(Clone)]
+pub struct NodeConfig {
+    // ── Paths ────────────────────────────────────────────────────────
+    /// rfed config/storage directory (e.g. ~/.rfed)
+    pub config_dir: PathBuf,
+    /// Optional override for the Reticulum config directory
+    pub rns_config_dir: Option<PathBuf>,
+    /// Path to the node identity file
+    pub identity_file: PathBuf,
+
+    // ── Node identity ─────────────────────────────────────────────────
+    /// Human-readable node name sent in announces
+    pub display_name: String,
+    /// How often the node re-announces itself (seconds)
+    pub announce_interval_secs: u64,
+    /// Whether to announce immediately on startup
+    pub announce_at_start: bool,
+
+    // ── Tiered delivery policy ────────────────────────────────────────
+    /// Policy applied to non-VIP subscribers/senders.
+    pub default_policy: TierPolicy,
+    /// Policy applied to VIP subscribers (listed in `vip_subscribers`).
+    pub vip_policy: TierPolicy,
+    /// 16-byte truncated dest hashes of VIP subscribers.
+    pub vip_subscribers: Vec<Vec<u8>>,
+
+    // ── Node-wide anti-spam ───────────────────────────────────────────
+    /// PoW cost advertised to peers for peering establishment.
+    pub peering_cost: Option<u32>,
+
+    // ── Storage limits ────────────────────────────────────────────────
+    /// Maximum total bytes of stored inner blobs
+    pub storage_limit_bytes: u64,
+    /// Maximum bytes transferred to a peer in a single sync session
+    pub transfer_limit_bytes: Option<u64>,
+    /// Maximum bytes transferred to a peer across all sessions per period
+    pub sync_limit_bytes: Option<u64>,
+
+    // ── Peering ───────────────────────────────────────────────────────
+    /// Explicitly configured peer destination hashes (16-byte truncated)
+    pub static_peers: Vec<Vec<u8>>,
+    /// When true, only accept blobs from static peers
+    pub from_static_only: bool,
+
+    // ── Backup node peering ───────────────────────────────────────────
+    /// Destination hashes of nodes trusted as subscriber backup nodes.
+    /// Referenced by `TierPolicy::trusted_backup_only`.
+    pub trusted_backup_peers: Vec<Vec<u8>>,
+    /// Designated primary backup node for THIS node's subscribers.
+    /// First-choice target for subscription pushes.
+    pub primary_node: Option<Vec<u8>>,
+    /// Ordered fallback list of secondary backup nodes.  If the primary is
+    /// unreachable, the first alive secondary is used.  After all designated
+    /// nodes are exhausted, auto-selection picks the best alive peer.
+    /// Only ONE node receives pushes at a time; the active backup re-pushes
+    /// to ITS own backup on failover (chain of custody).
+    pub secondary_nodes: Vec<Vec<u8>>,
+
+    /// Seconds since the last rfed.node announce before a backup node
+    /// considers the primary offline and starts delivering. Default: 90.
+    pub owner_offline_secs: f64,
+
+    // ── LXMF propagation (notify-receive) ─────────────────────────────
+    /// When true, rfed announces `lxmf.propagation` and accepts inbound
+    /// LXMF PUTs, but only stores/fires notify for registered destinations.
+    pub lxmf_propagation_enabled: bool,
+
+}
+
+impl NodeConfig {
+    /// Returns the delivery policy for `subscriber_hash`.
+    ///
+    /// VIP match is O(n) on the VIP list; in practice this list is small.
+    pub fn policy_for(&self, subscriber_hash: &[u8]) -> &TierPolicy {
+        if self.vip_subscribers.iter().any(|h| h.as_slice() == subscriber_hash) {
+            &self.vip_policy
+        } else {
+            &self.default_policy
+        }
+    }
+
+    pub fn blob_store_dir(&self) -> PathBuf {
+        self.config_dir.join("blobs")
+    }
+    pub fn subscription_file(&self) -> PathBuf {
+        self.config_dir.join("subscriptions.rmp")
+    }
+    pub fn notify_registry_file(&self) -> PathBuf {
+        self.config_dir.join("notify_registrations.rmp")
+    }
+    pub fn deferred_queue_file(&self) -> PathBuf {
+        self.config_dir.join("deferred_delivery.rmp")
+    }
+    pub fn peer_state_file(&self) -> PathBuf {
+        self.config_dir.join("peers.rmp")
+    }
+}
