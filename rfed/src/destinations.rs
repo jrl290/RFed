@@ -3,6 +3,7 @@
 //! Four inbound destinations are registered:
 //!
 //!   rfed.node      — Node announce + peer manifest/sync (OFFER, MESSAGE_GET)
+//!                    Backup push, capabilities query
 //!   rfed.delivery  — Client inbox pull (PULL request proves private key)
 //!   rfed.channel   — Inbound inner blobs + subscription control
 //!                    (SEND packet, SUBSCRIBE / UNSUBSCRIBE requests)
@@ -67,6 +68,8 @@ pub const NOTIFY_REGISTER_PATH: &str = "/rfed/notify/register";
 pub const NOTIFY_UNREGISTER_PATH: &str = "/rfed/notify/unregister";
 /// Client clears all notify relay registrations.
 pub const NOTIFY_CLEAR_PATH: &str = "/rfed/notify/clear";
+/// Client queries node capabilities and enabled features.
+pub const CAPABILITIES_PATH: &str = "/rfed/capabilities";
 
 /// RNS app namespace for all rfed destinations.
 pub const APP_NAME: &str = "rfed";
@@ -1240,6 +1243,66 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
 
+    // CAPABILITIES — public query returning node features and config surface.
+    // Response is a msgpack map that can be extended over time.
+    let caps_node = Arc::clone(node);
+    let capabilities_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
+                                         _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+        let guard = match caps_node.lock() {
+            Ok(g) => g,
+            Err(_) => return Vec::new(),
+        };
+        let cfg = &guard.config;
+
+        let mut caps: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+
+        // Protocol version — bump when wire formats change.
+        caps.push((
+            rmpv::Value::String("protocol_version".into()),
+            rmpv::Value::Integer(1.into()),
+        ));
+
+        // Node display name.
+        caps.push((
+            rmpv::Value::String("display_name".into()),
+            rmpv::Value::String(cfg.display_name.clone().into()),
+        ));
+
+        // Feature flags — reflects what this node has enabled.
+        caps.push((
+            rmpv::Value::String("subscription".into()),
+            rmpv::Value::Boolean(cfg.default_policy.allow_subscription),
+        ));
+        caps.push((
+            rmpv::Value::String("notify".into()),
+            rmpv::Value::Boolean(cfg.default_policy.allow_notify_registration),
+        ));
+        caps.push((
+            rmpv::Value::String("lxmf_propagation".into()),
+            rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
+        ));
+        caps.push((
+            rmpv::Value::String("backup".into()),
+            rmpv::Value::Boolean(cfg.primary_node.is_some() || !cfg.secondary_nodes.is_empty()),
+        ));
+
+        // Anti-spam parameters.
+        caps.push((
+            rmpv::Value::String("stamp_cost".into()),
+            match cfg.default_policy.stamp_cost {
+                Some(c) => rmpv::Value::Integer(c.into()),
+                None    => rmpv::Value::Nil,
+            },
+        ));
+
+        let mut buf = Vec::new();
+        if rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(caps)).is_ok() {
+            buf
+        } else {
+            Vec::new()
+        }
+    });
+
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.node_dest.register_request_handler(
         OFFER_PATH.to_string(), Some(sync_offer), ALLOW_ALL, None, false,
@@ -1249,6 +1312,9 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     )?;
     guard.node_dest.register_request_handler(
         BACKUP_PUSH_PATH.to_string(), Some(backup_push_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.node_dest.register_request_handler(
+        CAPABILITIES_PATH.to_string(), Some(capabilities_cb), ALLOW_ALL, None, false,
     )?;
     Transport::register_destination(guard.node_dest.clone());
     Ok(())

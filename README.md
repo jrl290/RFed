@@ -76,7 +76,7 @@ See the [Specification](SPEC.md#13-configuration) for all options.
 
 ## Channels Are Reticulum Destinations
 
-A channel is a **full Reticulum identity** with its own X25519 encryption key and Ed25519 signing key, deterministically derived from the channel name. Anyone who knows the name independently derives the same keypair and the same 16-byte destination hash:
+A channel is derived using the same cryptographic primitives as a Reticulum identity — X25519 for encryption and Ed25519 for signing — but it is **not** a registered or announced identity on the network. The keypair is deterministically computed from the channel name, so anyone who knows the name independently derives the same keys and the same 16-byte destination hash:
 
 ```
 "public.news.tech"

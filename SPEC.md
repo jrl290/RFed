@@ -167,6 +167,7 @@ multi-hop routed).
 | `/rfed/offer` | Peer | `msgpack [message_id, ...]` | `msgpack [(channel_hash, message_id), ...]` |
 | `/rfed/get` | Peer | `msgpack [message_id, ...]` | Binary blob stream (see §3) |
 | `/rfed/backup/push` | Owner node | `msgpack [(sub_hash, ch_hash), ...]` | `msgpack bool` |
+| `/rfed/capabilities` | Any | *(ignored)* | `msgpack Map` (see §17) |
 
 **rfed.channel** (publisher → node):
 | Path | Caller | Payload | Response |
@@ -700,6 +701,44 @@ and the `channel_hash.py` utility module for deterministic hash computation.
 | `ed25519-dalek` | 1.0.1 | Ed25519 key derivation |
 | `rand` | 0.8 | Random message ID generation |
 | `ctrlc` | 3.4 | Graceful shutdown (SIGINT) |
+
+---
+
+## 17. Capabilities Query
+
+The `/rfed/capabilities` request path on `rfed.node` returns a msgpack Map
+describing features, protocol version, and anti-spam parameters advertised by
+this node.  Any caller may issue the request; the payload is ignored.
+
+### Response Fields
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `protocol_version` | Integer | Wire-format version (currently `1`). Bump on breaking changes. |
+| `display_name` | String | Human-readable node name from config. |
+| `subscription` | Boolean | Whether the default policy allows subscription. |
+| `notify` | Boolean | Whether the default policy allows notify registration. |
+| `lxmf_propagation` | Boolean | Whether the node announces `lxmf.propagation`. |
+| `backup` | Boolean | Whether backup failover is configured (primary or secondary nodes set). |
+| `stamp_cost` | Integer / Nil | Required PoW leading-zero bits, or Nil if stamping is disabled. |
+
+The map is intentionally extensible — clients must tolerate unknown keys.
+Future versions may add fields such as `storage_available`, `peer_count`,
+or feature-specific sub-maps.
+
+### Example Response (decoded)
+
+```
+{
+  "protocol_version": 1,
+  "display_name": "my-rfed-node",
+  "subscription": true,
+  "notify": true,
+  "lxmf_propagation": false,
+  "backup": true,
+  "stamp_cost": 16
+}
+```
 
 ---
 
