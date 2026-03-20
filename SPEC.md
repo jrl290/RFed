@@ -423,37 +423,157 @@ delivered verbatim.
 ## 9. Notify System
 
 The notify system sends lightweight wake-up signals to relay nodes when a
-blob arrives for an offline subscriber. These wake packets carry no message
+blob arrives for an offline subscriber.  These wake packets carry no message
 content and can be used for mobile push notifications (APNs, FCM,
-UnifiedPush) or any other out-of-band alerting mechanism, without the node
-holding platform credentials.
+UnifiedPush) or any other out-of-band alerting mechanism, without the rfed
+node holding platform credentials.
 
-### Registration
+### 9.1 Registration
 
-Subscribers register notify relay hashes via `/rfed/notify/register`:
+Subscribers register notify relay hashes via `/rfed/notify/register`.
+The relay hash is the **32-character lowercase hex** representation of the
+relay's 16-byte RNS destination hash.
 
 ```python
 # Register a relay node for wake-ups
-relay_hash = "aabbccdd..."   # 32-char hex, rfed.notify dest of relay
-# → POST /rfed/notify/register  payload = msgpack("aabbccdd...")
+relay_hash = "aabbccdd11223344aabbccdd11223344"  # exactly 32 hex chars
+# → /rfed/notify/register  payload = msgpack string("aabbccdd...")
+# ← response: msgpack bool (true = accepted)
 ```
 
-### Dispatch Flow
+**Validation:** The hash must be exactly 32 ASCII hex digits (`[0-9a-f]`).
+Any other value is rejected.
 
-1. Blob arrives for subscriber who has registered notify relays.
-2. For each relay, rfed sends a wake packet to the relay's `rns.notify`
-   destination.
-3. The wake packet is a msgpack Map containing only destination hashes
-   (receiver, and optionally sender and channel). No message content.
-4. On failure, a single retry is attempted after 8 seconds.
+**Persistence:** Registrations are stored on disk in
+`~/.rfed/notify_registrations.rmp` and survive node restarts.
 
-### Privacy
+#### NotifyRegistration Record
 
-- The relay sees only which subscriber hash should be woken.
-- The relay never sees message content, channel names, or sender identities
-  (unless the sender hash is included from LXMF).
-- The relay is responsible for acting on the wake signal (e.g. converting
-  it into a platform push via APNs, FCM, or UnifiedPush).
+Each registration is stored as:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `subscriber_hash` | `bin(16)` | Subscriber's RNS identity hash (derived from caller's public key) |
+| `relay_hash` | `string(32)` | Hex-encoded relay destination hash |
+| `registered` | `f64` | Unix timestamp of registration (for expiry/refresh) |
+
+A subscriber may register multiple relays.  Each relay receives wake
+packets independently.
+
+### 9.2 Relay Destination Addressing
+
+The rfed node addresses the relay as a **Reticulum Single destination**
+using the following namespace:
+
+| Component | Value |
+|-----------|-------|
+| App name | `"rns"` |
+| Aspects | `["notify"]` |
+| Destination type | `Single` (asymmetric encryption, multi-hop routed) |
+| Identity | Recalled from Reticulum transport by the 16-byte relay hash |
+
+The full RNS destination name is `rns.notify`.  The relay must announce
+this destination so that Reticulum transport can route packets to it.
+
+### 9.3 Wake Packet Wire Format
+
+The wake packet payload is a **msgpack Map** with string keys and binary
+values.  It contains only destination hashes — never message content.
+
+| Key | Type | Present | Description |
+|-----|------|---------|-------------|
+| `"receiver"` | `bin(16)` | **Always** | Subscriber's RNS destination hash |
+| `"sender"` | `bin(16)` | Optional | Sender's RNS destination hash (LXMF path only) |
+| `"channel"` | `bin(16)` | Optional | Channel hash (rfed.channel fanout path only) |
+
+The map contains **at most 3 entries**.  Clients must tolerate unknown keys
+in future versions.
+
+**Encoding:** `rmpv::Value::Map` (msgpack fixmap or map16).
+
+#### Example: Channel Fanout Wake
+
+When a blob arrives on `rfed.channel` for a subscribed channel:
+
+```
+msgpack Map {
+  "receiver" → bin(16)   ← subscriber destination hash
+  "channel"  → bin(16)   ← channel hash the blob was published to
+}
+```
+
+`"sender"` is absent because fire-and-forget SEND packets carry no sender
+identity.
+
+#### Example: LXMF Propagation Notification Wake
+
+When an LXMF message arrives for a notify-registered destination:
+
+```
+msgpack Map {
+  "receiver" → bin(16)   ← recipient destination hash
+  "sender"   → bin(16)   ← sender destination hash (from LXMF payload)
+}
+```
+
+`"channel"` is absent because LXMF messages are not channel-scoped.
+
+### 9.4 Dispatch Flow
+
+1. Blob arrives for a subscriber who has registered notify relays.
+2. For each registered relay, rfed spawns an async task that:
+   a. Decodes the 32-char hex relay hash to 16 bytes.
+   b. Recalls the relay's identity from Reticulum transport.
+   c. Builds an outbound `rns.notify` Single destination.
+   d. Sends the msgpack wake packet as a Reticulum packet.
+3. On send failure, **one retry** is attempted after **8 seconds**.
+4. If the retry also fails, the wake is silently dropped.  The subscriber
+   will still receive the message via deferred queue pull or live fanout
+   on their next connection.
+
+### 9.5 Relay Implementation Guide (e.g. Retichat iOS)
+
+A relay is a service that:
+
+1. **Announces** a Reticulum identity on the `rns.notify` destination
+   (`app_name="rns"`, `aspects=["notify"]`, `DestinationType::Single`).
+2. **Receives** incoming Reticulum packets on that destination.
+3. **Decodes** the msgpack Map payload (see §9.3).
+4. **Maps** the `"receiver"` hash to a platform-specific device token
+   (APNs, FCM, etc.) using a relay-side database.
+5. **Sends** a platform push notification to the device.
+
+```
+┌─────────┐   SEND blob    ┌──────────┐  wake packet   ┌───────────┐  APNs/FCM  ┌──────────┐
+│ Publisher│───────────────→│ rfed node│───────────────→│   Relay   │───────────→│  Device  │
+└─────────┘                 └──────────┘                └───────────┘            └──────────┘
+                                 │                           │
+                         stores blob,                 maps receiver
+                         checks subs,                 hash → device
+                         dispatches wake              token, sends
+                                                      platform push
+```
+
+**The rfed node never holds APNs/FCM credentials.**  The relay operator
+manages all platform integrations independently.
+
+#### Relay-Side Requirements
+
+| Responsibility | Owner | Notes |
+|---------------|-------|-------|
+| `subscriber_hash → device_token` mapping | Relay | Relay must maintain this; rfed does not provide it |
+| APNs/FCM/UnifiedPush credentials | Relay | Stored on relay infrastructure, never shared with rfed |
+| Rate limiting outbound pushes | Relay | rfed imposes no backpressure on the relay |
+| Delivery confirmation | N/A | No ack path from relay back to rfed (fire-and-forget) |
+
+### 9.6 Privacy
+
+- The relay sees only which `subscriber_hash` should be woken, and
+  optionally which `sender` or `channel` triggered the wake.
+- The relay **never** sees message content, channel names, or any
+  encrypted payload.
+- The rfed node **never** sees device tokens, APNs certificates, or any
+  platform credentials.
 
 ---
 
