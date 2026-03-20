@@ -36,14 +36,17 @@
 //! `"public"`.  Any peer that knows the path can independently derive the
 //! same hash — no server-side registration required.
 //!
-//! For **private** channels the name (or first segment) is an unguessable
-//! secret.  Possession of the name = channel membership.
+//! For **private** channels the first segment should be a cryptographically
+//! random hex string (32+ characters from a CSPRNG).  Possession of the
+//! channel name = possession of the decryption keys = channel membership.
 //!
-//! Clients should use [`ChannelKeypair::from_path`] when constructing a
-//! channel from segments, or [`ChannelKeypair::from_name`] when the full
-//! dot-joined name is already known.
+//! Use [`ChannelKeypair::new_private`] to generate a fresh private channel
+//! with a random prefix, [`ChannelKeypair::from_path`] when constructing a
+//! channel from known segments, or [`ChannelKeypair::from_name`] when the
+//! full dot-joined name is already known.
 
 use sha2::{Digest, Sha256};
+use rand::Rng;
 use x25519_dalek::{StaticSecret as X25519Secret, PublicKey as X25519Public};
 use ed25519_dalek::{SecretKey as Ed25519Secret, PublicKey as Ed25519Public};
 
@@ -110,13 +113,47 @@ impl ChannelKeypair {
     ///
     /// # Private channels
     ///
-    /// Pass a single unguessable secret as the only segment:
+    /// Use [`new_private`](Self::new_private) to generate a fresh private
+    /// channel, or pass a CSPRNG-generated hex prefix as the first segment:
     ///
     /// ```rust,ignore
-    /// let kp = ChannelKeypair::from_path(&["s3cr3t-invite-token"]);
+    /// let kp = ChannelKeypair::from_path(&["a1b2c3d4...", "team", "ops"]);
     /// ```
     pub fn from_path(segments: &[&str]) -> Self {
         Self::from_name(&segments.join("."))
+    }
+
+    /// Generate a new private channel with a cryptographically random prefix.
+    ///
+    /// Produces a 32-character hex string from 16 random bytes (128 bits of
+    /// entropy) and joins it with the supplied path segments:
+    ///
+    /// ```rust,ignore
+    /// let kp = ChannelKeypair::new_private(&["team", "ops"]);
+    /// // kp.name → "a1b2c3d4e5f67890a1b2c3d4e5f67890.team.ops"
+    /// ```
+    ///
+    /// With no additional segments, the channel name is the hex string alone:
+    ///
+    /// ```rust,ignore
+    /// let kp = ChannelKeypair::new_private(&[]);
+    /// // kp.name → "a1b2c3d4e5f67890a1b2c3d4e5f67890"
+    /// ```
+    ///
+    /// The caller must persist and distribute `kp.name` out-of-band —
+    /// it is the only way to recover the channel's encryption keys.
+    pub fn new_private(segments: &[&str]) -> Self {
+        let mut rng = rand::thread_rng();
+        let mut bytes = [0u8; 16];
+        rng.fill(&mut bytes);
+        let prefix: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+        let name = if segments.is_empty() {
+            prefix
+        } else {
+            format!("{}.{}", prefix, segments.join("."))
+        };
+        Self::from_name(&name)
     }
 
     /// The 64-byte public key bundle (X25519 || Ed25519) that Reticulum's
