@@ -1,6 +1,6 @@
 # RFed — Reticulum Federation Node
 
-A subscriber federation node for the [Reticulum](https://reticulum.network) network. RFed provides named **channel** messaging with offline delivery, cross-node synchronisation, notify wake-ups, and subscriber backup failover — all running over Reticulum's encrypted transport layer.
+A subscriber federation node for the [Reticulum](https://reticulum.network) network. RFed provides named **channel** messaging with deferred delivery, cross-node synchronisation, notify wake-ups, and subscriber backup failover — all running over Reticulum's encrypted transport layer.
 
 > **AI-Assisted Development**: This project was developed with significant
 > assistance from AI language models. Architecture, implementation, code review,
