@@ -58,7 +58,7 @@ pub mod notify;
 
 use config::{NodeConfig, TierPolicy};
 use destinations::FedNode;
-use toml_config::TomlFile;
+use toml_config::{IniConfig, InterfaceSection, CONFIG_FILENAME};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -107,6 +107,59 @@ fn home_dir() -> PathBuf {
 
 // ── main() ───────────────────────────────────────────────────────────────────
 
+/// Build a merged Reticulum config at `merged_dir/config` that includes
+/// everything from `base_rns_dir/config` plus the extra interface sections
+/// declared in rfed.conf.  `storagepath` is injected so Reticulum continues
+/// to use its original storage directory regardless of the new configdir.
+fn merge_rns_interfaces(
+    base_rns_dir: &std::path::Path,
+    interfaces: &[InterfaceSection],
+    merged_dir: &std::path::Path,
+) -> Result<(), String> {
+    let base_config = base_rns_dir.join("config");
+    let base_storage = base_rns_dir.join("storage");
+
+    // Start with the existing config text (or a minimal skeleton).
+    let mut text = if base_config.exists() {
+        fs::read_to_string(&base_config)
+            .map_err(|e| format!("Cannot read RNS config {:?}: {e}", base_config))?
+    } else {
+        String::new()
+    };
+
+    // Ensure there is a [reticulum] section with storagepath set so Reticulum
+    // keeps using ~/.reticulum/storage even though we changed configdir.
+    if !text.contains("storagepath") {
+        let storage_line = format!(
+            "  storagepath = {}\n",
+            base_storage.to_string_lossy()
+        );
+        if let Some(pos) = text.find("[reticulum]") {
+            // Insert after the [reticulum] header line.
+            let after = pos + "[reticulum]".len();
+            text.insert_str(after, &format!("\n{}", storage_line));
+        } else {
+            // Prepend a [reticulum] section.
+            text = format!("[reticulum]\n{storage_line}\n{text}");
+        }
+    }
+
+    // Append the rfed-declared interface sections.
+    for iface in interfaces {
+        text.push_str(&format!("\n\n[{}]\n", iface.name));
+        for (k, v) in &iface.entries {
+            text.push_str(&format!("  {} = {}\n", k, v));
+        }
+    }
+
+    fs::create_dir_all(merged_dir)
+        .map_err(|e| format!("Cannot create merged RNS dir: {e}"))?;
+    fs::write(merged_dir.join("config"), &text)
+        .map_err(|e| format!("Cannot write merged RNS config: {e}"))?;
+
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
 
@@ -120,28 +173,22 @@ fn main() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".rfed"));
 
-    // ── Load TOML config (before CLI merge) ──────────────────────────
-    let toml_path = config_dir.join("rfed.toml");
+    // ── Load INI config (before CLI merge) ───────────────────────────
+    let conf_path = config_dir.join(CONFIG_FILENAME);
     // Write sample config on first run so the operator has a documented template.
-    if !toml_path.exists() {
+    if !conf_path.exists() {
         if let Err(e) = fs::create_dir_all(&config_dir) {
             if !config_dir.is_dir() {
                 return Err(format!("Cannot create config dir {:?}: {e}", config_dir));
             }
         }
-        let _ = fs::write(&toml_path, toml_config::SAMPLE_CONFIG);
-        eprintln!("[rfed] Wrote sample config to {}", toml_path.display());
+        let _ = fs::write(&conf_path, toml_config::SAMPLE_CONFIG);
+        eprintln!("[rfed] Wrote sample config to {}", conf_path.display());
     }
-    let toml = TomlFile::load(&toml_path)?;
-    let toml_node    = toml.node.as_ref();
-    let toml_storage = toml.storage.as_ref();
-    let toml_peering = toml.peering.as_ref();
-    let toml_def_pol = toml.policy.as_ref().and_then(|p| p.default.as_ref());
-    let toml_vip_pol = toml.policy.as_ref().and_then(|p| p.vip.as_ref());
-    let toml_vip     = toml.vip.as_ref();
+    let cfg = IniConfig::load(&conf_path)?;
 
-    // ── Merge: CLI wins over TOML wins over compiled default ──────────
-    let rns_config_dir: Option<PathBuf> = arg_value(&args, "--rnsconfig").map(PathBuf::from);
+    // ── Merge: CLI wins over file wins over compiled default ──────────
+    let rns_config_dir_arg: Option<PathBuf> = arg_value(&args, "--rnsconfig").map(PathBuf::from);
 
     let identity_path: PathBuf = arg_value(&args, "--identity")
         .map(PathBuf::from)
@@ -149,107 +196,95 @@ fn main() -> Result<(), String> {
 
     let node_name: String = arg_value(&args, "--name")
         .map(|s| s.to_string())
-        .or_else(|| toml_node.and_then(|n| n.name.clone()))
+        .or_else(|| cfg.node.name.clone())
         .unwrap_or_else(|| "rfed".to_string());
 
     let announce_interval_minutes: u64 = arg_value(&args, "--announce-interval")
         .and_then(|s| s.parse().ok())
-        .or_else(|| toml_node.and_then(|n| n.announce_interval_minutes))
+        .or(cfg.node.announce_interval_minutes)
         .unwrap_or(360);
 
     let announce_at_start: bool = if has_flag(&args, "--no-announce-at-start") {
         false
     } else {
-        toml_node.and_then(|n| n.announce_at_start).unwrap_or(true)
+        cfg.node.announce_at_start.unwrap_or(true)
     };
 
     // ── Default policy ────────────────────────────────────────────────
     let default_stamp_cost: Option<u32> =
         arg_value(&args, "--stamp-cost").and_then(|s| s.parse().ok())
-        .or_else(|| toml_def_pol.and_then(|p| p.stamp_cost))
+        .or(cfg.default_policy.stamp_cost)
         .or(Some(16));
     let default_stamp_flex: Option<u32> =
         arg_value(&args, "--stamp-flexibility").and_then(|s| s.parse().ok())
-        .or_else(|| toml_def_pol.and_then(|p| p.stamp_flexibility))
+        .or(cfg.default_policy.stamp_flexibility)
         .or(Some(3));
     let default_deferred_limit: usize =
-        toml_def_pol.and_then(|p| p.deferred_queue_limit).unwrap_or(256);
+        cfg.default_policy.deferred_queue_limit.unwrap_or(256);
     let default_allow_notify_reg: bool =
-        toml_def_pol.and_then(|p| p.allow_notify_registration).unwrap_or(true);
+        cfg.default_policy.allow_notify_registration.unwrap_or(true);
     let default_allow_sub: bool =
-        toml_def_pol.and_then(|p| p.allow_subscription).unwrap_or(true);
+        cfg.default_policy.allow_subscription.unwrap_or(true);
     let default_trusted_backup_only: bool =
-        toml_def_pol.and_then(|p| p.trusted_backup_only).unwrap_or(false);
+        cfg.default_policy.trusted_backup_only.unwrap_or(false);
 
     // ── VIP policy ────────────────────────────────────────────────────
     let vip_stamp_cost: Option<u32> =
-        toml_vip_pol.and_then(|p| p.stamp_cost).or(Some(8));
+        cfg.vip_policy.stamp_cost.or(Some(8));
     let vip_stamp_flex: Option<u32> =
-        toml_vip_pol.and_then(|p| p.stamp_flexibility).or(Some(2));
+        cfg.vip_policy.stamp_flexibility.or(Some(2));
     let vip_deferred_limit: usize =
-        toml_vip_pol.and_then(|p| p.deferred_queue_limit).unwrap_or(1024);
+        cfg.vip_policy.deferred_queue_limit.unwrap_or(1024);
     let vip_allow_notify_reg: bool =
-        toml_vip_pol.and_then(|p| p.allow_notify_registration).unwrap_or(true);
+        cfg.vip_policy.allow_notify_registration.unwrap_or(true);
     let vip_allow_sub: bool =
-        toml_vip_pol.and_then(|p| p.allow_subscription).unwrap_or(true);
+        cfg.vip_policy.allow_subscription.unwrap_or(true);
     let vip_trusted_backup_only: bool =
-        toml_vip_pol.and_then(|p| p.trusted_backup_only).unwrap_or(false);
+        cfg.vip_policy.trusted_backup_only.unwrap_or(false);
 
     // ── VIP subscriber list ───────────────────────────────────────────
     let mut vip_subscribers: Vec<Vec<u8>> = Vec::new();
-    if let Some(hex_list) = toml_vip.and_then(|v| v.subscribers.as_ref()) {
-        for hex_str in hex_list {
-            match reticulum_rust::decode_hex(hex_str.trim()) {
-                Some(bytes) => vip_subscribers.push(bytes),
-                None => return Err(format!("Invalid VIP subscriber hash in rfed.toml: {hex_str}")),
-            }
+    for hex_str in &cfg.vip.subscribers {
+        match reticulum_rust::decode_hex(hex_str.trim()) {
+            Some(bytes) => vip_subscribers.push(bytes),
+            None => return Err(format!("Invalid VIP subscriber hash in rfed.conf: {hex_str}")),
         }
     }
 
     // ── Trusted backup peers ──────────────────────────────────────────
     let mut trusted_backup_peers: Vec<Vec<u8>> = Vec::new();
-    if let Some(hex_list) = toml_peering.and_then(|p| p.trusted_backup_peers.as_ref()) {
-        for hex_str in hex_list {
-            match reticulum_rust::decode_hex(hex_str.trim()) {
-                Some(bytes) => trusted_backup_peers.push(bytes),
-                None => return Err(format!("Invalid trusted_backup_peer hash in rfed.toml: {hex_str}")),
-            }
+    for hex_str in &cfg.peering.trusted_backup_peers {
+        match reticulum_rust::decode_hex(hex_str.trim()) {
+            Some(bytes) => trusted_backup_peers.push(bytes),
+            None => return Err(format!("Invalid trusted_backup_peer hash in rfed.conf: {hex_str}")),
         }
     }
-    let primary_node: Option<Vec<u8>> = toml_peering
-        .and_then(|p| p.primary_node.as_deref())
+    let primary_node: Option<Vec<u8>> = cfg.peering.primary_node.as_deref()
         .and_then(|hex_str| reticulum_rust::decode_hex(hex_str.trim()))
         .and_then(|bytes| if bytes.len() == 16 { Some(bytes) } else { None });
 
-    let secondary_nodes: Vec<Vec<u8>> = toml_peering
-        .and_then(|p| p.secondary_nodes.as_ref())
-        .map(|list| {
-            list.iter()
-                .filter_map(|hex_str| reticulum_rust::decode_hex(hex_str.trim()))
-                .filter(|bytes| bytes.len() == 16)
-                .collect()
-        })
-        .unwrap_or_default();
+    let secondary_nodes: Vec<Vec<u8>> = cfg.peering.secondary_nodes.iter()
+        .filter_map(|hex_str| reticulum_rust::decode_hex(hex_str.trim()))
+        .filter(|bytes| bytes.len() == 16)
+        .collect();
 
-
-    let owner_offline_secs: f64 =
-        toml_peering.and_then(|p| p.owner_offline_secs).unwrap_or(90.0);
+    let owner_offline_secs: f64 = cfg.peering.owner_offline_secs.unwrap_or(90.0);
 
     // ── Peering / storage ─────────────────────────────────────────────
     let peering_cost: Option<u32> =
         arg_value(&args, "--peering-cost").and_then(|s| s.parse().ok())
-        .or_else(|| toml_peering.and_then(|p| p.peering_cost))
+        .or(cfg.peering.peering_cost)
         .or(Some(18));
 
     let storage_limit_mb: u64 =
         arg_value(&args, "--storage-limit").and_then(|s| s.parse().ok())
-        .or_else(|| toml_storage.and_then(|s| s.limit_mb))
+        .or(cfg.storage.limit_mb)
         .unwrap_or(2000);
 
-    let transfer_limit_mb: Option<u64> = toml_storage.and_then(|s| s.transfer_limit_mb);
-    let sync_limit_mb: Option<u64>     = toml_storage.and_then(|s| s.sync_limit_mb);
+    let transfer_limit_mb: Option<u64> = cfg.storage.transfer_limit_mb;
+    let sync_limit_mb: Option<u64>     = cfg.storage.sync_limit_mb;
 
-    // Collect --static-peer CLI flags (repeatable), then fall back to TOML.
+    // Collect --static-peer CLI flags (repeatable), then fall back to config.
     let mut static_peers: Vec<Vec<u8>> = Vec::new();
     let mut idx = 1;
     while idx < args.len() {
@@ -266,27 +301,37 @@ fn main() -> Result<(), String> {
         idx += 1;
     }
     if static_peers.is_empty() {
-        if let Some(hex_list) = toml_peering.and_then(|p| p.static_peers.as_ref()) {
-            for hex_str in hex_list {
-                match reticulum_rust::decode_hex(hex_str.trim()) {
-                    Some(bytes) => static_peers.push(bytes),
-                    None => return Err(format!("Invalid static_peer in rfed.toml: {hex_str}")),
-                }
+        for hex_str in &cfg.peering.static_peers {
+            match reticulum_rust::decode_hex(hex_str.trim()) {
+                Some(bytes) => static_peers.push(bytes),
+                None => return Err(format!("Invalid static_peer in rfed.conf: {hex_str}")),
             }
         }
     }
 
     let from_static_only: bool =
         has_flag(&args, "--from-static-only")
-        || toml_peering.and_then(|p| p.from_static_only).unwrap_or(false);
+        || cfg.peering.from_static_only.unwrap_or(false);
 
     // ── LXMF propagation notification ─────────────────────────────────
-
-    // The node operator enables this; clients self-register notify relay hashes.
-    // This is NOT full LXMF propagation — inbound LXMF messages only trigger
-    // notify wake-ups and are immediately discarded.
     let lxmf_propagation_notification_enabled: bool =
-        toml_node.and_then(|n| n.lxmf_propagation_notification).unwrap_or(false);
+        cfg.node.lxmf_propagation_notification.unwrap_or(false);
+
+    // ── Reticulum interface merging ────────────────────────────────────
+    // If rfed.conf declares any interface sections, merge them into a
+    // temporary Reticulum config (additive to ~/.reticulum/config).
+    let rns_config_dir: Option<PathBuf> = if cfg.interfaces.is_empty() {
+        rns_config_dir_arg
+    } else {
+        let base_rns = rns_config_dir_arg
+            .clone()
+            .unwrap_or_else(|| home_dir().join(".reticulum"));
+        let merged_dir = config_dir.join("_rns");
+        merge_rns_interfaces(&base_rns, &cfg.interfaces, &merged_dir)?;
+        eprintln!("[rfed] Merged {} interface(s) from rfed.conf into {}",
+            cfg.interfaces.len(), merged_dir.display());
+        Some(merged_dir)
+    };
 
     // ── Print banner ─────────────────────────────────────────────────
     eprintln!("┌──────────────────────────────────────────────────────┐");

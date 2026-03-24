@@ -467,12 +467,12 @@ using the following namespace:
 
 | Component | Value |
 |-----------|-------|
-| App name | `"rns"` |
+| App name | `"rfed"` |
 | Aspects | `["notify"]` |
 | Destination type | `Single` (asymmetric encryption, multi-hop routed) |
 | Identity | Recalled from Reticulum transport by the 16-byte relay hash |
 
-The full RNS destination name is `rns.notify`.  The relay must announce
+The full RNS destination name is `rfed.notify`.  The relay must announce
 this destination so that Reticulum transport can route packets to it.
 
 ### 9.3 Wake Packet Wire Format
@@ -524,7 +524,7 @@ msgpack Map {
 2. For each registered relay, rfed spawns an async task that:
    a. Decodes the 32-char hex relay hash to 16 bytes.
    b. Recalls the relay's identity from Reticulum transport.
-   c. Builds an outbound `rns.notify` Single destination.
+   c. Builds an outbound `rfed.notify` Single destination.
    d. Sends the msgpack wake packet as a Reticulum packet.
 3. On send failure, **one retry** is attempted after **8 seconds**.
 4. If the retry also fails, the wake is silently dropped.  The subscriber
@@ -535,8 +535,8 @@ msgpack Map {
 
 A relay is a service that:
 
-1. **Announces** a Reticulum identity on the `rns.notify` destination
-   (`app_name="rns"`, `aspects=["notify"]`, `DestinationType::Single`).
+1. **Announces** a Reticulum identity on the `rfed.notify` destination
+   (`app_name="rfed"`, `aspects=["notify"]`, `DestinationType::Single`).
 2. **Receives** incoming Reticulum packets on that destination.
 3. **Decodes** the msgpack Map payload (see §9.3).
 4. **Maps** the `"receiver"` hash to a platform-specific device token

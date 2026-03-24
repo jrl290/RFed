@@ -1,0 +1,16 @@
+[relay]
+# Absolute path to the relay's persistent Reticulum identity file.
+# Created automatically on first run.  Keep this file safe.
+identity_path = /var/lib/rfed-relay/identity
+
+# URL of the PHP bridge /wake endpoint.
+# Run the bridge on localhost and bind it to 127.0.0.1 for security.
+bridge_url = http://127.0.0.1:8080/wake
+
+# Shared secret — must match bridge_secret in config.local.php.
+# Generate with: openssl rand -hex 32
+bridge_secret = REPLACE_WITH_SECURE_RANDOM_HEX_STRING
+
+# Optional: path to a custom Reticulum config directory.
+# Leave blank to use the default (~/.reticulum).
+# rns_config = /etc/reticulum

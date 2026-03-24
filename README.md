@@ -18,7 +18,7 @@ RFed's core transport is modelled directly on the [LXMF](https://github.com/mark
 | **Peering cost** | Propagation nodes advertise a PoW cost for incoming peers | Parsed from peer announces; used in sync backoff scheduling |
 | **Destination hash routing** | First 16 bytes of wire format = recipient hash (plaintext, for routing) | Channel hash occupies the same position in the SEND packet |
 | **Exponential backoff** | Sync retry with increasing delay on failure, reset on success | Same pattern: 10 s min → 1 hour max, reset on announce heard |
-| **Announce metadata** | Msgpack array with node state, limits, stamp params, metadata map | Simplified 3-field announce; LXMF-format announce on optional `lxmf.propagation` destination |
+| **Announce metadata** | Msgpack array with node state, limits, stamp params, metadata map | Simplified 3-field announce; LXMF-format announce on optional `lxmf.propagation` destination (**notify trigger only — rfed is not an LXMF propagation node**) |
 
 RFed extends beyond LXMF with **named channels**, **explicit subscriptions**, **double-envelope encryption**, **notify relays**, **deferred per-subscriber queuing**, and **backup failover with chain-of-custody** — none of which exist in LXMF.
 
@@ -30,7 +30,7 @@ RFed extends beyond LXMF with **named channels**, **explicit subscriptions**, **
 - **Deferred delivery** — offline subscribers receive queued blobs on reconnect or explicit pull
 - **Notify relays** — lightweight wake packets to registered relays; can be used for mobile push notifications (APNs, FCM, UnifiedPush) without exposing message content
 - **Backup failover** — chain-of-custody handoff when a primary node goes silent
-- **LXMF propagation notification** — optional inbound LXMF acceptance solely for triggering notify wake-ups (not full propagation)
+- **LXMF notify trigger** — when enabled, rfed announces an `lxmf.propagation` destination and accepts inbound LXMF messages **only** to trigger notify wake-ups; messages are never stored, forwarded, or made available for download. **rfed is not an LXMF propagation node and does not provide propagation services.**
 - **Proof-of-work stamps** — configurable PoW difficulty per subscriber tier (default / VIP)
 - **Double-envelope encryption** — node never sees inner blob content; encrypted end-to-end
 

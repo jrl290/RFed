@@ -1,0 +1,50 @@
+# rfed APNs Push Bridge — Configuration
+# Copy this file to apns_bridge.conf and fill in the values.
+# Lines beginning with # are comments.
+
+[bridge]
+
+# Path where the bridge's Reticulum identity key is stored.
+# On first run a new identity is created automatically.
+# IMPORTANT: back this file up.  The identity hash is announced as
+# rfed.notify and rfed.apns — the iOS app and rfed node both need it.
+identity_path = ~/.rfed-apns/identity
+
+# SQLite database for subscriber_hash → APNs device token mappings.
+db_path = ~/.rfed-apns/tokens.db
+
+# Optional: path to a custom Reticulum config directory.
+# Leave commented to use the default (~/.reticulum).
+# rns_config = ~/.reticulum
+
+
+[apns]
+
+# Path to the .p8 private key file downloaded from developer.apple.com.
+key_file = /path/to/AuthKey_XXXXXXXXXX.p8
+
+# The 10-character Key ID shown beside the key on developer.apple.com.
+key_id = XXXXXXXXXX
+
+# Your Apple Developer Team ID (10 characters, top-right of the portal).
+team_id = XXXXXXXXXX
+
+# The app's bundle identifier (e.g. com.example.retichat).
+bundle_id = com.example.retichat
+
+# Set to true for APNs sandbox (development builds / simulator).
+# Set to false (or remove) for production.
+sandbox = true
+
+# APNs push type sent in the apns-push-type header.
+# Use "alert" for visible notifications, "voip" for VoIP (requires entitlement).
+push_type = alert
+
+# Text shown in the notification banner on the iOS device.
+alert_title = New message
+alert_body  = You have a new message waiting.
+
+# How long (seconds) to cache the ES256 JWT before regenerating it.
+# Apple requires re-generation before 60 minutes (3600 s).
+# Setting this lower reduces the window if a key is rotated.
+token_ttl = 3000

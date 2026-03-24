@@ -16,6 +16,8 @@
 //!
 //! No message content is included.
 //!
+//! The relay destination is `rfed.notify` (`app_name="rfed"`, `aspects=["notify"]`).
+//!
 //! # Retry & fallback
 //! If no path to the relay exists, a path request is issued and dispatch is
 //! retried once after a short delay.  If the retry also fails, the notify is
@@ -134,7 +136,7 @@ fn try_send(
     let dest = match Destination::new_outbound(
         Some(identity),
         DestinationType::Single,
-        "rns".to_string(),
+        "rfed".to_string(),
         vec!["notify".to_string()],
     ) {
         Ok(d) => d,
