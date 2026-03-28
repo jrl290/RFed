@@ -118,6 +118,24 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
+/// Map lowercased interface type (from configparser) back to the exact
+/// casing Reticulum-rust expects in `synthesize_interface()`.
+fn canonical_interface_type(lowered: &str) -> &str {
+    match lowered {
+        "autointerface"            => "AutoInterface",
+        "tcpclientinterface"       => "TCPClientInterface",
+        "tcpserverinterface"       => "TCPServerInterface",
+        "udpinterface"             => "UDPInterface",
+        "pipeinterface"            => "PipeInterface",
+        "serialinterface"          => "SerialInterface",
+        "kissinterface"            => "KISSInterface",
+        "rnodeinterface"           => "RNodeInterface",
+        "backboneinterface"        => "BackboneInterface",
+        "backboneclientinterface"  => "BackboneClientInterface",
+        _                          => lowered,
+    }
+}
+
 /// Generate the Reticulum config that rfed uses.
 ///
 /// Creates `<rfed_dir>/_rns/config`.  If `interfaces` is empty an
@@ -138,7 +156,8 @@ fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Resu
         for iface in interfaces {
             cfg.push_str(&format!("  [[{}]]\n", iface.name));
             for (k, v) in &iface.entries {
-                cfg.push_str(&format!("    {} = {}\n", k, v));
+                let val = if k == "type" { canonical_interface_type(v).to_string() } else { v.clone() };
+                cfg.push_str(&format!("    {} = {}\n", k, val));
             }
             cfg.push('\n');
         }
