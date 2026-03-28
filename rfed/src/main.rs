@@ -131,13 +131,14 @@ fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Resu
         "[reticulum]\n  share_instance = No\n  enable_transport = No\n  panic_on_interface_error = No\n\n",
     );
 
+    cfg.push_str("[interfaces]\n\n");
     if interfaces.is_empty() {
-        cfg.push_str("[AutoInterface Default]\n  type = AutoInterface\n  enabled = yes\n");
+        cfg.push_str("  [[AutoInterface Default]]\n    type = AutoInterface\n    enabled = yes\n");
     } else {
         for iface in interfaces {
-            cfg.push_str(&format!("[{}]\n", iface.name));
+            cfg.push_str(&format!("  [[{}]]\n", iface.name));
             for (k, v) in &iface.entries {
-                cfg.push_str(&format!("  {} = {}\n", k, v));
+                cfg.push_str(&format!("    {} = {}\n", k, v));
             }
             cfg.push('\n');
         }
