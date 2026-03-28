@@ -11,9 +11,10 @@
 //!
 //! Any section whose `type` value ends with `Interface` (case-insensitive)
 //! is treated as a Reticulum interface definition.  These sections are
-//! collected in `IniConfig::interfaces` and merged into a temporary
-//! Reticulum config at startup, making them additive to whatever interfaces
-//! Reticulum itself has configured in `~/.reticulum/config`.
+//! collected in `IniConfig::interfaces` and written into rfed's own
+//! Reticulum config at startup (`<config_dir>/_rns/config`).  rfed does
+//! NOT read or inherit interfaces from `~/.reticulum/config`, so it never
+//! conflicts with a co-located rnsd.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -338,11 +339,15 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed.conf — Reticulum Federation Node con
   # subscribers = aabbccddaabbccddaabbccddaabbccdd, 11223344112233441122334411223344
 
 
-# ── Reticulum interfaces (additive) ──────────────────────────────────────────
+# ── Reticulum interfaces ─────────────────────────────────────────────────────
 #
-# Any section whose type ends with Interface is treated as a Reticulum
-# interface definition and merged into Reticulum's config at startup —
-# additive to any interfaces already configured in ~/.reticulum/config.
+# rfed runs its own Reticulum instance with a separate config so it never
+# conflicts with a local rnsd.  By default it connects to the local rnsd
+# shared instance automatically (no interfaces needed).
+#
+# If you need rfed to reach additional networks (or run without rnsd),
+# add interface sections here.  Any section whose type ends with Interface
+# is written into rfed's Reticulum config at startup.
 #
 # Use the exact same syntax as ~/.reticulum/config.  For example:
 #
