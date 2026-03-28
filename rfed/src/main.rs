@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use reticulum_rust::identity::Identity;
 use reticulum_rust::reticulum::Reticulum;
-use reticulum_rust::transport::Transport;
+use reticulum_rust::transport::{Transport, get_state_snapshot};
 use reticulum_rust::hexrep;
 
 mod config;
@@ -102,6 +102,16 @@ fn home_dir() -> PathBuf {
     env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/root"))
+}
+
+fn format_bytes(b: u64) -> String {
+    if b < 1024 {
+        format!("{} B", b)
+    } else if b < 1024 * 1024 {
+        format!("{:.1} KiB", b as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0))
+    }
 }
 
 // ── main() ───────────────────────────────────────────────────────────────────
@@ -376,16 +386,23 @@ fn main() -> Result<(), String> {
     // ── Report Reticulum connection status ─────────────────────────
     let connected_to_shared = Transport::is_connected_to_shared_instance();
     let ifaces = Transport::get_interface_list();
+
     if connected_to_shared {
-        eprintln!("[rfed] Connected to local shared instance (rnsd)");
+        eprintln!("[rfed] Connected to shared instance (rnsd)");
     } else if ifaces.is_empty() {
-        eprintln!("[rfed] WARNING: Not connected to any Reticulum interface!");
+        eprintln!("[rfed] WARNING: No Reticulum interfaces active!");
         eprintln!("[rfed]   Either start rnsd or add interfaces to rfed.conf");
     } else {
-        eprintln!("[rfed] Running standalone (no shared instance)");
+        eprintln!("[rfed] Running as standalone Reticulum instance");
     }
+
+    // Classify interfaces: local socket vs network
     for iface in &ifaces {
-        eprintln!("[rfed]   Interface: {}", iface.name);
+        if iface.name.starts_with("Shared Instance[") || iface.name.starts_with("LocalInterface[") {
+            eprintln!("[rfed]   Local socket : {}", iface.name);
+        } else {
+            eprintln!("[rfed]   Interface    : {}", iface.name);
+        }
     }
 
     // ── Identity ─────────────────────────────────────────────────────
@@ -477,6 +494,34 @@ fn main() -> Result<(), String> {
             guard.announce();
         }
         eprintln!("[rfed] Initial announce queued");
+    } else {
+        // Even without announce, wait a moment for interfaces to connect.
+        thread::sleep(Duration::from_secs(3));
+    }
+
+    // ── Delayed network status (interfaces have had time to connect) ─
+    {
+        let snap = get_state_snapshot();
+        let net_ifaces: Vec<_> = snap.interfaces.iter()
+            .filter(|i| !i.name.starts_with("Shared Instance[") && !i.name.starts_with("LocalInterface["))
+            .collect();
+        let paths = snap.path_table.len();
+
+        if net_ifaces.is_empty() && !connected_to_shared {
+            eprintln!("[rfed] WARNING: No network interfaces connected");
+            eprintln!("[rfed]   Check your rfed.conf [interface] sections or start rnsd");
+        } else {
+            eprintln!("[rfed] ── Network status ──");
+            for iface in &net_ifaces {
+                let rx = format_bytes(iface.rxb);
+                let tx = format_bytes(iface.txb);
+                eprintln!("[rfed]   {} (rx: {}, tx: {})", iface.name, rx, tx);
+            }
+            if connected_to_shared {
+                eprintln!("[rfed]   (interfaces managed by rnsd)");
+            }
+            eprintln!("[rfed]   Known paths: {}", paths);
+        }
     }
 
     let mut last_announce     = Instant::now();
