@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use reticulum_rust::identity::Identity;
 use reticulum_rust::reticulum::Reticulum;
+use reticulum_rust::transport::Transport;
 use reticulum_rust::hexrep;
 
 mod config;
@@ -371,6 +372,21 @@ fn main() -> Result<(), String> {
         }
     }
     eprintln!("[rfed] Reticulum ready");
+
+    // ── Report Reticulum connection status ─────────────────────────
+    let connected_to_shared = Transport::is_connected_to_shared_instance();
+    let ifaces = Transport::get_interface_list();
+    if connected_to_shared {
+        eprintln!("[rfed] Connected to local shared instance (rnsd)");
+    } else if ifaces.is_empty() {
+        eprintln!("[rfed] WARNING: Not connected to any Reticulum interface!");
+        eprintln!("[rfed]   Either start rnsd or add interfaces to rfed.conf");
+    } else {
+        eprintln!("[rfed] Running standalone (no shared instance)");
+    }
+    for iface in &ifaces {
+        eprintln!("[rfed]   Interface: {}", iface.name);
+    }
 
     // ── Identity ─────────────────────────────────────────────────────
     let identity = if identity_path.exists() {
