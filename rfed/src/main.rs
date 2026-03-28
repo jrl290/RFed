@@ -133,7 +133,7 @@ fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Resu
         .map_err(|e| format!("Cannot create {:?}: {e}", rns_dir))?;
 
     let mut cfg = String::from(
-        "[reticulum]\n  share_instance = Yes\n  enable_transport = No\n\n",
+        "[reticulum]\n  share_instance = Yes\n  enable_transport = No\n  panic_on_interface_error = Yes\n\n",
     );
 
     for iface in interfaces {
@@ -384,6 +384,20 @@ fn main() -> Result<(), String> {
     if Transport::is_connected_to_shared_instance() {
         eprintln!("[rfed] Connected to rnsd shared instance");
     } else if rns_config_dir.is_some() {
+        // Standalone mode — verify at least one real interface came up.
+        // Give interfaces a moment to connect before checking.
+        thread::sleep(Duration::from_secs(2));
+        let snap = get_state_snapshot();
+        let real_interfaces: Vec<&str> = snap.interfaces.iter()
+            .map(|i| i.name.as_str())
+            .filter(|n| !n.starts_with("Shared Instance") && !n.starts_with("Local shared"))
+            .collect();
+        if real_interfaces.is_empty() {
+            return Err(
+                "All configured interfaces failed to start.\n\
+                 Check interface settings in rfed.conf or remove them to use rnsd.".to_string()
+            );
+        }
         eprintln!("[rfed] Running standalone (own interfaces from rfed.conf)");
     } else {
         eprintln!("[rfed] Running standalone (system Reticulum config)");
