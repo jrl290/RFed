@@ -68,8 +68,9 @@ fn print_help() {
     eprintln!(
         r#"rfed v{VERSION} — Reticulum Federation Node
 
-Runs standalone with its own Reticulum interfaces (AutoInterface by
-default).  Add interface sections to rfed.conf for TCP, RNode, etc.
+By default, connects to rnsd (shared instance on the system Reticulum
+config).  Add interface sections to rfed.conf to run standalone with
+your own TCP, RNode, or other interfaces instead.
 
 Usage: rfed [OPTIONS]
 
@@ -117,37 +118,37 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
-/// Generate the Reticulum config used by rfed.
+/// Build an rfed-private Reticulum config with explicit interfaces.
 ///
-/// Creates `<rfed_config_dir>/_rns/config`.  If `interfaces` is empty an
-/// AutoInterface section is written so rfed always has at least local
-/// network reachability.
-fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Result<PathBuf, String> {
+/// Returns `Some(path)` when `interfaces` is non-empty (standalone mode),
+/// or `None` when no interfaces are configured (use system Reticulum
+/// config, typically connecting to rnsd).
+fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Result<Option<PathBuf>, String> {
+    if interfaces.is_empty() {
+        return Ok(None);
+    }
+
     let rns_dir = rfed_dir.join("_rns");
     fs::create_dir_all(&rns_dir)
         .map_err(|e| format!("Cannot create {:?}: {e}", rns_dir))?;
 
     let mut cfg = String::from(
-        "[reticulum]\n  share_instance = No\n  enable_transport = No\n\n",
+        "[reticulum]\n  share_instance = Yes\n  enable_transport = No\n\n",
     );
 
-    if interfaces.is_empty() {
-        cfg.push_str("[AutoInterface Default]\n  type = AutoInterface\n  enabled = yes\n");
-    } else {
-        for iface in interfaces {
-            cfg.push_str(&format!("[{}]\n", iface.name));
-            for (k, v) in &iface.entries {
-                cfg.push_str(&format!("  {} = {}\n", k, v));
-            }
-            cfg.push('\n');
+    for iface in interfaces {
+        cfg.push_str(&format!("[{}]\n", iface.name));
+        for (k, v) in &iface.entries {
+            cfg.push_str(&format!("  {} = {}\n", k, v));
         }
+        cfg.push('\n');
     }
 
     let config_path = rns_dir.join("config");
     fs::write(&config_path, &cfg)
         .map_err(|e| format!("Cannot write {:?}: {e}", config_path))?;
 
-    Ok(rns_dir)
+    Ok(Some(rns_dir))
 }
 
 // ── main() ───────────────────────────────────────────────────────────────────
@@ -308,6 +309,8 @@ fn main() -> Result<(), String> {
         cfg.node.lxmf_propagation_notification.unwrap_or(false);
 
     // ── Build Reticulum config for rfed ──────────────────────────
+    // No interface sections → use system Reticulum (~/.reticulum/) → connects to rnsd.
+    // Interface sections present → generate rfed's own config → runs standalone.
     let rns_config_dir = build_rns_config(&config_dir, &cfg.interfaces)?;
 
     // ── Print banner ─────────────────────────────────────────────────
@@ -352,7 +355,7 @@ fn main() -> Result<(), String> {
     // ── Reticulum init ───────────────────────────────────────────────
     eprintln!("[rfed] Initialising Reticulum...");
     let rns_init = std::panic::catch_unwind(|| {
-        Reticulum::init(Some(rns_config_dir.clone()), None, None, None, false, None)
+        Reticulum::init(rns_config_dir.clone(), None, None, None, false, None)
     });
     match rns_init {
         Ok(Ok(())) => {}
@@ -372,8 +375,10 @@ fn main() -> Result<(), String> {
 
     if Transport::is_connected_to_shared_instance() {
         eprintln!("[rfed] Connected to rnsd shared instance");
+    } else if rns_config_dir.is_some() {
+        eprintln!("[rfed] Running standalone (own interfaces from rfed.conf)");
     } else {
-        eprintln!("[rfed] Running standalone (own interfaces)");
+        eprintln!("[rfed] Running standalone (system Reticulum config)");
     }
 
     // ── Identity ─────────────────────────────────────────────────────
@@ -395,7 +400,7 @@ fn main() -> Result<(), String> {
     // ── NodeConfig ───────────────────────────────────────────────────
     let config = NodeConfig {
         config_dir,
-        rns_config_dir: Some(rns_config_dir),
+        rns_config_dir,
 
         identity_file: identity_path,
         display_name: node_name,
