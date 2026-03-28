@@ -7,14 +7,10 @@
 //! On first run (no rfed.conf found) a commented sample is written so the
 //! operator has a self-documenting starting point.
 //!
-//! # Interface sections
-//!
-//! Any section whose `type` value ends with `Interface` (case-insensitive)
-//! is treated as a Reticulum interface definition.  These sections are
-//! collected in `IniConfig::interfaces` and written into rfed's own
-//! Reticulum config at startup (`<config_dir>/_rns/config`).  rfed does
-//! NOT read or inherit interfaces from `~/.reticulum/config`, so it never
-//! conflicts with a co-located rnsd.
+//! rfed runs standalone with its own Reticulum interfaces.  If no
+//! interface sections appear in rfed.conf, AutoInterface is used by
+//! default.  Any section whose `type` ends with `Interface` is passed
+//! through to the generated Reticulum config.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -341,33 +337,21 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed.conf — Reticulum Federation Node con
 
 # ── Reticulum interfaces ─────────────────────────────────────────────────────
 #
-# rfed runs its own Reticulum instance with a separate config so it never
-# conflicts with a local rnsd.  By default it connects to the local rnsd
-# shared instance automatically (no interfaces needed).
+# If no interface sections are defined here, rfed enables AutoInterface by
+# default (local network discovery).  Add sections exactly as you would in
+# the Reticulum config (~/.reticulum/config).  Any section with
+# type = *Interface is passed through to rfed's generated Reticulum config.
 #
-# If you need rfed to reach additional networks (or run without rnsd),
-# add interface sections here.  Any section whose type ends with Interface
-# is written into rfed's Reticulum config at startup.
+# Examples:
 #
-# Use the exact same syntax as ~/.reticulum/config.  For example:
-#
-# [TCP Seed Server]
-#
+# [TCP Transport]
 #   type        = TCPClientInterface
 #   enabled     = yes
-#   target_host = reticulum.betweentheborders.com
-#   target_port = 4965
+#   target_host = rns.stoppedcold.com
+#   target_port = 4242
 #
-#
-# [RNode LoRa]
-#
-#   type      = RNodeInterface
-#   enabled   = yes
-#   port      = /dev/ttyUSB0
-#   frequency = 868000000
-#   bandwidth = 125000
-#   txpower   = 7
-#   sf        = 7
-#   cr        = 5
+# [AutoInterface Default]
+#   type    = AutoInterface
+#   enabled = yes
 "#;
 
