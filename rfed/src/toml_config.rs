@@ -7,10 +7,10 @@
 //! On first run (no rfed.conf found) a commented sample is written so the
 //! operator has a self-documenting starting point.
 //!
-//! rfed uses the system Reticulum config by default (connects to rnsd).
-//! If interface sections appear in rfed.conf, rfed generates its own
-//! Reticulum config and runs standalone with those interfaces.  Any
-//! section whose `type` ends with `Interface` is passed through.
+//! rfed always uses its own Reticulum config (`<config_dir>/_rns/`).
+//! If no interface sections appear in rfed.conf, AutoInterface is used
+//! by default.  Any section whose `type` ends with `Interface` is
+//! written into the generated Reticulum config.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -337,13 +337,12 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed.conf — Reticulum Federation Node con
 
 # ── Reticulum interfaces ─────────────────────────────────────────────────────
 #
-# By default (no interface sections below), rfed uses the system Reticulum
-# config (~/.reticulum/config) and connects to rnsd if it is running.
-# This is the recommended setup when rnsd is already managing interfaces.
+# rfed uses its own Reticulum interfaces.  If no interface sections are
+# defined below, AutoInterface is enabled by default.
 #
-# To run rfed standalone (without rnsd), add interface sections here
-# exactly as you would in ~/.reticulum/config.  Any section with
-# type = *Interface is passed through to rfed's own Reticulum config.
+# Add sections exactly as you would in ~/.reticulum/config.  Any section
+# with type = *Interface is used.  Only what you list here is used —
+# nothing else, no assumptions.
 #
 # Examples:
 #

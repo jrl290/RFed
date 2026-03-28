@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use reticulum_rust::identity::Identity;
 use reticulum_rust::reticulum::Reticulum;
-use reticulum_rust::transport::{Transport, get_state_snapshot};
+use reticulum_rust::transport::get_state_snapshot;
 use reticulum_rust::hexrep;
 
 mod config;
@@ -68,9 +68,9 @@ fn print_help() {
     eprintln!(
         r#"rfed v{VERSION} — Reticulum Federation Node
 
-By default, connects to rnsd (shared instance on the system Reticulum
-config).  Add interface sections to rfed.conf to run standalone with
-your own TCP, RNode, or other interfaces instead.
+Uses its own Reticulum interfaces defined in rfed.conf.
+If no interfaces are configured, AutoInterface is used by default.
+Add TCP, RNode, or other interface sections to rfed.conf as needed.
 
 Usage: rfed [OPTIONS]
 
@@ -118,37 +118,36 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
-/// Build an rfed-private Reticulum config with explicit interfaces.
+/// Generate the Reticulum config that rfed uses.
 ///
-/// Returns `Some(path)` when `interfaces` is non-empty (standalone mode),
-/// or `None` when no interfaces are configured (use system Reticulum
-/// config, typically connecting to rnsd).
-fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Result<Option<PathBuf>, String> {
-    if interfaces.is_empty() {
-        return Ok(None);
-    }
-
+/// Creates `<rfed_dir>/_rns/config`.  If `interfaces` is empty an
+/// AutoInterface section is written as the default.
+fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Result<PathBuf, String> {
     let rns_dir = rfed_dir.join("_rns");
     fs::create_dir_all(&rns_dir)
         .map_err(|e| format!("Cannot create {:?}: {e}", rns_dir))?;
 
     let mut cfg = String::from(
-        "[reticulum]\n  share_instance = Yes\n  enable_transport = No\n  panic_on_interface_error = Yes\n\n",
+        "[reticulum]\n  share_instance = No\n  enable_transport = No\n  panic_on_interface_error = No\n\n",
     );
 
-    for iface in interfaces {
-        cfg.push_str(&format!("[{}]\n", iface.name));
-        for (k, v) in &iface.entries {
-            cfg.push_str(&format!("  {} = {}\n", k, v));
+    if interfaces.is_empty() {
+        cfg.push_str("[AutoInterface Default]\n  type = AutoInterface\n  enabled = yes\n");
+    } else {
+        for iface in interfaces {
+            cfg.push_str(&format!("[{}]\n", iface.name));
+            for (k, v) in &iface.entries {
+                cfg.push_str(&format!("  {} = {}\n", k, v));
+            }
+            cfg.push('\n');
         }
-        cfg.push('\n');
     }
 
     let config_path = rns_dir.join("config");
     fs::write(&config_path, &cfg)
         .map_err(|e| format!("Cannot write {:?}: {e}", config_path))?;
 
-    Ok(Some(rns_dir))
+    Ok(rns_dir)
 }
 
 // ── main() ───────────────────────────────────────────────────────────────────
@@ -309,13 +308,14 @@ fn main() -> Result<(), String> {
         cfg.node.lxmf_propagation_notification.unwrap_or(false);
 
     // ── Build Reticulum config for rfed ──────────────────────────
-    // No interface sections → use system Reticulum (~/.reticulum/) → connects to rnsd.
-    // Interface sections present → generate rfed's own config → runs standalone.
+    // rfed always has its own Reticulum config in <config_dir>/_rns/.
+    // If no interfaces in rfed.conf → AutoInterface default.
+    // If interfaces in rfed.conf → exactly those, nothing else.
     if cfg.interfaces.is_empty() {
-        eprintln!("[rfed] No interfaces in rfed.conf — will use system Reticulum (rnsd)");
+        eprintln!("[rfed] No interfaces in rfed.conf — using AutoInterface default");
     } else {
         eprintln!(
-            "[rfed] Interfaces in rfed.conf: {}",
+            "[rfed] Interfaces: {}",
             cfg.interfaces.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")
         );
     }
@@ -363,7 +363,7 @@ fn main() -> Result<(), String> {
     // ── Reticulum init ───────────────────────────────────────────────
     eprintln!("[rfed] Initialising Reticulum...");
     let rns_init = std::panic::catch_unwind(|| {
-        Reticulum::init(rns_config_dir.clone(), None, None, None, false, None)
+        Reticulum::init(Some(rns_config_dir.clone()), None, None, None, false, None)
     });
     match rns_init {
         Ok(Ok(())) => {}
@@ -381,26 +381,16 @@ fn main() -> Result<(), String> {
     }
     eprintln!("[rfed] Reticulum ready");
 
-    if Transport::is_connected_to_shared_instance() {
-        eprintln!("[rfed] Connected to rnsd shared instance");
-    } else if rns_config_dir.is_some() {
-        // Standalone mode — verify at least one real interface came up.
-        // Give interfaces a moment to connect before checking.
-        thread::sleep(Duration::from_secs(2));
+    // Log interface status
+    {
         let snap = get_state_snapshot();
-        let real_interfaces: Vec<&str> = snap.interfaces.iter()
-            .map(|i| i.name.as_str())
-            .filter(|n| !n.starts_with("Shared Instance") && !n.starts_with("Local shared"))
-            .collect();
-        if real_interfaces.is_empty() {
-            return Err(
-                "All configured interfaces failed to start.\n\
-                 Check interface settings in rfed.conf or remove them to use rnsd.".to_string()
-            );
+        if snap.interfaces.is_empty() {
+            eprintln!("[rfed] Warning: no active interfaces yet (will keep trying)");
+        } else {
+            for iface in &snap.interfaces {
+                eprintln!("[rfed] Interface up: {}", iface.name);
+            }
         }
-        eprintln!("[rfed] Running standalone (own interfaces from rfed.conf)");
-    } else {
-        eprintln!("[rfed] Running standalone (system Reticulum config)");
     }
 
     // ── Identity ─────────────────────────────────────────────────────
@@ -422,7 +412,7 @@ fn main() -> Result<(), String> {
     // ── NodeConfig ───────────────────────────────────────────────────
     let config = NodeConfig {
         config_dir,
-        rns_config_dir,
+        rns_config_dir: Some(rns_config_dir),
 
         identity_file: identity_path,
         display_name: node_name,
@@ -501,9 +491,7 @@ fn main() -> Result<(), String> {
     // ── Delayed network status (interfaces have had time to connect) ────
     {
         let snap = get_state_snapshot();
-        let connected_to_shared = Transport::is_connected_to_shared_instance();
-        let mode = if connected_to_shared { "via rnsd" } else { "standalone" };
-        eprintln!("[rfed] ── Network status ({}) ──", mode);
+        eprintln!("[rfed] ── Network status ──");
         for iface in &snap.interfaces {
             let rx = format_bytes(iface.rxb);
             let tx = format_bytes(iface.txb);
