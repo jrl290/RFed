@@ -311,6 +311,14 @@ fn main() -> Result<(), String> {
     // ── Build Reticulum config for rfed ──────────────────────────
     // No interface sections → use system Reticulum (~/.reticulum/) → connects to rnsd.
     // Interface sections present → generate rfed's own config → runs standalone.
+    if cfg.interfaces.is_empty() {
+        eprintln!("[rfed] No interfaces in rfed.conf — will use system Reticulum (rnsd)");
+    } else {
+        eprintln!(
+            "[rfed] Interfaces in rfed.conf: {}",
+            cfg.interfaces.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")
+        );
+    }
     let rns_config_dir = build_rns_config(&config_dir, &cfg.interfaces)?;
 
     // ── Print banner ─────────────────────────────────────────────────
