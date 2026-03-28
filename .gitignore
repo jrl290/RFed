@@ -25,3 +25,7 @@ subscriptions.rmp
 notify_registrations.rmp
 deferred_delivery.rmp
 peers.rmp
+
+# APNs credentials (never commit)
+utilities/apns_bridge.conf
+utilities/*.p8

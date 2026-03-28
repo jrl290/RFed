@@ -11,9 +11,9 @@ Two Reticulum destinations are announced:
                  These are fire-and-forget msgpack Maps carrying only hashes.
 
   rfed.apns    — Token registration endpoint for the iOS app.
-                 The app opens a Reticulum Link and sends a request to:
-                   /rfed/apns/register     register or refresh a token
-                   /rfed/apns/unregister   remove a token (logout / opt-out)
+                 The app sends a plain encrypted RNS packet (no Link required):
+                   register:   {"subscriber_hash": bin(16), "apns_token": str(64 hex)}
+                   unregister: {"subscriber_hash": bin(16)}
 
 When a wake packet arrives for a registered subscriber, this bridge sends
 an APNs HTTP/2 push notification using token-based auth (p8 key / ES256 JWT).
@@ -26,17 +26,11 @@ Architecture
   [rfed node] ──rfed.notify wake──▶ [apns_bridge.py] ──APNs HTTP/2──▶ iOS device
   [iOS app]   ──rfed.apns /register──▶ [apns_bridge.py]  (stores token → SQLite)
 
-Registration wire format  (/rfed/apns/register)
+Registration wire format  (/rfed/apns — plain encrypted packet)
 ─────────────────────────
-  Request payload:  msgpack Map
-    "subscriber_hash" : bin(16)   ← app's RNS identity hash (16 raw bytes)
-    "apns_token"      : str       ← 64-char lowercase hex device token
-  Response:         msgpack bool  (true = accepted)
-
-Unregister wire format  (/rfed/apns/unregister)
-───────────────────────
-  Request payload:  msgpack bin(16)  ← subscriber hash
-  Response:         msgpack bool     (true = removed)
+  Payload: msgpack Map
+    register:   {"subscriber_hash": bin(16), "apns_token": str(64 hex)}
+    unregister: {"subscriber_hash": bin(16)}   (no "apns_token" key)
 
 Requirements
 ───────────
@@ -343,22 +337,19 @@ class ApnsBridge:
         log.info("rfed.notify  hash: %s", RNS.prettyhexrep(notify_dest.hash))
 
         # ── rfed.apns (registration) ─────────────────────────────────────────
+        # Accepts plain encrypted packets (no Link required) so the iOS app
+        # can register without a Link FFI.
+        #
+        # Packet payload: msgpack Map
+        #   register:   {"subscriber_hash": bin(16), "apns_token": str(64 hex)}
+        #   unregister: {"subscriber_hash": bin(16)}  (no "apns_token" key)
         apns_dest = RNS.Destination(
             identity,
             RNS.Destination.IN,
             RNS.Destination.SINGLE,
             APNS_REG_APP, APNS_REG_ASPECT,
         )
-        apns_dest.register_request_handler(
-            "/rfed/apns/register",
-            response_generator=self._handle_register,
-            allow=RNS.Destination.ALLOW_ALL,
-        )
-        apns_dest.register_request_handler(
-            "/rfed/apns/unregister",
-            response_generator=self._handle_unregister,
-            allow=RNS.Destination.ALLOW_ALL,
-        )
+        apns_dest.set_packet_callback(self._on_register_packet)
         log.info("rfed.apns    hash: %s", RNS.prettyhexrep(apns_dest.hash))
         log.info("Token registry: %d registered", self._db.count())
 
@@ -440,61 +431,43 @@ class ApnsBridge:
             log.error("Wake: APNs error for %s: HTTP %d reason=%s",
                       receiver_hex, http_code, reason)
 
-    # ── Registration request handlers ─────────────────────────────────────────
+    # ── Registration packet handler ───────────────────────────────────────────
 
-    def _handle_register(
-        self, path, data, request_id, link_id, remote_identity, requested_at
-    ):
+    def _on_register_packet(self, message: bytes, packet: RNS.Packet) -> None:
         """
-        /rfed/apns/register
-        Request payload: msgpack Map
-          "subscriber_hash" : bin(16)
-          "apns_token"      : str  — 64 lowercase hex chars
-        Response: msgpack bool
+        Plain-packet registration from the iOS app.
+
+        Payload: msgpack Map
+          register:   {"subscriber_hash": bin(16), "apns_token": str(64 hex)}
+          unregister: {"subscriber_hash": bin(16)}   (no "apns_token" key)
         """
         try:
-            payload = msgpack.unpackb(bytes(data), raw=False)
+            payload = msgpack.unpackb(bytes(message), raw=False)
+            if not isinstance(payload, dict):
+                raise ValueError("payload must be a msgpack map")
 
-            sub_bytes  = payload["subscriber_hash"]
-            apns_token = payload["apns_token"]
-
+            sub_bytes = payload.get("subscriber_hash")
             if not isinstance(sub_bytes, (bytes, bytearray)) or len(sub_bytes) != 16:
                 raise ValueError("subscriber_hash must be 16 bytes")
-            if not isinstance(apns_token, str) or len(apns_token) != 64 \
-                    or not all(c in "0123456789abcdef" for c in apns_token):
-                raise ValueError("apns_token must be 64-char lowercase hex")
 
-            sub_hex = sub_bytes.hex()
-            self._db.register(sub_hex, apns_token)
-            log.info("Register: token stored for %s", sub_hex)
-            return msgpack.packb(True)
+            sub_hex    = sub_bytes.hex()
+            apns_token = payload.get("apns_token")
 
-        except Exception as exc:
-            log.warning("Register: rejected — %s", exc)
-            return msgpack.packb(False)
-
-    def _handle_unregister(
-        self, path, data, request_id, link_id, remote_identity, requested_at
-    ):
-        """
-        /rfed/apns/unregister
-        Request payload: msgpack bin(16) — subscriber hash
-        Response: msgpack bool
-        """
-        try:
-            sub_bytes = msgpack.unpackb(bytes(data), raw=True)
-
-            if not isinstance(sub_bytes, (bytes, bytearray)) or len(sub_bytes) != 16:
-                raise ValueError("payload must be 16-byte subscriber hash")
-
-            removed = self._db.unregister(sub_bytes.hex())
-            log.info("Unregister: %s for %s", "removed" if removed else "not found",
-                     sub_bytes.hex())
-            return msgpack.packb(removed)
+            if apns_token is not None:
+                # Register / refresh
+                if not isinstance(apns_token, str) or len(apns_token) != 64 \
+                        or not all(c in "0123456789abcdef" for c in apns_token):
+                    raise ValueError("apns_token must be 64-char lowercase hex")
+                self._db.register(sub_hex, apns_token)
+                log.info("Register: token stored for %s", sub_hex)
+            else:
+                # Unregister
+                removed = self._db.unregister(sub_hex)
+                log.info("Unregister: %s for %s",
+                          "removed" if removed else "not found", sub_hex)
 
         except Exception as exc:
-            log.warning("Unregister: rejected — %s", exc)
-            return msgpack.packb(False)
+            log.warning("Registration packet: rejected — %s", exc)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
