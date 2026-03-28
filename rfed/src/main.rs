@@ -58,7 +58,7 @@ pub mod notify;
 
 use config::{NodeConfig, TierPolicy};
 use destinations::FedNode;
-use toml_config::{IniConfig, InterfaceSection, CONFIG_FILENAME};
+use toml_config::{IniConfig, CONFIG_FILENAME};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -68,9 +68,8 @@ fn print_help() {
     eprintln!(
         r#"rfed v{VERSION} — Reticulum Federation Node
 
-Uses its own Reticulum interfaces defined in rfed.conf.
-If no interfaces are configured, AutoInterface is used by default.
-Add TCP, RNode, or other interface sections to rfed.conf as needed.
+Interfaces and Reticulum settings are in ~/.rfed/config
+using Reticulum's native config format.
 
 Usage: rfed [OPTIONS]
 
@@ -118,55 +117,13 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
-/// Map lowercased interface type (from configparser) back to the exact
-/// casing Reticulum-rust expects in `synthesize_interface()`.
-fn canonical_interface_type(lowered: &str) -> &str {
-    match lowered {
-        "autointerface"            => "AutoInterface",
-        "tcpclientinterface"       => "TCPClientInterface",
-        "tcpserverinterface"       => "TCPServerInterface",
-        "udpinterface"             => "UDPInterface",
-        "pipeinterface"            => "PipeInterface",
-        "serialinterface"          => "SerialInterface",
-        "kissinterface"            => "KISSInterface",
-        "rnodeinterface"           => "RNodeInterface",
-        "backboneinterface"        => "BackboneInterface",
-        "backboneclientinterface"  => "BackboneClientInterface",
-        _                          => lowered,
-    }
-}
-
-/// Generate the Reticulum config that rfed uses.
-///
-/// Creates `<rfed_dir>/_rns/config`.  If `interfaces` is empty an
-/// AutoInterface section is written as the default.
-fn build_rns_config(rfed_dir: &PathBuf, interfaces: &[InterfaceSection]) -> Result<PathBuf, String> {
-    let rns_dir = rfed_dir.join("_rns");
+/// Copy rfed's config to `_rns/` for Reticulum to read directly.
+fn prepare_rns_config(config_dir: &PathBuf) -> Result<PathBuf, String> {
+    let rns_dir = config_dir.join("_rns");
     fs::create_dir_all(&rns_dir)
         .map_err(|e| format!("Cannot create {:?}: {e}", rns_dir))?;
-
-    let mut cfg = String::from(
-        "[reticulum]\n  share_instance = No\n  enable_transport = No\n  panic_on_interface_error = No\n\n",
-    );
-
-    cfg.push_str("[interfaces]\n\n");
-    if interfaces.is_empty() {
-        cfg.push_str("  [[AutoInterface Default]]\n    type = AutoInterface\n    enabled = yes\n");
-    } else {
-        for iface in interfaces {
-            cfg.push_str(&format!("  [[{}]]\n", iface.name));
-            for (k, v) in &iface.entries {
-                let val = if k == "type" { canonical_interface_type(v).to_string() } else { v.clone() };
-                cfg.push_str(&format!("    {} = {}\n", k, val));
-            }
-            cfg.push('\n');
-        }
-    }
-
-    let config_path = rns_dir.join("config");
-    fs::write(&config_path, &cfg)
-        .map_err(|e| format!("Cannot write {:?}: {e}", config_path))?;
-
+    fs::copy(config_dir.join("config"), rns_dir.join("config"))
+        .map_err(|e| format!("Cannot prepare RNS config: {e}"))?;
     Ok(rns_dir)
 }
 
@@ -185,14 +142,17 @@ fn main() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".rfed"));
 
-    // ── Load INI config (before CLI merge) ───────────────────────────
+    // ── Load config ──────────────────────────────────────────────────
     let conf_path = config_dir.join(CONFIG_FILENAME);
-    // Write sample config on first run so the operator has a documented template.
     if !conf_path.exists() {
         if let Err(e) = fs::create_dir_all(&config_dir) {
             if !config_dir.is_dir() {
                 return Err(format!("Cannot create config dir {:?}: {e}", config_dir));
             }
+        }
+        if config_dir.join("rfed.conf").exists() {
+            eprintln!("[rfed] NOTE: config format has changed to Reticulum's native format.");
+            eprintln!("[rfed]       Please migrate your settings from rfed.conf to config.");
         }
         let _ = fs::write(&conf_path, toml_config::SAMPLE_CONFIG);
         eprintln!("[rfed] Wrote sample config to {}", conf_path.display());
@@ -257,7 +217,7 @@ fn main() -> Result<(), String> {
     for hex_str in &cfg.vip.subscribers {
         match reticulum_rust::decode_hex(hex_str.trim()) {
             Some(bytes) => vip_subscribers.push(bytes),
-            None => return Err(format!("Invalid VIP subscriber hash in rfed.conf: {hex_str}")),
+            None => return Err(format!("Invalid VIP subscriber hash in config: {hex_str}")),
         }
     }
 
@@ -266,7 +226,7 @@ fn main() -> Result<(), String> {
     for hex_str in &cfg.peering.trusted_backup_peers {
         match reticulum_rust::decode_hex(hex_str.trim()) {
             Some(bytes) => trusted_backup_peers.push(bytes),
-            None => return Err(format!("Invalid trusted_backup_peer hash in rfed.conf: {hex_str}")),
+            None => return Err(format!("Invalid trusted_backup_peer hash in config: {hex_str}")),
         }
     }
     let primary_node: Option<Vec<u8>> = cfg.peering.primary_node.as_deref()
@@ -314,7 +274,7 @@ fn main() -> Result<(), String> {
         for hex_str in &cfg.peering.static_peers {
             match reticulum_rust::decode_hex(hex_str.trim()) {
                 Some(bytes) => static_peers.push(bytes),
-                None => return Err(format!("Invalid static_peer in rfed.conf: {hex_str}")),
+                None => return Err(format!("Invalid static_peer in config: {hex_str}")),
             }
         }
     }
@@ -327,19 +287,8 @@ fn main() -> Result<(), String> {
     let lxmf_propagation_notification_enabled: bool =
         cfg.node.lxmf_propagation_notification.unwrap_or(false);
 
-    // ── Build Reticulum config for rfed ──────────────────────────
-    // rfed always has its own Reticulum config in <config_dir>/_rns/.
-    // If no interfaces in rfed.conf → AutoInterface default.
-    // If interfaces in rfed.conf → exactly those, nothing else.
-    if cfg.interfaces.is_empty() {
-        eprintln!("[rfed] No interfaces in rfed.conf — using AutoInterface default");
-    } else {
-        eprintln!(
-            "[rfed] Interfaces: {}",
-            cfg.interfaces.iter().map(|i| i.name.as_str()).collect::<Vec<_>>().join(", ")
-        );
-    }
-    let rns_config_dir = build_rns_config(&config_dir, &cfg.interfaces)?;
+    // ── Prepare Reticulum config ─────────────────────────────────
+    let rns_config_dir = prepare_rns_config(&config_dir)?;
 
     // ── Print banner ─────────────────────────────────────────────────
     eprintln!("┌──────────────────────────────────────────────────────┐");

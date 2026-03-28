@@ -1,16 +1,11 @@
-//! INI-format configuration file loader (Reticulum ecosystem format).
+//! Configuration loader for rfed.
 //!
-//! Reads `<config_dir>/rfed.conf`.  All sections and keys are optional;
-//! a missing file or missing key silently falls back to the compiled-in
-//! default.  CLI flags always override file values.
+//! rfed uses a single config file (`<config_dir>/config`) in Reticulum's
+//! native INI format.  The `[reticulum]` and `[interfaces]` sections are
+//! read by Reticulum directly; the rfed-specific sections (`[node]`,
+//! `[storage]`, `[peering]`, etc.) are parsed here.
 //!
-//! On first run (no rfed.conf found) a commented sample is written so the
-//! operator has a self-documenting starting point.
-//!
-//! rfed always uses its own Reticulum config (`<config_dir>/_rns/`).
-//! If no interface sections appear in rfed.conf, AutoInterface is used
-//! by default.  Any section whose `type` ends with `Interface` is
-//! written into the generated Reticulum config.
+//! On first run a sample config is written as a starting point.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -57,14 +52,6 @@ pub struct IniVip {
     pub subscribers: Vec<String>,
 }
 
-/// A Reticulum interface section declared in rfed.conf.
-/// `name` is the section header; `entries` are the raw key/value pairs
-/// in the order they will be written to the merged Reticulum config.
-pub struct InterfaceSection {
-    pub name: String,
-    pub entries: Vec<(String, String)>,
-}
-
 // ── Top-level parsed config ───────────────────────────────────────────────────
 
 pub struct IniConfig {
@@ -74,17 +61,7 @@ pub struct IniConfig {
     pub default_policy: IniTierPolicy,
     pub vip_policy:     IniTierPolicy,
     pub vip:            IniVip,
-    /// Reticulum interface sections to be merged into the RNS config at startup.
-    pub interfaces:     Vec<InterfaceSection>,
 }
-
-// Section names that belong to rfed — everything else with type=*Interface
-// is an RNS interface definition.
-const RFED_SECTIONS: &[&str] = &[
-    "node", "storage", "peering",
-    "policy.default", "policy.vip",
-    "vip",
-];
 
 impl IniConfig {
     /// Load and parse `rfed.conf`.  Returns an all-defaults config if the
@@ -144,38 +121,7 @@ impl IniConfig {
             subscribers: flat_csv(map.get("vip"), "subscribers"),
         };
 
-        // ── Interface sections ─────────────────────────────────────────
-        // Any section with type = *Interface and not a known rfed section.
-        let mut interfaces: Vec<InterfaceSection> = Vec::new();
-        for (section, kvs) in &map {
-            if section == "default" || RFED_SECTIONS.contains(&section.as_str()) {
-                continue;
-            }
-            let type_val = kvs.get("type")
-                .and_then(|v| v.as_deref())
-                .unwrap_or("")
-                .to_lowercase();
-            if type_val.ends_with("interface") {
-                let mut entries: Vec<(String, String)> = kvs
-                    .iter()
-                    .filter_map(|(k, v)| v.as_ref().map(|val| (k.clone(), val.clone())))
-                    .collect();
-                // type first, then enabled, then the rest alphabetically
-                entries.sort_by(|a, b| {
-                    let rank = |k: &str| match k {
-                        "type"    => 0,
-                        "enabled" => 1,
-                        _         => 2,
-                    };
-                    rank(&a.0).cmp(&rank(&b.0)).then(a.0.cmp(&b.0))
-                });
-                interfaces.push(InterfaceSection { name: section.clone(), entries });
-            }
-        }
-        // Stable order across runs
-        interfaces.sort_by(|a, b| a.name.cmp(&b.name));
-
-        Ok(IniConfig { node, storage, peering, default_policy, vip_policy, vip, interfaces })
+        Ok(IniConfig { node, storage, peering, default_policy, vip_policy, vip })
     }
 
     fn empty() -> Self {
@@ -203,7 +149,6 @@ impl IniConfig {
                 trusted_backup_only: None,
             },
             vip: IniVip { subscribers: vec![] },
-            interfaces: vec![],
         }
     }
 }
@@ -258,14 +203,42 @@ fn parse_tier_policy(sec: Option<&SectionMap>) -> Result<IniTierPolicy, String> 
 
 // ── Sample config ─────────────────────────────────────────────────────────────
 
-pub const CONFIG_FILENAME: &str = "rfed.conf";
+pub const CONFIG_FILENAME: &str = "config";
 
-/// Commented sample written on first run.
-pub const SAMPLE_CONFIG: &str = r#"# rfed.conf — Reticulum Federation Node configuration
-# All settings are optional; defaults are shown in comments.
-# CLI flags override these values for the current run only.
+/// Sample config written on first run.
+pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configuration
 #
-# This file uses the same INI format as ~/.reticulum/config and lxmd.
+# This file uses Reticulum's native config format.
+# The [reticulum] and [interfaces] sections are read by Reticulum directly.
+# The remaining sections are rfed-specific.
+#
+# CLI flags override rfed values for the current run only.
+
+[reticulum]
+  # Required for rfed — do not change these.
+  share_instance = No
+  enable_transport = No
+  panic_on_interface_error = No
+
+
+# ── Reticulum interfaces ─────────────────────────────────────────────────────
+# Use standard Reticulum format: [[double brackets]] for each interface.
+# Uncomment at least one interface for network connectivity.
+
+[interfaces]
+
+  # [[Default Interface]]
+  #   type = AutoInterface
+  #   enabled = Yes
+
+  # [[TCP Transport]]
+  #   type = TCPClientInterface
+  #   enabled = Yes
+  #   target_host = rmap.world
+  #   target_port = 4242
+
+
+# ── rfed settings ────────────────────────────────────────────────────────────
 
 [node]
 
@@ -278,45 +251,29 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed.conf — Reticulum Federation Node con
 [storage]
 
   # limit_mb          = 2000
-  # transfer_limit_mb = 500    # max bytes sent to a single peer per sync session
-  # sync_limit_mb     = 1000   # max bytes transferred across all peers per period
+  # transfer_limit_mb = 500
+  # sync_limit_mb     = 1000
 
 
 [peering]
 
-  # Federation peers — 16-byte destination hashes (32 hex chars), comma-separated.
   # static_peers      = aabbccddaabbccddaabbccddaabbccdd
-
   # from_static_only  = no
   # peering_cost      = 18
-
-  # Nodes trusted as subscriber backup delivery nodes (comma-separated hashes).
   # trusted_backup_peers = aabbccddaabbccddaabbccddaabbccdd
-
-  # Designated primary backup node for this node's subscribers.
   # primary_node = aabbccddaabbccddaabbccddaabbccdd
-
-  # Ordered fallback list of secondary backup nodes (comma-separated).
   # secondary_nodes = aabbccddaabbccddaabbccddaabbccdd, 11223344112233441122334411223344
-
-  # Seconds of silence before a backup node considers the primary offline.
   # owner_offline_secs = 90
 
-
-# ── Delivery policy ──────────────────────────────────────────────────────────
-# Two tiers: default (all subscribers) and vip (listed in [vip]).
-#
-# stamp_cost       — required PoW leading-zero bits for inbound channel posts.
-# stamp_flexibility — accept stamps with cost >= (stamp_cost - flexibility).
 
 [policy.default]
 
   # stamp_cost                = 16
   # stamp_flexibility         = 3
-  # deferred_queue_limit      = 256   # max blobs held while subscriber is offline
+  # deferred_queue_limit      = 256
   # allow_notify_registration = yes
   # allow_subscription        = yes
-  # trusted_backup_only       = no    # require backup nodes in [peering] trusted_backup_peers
+  # trusted_backup_only       = no
 
 
 [policy.vip]
@@ -331,29 +288,6 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed.conf — Reticulum Federation Node con
 
 [vip]
 
-  # Destination hashes (32 hex chars) of VIP subscribers, comma-separated.
   # subscribers = aabbccddaabbccddaabbccddaabbccdd, 11223344112233441122334411223344
-
-
-# ── Reticulum interfaces ─────────────────────────────────────────────────────
-#
-# rfed uses its own Reticulum interfaces.  If no interface sections are
-# defined below, AutoInterface is enabled by default.
-#
-# Add sections exactly as you would in ~/.reticulum/config.  Any section
-# with type = *Interface is used.  Only what you list here is used —
-# nothing else, no assumptions.
-#
-# Examples:
-#
-# [TCP Transport]
-#   type        = TCPClientInterface
-#   enabled     = yes
-#   target_host = rns.stoppedcold.com
-#   target_port = 4242
-#
-# [AutoInterface Default]
-#   type    = AutoInterface
-#   enabled = yes
 "#;
 
