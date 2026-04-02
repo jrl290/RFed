@@ -41,7 +41,7 @@ use std::time::{Duration, Instant};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::get_state_snapshot;
-use reticulum_rust::hexrep;
+use reticulum_rust::{hexrep, log, LOG_NOTICE};
 
 mod config;
 mod announce;
@@ -115,6 +115,67 @@ fn format_bytes(b: u64) -> String {
     } else {
         format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0))
     }
+}
+
+/// Write a `status.json` file into the config directory with all destination
+/// hashes and runtime info.  Any tool can `cat ~/.rfed/status.json` while rfed
+/// is running to inspect keys without restarting.
+fn write_status_file(
+    node: &Arc<Mutex<FedNode>>,
+    lxmf_prop: &Option<Arc<Mutex<lxmf_propagation::LxmfPropagationNode>>>,
+    startup: &Instant,
+) {
+    let Ok(guard) = node.lock() else { return };
+    let config_dir = &guard.config.config_dir;
+    let identity_hash = guard.identity.hash.as_ref()
+        .map(|h| hexrep(h, false))
+        .unwrap_or_default();
+
+    let prop_hash = lxmf_prop.as_ref().and_then(|arc| {
+        arc.lock().ok().map(|g| hexrep(&g.destination.hash, false))
+    }).unwrap_or_default();
+
+    let sub_count = guard.subscription_table.lock()
+        .map(|s| s.len()).unwrap_or(0);
+    let blob_count = guard.blob_store.lock()
+        .map(|b| b.index.len()).unwrap_or(0);
+    let notify_count = guard.notify_registry.lock()
+        .map(|n| n.count()).unwrap_or(0);
+
+    let uptime_secs = startup.elapsed().as_secs();
+    let name = &guard.config.display_name;
+
+    let json = format!(
+        concat!(
+            "{{\n",
+            "  \"node_name\": \"{}\",\n",
+            "  \"identity\": \"{}\",\n",
+            "  \"destinations\": {{\n",
+            "    \"rfed.node\": \"{}\",\n",
+            "    \"rfed.delivery\": \"{}\",\n",
+            "    \"rfed.channel\": \"{}\",\n",
+            "    \"rfed.notify\": \"{}\",\n",
+            "    \"lxmf.propagation\": \"{}\"\n",
+            "  }},\n",
+            "  \"stats\": {{\n",
+            "    \"uptime_secs\": {},\n",
+            "    \"subscribers\": {},\n",
+            "    \"blobs\": {},\n",
+            "    \"notify_registrations\": {}\n",
+            "  }}\n",
+            "}}\n"
+        ),
+        name, identity_hash,
+        hexrep(&guard.node_dest.hash, false),
+        hexrep(&guard.delivery_dest.hash, false),
+        hexrep(&guard.channel_dest.hash, false),
+        hexrep(&guard.notify_dest.hash, false),
+        prop_hash,
+        uptime_secs, sub_count, blob_count, notify_count,
+    );
+
+    let path = config_dir.join("status.json");
+    let _ = fs::write(&path, json);
 }
 
 /// Copy rfed's config to `_rns/` for Reticulum to read directly.
@@ -455,6 +516,14 @@ fn main() -> Result<(), String> {
 
         lxmf_propagation::LxmfPropagationNode::announce(&prop);
         node.lock().map_err(|_| "lock")?.lxmf_propagation = Some(Arc::clone(&prop));
+        if let Ok(guard) = prop.lock() {
+            log(
+                &format!("[rfed] lxmf.propagation dest hash: {}", hexrep(&guard.destination.hash, false)),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+        }
         eprintln!("[rfed] lxmf.propagation node active (full mode)");
         Some(prop)
     } else {
@@ -502,6 +571,9 @@ fn main() -> Result<(), String> {
 
     eprintln!("[rfed] Node running. Press Ctrl-C to stop.");
 
+    // Write initial status file so operators can inspect keys immediately.
+    write_status_file(&node, &lxmf_prop_arc, &startup);
+
     // ── Main loop ────────────────────────────────────────────────────
     loop {
         if interrupted.load(Ordering::Relaxed) {
@@ -513,6 +585,7 @@ fn main() -> Result<(), String> {
             // ── Graceful shutdown: persist all state ─────────────────
             if let Ok(guard) = node.lock() {
                 guard.save_all();
+                let _ = fs::remove_file(guard.config.config_dir.join("status.json"));
             }
             if let Some(ref prop) = lxmf_prop_arc {
                 if let Ok(guard) = prop.lock() {
@@ -549,6 +622,7 @@ fn main() -> Result<(), String> {
             if let Ok(mut guard) = node.lock() {
                 guard.tick_backup_delivery();
             }
+            write_status_file(&node, &lxmf_prop_arc, &startup);
             last_backup_tick = Instant::now();
         }
 

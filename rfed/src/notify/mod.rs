@@ -173,6 +173,10 @@ impl NotifyRegistry {
             .map_err(|e| format!("NotifyRegistry write: {e}"))?;
         Ok(())
     }
+
+    pub fn count(&self) -> usize {
+        self.registrations.len()
+    }
 }
 
 // ── HookRegistry ─────────────────────────────────────────────────────────────
