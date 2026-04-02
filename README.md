@@ -154,7 +154,14 @@ See [SPEC.md §1](SPEC.md#1-channel-hash-derivation) for the full derivation alg
 
 #### Step 1 — Sender publishes to rfed node
 
-The sender derives the channel's X25519 public key from the channel name and encrypts the message content to it. The sender also signs the ciphertext with their own Ed25519 key. This produces an **inner blob** — opaque to anyone who doesn't know the channel name.
+The sender derives the channel's X25519 public key from the channel name and encrypts the message content to it (ephemeral ECDH + HKDF + AES-CBC-HMAC — the same scheme Reticulum uses for `Identity.encrypt()`). This produces an **inner blob** — opaque to anyone who doesn't know the channel name.
+
+> **Note:** The current channel wire format does not include sender authentication.
+> Any party that knows the channel name can publish. Sender identity verification
+> is planned by adopting LXMF as the inner payload format, which provides Ed25519
+> signatures, source identity, timestamps, and structured fields — identical to
+> how LXMF propagation authenticates senders without the propagation node seeing
+> message content.
 
 The sender transmits to the node's `rfed.channel` destination:
 
@@ -166,7 +173,7 @@ The sender transmits to the node's `rfed.channel` destination:
 |------|-----------|----------------------|
 | Channel hash | No (routing label) | **Yes** — used for storage and fanout lookup |
 | Inner blob content | Yes (to channel pubkey) | **No** — opaque ciphertext |
-| Sender identity | Not in wire header | **No** — Reticulum Single destinations carry no sender |
+| Sender identity | Not in wire format | **No** — not included in current protocol (planned via LXMF inner format) |
 | PoW stamp | No | **Yes** — validated then stripped before storage |
 
 #### Step 2 — Node stores the blob
@@ -201,8 +208,8 @@ The node wraps each inner blob in a second Reticulum envelope addressed to the s
 │                                                              │
 │  ┌─── Inner Blob (sender → channel) ─────────────────────┐  │
 │  │  Encrypted to channel's X25519 pubkey                  │  │
-│  │  Signed by sender's Ed25519 key                        │  │
 │  │  Content: opaque to rfed node                          │  │
+│  │  (sender auth planned via LXMF inner format)           │  │
 │  └────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -212,7 +219,6 @@ The node wraps each inner blob in a second Reticulum envelope addressed to the s
 | Outer envelope (routing) | **Yes** — the node created it | Decrypted by subscriber |
 | Inner blob ciphertext | **Yes** — but cannot decrypt | **Yes** — then decrypts with channel privkey |
 | Inner blob plaintext | **No** — lacks channel privkey | **Yes** — knows channel name |
-| Sender signature | Verifiable but anonymous | Verified with sender's pubkey |
 
 If the subscriber is offline, the blob enters the **deferred queue** and is delivered on reconnect or explicit pull.
 
@@ -222,7 +228,7 @@ If the subscriber is offline, the blob enters the **deferred queue** and is deli
 |-------|-------|---------------------|------|
 | **Sender** | Channel name, own keys | Yes | Only what they send |
 | **rfed node** | Channel hash only | **No** | Opaque blobs, routing hashes |
-| **Subscriber** | Channel name | **Yes** | Decrypted content + sender signature |
+| **Subscriber** | Channel name | **Yes** | Decrypted content |
 | **Federation peer** | Channel hash only | **No** | Opaque blobs during sync |
 | **Network observer** | Nothing | **No** | Reticulum-encrypted packets |
 

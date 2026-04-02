@@ -49,7 +49,7 @@ fn decode_msgpack_bin(data: &[u8]) -> Vec<u8> {
 use crate::config::NodeConfig;
 use crate::deferred_queue::DeferredQueue;
 use crate::fanout;
-use crate::lxmf_propagation_notification::LxmfPropagation;
+use crate::lxmf_propagation::LxmfPropagationNode;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
 use crate::subscription::SubscriptionTable;
 use crate::sync::{FedSync, OFFER_PATH, MESSAGE_GET_PATH, BACKUP_PUSH_PATH};
@@ -85,6 +85,11 @@ const STAMP_EXPAND_ROUNDS: u32 = 16;
 // ── FedNode ──────────────────────────────────────────────────────────────────
 
 /// Central state for a running Federation Node.
+///
+/// Owns all four RNS inbound destinations, the blob store, subscription table,
+/// deferred delivery queue, notify registry, and inter-node sync engine.
+/// Wrapped in `Arc<Mutex<FedNode>>` and shared across all callback closures
+/// via a `Weak` self-reference to avoid reference cycles.
 pub struct FedNode {
     pub identity: Identity,
     pub config: NodeConfig,
@@ -96,8 +101,8 @@ pub struct FedNode {
     pub sync: Arc<Mutex<FedSync>>,
     pub deferred_queue: Arc<Mutex<DeferredQueue>>,
 
-    /// Optional `lxmf.propagation` node for notify-receive (None when disabled).
-    pub lxmf_propagation: Option<Arc<Mutex<LxmfPropagation>>>,
+    /// Optional full `lxmf.propagation` node (None when disabled).
+    pub lxmf_propagation: Option<Arc<Mutex<LxmfPropagationNode>>>,
 
     // Inbound RNS destinations
     pub node_dest: Destination,
@@ -106,6 +111,8 @@ pub struct FedNode {
     pub notify_dest: Destination,
 
     /// Active outbound sync links keyed by peer destination hash.
+    /// Pruned each tick_sync — entries whose link has reached STATE_CLOSED
+    /// are removed so a new link can be opened on the next attempt.
     pub sync_links: HashMap<Vec<u8>, Arc<Mutex<Link>>>,
 
     /// Pending (subscriber_hash, channel_hash) pairs awaiting backup delivery to
@@ -218,6 +225,10 @@ impl FedNode {
     }
 
     /// Broadcast the rfed.node announce with current app_data.
+    ///
+    /// The announce is delayed by `NODE_ANNOUNCE_DELAY` seconds on a background
+    /// thread to let interfaces settle.  Also announces the three service
+    /// destinations (channel, delivery, notify) so clients can discover them.
     pub fn announce(&self) {
         let _app_data = announce::encode_node_announce(
             &self.config.display_name,
@@ -274,8 +285,14 @@ impl FedNode {
     }
 
     /// Called from the main event loop — drives pending peer sync sessions.
+    ///
+    /// For each peer that is due for a sync attempt, opens an outbound encrypted
+    /// Link to their rfed.node destination.  The link_established callback then
+    /// runs `run_sync_session()` which handles the OFFER → MESSAGE_GET flow.
     pub fn tick_sync(&mut self) {
         // Prune links that have closed since the last tick.
+        // Retaining only live links prevents stale entries from blocking
+        // new connection attempts.
         self.sync_links.retain(|_, link| {
             link.lock().map(|l| l.state != STATE_CLOSED).unwrap_or(false)
         });
@@ -348,10 +365,14 @@ impl FedNode {
 
             if let Ok(mut guard) = link_arc.lock() {
                 // link_established → start the OFFER → MESSAGE_GET session.
+                //
                 // IMPORTANT: The callback receives `la` which for an initiator link
                 // is `Arc::new(Mutex::new(self.clone()))` — a separate Arc wrapping
                 // a clone, not the registered link_arc.  We must capture and use the
                 // original link_arc so that request() sends over the real link.
+                //
+                // The `pw_est` weak ref lets the callback lock FedNode without
+                // creating a strong reference cycle.
                 let pw_est = node_weak.clone();
                 let ph_est = ph.clone();
                 let la_real = Arc::clone(&link_arc);
@@ -359,7 +380,8 @@ impl FedNode {
                     run_sync_session(Arc::clone(&la_real), ph_est.clone(), pw_est.clone());
                 }));
 
-                // link_closed → clean up and schedule retry
+                // link_closed → clean up the sync link entry so tick_sync knows
+                // the link is dead and a new attempt may be scheduled.
                 let pw_cls = node_weak.clone();
                 let ph_cls = ph.clone();
                 guard.callbacks.link_closed = Some(Arc::new(move |_| {
@@ -548,7 +570,8 @@ fn run_sync_session(
     node_weak: Option<Weak<Mutex<FedNode>>>,
 ) {
     // Build our local manifest — send only the IDs (no channel hashes needed
-    // in the outgoing OFFER; the peer uses them just for rate-limiting).
+    // in the outgoing OFFER; the peer uses them just for filtering channels
+    // it has subscribers for).
     let our_ids: Vec<Vec<u8>> = if let Some(arc) =
         node_weak.as_ref().and_then(|w| w.upgrade())
     {
@@ -576,7 +599,9 @@ fn run_sync_session(
     let la_ok = Arc::clone(&link_arc);
     let la_fail = Arc::clone(&link_arc);
 
-    // OFFER response callback
+    // OFFER response callback: receives the peer's manifest, computes the
+    // gap (IDs they have that we don't, filtered to our subscribed channels),
+    // then issues a MESSAGE_GET for the missing blobs.
     let offer_response: Arc<dyn Fn(RequestReceipt) + Send + Sync> =
         Arc::new(move |receipt| {
             let response = match receipt.response {
@@ -591,6 +616,8 @@ fn run_sync_session(
 
             // Peer manifest is (channel_hash, message_id) pairs — this lets
             // us filter to only channels we have local subscribers for.
+            // The gap_from_peer() call acquires blob_store and subscription_table
+            // locks exactly once each to avoid potential double-locking.
             let peer_pairs: Vec<(Vec<u8>, Vec<u8>)> = rmp_serde::from_slice(&response)
                 .unwrap_or_default();
 
@@ -632,7 +659,9 @@ fn run_sync_session(
                     let data = receipt.response.unwrap_or_default();
 
                     // Ingest blobs into the store, then fanout each new one to
-                    // local subscribers — same path as a direct SEND packet.
+                    // local subscribers — same delivery path as a direct SEND packet.
+                    // Missed subscribers (offline) are enqueued in the deferred queue
+                    // and get a notify wake-up.
                     let ingested: Vec<(Vec<u8>, Vec<u8>)> = if let Some(arc) =
                         nw2.as_ref().and_then(|w| w.upgrade())
                     {
@@ -754,9 +783,16 @@ fn teardown_sync(
 
 // ── Backup delivery helpers ───────────────────────────────────────────────────
 
-/// Open a link to the backup node and send a batch of backup subscription
-/// registrations.  Fire-and-forget: if path is unavailable, pairs are
+/// Open a link to a backup node and send a batch of backup subscription
+/// registrations.  Fire-and-forget: if the path is unavailable, pairs are
 /// re-enqueued for the next `tick_backup_delivery` attempt.
+///
+/// The pattern is:
+///   1. Verify path/identity to backup node; re-enqueue pairs if missing.
+///   2. Open encrypted Link; in link_established callback:
+///      a. Identify ourselves (so backup knows the owner).
+///      b. Send BACKUP_PUSH request with the subscription pairs.
+///      c. Tear down the link on response (success or failure).
 fn push_subscriptions_to_backup(
     backup_hash: Vec<u8>,
     pairs: Vec<(Vec<u8>, Vec<u8>)>,
@@ -826,7 +862,8 @@ fn push_subscriptions_to_backup(
 
     // The caller passes our_identity directly (the BACKUP_PUSH handler
     // derives the owner_hash from the caller identity).  We must NOT try to
-    // lock node_weak here — tick_backup_delivery already holds that lock.
+    // lock node_weak here — tick_backup_delivery already holds that lock,
+    // so attempting to lock again would deadlock.
 
     if let Ok(mut guard) = link_arc.lock() {
         let payload_for_est = payload.clone();
@@ -862,16 +899,14 @@ fn push_subscriptions_to_backup(
     register_runtime_link(Arc::clone(&link_arc));
 }
 
-/// Scan backup subscriptions held by this node.  For each owner whose path
-/// has decayed, enqueue their subscribers' channel blobs into the deferred
-/// delivery queue so they flush when the subscriber next comes online.
-/// Scan backup subscriptions held by this node.  For each owner whose path
-/// has decayed, enqueue their subscribers' channel blobs into the deferred
-/// delivery queue so they flush when the subscriber next comes online.
+/// Scan backup subscriptions held by this node.  For each owner node whose
+/// path has decayed (not heard within `owner_offline_secs`), copy that owner's
+/// subscribers' channel blobs into the deferred delivery queue so they flush
+/// when the subscriber next comes online or PULLs.
 ///
 /// Returns the list of `(subscriber_hash, channel_hash)` pairs that were
 /// actually delivered ("adopted").  The caller re-pushes these to its own
-/// backup node so the chain of custody extends.
+/// backup node so the chain of custody extends further.
 fn backup_delivery_tick(
     subscription_table: Arc<Mutex<crate::subscription::SubscriptionTable>>,
     blob_store: Arc<Mutex<crate::blob_store::BlobStore>>,
@@ -891,6 +926,7 @@ fn backup_delivery_tick(
     }
 
     // Group by owner — one liveness check per owner node.
+    // This avoids locking sync once per (sub, channel) pair.
     let mut by_owner: std::collections::HashMap<Vec<u8>, Vec<(Vec<u8>, Vec<u8>)>> =
         std::collections::HashMap::new();
     for (sub_hash, ch_hash, owner_hash) in entries {
@@ -978,6 +1014,15 @@ fn backup_delivery_tick(
 /// Register all four destinations with Reticulum Transport and wire up
 /// packet callbacks + request handlers.  Must be called once after
 /// `FedNode::new`.
+///
+/// Initialization order:
+///   1. Inject weak self-reference into `FedNode` for callback use.
+///   2. Wire all four destinations (node, channel, delivery, notify).
+///   3. Load persisted sync peers and request paths.
+///   4. Print destination hashes for operator convenience.
+///   5. Register announce handlers:
+///      - `rfed.node`     → detect/update sync peers.
+///      - `rfed.delivery` → flush deferred blobs when subscriber comes online.
 pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     // Inject weak self-reference so callbacks can lock FedNode.
     {
@@ -1046,6 +1091,10 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     // Register rfed.delivery announce handler — flush deferred blobs when a
     // subscriber comes online.  Subscribers announce on their rfed.delivery
     // destination so we observe `APP_NAME.delivery` aspects here.
+    //
+    // Flow: announce heard → check deferred queue → drain → build outbound
+    //   single dest for this subscriber → send each blob as a DATA packet.
+    //   If dest build fails, re-enqueue for retry on next announce.
     let delivery_weak = Arc::downgrade(&node);
     Transport::register_announce_handler(AnnounceHandler {
         aspect_filter: Some(format!("{APP_NAME}.delivery")),
@@ -1195,6 +1244,8 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // BACKUP_PUSH — owner node registers backup subscriptions on this node.
     // The caller's identity is used to derive their rfed.node destination hash
     // (unforgeable — computed from their actual public key material).
+    // This prevents spoofed owner_hash values; only the real key holder can
+    // produce the matching link authentication.
     let backup_push_node = Arc::clone(node);
     let backup_push_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                         caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
@@ -1244,7 +1295,8 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     });
 
     // CAPABILITIES — public query returning node features and config surface.
-    // Response is a msgpack map that can be extended over time.
+    // Response is a msgpack map that can be extended over time without
+    // breaking older clients (unknown keys are simply ignored).
     let caps_node = Arc::clone(node);
     let capabilities_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
                                          _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
@@ -1278,8 +1330,8 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             rmpv::Value::Boolean(cfg.default_policy.allow_notify_registration),
         ));
         caps.push((
-            rmpv::Value::String("lxmf_propagation_notification".into()),
-            rmpv::Value::Boolean(cfg.lxmf_propagation_notification_enabled),
+            rmpv::Value::String("lxmf_propagation".into()),
+            rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
         ));
         caps.push((
             rmpv::Value::String("backup".into()),
@@ -1505,7 +1557,8 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // been delivered by live fanout to any other session, or will re-arrive via
     // a future sync from the origin node.
     //
-    // Wire format: msgpack [[channel_hash: bin(16), blob: bin], ...]
+    // Wire format (response): msgpack [[bin(16), bin], ...] — each sub-array
+    // is [channel_hash, blob].  Uses rmpv so Python receives `bytes` objects.
     let pull_node = Arc::clone(node);
     let pull_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
                                   caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
@@ -1547,13 +1600,26 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // NOTIFY_REGISTER — client sends a 32-char hex relay destination hash.
     // Multiple calls with different hashes register additional relays for the
     // same subscriber; duplicate hashes refresh the timestamp only.
+    //
+    // Two entries are inserted per registration:
+    //   1. subscriber_identity_hash → relay_hash  (for channel notify)
+    //   2. lxmf.delivery_dest_hash  → relay_hash  (for LXMF propagation notify)
+    // This dual-hash approach ensures the propagation handler (which only knows
+    // the lxmf.delivery dest hash from message headers) can look up the relay.
     let reg_node = Arc::clone(node);
     let register_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                       caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let relay_hash: String = match rmp_serde::from_slice(data) {
-            Ok(s) => s,
-            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
-        };
+        // The Link request framework unpacks the outer msgpack array and delivers
+        // the data element's raw bytes.  When the sender encodes a String via
+        // rmp_serde::to_vec the framework round-trips it, so `data` is plain UTF-8.
+        // Try msgpack first (Python clients), then raw UTF-8.
+        let relay_hash: String = rmp_serde::from_slice(data)
+            .or_else(|_| String::from_utf8(data.to_vec()).map_err(|e| e.to_string()))
+            .unwrap_or_default();
+        if relay_hash.is_empty() {
+            log("[rfed] notify/register: empty or un-decodable relay hash", LOG_WARNING, false, false);
+            return rmp_serde::to_vec(&false).unwrap_or_default();
+        }
 
         if let Err(reason) = validate_relay_hash(&relay_hash) {
             log(
@@ -1567,7 +1633,10 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
-            None => return rmp_serde::to_vec(&false).unwrap_or_default(),
+            None => {
+                log("[rfed] notify/register: caller identity hash is None", LOG_WARNING, false, false);
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
         };
 
         if let Ok(guard) = reg_node.lock() {
@@ -1585,7 +1654,16 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return rmp_serde::to_vec(&false).unwrap_or_default();
             }
             if let Ok(mut notify) = guard.notify_registry.lock() {
-                notify.register(subscriber_hash, relay_hash);
+                // Register against the identity hash (for non-LXMF uses).
+                notify.register(subscriber_hash.clone(), relay_hash.clone());
+                // Also register against the lxmf.delivery destination hash.
+                // LXMF messages carry the lxmf.delivery dest hash (not the
+                // identity hash) in their first 16 bytes, so the propagation
+                // handler needs this derived hash in the registry to match.
+                let lxmf_delivery_hash = Destination::hash(
+                    Some(&subscriber_hash), "lxmf", &["delivery"],
+                );
+                notify.register(lxmf_delivery_hash, relay_hash);
             }
         }
         rmp_serde::to_vec(&true).unwrap_or_default()
@@ -1596,10 +1674,12 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let unreg_node = Arc::clone(node);
     let unregister_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                         caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let relay_hash: String = match rmp_serde::from_slice(data) {
-            Ok(s) => s,
-            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
-        };
+        let relay_hash: String = rmp_serde::from_slice(data)
+            .or_else(|_| String::from_utf8(data.to_vec()).map_err(|e| e.to_string()))
+            .unwrap_or_default();
+        if relay_hash.is_empty() {
+            return rmp_serde::to_vec(&false).unwrap_or_default();
+        }
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
             None => return rmp_serde::to_vec(&false).unwrap_or_default(),

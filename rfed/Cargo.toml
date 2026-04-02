@@ -7,6 +7,10 @@ edition = "2021"
 name = "rfed"
 path = "src/main.rs"
 
+[[bin]]
+name = "rfed_notify_test"
+path = "tests/notify_register.rs"
+
 [dependencies]
 reticulum_rust = { path = "../../Reticulum-rust" }
 lxmf_rust      = { path = "../../LXMF-rust" }

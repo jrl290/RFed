@@ -184,5 +184,58 @@ impl ChannelKeypair {
         prv_bundle.extend_from_slice(self.ed25519_secret.as_bytes());
         Identity::from_bytes(&prv_bundle)
     }
+
+    /// Encrypt an inner blob so only parties that know the channel name can
+    /// decrypt it.  Uses the same ECDH + HKDF + AES-CBC-HMAC scheme as
+    /// `Identity::encrypt`, with the channel's X25519 public key as the
+    /// target and the channel hash as the HKDF salt.
+    ///
+    /// The rfed node never learns the channel name, so it cannot derive the
+    /// keys and the blob remains opaque — identical to how LXMF propagation
+    /// nodes store messages encrypted to the recipient's public key.
+    ///
+    /// Wire format: `ephemeral_pub(32) | iv(16) | aes_ciphertext(*) | hmac(32)`
+    pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let identity = self.to_identity()?;
+        identity.encrypt(plaintext)
+    }
+
+    /// Decrypt an inner blob that was encrypted with [`encrypt`](Self::encrypt).
+    ///
+    /// Requires possession of the channel name (and therefore the X25519
+    /// private key).  Returns the original plaintext on success.
+    pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        let mut identity = self.to_identity()?;
+        identity.decrypt(ciphertext)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypt_decrypt_roundtrip() {
+        let kp = ChannelKeypair::from_name("public.test");
+        let plaintext = b"Hello from channel test!";
+        let ciphertext = kp.encrypt(plaintext).expect("encrypt failed");
+
+        // Ciphertext must be longer than plaintext (ephemeral_pub + iv + padding + hmac).
+        assert!(ciphertext.len() > plaintext.len());
+
+        // A second party who knows the same channel name can decrypt.
+        let kp2 = ChannelKeypair::from_name("public.test");
+        let decrypted = kp2.decrypt(&ciphertext).expect("decrypt failed");
+        assert_eq!(decrypted, plaintext);
+    }
+
+    #[test]
+    fn wrong_channel_cannot_decrypt() {
+        let kp = ChannelKeypair::from_name("public.test");
+        let ciphertext = kp.encrypt(b"secret").expect("encrypt failed");
+
+        let wrong = ChannelKeypair::from_name("public.wrong");
+        assert!(wrong.decrypt(&ciphertext).is_err());
+    }
 }
 

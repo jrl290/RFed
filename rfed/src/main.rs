@@ -53,7 +53,7 @@ mod fanout;
 mod sync;
 mod toml_config;
 mod destinations;
-mod lxmf_propagation_notification;
+mod lxmf_propagation;
 pub mod notify;
 
 use config::{NodeConfig, TierPolicy};
@@ -283,9 +283,19 @@ fn main() -> Result<(), String> {
         has_flag(&args, "--from-static-only")
         || cfg.peering.from_static_only.unwrap_or(false);
 
-    // ── LXMF propagation notification ─────────────────────────────────
-    let lxmf_propagation_notification_enabled: bool =
-        cfg.node.lxmf_propagation_notification.unwrap_or(false);
+    // ── LXMF propagation ───────────────────────────────────────────
+    let lxmf_propagation_enabled: bool =
+        cfg.node.lxmf_propagation.unwrap_or(false);
+    let lxmf_propagation_autopeer: bool =
+        cfg.node.lxmf_propagation_autopeer.unwrap_or(false);
+
+    let mut lxmf_propagation_peers: Vec<Vec<u8>> = Vec::new();
+    for hex_str in &cfg.peering.propagation_peers {
+        match reticulum_rust::decode_hex(hex_str.trim()) {
+            Some(bytes) => lxmf_propagation_peers.push(bytes),
+            None => return Err(format!("Invalid propagation_peer hash in config: {hex_str}")),
+        }
+    }
 
     // ── Prepare Reticulum config ─────────────────────────────────
     let rns_config_dir = prepare_rns_config(&config_dir)?;
@@ -302,7 +312,7 @@ fn main() -> Result<(), String> {
     eprintln!("│  VIP subs       : {:<34}│", vip_subscribers.len());
     eprintln!("│  Stamp cost     : {:<34}│",
         default_stamp_cost.map(|c| c.to_string()).as_deref().unwrap_or("disabled"));
-    eprintln!("│  lxmf.prop.notif: {:<34}│", if lxmf_propagation_notification_enabled { "yes" } else { "no" });
+    eprintln!("│  lxmf.propagation: {:<33}│", if lxmf_propagation_enabled { "yes" } else { "no" });
     eprintln!("└──────────────────────────────────────────────────────┘");
 
     // ── Ensure directories exist ─────────────────────────────────────
@@ -414,7 +424,9 @@ fn main() -> Result<(), String> {
         primary_node,
         secondary_nodes,
         owner_offline_secs,
-        lxmf_propagation_notification_enabled,
+        lxmf_propagation_enabled,
+        lxmf_propagation_autopeer,
+        lxmf_propagation_peers,
     };
 
     // ── Federation Node ──────────────────────────────────────────────
@@ -428,18 +440,26 @@ fn main() -> Result<(), String> {
     destinations::enable(Arc::clone(&node))?;
     eprintln!("[rfed] Federation Node active");
 
-    // ── Optional lxmf.propagation notification service ──────────────
-    if lxmf_propagation_notification_enabled {
+    // ── Optional full lxmf.propagation node ─────────────────────────
+    let lxmf_prop_arc: Option<Arc<Mutex<lxmf_propagation::LxmfPropagationNode>>> =
+    if lxmf_propagation_enabled {
         let notify_reg = node.lock().map_err(|_| "lock")?.notify_registry.clone();
         let node_config = node.lock().map_err(|_| "lock")?.config.clone();
-        // Use the node identity (clone required; identity is non-Copy).
         let prop_identity = node.lock().map_err(|_| "lock")?.identity.clone();
-        let prop = lxmf_propagation_notification::LxmfPropagation::new(prop_identity, &node_config, notify_reg)?;
-        lxmf_propagation_notification::LxmfPropagation::wire(&prop)?;
-        lxmf_propagation_notification::LxmfPropagation::announce(&prop);
-        node.lock().map_err(|_| "lock")?.lxmf_propagation = Some(prop);
-        eprintln!("[rfed] lxmf.propagation notification active (notify-only mode)");
-    }
+        let prop = lxmf_propagation::LxmfPropagationNode::new(prop_identity, &node_config, notify_reg)?;
+        lxmf_propagation::LxmfPropagationNode::enable(&prop)?;
+
+        // Register announce handler so we discover other propagation peers
+        let ah = lxmf_propagation::LxmfPropagationNode::announce_handler(&prop);
+        reticulum_rust::transport::Transport::register_announce_handler(ah);
+
+        lxmf_propagation::LxmfPropagationNode::announce(&prop);
+        node.lock().map_err(|_| "lock")?.lxmf_propagation = Some(Arc::clone(&prop));
+        eprintln!("[rfed] lxmf.propagation node active (full mode)");
+        Some(prop)
+    } else {
+        None
+    };
 
     // ── Initial announce ─────────────────────────────────────────────
     let announce_interval = Duration::from_secs(
@@ -494,6 +514,11 @@ fn main() -> Result<(), String> {
             if let Ok(guard) = node.lock() {
                 guard.save_all();
             }
+            if let Some(ref prop) = lxmf_prop_arc {
+                if let Ok(guard) = prop.lock() {
+                    guard.save_all();
+                }
+            }
 
             return Ok(());
         }
@@ -503,12 +528,20 @@ fn main() -> Result<(), String> {
             if let Ok(guard) = node.lock() {
                 guard.announce();
             }
+            if let Some(ref prop) = lxmf_prop_arc {
+                lxmf_propagation::LxmfPropagationNode::announce(prop);
+            }
             last_announce = Instant::now();
         }
 
         // Drive pending peer sync sessions
         if let Ok(mut guard) = node.lock() {
             guard.tick_sync();
+        }
+
+        // Drive LXMF propagation peer sync
+        if let Some(ref prop) = lxmf_prop_arc {
+            lxmf_propagation::LxmfPropagationNode::tick_sync(prop);
         }
 
         // Backup delivery: forward pending registrations + check owner failover.
@@ -524,6 +557,13 @@ fn main() -> Result<(), String> {
             if let Ok(guard) = node.lock() {
                 if let Ok(mut q) = guard.deferred_queue.lock() {
                     q.evict_expired(evict_max_age);
+                }
+            }
+            // Also evict expired LXMF propagation messages
+            if let Some(ref prop) = lxmf_prop_arc {
+                if let Ok(mut guard) = prop.lock() {
+                    guard.evict_expired();
+                    guard.enforce_storage_limit();
                 }
             }
             last_evict = Instant::now();

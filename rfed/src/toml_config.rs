@@ -20,7 +20,8 @@ pub struct IniNode {
     pub name: Option<String>,
     pub announce_interval_minutes: Option<u64>,
     pub announce_at_start: Option<bool>,
-    pub lxmf_propagation_notification: Option<bool>,
+    pub lxmf_propagation: Option<bool>,
+    pub lxmf_propagation_autopeer: Option<bool>,
 }
 
 pub struct IniStorage {
@@ -37,6 +38,7 @@ pub struct IniPeering {
     pub primary_node: Option<String>,
     pub secondary_nodes: Vec<String>,
     pub owner_offline_secs: Option<f64>,
+    pub propagation_peers: Vec<String>,
 }
 
 pub struct IniTierPolicy {
@@ -89,7 +91,8 @@ impl IniConfig {
             name:                          flat_str(n, "name"),
             announce_interval_minutes:     flat_uint(n, "announce_interval_minutes")?,
             announce_at_start:             flat_bool(n, "announce_at_start")?,
-            lxmf_propagation_notification: flat_bool(n, "lxmf_propagation_notification")?,
+            lxmf_propagation:              flat_bool(n, "lxmf_propagation")?,
+            lxmf_propagation_autopeer:     flat_bool(n, "lxmf_propagation_autopeer")?,
         };
 
         // ── [storage] ─────────────────────────────────────────────────
@@ -110,6 +113,7 @@ impl IniConfig {
             primary_node:         flat_str(p, "primary_node"),
             secondary_nodes:      flat_csv(p, "secondary_nodes"),
             owner_offline_secs:   flat_float(p, "owner_offline_secs")?,
+            propagation_peers:    flat_csv(p, "propagation_peers"),
         };
 
         // ── [policy.default] / [policy.vip] ───────────────────────────
@@ -128,7 +132,8 @@ impl IniConfig {
         IniConfig {
             node: IniNode {
                 name: None, announce_interval_minutes: None,
-                announce_at_start: None, lxmf_propagation_notification: None,
+                announce_at_start: None, lxmf_propagation: None,
+                lxmf_propagation_autopeer: None,
             },
             storage: IniStorage {
                 limit_mb: None, transfer_limit_mb: None, sync_limit_mb: None,
@@ -137,6 +142,7 @@ impl IniConfig {
                 static_peers: vec![], from_static_only: None, peering_cost: None,
                 trusted_backup_peers: vec![], primary_node: None,
                 secondary_nodes: vec![], owner_offline_secs: None,
+                propagation_peers: vec![],
             },
             default_policy: IniTierPolicy {
                 stamp_cost: None, stamp_flexibility: None, deferred_queue_limit: None,
@@ -245,7 +251,8 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
   # name                         = rfed
   # announce_interval_minutes    = 360
   # announce_at_start            = yes
-  # lxmf_propagation_notification = no
+  # lxmf_propagation             = no
+  # lxmf_propagation_autopeer    = no
 
 
 [storage]
@@ -264,6 +271,7 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
   # primary_node = aabbccddaabbccddaabbccddaabbccdd
   # secondary_nodes = aabbccddaabbccddaabbccddaabbccdd, 11223344112233441122334411223344
   # owner_offline_secs = 90
+  # propagation_peers = aabbccddaabbccddaabbccddaabbccdd
 
 
 [policy.default]

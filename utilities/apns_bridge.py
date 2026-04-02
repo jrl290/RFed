@@ -310,16 +310,48 @@ class ApnsBridge:
         db:            TokenDB,
         apns:          ApnsSender,
         rns_config:    Optional[str] = None,
+        rns_tcp_host:  Optional[str] = None,
+        rns_tcp_port:  int = 4242,
     ):
         self._identity_path = identity_path
         self._db            = db
         self._apns          = apns
         self._rns_config    = rns_config
+        self._rns_tcp_host  = rns_tcp_host
+        self._rns_tcp_port  = rns_tcp_port
+        self._notify_count  = 0
+        self._push_count    = 0
+        self._push_fail     = 0
 
     def start(self) -> None:
         rns_kwargs: dict = {}
         if self._rns_config:
             rns_kwargs["configdir"] = os.path.expanduser(self._rns_config)
+        elif self._rns_tcp_host:
+            # Build a dedicated Reticulum configdir next to the identity file so
+            # we can inject the TCPClientInterface without touching ~/.reticulum.
+            config_dir = os.path.join(
+                os.path.dirname(os.path.expanduser(self._identity_path)),
+                "reticulum",
+            )
+            os.makedirs(config_dir, exist_ok=True)
+            config_file = os.path.join(config_dir, "config")
+            config_text = (
+                "[reticulum]\n"
+                "  enable_transport = false\n"
+                "  share_instance = false\n\n"
+                "[interfaces]\n\n"
+                "  [[ApnsBridgeTCP]]\n"
+                "    type = TCPClientInterface\n"
+                "    enabled = yes\n"
+                f"    target_host = {self._rns_tcp_host}\n"
+                f"    target_port = {self._rns_tcp_port}\n"
+            )
+            with open(config_file, "w") as fh:
+                fh.write(config_text)
+            log.info("Using TCP interface → %s:%s (configdir: %s)",
+                     self._rns_tcp_host, self._rns_tcp_port, config_dir)
+            rns_kwargs["configdir"] = config_dir
         RNS.Reticulum(**rns_kwargs)
 
         identity = self._load_identity()
@@ -410,12 +442,14 @@ class ApnsBridge:
         sender_hex   = _opt_hash_hex(data.get("sender"))
         channel_hex  = _opt_hash_hex(data.get("channel"))
 
-        log.info("Wake: receiver=%s sender=%s channel=%s",
-                 receiver_hex, sender_hex or "-", channel_hex or "-")
+        self._notify_count += 1
+        log.info("NOTIFY #%d received  receiver=%s sender=%s channel=%s",
+                 self._notify_count, receiver_hex, sender_hex or "-", channel_hex or "-")
 
         apns_token = self._db.get_token(receiver_hex)
         if apns_token is None:
-            log.debug("Wake: no token for %s — ignoring", receiver_hex)
+            log.info("NOTIFY #%d skipped   receiver=%s (no APNs token registered)",
+                     self._notify_count, receiver_hex)
             return
 
         success, http_code, reason = self._apns.send(
@@ -423,13 +457,18 @@ class ApnsBridge:
         )
 
         if success:
-            log.info("Wake: push sent for %s", receiver_hex)
+            self._push_count += 1
+            log.info("NOTIFY #%d pushed    receiver=%s → APNs OK  (total pushed: %d)",
+                     self._notify_count, receiver_hex, self._push_count)
         elif self._apns.should_invalidate(http_code, reason):
+            self._push_fail += 1
             self._db.invalidate_token(apns_token)
-            log.info("Wake: stale token purged for %s (reason=%s)", receiver_hex, reason)
+            log.warning("NOTIFY #%d purged    receiver=%s — stale token (reason=%s)",
+                        self._notify_count, receiver_hex, reason)
         else:
-            log.error("Wake: APNs error for %s: HTTP %d reason=%s",
-                      receiver_hex, http_code, reason)
+            self._push_fail += 1
+            log.error("NOTIFY #%d FAILED    receiver=%s — HTTP %d reason=%s  (total failed: %d)",
+                      self._notify_count, receiver_hex, http_code, reason, self._push_fail)
 
     # ── Registration packet handler ───────────────────────────────────────────
 
@@ -513,13 +552,18 @@ def main() -> None:
     )
     apns = ApnsSender(apns_section)
 
+    rns_tcp_host = bridge_section.get("rns_tcp_host") or None
+    rns_tcp_port = int(bridge_section.get("rns_tcp_port", 4242))
+
     bridge = ApnsBridge(
         identity_path = os.path.expanduser(
             bridge_section.get("identity_path", "~/.rfed-apns/identity")
         ),
-        db         = db,
-        apns       = apns,
-        rns_config = bridge_section.get("rns_config") or None,
+        db           = db,
+        apns         = apns,
+        rns_config   = bridge_section.get("rns_config") or None,
+        rns_tcp_host = rns_tcp_host,
+        rns_tcp_port = rns_tcp_port,
     )
 
     try:
