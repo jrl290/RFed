@@ -264,7 +264,7 @@ class ApnsSender:
             "Authorization":  f"bearer {self._jwt.get()}",
             "apns-topic":     self._bundle_id,
             "apns-push-type": self._push_type,
-            "apns-priority":  "5",
+            "apns-priority":  "10",
             "Content-Type":   "application/json",
         }
 
@@ -295,7 +295,7 @@ class ApnsSender:
             "aps": {
                 "alert":             {"title": self._alert_title, "body": self._alert_body},
                 "sound":             "default",
-                "content-available": 1,
+                "mutable-content":   1,
             },
             "rfed": rfed,
         }, separators=(",", ":"))
