@@ -25,6 +25,8 @@
 //!     --peering-cost <N>        Peering cost (default: 18)
 //!     --storage-limit <MB>      Storage limit in megabytes (default: 2000)
 //!     --static-peer <HASH>      Add a static peer (repeatable)
+//!     --secondary-node <HASH>   Add a secondary/backup node (repeatable)
+//!     --owner-offline-secs <S>  Seconds before owner deemed offline (default: 90)
 //!     --from-static-only        Only accept blobs/peers from static peers
 //!     -v, --verbose             Increase log verbosity
 //!     -q, --quiet               Decrease log verbosity
@@ -84,6 +86,8 @@ Options:
   --peering-cost <N>        Peering cost (default: 18)
   --storage-limit <MB>      Storage limit in MB (default: 2000)
   --static-peer <HASH>      Add a static peer (repeatable)
+  --secondary-node <HASH>   Add a secondary/backup node (repeatable)
+  --owner-offline-secs <S>  Seconds before owner deemed offline (default: 90)
   --from-static-only        Only accept blobs/peers from static peers
   -v, --verbose             Increase log verbosity
   -q, --quiet               Decrease log verbosity
@@ -230,10 +234,12 @@ fn main() -> Result<(), String> {
         .or_else(|| cfg.node.name.clone())
         .unwrap_or_else(|| "rfed".to_string());
 
-    let announce_interval_minutes: u64 = arg_value(&args, "--announce-interval")
-        .and_then(|s| s.parse().ok())
-        .or(cfg.node.announce_interval_minutes)
-        .unwrap_or(360);
+    // Parse as f64 to support fractional minutes (e.g. 0.1 = 6 seconds).
+    let announce_interval_secs: u64 = arg_value(&args, "--announce-interval")
+        .and_then(|s| s.parse::<f64>().ok())
+        .map(|m| (m * 60.0).max(1.0) as u64)
+        .or_else(|| cfg.node.announce_interval_minutes.map(|m| m * 60))
+        .unwrap_or(360 * 60);
 
     let announce_at_start: bool = if has_flag(&args, "--no-announce-at-start") {
         false
@@ -299,7 +305,10 @@ fn main() -> Result<(), String> {
         .filter(|bytes| bytes.len() == 16)
         .collect();
 
-    let owner_offline_secs: f64 = cfg.peering.owner_offline_secs.unwrap_or(90.0);
+    let owner_offline_secs: f64 =
+        arg_value(&args, "--owner-offline-secs").and_then(|s| s.parse().ok())
+        .or(cfg.peering.owner_offline_secs)
+        .unwrap_or(90.0);
 
     // ── Peering / storage ─────────────────────────────────────────────
     let peering_cost: Option<u32> =
@@ -340,6 +349,28 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // Collect --secondary-node CLI flags (repeatable), then fall back to config.
+    let mut cli_secondary_nodes: Vec<Vec<u8>> = Vec::new();
+    let mut idx2 = 1;
+    while idx2 < args.len() {
+        if args[idx2] == "--secondary-node" {
+            if let Some(hex_str) = args.get(idx2 + 1) {
+                match reticulum_rust::decode_hex(hex_str.trim()) {
+                    Some(bytes) => cli_secondary_nodes.push(bytes),
+                    None => return Err(format!("Invalid --secondary-node hash: {hex_str}")),
+                }
+                idx2 += 2;
+                continue;
+            }
+        }
+        idx2 += 1;
+    }
+    let secondary_nodes: Vec<Vec<u8>> = if !cli_secondary_nodes.is_empty() {
+        cli_secondary_nodes
+    } else {
+        secondary_nodes
+    };
+
     let from_static_only: bool =
         has_flag(&args, "--from-static-only")
         || cfg.peering.from_static_only.unwrap_or(false);
@@ -367,7 +398,7 @@ fn main() -> Result<(), String> {
     eprintln!("├──────────────────────────────────────────────────────┤");
     eprintln!("│  Config dir     : {:<34}│", config_dir.display());
     eprintln!("│  Node name      : {:<34}│", node_name);
-    eprintln!("│  Announce int.  : {:<3} minutes{:<24}│", announce_interval_minutes, "");
+    eprintln!("│  Announce int.  : {:<3} secs{:<27}│", announce_interval_secs, "");
     eprintln!("│  Storage limit  : {:<4} MB{:<27}│", storage_limit_mb, "");
     eprintln!("│  Static peers   : {:<34}│", static_peers.len());
     eprintln!("│  VIP subs       : {:<34}│", vip_subscribers.len());
@@ -456,7 +487,7 @@ fn main() -> Result<(), String> {
 
         identity_file: identity_path,
         display_name: node_name,
-        announce_interval_secs: announce_interval_minutes * 60,
+        announce_interval_secs,
         announce_at_start,
         default_policy: TierPolicy {
             stamp_cost: default_stamp_cost,

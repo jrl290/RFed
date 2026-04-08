@@ -444,7 +444,11 @@ impl FedSync {
             total_sent += meta.size as u64;
             self.sync_bytes_sent += meta.size as u64;
         }
-        out
+        // Wrap raw bytes in a msgpack Binary so handle_request_packet can embed
+        // them safely in the [request_id, response_value] array without the binary
+        // bytes being mis-parsed as a msgpack value (e.g. channel hashes whose
+        // first byte happens to encode an ext8 marker like 0xc7).
+        rmp_serde::to_vec(&out).unwrap_or_default()
     }
 
     /// Parse a MESSAGE_GET response, store new blobs, and return them so the
@@ -466,6 +470,9 @@ impl FedSync {
         _peer_hash: &[u8],
         data: &[u8],
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        // Unwrap the msgpack Binary wrapper added by handle_message_get.
+        let raw: Vec<u8> = rmp_serde::from_slice(data).unwrap_or_else(|_| data.to_vec());
+        let data = raw.as_slice();
         let mut cursor = 0usize;
         let mut ingested: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         let mut store = self.blob_store.lock().unwrap();

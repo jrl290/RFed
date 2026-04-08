@@ -159,14 +159,29 @@ pub fn fanout_blob(
                     false,
                     FLAG_UNSET,
                 );
-                if let Err(e) = packet.send() {
-                    log(
-                        &format!("[fanout] send to {} failed: {e} — will defer", hexrep(sub_hash, false)),
-                        LOG_WARNING,
-                        false,
-                        false,
-                    );
-                    missed.push(sub_hash.clone());
+                match packet.send() {
+                    Err(e) => {
+                        log(
+                            &format!("[fanout] send to {} failed: {e} — will defer", hexrep(sub_hash, false)),
+                            LOG_WARNING,
+                            false,
+                            false,
+                        );
+                        missed.push(sub_hash.clone());
+                    }
+                    Ok(None) => {
+                        // Transport::outbound returned false (e.g. subscriber's TCP
+                        // session is gone but the path entry still exists).  Treat as
+                        // delivery failure and defer the blob.
+                        log(
+                            &format!("[fanout] no interface for {} — will defer", hexrep(sub_hash, false)),
+                            LOG_WARNING,
+                            false,
+                            false,
+                        );
+                        missed.push(sub_hash.clone());
+                    }
+                    Ok(Some(_)) => {}
                 }
                 // Also fire delivery hooks (notify adapters etc.)
                 hook_registry.on_deliver(sub_hash, inner_blob);

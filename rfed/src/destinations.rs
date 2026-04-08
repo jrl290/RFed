@@ -509,7 +509,11 @@ impl FedNode {
         }
 
         // ── Part 2: prune stale backup entries (chain unravel) ────────
-        let ttl = self.config.owner_offline_secs * 2.0;
+        // TTL must be at least 3× the backup push tick (90s) so that backup
+        // subscriptions survive multiple tick cycles before being pruned.
+        // owner_offline_secs * 2 can be < BACKUP_TICK_SECS (30s) when
+        // owner_offline_secs is configured small (e.g. 12s → TTL=24s < 30s).
+        let ttl = (self.config.owner_offline_secs * 2.0).max(90.0);
         if let Ok(mut table) = self.subscription_table.lock() {
             let pruned = table.prune_stale_backups(ttl);
             if pruned > 0 {
@@ -1100,6 +1104,13 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
         aspect_filter: Some(format!("{APP_NAME}.delivery")),
         receive_path_responses: false,
         callback: Arc::new(move |dest_hash, identity, _app_data, _ann_hash, _is_path| {
+            // The deferred queue is keyed by IDENTITY HASH (not the delivery
+            // destination hash).  The identity hash is truncated_hash(pub_key).
+            let sub_id_hash: Vec<u8> = match identity.hash.as_ref() {
+                Some(h) => h.clone(),
+                None => return,
+            };
+
             let arc = match delivery_weak.upgrade() {
                 Some(a) => a,
                 None => return,
@@ -1114,18 +1125,18 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 .deferred_queue
                 .lock()
                 .ok()
-                .map(|q| q.has_pending(dest_hash))
+                .map(|q| q.has_pending(&sub_id_hash))
                 .unwrap_or(false);
             if !has_pending {
                 return;
             }
 
-            // Drain the queue for this subscriber.
+            // Drain the queue for this subscriber (keyed by identity hash).
             let pending = guard
                 .deferred_queue
                 .lock()
                 .ok()
-                .map(|mut q| q.drain(dest_hash))
+                .map(|mut q| q.drain(&sub_id_hash))
                 .unwrap_or_default();
 
             if pending.is_empty() {
@@ -1134,7 +1145,8 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
 
             log(
                 &format!(
-                    "[deferred] subscriber {} back online — flushing {} blob(s)",
+                    "[deferred] subscriber {} (delivery {}) back online — flushing {} blob(s)",
+                    hexrep(&sub_id_hash, false),
                     hexrep(dest_hash, false),
                     pending.len()
                 ),
@@ -1155,16 +1167,16 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 Err(e) => {
                     log(
                         &format!("[deferred] failed to build dest for {}: {e}",
-                            hexrep(dest_hash, false)),
+                            hexrep(&sub_id_hash, false)),
                         LOG_WARNING,
                         false,
                         false,
                     );
                     // Re-enqueue everything — we'll try again on next announce.
                     if let Ok(mut q) = guard.deferred_queue.lock() {
-                        let limit = guard.config.policy_for(dest_hash).deferred_queue_limit;
+                        let limit = guard.config.policy_for(&sub_id_hash).deferred_queue_limit;
                         for pb in pending {
-                            let _ = q.enqueue(dest_hash.to_vec(), pb.channel_hash, pb.blob, limit);
+                            let _ = q.enqueue(sub_id_hash.clone(), pb.channel_hash, pb.blob, limit);
                         }
                     }
                     return;
@@ -1188,14 +1200,14 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 if let Err(e) = packet.send() {
                     log(
                         &format!("[deferred] send to {} failed: {e}",
-                            hexrep(dest_hash, false)),
+                            hexrep(&sub_id_hash, false)),
                         LOG_WARNING,
                         false,
                         false,
                     );
                 }
                 if let Some(ref hooks) = hooks {
-                    hooks.on_deliver(dest_hash, &pb.blob);
+                    hooks.on_deliver(&sub_id_hash, &pb.blob);
                 }
             }
         }),

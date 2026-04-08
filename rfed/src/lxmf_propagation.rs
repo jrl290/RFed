@@ -517,8 +517,8 @@ impl LxmfPropagationNode {
             Value::Boolean(false),
             Value::Integer(ts.into()),
             Value::Boolean(true),
-            Value::F64(self.transfer_limit_kb / 1024.0),  // Convert to MB for wire format
-            Value::F64(self.sync_limit_kb / 1024.0),
+            Value::Integer(((self.transfer_limit_kb / 1024.0) as i64).into()),
+            Value::Integer(((self.sync_limit_kb / 1024.0) as i64).into()),
             stamp_costs,
             metadata,
         ]);
