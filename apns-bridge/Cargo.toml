@@ -1,0 +1,44 @@
+[package]
+name = "apns-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "apns_bridge"
+path = "src/main.rs"
+
+[dependencies]
+reticulum_rust = { path = "../../Reticulum-rust" }
+
+# MessagePack — pinned to match workspace
+rmpv = "=1.0.0"
+
+# HTTP/2 client for APNs (rustls avoids needing OpenSSL on the host)
+reqwest = { version = "0.12", features = ["rustls-tls", "http2", "blocking", "json"] }
+
+# ES256 signing (Apple p8 keys are P-256 / ECDSA-SHA256)
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+sha2 = "0.10"
+
+# SQLite — bundled feature compiles sqlite3.c into the binary (no system lib needed)
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# INI config parsing (same crate as rfed)
+configparser = "3"
+
+# JSON for APNs payload and JWT
+serde_json = "1"
+
+# Base64url for JWT
+base64 = "0.22"
+
+# Hex encoding
+hex = "0.4"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Pin dalek crates to match reticulum_rust's transitive deps
+x25519-dalek = "=1.1.1"
+ed25519-dalek = "=1.0.1"

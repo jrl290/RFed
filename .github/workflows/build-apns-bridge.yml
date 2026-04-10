@@ -1,0 +1,85 @@
+name: Build apns_bridge (Linux)
+
+# Run manually from the Actions tab, or automatically on push to main
+# that touches the apns-bridge source.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'apns-bridge/**'
+      - '.github/workflows/build-apns-bridge.yml'
+
+jobs:
+  build:
+    name: Build apns_bridge for Linux x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout RFed-rust (this repo)
+        uses: actions/checkout@v4
+        # Checked out at $GITHUB_WORKSPACE = /home/runner/work/RFed/RFed/
+
+      # The Cargo.toml path deps use "../../Reticulum-rust" and "../../LXMF-rust"
+      # relative to RFed-rust/rfed/, which resolves to the sibling dirs one level
+      # above $GITHUB_WORKSPACE.
+      - name: Checkout Reticulum-rust (Rusticulum)
+        uses: actions/checkout@v4
+        with:
+          repository: jrl290/Rusticulum
+          path: ../Reticulum-rust
+
+      - name: Checkout LXMF-rust
+        uses: actions/checkout@v4
+        with:
+          repository: jrl290/LXMF-rust
+          path: ../LXMF-rust
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            libdbus-1-dev \
+            pkg-config \
+            libssl-dev
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-apns-bridge-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-apns-bridge-
+
+      - name: Build release binary
+        run: cargo build --release -p apns-bridge
+
+      - name: Strip binary
+        run: strip target/release/apns_bridge
+
+      - name: Show binary info
+        run: |
+          ls -lh target/release/apns_bridge
+          file target/release/apns_bridge
+          ldd  target/release/apns_bridge
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apns_bridge-linux-x86_64
+          path: target/release/apns_bridge
+          retention-days: 30
+
+      # ── Optional: copy the example config alongside the binary ──────────────
+      - name: Upload config example
+        uses: actions/upload-artifact@v4
+        with:
+          name: apns_bridge-config-example
+          path: utilities/apns_bridge.conf.example
+          retention-days: 30
