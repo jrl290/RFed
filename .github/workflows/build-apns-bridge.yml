@@ -54,6 +54,8 @@ jobs:
             ${{ runner.os }}-cargo-apns-bridge-
 
       - name: Build release binary
+        env:
+          OPENSSL_STATIC: "1"
         run: cargo build --release -p apns-bridge
 
       - name: Strip binary
