@@ -1,0 +1,94 @@
+name: Build rfed (Linux)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+    paths:
+      - 'rfed/**'
+      - '.github/workflows/build-rfed.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build rfed for Linux x86_64
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout RFed-rust (this repo)
+        uses: actions/checkout@v4
+
+      - name: Clone sibling dependencies (outside workspace)
+        run: |
+          git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
+            "${{ github.workspace }}/../Reticulum-rust"
+          git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
+            "${{ github.workspace }}/../LXMF-rust"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools perl pkg-config
+
+      - name: Install Rust stable + musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Cargo registry + build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-rfed-musl-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-rfed-musl-
+
+      - name: Build release binary (musl — fully static)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+        run: cargo build --release --target x86_64-unknown-linux-musl -p rfed
+
+      - name: Strip binary
+        run: strip target/x86_64-unknown-linux-musl/release/rfed
+
+      - name: Show binary info
+        run: |
+          ls -lh target/x86_64-unknown-linux-musl/release/rfed
+          file target/x86_64-unknown-linux-musl/release/rfed
+          ldd  target/x86_64-unknown-linux-musl/release/rfed || true
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rfed-linux-x86_64
+          path: target/x86_64-unknown-linux-musl/release/rfed
+          retention-days: 30
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Copy binary into Docker context
+        run: cp target/x86_64-unknown-linux-musl/release/rfed rfed/rfed
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: rfed
+          file: rfed/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/rfed:latest
+            ghcr.io/${{ github.repository_owner }}/rfed:${{ github.sha }}
+
+      - name: Show image digest
+        run: echo "Pushed ghcr.io/${{ github.repository_owner }}/rfed:latest"

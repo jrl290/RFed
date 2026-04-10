@@ -12,7 +12,7 @@ name = "rfed_notify_test"
 path = "tests/notify_register.rs"
 
 [dependencies]
-reticulum_rust = { path = "../../Reticulum-rust" }
+reticulum_rust = { path = "../../Reticulum-rust", default-features = false }
 lxmf_rust      = { path = "../../LXMF-rust" }
 
 rmp          = "0.8.14"
