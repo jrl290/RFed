@@ -8,7 +8,7 @@ name = "apns_bridge"
 path = "src/main.rs"
 
 [dependencies]
-reticulum_rust = { path = "../../Reticulum-rust" }
+reticulum_rust = { path = "../../Reticulum-rust", default-features = false }
 
 # MessagePack — pinned to match workspace
 rmpv = "=1.0.0"
@@ -31,6 +31,10 @@ serde_json = "1"
 
 # Base64url for JWT
 base64 = "0.22"
+
+# Force static OpenSSL: compiles OpenSSL from source during build so the binary
+# doesn't require libssl.so / libcrypto.so on the target host.
+openssl = { version = "0.10", features = ["vendored"] }
 
 # Hex encoding
 hex = "0.4"

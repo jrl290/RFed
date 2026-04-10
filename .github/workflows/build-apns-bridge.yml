@@ -33,11 +33,8 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libdbus-1-dev \
-            libudev-dev \
-            pkg-config \
-            libssl-dev
+          # perl is required by the vendored OpenSSL build in openssl-sys
+          sudo apt-get install -y --no-install-recommends perl pkg-config
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -54,8 +51,6 @@ jobs:
             ${{ runner.os }}-cargo-apns-bridge-
 
       - name: Build release binary
-        env:
-          OPENSSL_STATIC: "1"
         run: cargo build --release -p apns-bridge
 
       - name: Strip binary
