@@ -27,6 +27,10 @@ jobs:
             "${{ github.workspace }}/../Reticulum-rust"
           git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
             "${{ github.workspace }}/../LXMF-rust"
+          # lxmf_rust depends on reticulum_rust with default features, which pulls
+          # in btleplug -> libdbus-sys.  Patch it to disable before building.
+          sed -i 's|reticulum_rust = { path = "../Reticulum-rust" }|reticulum_rust = { path = "../Reticulum-rust", default-features = false }|' \
+            "${{ github.workspace }}/../LXMF-rust/Cargo.toml"
 
       - name: Install system dependencies
         run: |
