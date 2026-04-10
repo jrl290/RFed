@@ -549,7 +549,7 @@ fn main() -> Result<(), String> {
         node.lock().map_err(|_| "lock")?.lxmf_propagation = Some(Arc::clone(&prop));
         if let Ok(guard) = prop.lock() {
             log(
-                &format!("[rfed] lxmf.propagation dest hash: {}", hexrep(&guard.destination.hash, false)),
+                format!("[rfed] lxmf.propagation dest hash: {}", hexrep(&guard.destination.hash, false)),
                 LOG_NOTICE,
                 false,
                 false,

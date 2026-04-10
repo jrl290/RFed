@@ -242,7 +242,7 @@ impl PropPeer {
             Some(id) => id,
             None => {
                 log(
-                    &format!("[lxmf.prop] cannot recall identity for peer {}", hexrep(&self.destination_hash, false)),
+                    format!("[lxmf.prop] cannot recall identity for peer {}", hexrep(&self.destination_hash, false)),
                     LOG_WARNING, false, false,
                 );
                 return false;
@@ -270,7 +270,7 @@ impl PropPeer {
             if let Some(key) = key {
                 self.peering_key = Some((key, value));
                 log(
-                    &format!("[lxmf.prop] peering key generated for {}", hexrep(&self.destination_hash, false)),
+                    format!("[lxmf.prop] peering key generated for {}", hexrep(&self.destination_hash, false)),
                     LOG_NOTICE, false, false,
                 );
                 return true;
@@ -426,7 +426,7 @@ impl LxmfPropagationNode {
         for static_peer in guard.static_peers.clone() {
             if !guard.peers.contains_key(&static_peer) {
                 log(
-                    &format!("[lxmf.prop] activating static peer {}", hexrep(&static_peer, false)),
+                    format!("[lxmf.prop] activating static peer {}", hexrep(&static_peer, false)),
                     LOG_NOTICE, false, false,
                 );
                 let peer = PropPeer::new(static_peer.clone());
@@ -489,7 +489,7 @@ impl LxmfPropagationNode {
         Transport::update_destination(guard.destination.clone());
 
         log(
-            &format!(
+            format!(
                 "[lxmf.prop] enabled: {} messages indexed, {} peers",
                 guard.entries.len(),
                 guard.peers.len(),
@@ -553,7 +553,7 @@ impl LxmfPropagationNode {
                         node.handle_propagation_announce(destination_hash, app_data, is_path_response);
                     },
                     Err(e) => {
-                        log(&format!("[lxmf.prop] POISONED LOCK in announce callback: {}", e), LOG_ERROR, false, false);
+                        log(format!("[lxmf.prop] POISONED LOCK in announce callback: {}", e), LOG_ERROR, false, false);
                     }
                 }
             }
@@ -567,7 +567,7 @@ impl LxmfPropagationNode {
 
     fn handle_propagation_announce(&mut self, destination_hash: &[u8], app_data: &[u8], is_path_response: bool) {
         log(
-            &format!("[lxmf.prop] handle_propagation_announce {} app_data_len={} is_path_response={}", hexrep(destination_hash, false), app_data.len(), is_path_response),
+            format!("[lxmf.prop] handle_propagation_announce {} app_data_len={} is_path_response={}", hexrep(destination_hash, false), app_data.len(), is_path_response),
             LOG_DEBUG, false, false,
         );
         // Don't peer with ourselves
@@ -577,28 +577,28 @@ impl LxmfPropagationNode {
         }
 
         if !lxmf_rust::lxmf::pn_announce_data_is_valid(app_data) {
-            log(&format!("[lxmf.prop] announce app_data INVALID for {}", hexrep(destination_hash, false)), LOG_DEBUG, false, false);
+            log(format!("[lxmf.prop] announce app_data INVALID for {}", hexrep(destination_hash, false)), LOG_DEBUG, false, false);
             return;
         }
 
         let config = match read_value(&mut Cursor::new(app_data)) {
             Ok(Value::Array(items)) if items.len() >= 7 => {
                 log(
-                    &format!("[lxmf.prop] announce config parsed: {} items", items.len()),
+                    format!("[lxmf.prop] announce config parsed: {} items", items.len()),
                     LOG_DEBUG, false, false,
                 );
                 items
             },
             Ok(other) => {
                 log(
-                    &format!("[lxmf.prop] announce config not array or <7 items: {:?}", other),
+                    format!("[lxmf.prop] announce config not array or <7 items: {:?}", other),
                     LOG_DEBUG, false, false,
                 );
                 return;
             },
             Err(e) => {
                 log(
-                    &format!("[lxmf.prop] announce config parse error: {}", e),
+                    format!("[lxmf.prop] announce config parse error: {}", e),
                     LOG_DEBUG, false, false,
                 );
                 return;
@@ -621,7 +621,7 @@ impl LxmfPropagationNode {
         let _ = write_value(&mut metadata, &config[6]);
 
         log(
-            &format!("[lxmf.prop] announce values: timebase={} enabled={} transfer_limit={} sync_limit={} stamp_cost={} stamp_flex={} peer_cost={} is_static={}",
+            format!("[lxmf.prop] announce values: timebase={} enabled={} transfer_limit={} sync_limit={} stamp_cost={} stamp_flex={} peer_cost={} is_static={}",
                 node_timebase, propagation_enabled, transfer_limit, sync_limit, stamp_cost, stamp_flex, peer_cost,
                 self.static_peers.contains(&destination_hash.to_vec())),
             LOG_DEBUG, false, false,
@@ -660,7 +660,7 @@ impl LxmfPropagationNode {
     ) {
         if peer_cost > MAX_PEERING_COST {
             log(
-                &format!("[lxmf.prop] peering cost {} exceeds max {}, ignoring {}", peer_cost, MAX_PEERING_COST, hexrep(&destination_hash, false)),
+                format!("[lxmf.prop] peering cost {} exceeds max {}, ignoring {}", peer_cost, MAX_PEERING_COST, hexrep(&destination_hash, false)),
                 LOG_NOTICE, false, false,
             );
             return;
@@ -680,7 +680,7 @@ impl LxmfPropagationNode {
                 peer.sync_backoff = 0.0;
                 peer.next_sync_attempt = 0.0;
                 log(
-                    &format!("[lxmf.prop] updated peer {}", hexrep(&destination_hash, false)),
+                    format!("[lxmf.prop] updated peer {}", hexrep(&destination_hash, false)),
                     LOG_NOTICE, false, false,
                 );
             }
@@ -697,7 +697,7 @@ impl LxmfPropagationNode {
             peer.metadata = Some(metadata);
             self.peers.insert(destination_hash.clone(), peer);
             log(
-                &format!("[lxmf.prop] peered with {}", hexrep(&destination_hash, false)),
+                format!("[lxmf.prop] peered with {}", hexrep(&destination_hash, false)),
                 LOG_NOTICE, false, false,
             );
         }
@@ -706,7 +706,7 @@ impl LxmfPropagationNode {
     fn unpeer(&mut self, destination_hash: &[u8]) {
         self.peers.remove(destination_hash);
         log(
-            &format!("[lxmf.prop] unpeered {}", hexrep(destination_hash, false)),
+            format!("[lxmf.prop] unpeered {}", hexrep(destination_hash, false)),
             LOG_NOTICE, false, false,
         );
     }
@@ -720,7 +720,7 @@ impl LxmfPropagationNode {
         let dir_entries = match fs::read_dir(&self.messagestore_path) {
             Ok(entries) => entries,
             Err(e) => {
-                log(&format!("[lxmf.prop] cannot read messagestore: {e}"), LOG_ERROR, false, false);
+                log(format!("[lxmf.prop] cannot read messagestore: {e}"), LOG_ERROR, false, false);
                 return;
             }
         };
@@ -778,7 +778,7 @@ impl LxmfPropagationNode {
 
         let elapsed = now() - start;
         log(
-            &format!(
+            format!(
                 "[lxmf.prop] indexed {} messages in {:.2}s",
                 self.entries.len(), elapsed,
             ),
@@ -831,7 +831,7 @@ impl LxmfPropagationNode {
         );
 
         if let Err(e) = fs::write(&filepath, &file_data) {
-            log(&format!("[lxmf.prop] cannot write message: {e}"), LOG_ERROR, false, false);
+            log(format!("[lxmf.prop] cannot write message: {e}"), LOG_ERROR, false, false);
             return None;
         }
 
@@ -855,7 +855,7 @@ impl LxmfPropagationNode {
         self.messages_received += 1;
 
         log(
-            &format!(
+            format!(
                 "[lxmf.prop] stored message {} for {} ({} bytes), queued for {} peers",
                 hexrep(&transient_id, false),
                 hexrep(&destination_hash, false),
@@ -888,7 +888,7 @@ impl LxmfPropagationNode {
 
         if !expired.is_empty() {
             log(
-                &format!("[lxmf.prop] evicted {} expired messages", expired.len()),
+                format!("[lxmf.prop] evicted {} expired messages", expired.len()),
                 LOG_NOTICE, false, false,
             );
         }
@@ -1018,7 +1018,7 @@ impl LxmfPropagationNode {
         let total = messages.len();
         let invalid_stamps = total - validated.len();
         log(
-            &format!(
+            format!(
                 "[lxmf.prop] processed {} msgs: {} stored, {} notified, {} bad-stamp",
                 total, stored, notified, invalid_stamps,
             ),
@@ -1138,7 +1138,7 @@ impl LxmfPropagationNode {
             _ => return encode_error(0xF4),
         };
 
-        let wants = request.get(0).cloned().unwrap_or(Value::Nil);
+        let wants = request.first().cloned().unwrap_or(Value::Nil);
         let haves = request.get(1).cloned().unwrap_or(Value::Nil);
         let client_limit_bytes = request.get(2).and_then(|v| v.as_f64()).map(|v| v * 1000.0);
 
@@ -1252,7 +1252,7 @@ impl LxmfPropagationNode {
         for (hash, peer) in &guard.peers {
             if !peer.unhandled_ids.is_empty() || !peer.alive {
                 log(
-                    &format!("[lxmf.prop] tick_sync peer {} alive={} state={} unhandled={} stamp_cost={:?} peer_cost={:?} peering_key_ready={}",
+                    format!("[lxmf.prop] tick_sync peer {} alive={} state={} unhandled={} stamp_cost={:?} peer_cost={:?} peering_key_ready={}",
                         hexrep(hash, false), peer.alive, peer.state, peer.unhandled_ids.len(),
                         peer.propagation_stamp_cost, peer.peering_cost, peer.peering_key_ready()),
                     LOG_DEBUG, false, false,
@@ -1262,7 +1262,7 @@ impl LxmfPropagationNode {
 
         if let Some(peer_hash) = sync_candidate {
             log(
-                &format!("[lxmf.prop] tick_sync: found sync candidate {}", hexrep(&peer_hash, false)),
+                format!("[lxmf.prop] tick_sync: found sync candidate {}", hexrep(&peer_hash, false)),
                 LOG_NOTICE, false, false,
             );
             // Check if peer needs a peering key — spawn background generation
@@ -1316,7 +1316,7 @@ impl LxmfPropagationNode {
                 Some(id) => id,
                 None => {
                     log(
-                        &format!("[lxmf.prop] cannot recall identity for peer {}", hexrep(&peer.destination_hash, false)),
+                        format!("[lxmf.prop] cannot recall identity for peer {}", hexrep(&peer.destination_hash, false)),
                         LOG_WARNING, false, false,
                     );
                     return;
@@ -1337,7 +1337,7 @@ impl LxmfPropagationNode {
         let weak = Arc::downgrade(arc);
         std::thread::spawn(move || {
             log(
-                &format!("[lxmf.prop] generating peering key for {} (cost {}) in background...",
+                format!("[lxmf.prop] generating peering key for {} (cost {}) in background...",
                     hexrep(&dest_hash, false), peering_cost),
                 LOG_NOTICE, false, false,
             );
@@ -1356,7 +1356,7 @@ impl LxmfPropagationNode {
                             if let Some(peer) = guard.peers.get_mut(&dest_hash) {
                                 peer.peering_key = Some((key, value));
                                 log(
-                                    &format!("[lxmf.prop] peering key generated for {}", hexrep(&dest_hash, false)),
+                                    format!("[lxmf.prop] peering key generated for {}", hexrep(&dest_hash, false)),
                                     LOG_NOTICE, false, false,
                                 );
                             }
@@ -1375,7 +1375,7 @@ impl LxmfPropagationNode {
     /// sends the OFFER request and processes the response.
     fn initiate_sync(&mut self, peer_hash: &[u8]) {
         log(
-            &format!("[lxmf.prop] initiate_sync starting for {}", hexrep(peer_hash, false)),
+            format!("[lxmf.prop] initiate_sync starting for {}", hexrep(peer_hash, false)),
             LOG_DEBUG, false, false,
         );
         let peer = match self.peers.get_mut(peer_hash) {
@@ -1386,7 +1386,7 @@ impl LxmfPropagationNode {
         peer.last_sync_attempt = now();
 
         if peer.state != PropPeer::IDLE {
-            log(&format!("[lxmf.prop] sync: peer state={} not IDLE", peer.state), LOG_DEBUG, false, false);
+            log(format!("[lxmf.prop] sync: peer state={} not IDLE", peer.state), LOG_DEBUG, false, false);
             return;
         }
 
@@ -1477,7 +1477,7 @@ impl LxmfPropagationNode {
         let link = match Link::new_outbound(destination, MODE_AES256_CBC) {
             Ok(l) => l,
             Err(e) => {
-                log(&format!("[lxmf.prop] link creation failed: {e}"), LOG_WARNING, false, false);
+                log(format!("[lxmf.prop] link creation failed: {e}"), LOG_WARNING, false, false);
                 return;
             }
         };
@@ -1528,7 +1528,7 @@ impl LxmfPropagationNode {
             }));
 
             if let Err(e) = link_guard.initiate() {
-                log(&format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
+                log(format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
                 return;
             }
         }
@@ -1542,7 +1542,7 @@ impl LxmfPropagationNode {
         peer.next_sync_attempt = now() + peer.sync_backoff;
 
         log(
-            &format!("[lxmf.prop] initiating sync with {}", hexrep(peer_hash, false)),
+            format!("[lxmf.prop] initiating sync with {}", hexrep(peer_hash, false)),
             LOG_DEBUG, false, false,
         );
     }
@@ -1611,7 +1611,7 @@ impl LxmfPropagationNode {
                     peer.state = PropPeer::REQUEST_SENT;
                 }
                 Err(e) => {
-                    log(&format!("[lxmf.prop] offer request failed: {e}"), LOG_WARNING, false, false);
+                    log(format!("[lxmf.prop] offer request failed: {e}"), LOG_WARNING, false, false);
                     peer.state = PropPeer::IDLE;
                     peer.link = None;
                 }
@@ -1675,14 +1675,14 @@ impl LxmfPropagationNode {
                     peer.mark_handled(tid);
                 }
                 log(
-                    &format!("[lxmf.prop] peer {} has all {} offered messages", hexrep(peer_hash, false), last_offer.len()),
+                    format!("[lxmf.prop] peer {} has all {} offered messages", hexrep(peer_hash, false), last_offer.len()),
                     LOG_DEBUG, false, false,
                 );
             }
             Some(Value::Boolean(true)) => {
                 // Peer wants all messages — send them via resource
                 log(
-                    &format!("[lxmf.prop] peer {} wants all {} messages, sending...", hexrep(peer_hash, false), last_offer.len()),
+                    format!("[lxmf.prop] peer {} wants all {} messages, sending...", hexrep(peer_hash, false), last_offer.len()),
                     LOG_DEBUG, false, false,
                 );
                 self.send_messages_to_peer(peer_hash, &last_offer);
@@ -1703,7 +1703,7 @@ impl LxmfPropagationNode {
                 }
 
                 log(
-                    &format!("[lxmf.prop] peer {} wants {}/{} messages", hexrep(peer_hash, false), wanted.len(), last_offer.len()),
+                    format!("[lxmf.prop] peer {} wants {}/{} messages", hexrep(peer_hash, false), wanted.len(), last_offer.len()),
                     LOG_DEBUG, false, false,
                 );
                 self.send_messages_to_peer(peer_hash, &wanted);
@@ -1725,8 +1725,12 @@ impl LxmfPropagationNode {
     /// Package and send requested messages to a peer over the established link.
     ///
     /// Messages are bundled as a msgpack array `[type_marker, [lxmf_data, ...]]`
-    /// matching the standard LXMF propagation wire format.  The remote peer's
-    /// link packet callback ingests them directly.
+    /// matching the client PUT wire format, so the remote peer's
+    /// `on_propagation_packet` callback ingests them directly.
+    ///
+    /// Delivery is fire-and-forget — the IDs are marked handled optimistically
+    /// before the packet is sent.  If the packet is lost the peer will re-offer
+    /// those IDs on the next sync cycle.
     fn send_messages_to_peer(&mut self, peer_hash: &[u8], transient_ids: &[Vec<u8>]) {
         // Collect message data
         let mut lxm_list = Vec::new();
@@ -1748,61 +1752,60 @@ impl LxmfPropagationNode {
         };
 
         // Package as a msgpack array: [type_marker, [lxmf_data, ...]]
+        // This is the same format as client PUT packets, so the remote's
+        // on_propagation_packet callback will ingest the messages correctly.
         let transfer = Value::Array(vec![
-            Value::Integer(0.into()), // type marker
+            Value::Integer(0.into()), // type marker (same as client PUT)
             Value::Array(lxm_list),
         ]);
         let mut transfer_data = Vec::new();
         let _ = write_value(&mut transfer_data, &transfer);
 
-        // Send via request on the /offer path — the remote's link packet
-        // callback will process any data packets arriving on the link.
-        // We use a fire-and-forget request here; the remote ingests messages
-        // from its link packet callback.
-        let weak = self.self_handle.clone();
-        let ph = peer_hash.to_vec();
-        let tid_list = transient_ids.to_vec();
         let msg_count = transient_ids.len();
+        let peer_hash_str = hexrep(peer_hash, false);
+
+        // Mark IDs as handled before sending (optimistic delivery).
+        // If the packet is lost, the peer will re-offer those IDs on the next
+        // sync cycle and we will resend.
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            for tid in transient_ids {
+                peer.mark_handled(tid);
+            }
+        }
+
+        // Send as a raw link DATA packet.  This routes to the remote's
+        // callbacks.packet handler (on_propagation_packet), NOT to any request
+        // handler — which is what we need for the client PUT wire format.
         {
             let link_guard = match link.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            let response_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>> = Some(Arc::new({
-                let weak = weak.clone();
-                let ph = ph.clone();
-                let tid_list = tid_list.clone();
-                move |_receipt: RequestReceipt| {
-                    if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                        if let Ok(mut node) = arc.lock() {
-                            if let Some(peer) = node.peers.get_mut(&ph) {
-                                for tid in &tid_list {
-                                    peer.mark_handled(tid);
-                                }
-                            }
-                        }
-                    }
-                }
-            }));
-
-            match link_guard.request(
-                OFFER_PATH.to_string(),
-                transfer_data,
-                response_cb,
-                None,
-                None,
-            ) {
+            match link_guard.send_packet(&transfer_data) {
                 Ok(_) => {
                     log(
-                        &format!("[lxmf.prop] sent {} messages to peer {}", msg_count, hexrep(peer_hash, false)),
-                        LOG_DEBUG, false, false,
+                        format!("[lxmf.prop] sent {} message(s) to peer {}", msg_count, peer_hash_str),
+                        LOG_NOTICE, false, false,
                     );
                 }
                 Err(e) => {
-                    log(&format!("[lxmf.prop] message transfer failed: {e}"), LOG_WARNING, false, false);
+                    log(format!("[lxmf.prop] message send failed for {peer_hash_str}: {e}"),
+                        LOG_WARNING, false, false);
                 }
             }
         }
+
+        // Tear down the link in a background thread.  We cannot call teardown()
+        // here because the PropagationNode mutex is held by the current call
+        // stack, and the link_closed callback would attempt to re-acquire it
+        // (deadlock).  A short delay ensures the DATA packet clears the send
+        // buffer on the TCP interface before the LINKCLOSE is sent.
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            if let Ok(mut guard) = link.lock() {
+                guard.teardown();
+            }
+        });
     }
 
     // ── Persistence ──────────────────────────────────────────────────────────
@@ -1854,7 +1857,7 @@ impl LxmfPropagationNode {
         let serialised: Vec<Vec<u8>> = match rmp_serde::from_slice(&data) {
             Ok(v) => v,
             Err(e) => {
-                log(&format!("[lxmf.prop] cannot load peers: {e}"), LOG_WARNING, false, false);
+                log(format!("[lxmf.prop] cannot load peers: {e}"), LOG_WARNING, false, false);
                 return;
             }
         };
@@ -1894,7 +1897,7 @@ impl LxmfPropagationNode {
         }
 
         log(
-            &format!("[lxmf.prop] loaded {} peers", self.peers.len()),
+            format!("[lxmf.prop] loaded {} peers", self.peers.len()),
             LOG_NOTICE, false, false,
         );
     }
@@ -1978,7 +1981,7 @@ impl LxmfPropagationNode {
 
         if stored > 0 {
             log(
-                &format!("[lxmf.prop] ingested {} messages from peer", stored),
+                format!("[lxmf.prop] ingested {} messages from peer", stored),
                 LOG_NOTICE, false, false,
             );
         }

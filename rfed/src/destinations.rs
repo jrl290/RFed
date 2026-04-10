@@ -248,7 +248,7 @@ impl FedNode {
                     node.node_dest.set_default_app_data(Some(ad.clone()));
                     let _ = node.node_dest.announce(Some(&ad), false, None, None, true);
                     log(
-                        &format!("[rfed] announced node {}", hexrep(
+                        format!("[rfed] announced node {}", hexrep(
                             &node.node_dest.hash
                         , false)),
                         LOG_NOTICE,
@@ -344,7 +344,7 @@ impl FedNode {
             ) {
                 Ok(d) => d,
                 Err(e) => {
-                    log(&format!("[sync] dest error for {}: {e}",
+                    log(format!("[sync] dest error for {}: {e}",
                         hexrep(&peer_hash, false)), LOG_WARNING, false, false);
                     continue;
                 }
@@ -353,7 +353,7 @@ impl FedNode {
             let link = match Link::new_outbound(dest, MODE_AES256_CBC) {
                 Ok(l) => l,
                 Err(e) => {
-                    log(&format!("[sync] link error for {}: {e}",
+                    log(format!("[sync] link error for {}: {e}",
                         hexrep(&peer_hash, false)), LOG_WARNING, false, false);
                     continue;
                 }
@@ -396,7 +396,7 @@ impl FedNode {
             }
 
             register_runtime_link(Arc::clone(&link_arc));
-            log(&format!("[sync] link opening to {}", hexrep(&peer_hash, false)),
+            log(format!("[sync] link opening to {}", hexrep(&peer_hash, false)),
                 LOG_DEBUG, false, false);
 
             if let Ok(mut s) = self.sync.lock() {
@@ -464,7 +464,7 @@ impl FedNode {
             match &best {
                 Some(h) => {
                     log(
-                        &format!("[backup] auto-selected backup node {}",
+                        format!("[backup] auto-selected backup node {}",
                             hexrep(h, false)),
                         LOG_NOTICE, false, false,
                     );
@@ -518,7 +518,7 @@ impl FedNode {
             let pruned = table.prune_stale_backups(ttl);
             if pruned > 0 {
                 log(
-                    &format!("[backup] pruned {pruned} stale backup entry(ies) (TTL {ttl:.0}s)"),
+                    format!("[backup] pruned {pruned} stale backup entry(ies) (TTL {ttl:.0}s)"),
                     LOG_NOTICE, false, false,
                 );
             }
@@ -539,7 +539,7 @@ impl FedNode {
         if !adopted.is_empty() {
             if let Some(ref hash) = backup_hash {
                 log(
-                    &format!(
+                    format!(
                         "[backup] re-pushing {} adopted entry(ies) to backup {}",
                         adopted.len(),
                         hexrep(hash, false),
@@ -591,7 +591,7 @@ fn run_sync_session(
     let offer_payload = match rmp_serde::to_vec(&our_ids) {
         Ok(b) => b,
         Err(e) => {
-            log(&format!("[sync] offer encode error: {e}"), LOG_WARNING, false, false);
+            log(format!("[sync] offer encode error: {e}"), LOG_WARNING, false, false);
             return;
         }
     };
@@ -640,13 +640,13 @@ fn run_sync_session(
             };
 
             if want_ids.is_empty() {
-                log(&format!("[sync] already up to date with {}",
+                log(format!("[sync] already up to date with {}",
                     hexrep(&ph_ok, false)), LOG_DEBUG, false, false);
                 teardown_sync(&la_ok, &nw_ok, &ph_ok, true);
                 return;
             }
 
-            log(&format!("[sync] requesting {} blob(s) from {}",
+            log(format!("[sync] requesting {} blob(s) from {}",
                 want_ids.len(), hexrep(&ph_ok, false)), LOG_NOTICE, false, false);
 
             let get_payload = rmp_serde::to_vec(&want_ids).unwrap_or_default();
@@ -696,7 +696,7 @@ fn run_sync_session(
                                                     let limit = guard.config
                                                         .policy_for(sub_hash)
                                                         .deferred_queue_limit;
-                                                    let _ = deferred.enqueue(
+                                                    deferred.enqueue(
                                                         sub_hash.clone(),
                                                         channel_hash.clone(),
                                                         blob.clone(),
@@ -719,14 +719,14 @@ fn run_sync_session(
                         }
                     }
 
-                    log(&format!("[sync] ingested {count} blob(s) from {}",
+                    log(format!("[sync] ingested {count} blob(s) from {}",
                         hexrep(&ph2, false)), LOG_NOTICE, false, false);
                     teardown_sync(&la2, &nw2, &ph2, true);
                 });
 
             let get_failed: Arc<dyn Fn(RequestReceipt) + Send + Sync> =
                 Arc::new(move |_| {
-                    log(&format!("[sync] MESSAGE_GET failed for {}",
+                    log(format!("[sync] MESSAGE_GET failed for {}",
                         hexrep(&ph_fail2, false)), LOG_WARNING, false, false);
                     teardown_sync(&la_fail2, &nw_fail2, &ph_fail2, false);
                 });
@@ -745,7 +745,7 @@ fn run_sync_session(
     // OFFER failed callback
     let offer_failed: Arc<dyn Fn(RequestReceipt) + Send + Sync> =
         Arc::new(move |_| {
-            log(&format!("[sync] OFFER failed for {}",
+            log(format!("[sync] OFFER failed for {}",
                 hexrep(&ph_fail, false)), LOG_WARNING, false, false);
             teardown_sync(&la_fail, &nw_fail, &ph_fail, false);
         });
@@ -759,7 +759,7 @@ fn run_sync_session(
             None,
         );
     } else {
-        log(&format!("[sync] link lock poisoned for {} — tearing down",
+        log(format!("[sync] link lock poisoned for {} — tearing down",
             hexrep(&peer_hash, false)), LOG_WARNING, false, false);
         teardown_sync(&link_arc, &node_weak, &peer_hash, false);
     }
@@ -844,7 +844,7 @@ fn push_subscriptions_to_backup(
             d
         },
         Err(e) => {
-            log(&format!("[backup] dest error for backup node: {e}"),
+            log(format!("[backup] dest error for backup node: {e}"),
                 LOG_WARNING, false, false);
             return;
         }
@@ -855,7 +855,7 @@ fn push_subscriptions_to_backup(
             l
         },
         Err(e) => {
-            log(&format!("[backup] link error to backup node: {e}"),
+            log(format!("[backup] link error to backup node: {e}"),
                 LOG_WARNING, false, false);
             return;
         }
@@ -950,7 +950,7 @@ fn backup_delivery_tick(
         }
 
         log(
-            &format!(
+            format!(
                 "[backup] owner {} offline \u{2014} checking {} backup subscriber(s)",
                 hexrep(owner_hash, false),
                 subs.len()
@@ -995,7 +995,7 @@ fn backup_delivery_tick(
             }
             if enqueued > 0 {
                 log(
-                    &format!(
+                    format!(
                         "[backup] queued {enqueued} blob(s) for subscriber {} (owner offline)",
                         hexrep(sub_hash, false)
                     ),
@@ -1066,7 +1066,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             ("notify",   &guard.notify_dest),
         ] {
             log(
-                &format!("[rfed] rfed.{} dest hash: {}", label, hexrep(&dest.hash, false)),
+                format!("[rfed] rfed.{} dest hash: {}", label, hexrep(&dest.hash, false)),
                 LOG_NOTICE,
                 false,
                 false,
@@ -1084,9 +1084,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             let peering_cost = ann.as_ref().and_then(|a| a.stamp_cost);
             if let Some(arc) = node_weak.upgrade() {
                 if let Ok(guard) = arc.lock() {
-                    guard.sync.lock().ok().map(|mut s| {
-                        s.peer_heard(dest_hash.to_vec(), peering_cost);
-                    });
+                    if let Ok(mut s) = guard.sync.lock() { s.peer_heard(dest_hash.to_vec(), peering_cost); }
                 }
             }
         }),
@@ -1144,7 +1142,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             }
 
             log(
-                &format!(
+                format!(
                     "[deferred] subscriber {} (delivery {}) back online — flushing {} blob(s)",
                     hexrep(&sub_id_hash, false),
                     hexrep(dest_hash, false),
@@ -1166,7 +1164,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 Ok(d) => d,
                 Err(e) => {
                     log(
-                        &format!("[deferred] failed to build dest for {}: {e}",
+                        format!("[deferred] failed to build dest for {}: {e}",
                             hexrep(&sub_id_hash, false)),
                         LOG_WARNING,
                         false,
@@ -1176,7 +1174,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     if let Ok(mut q) = guard.deferred_queue.lock() {
                         let limit = guard.config.policy_for(&sub_id_hash).deferred_queue_limit;
                         for pb in pending {
-                            let _ = q.enqueue(sub_id_hash.clone(), pb.channel_hash, pb.blob, limit);
+                            q.enqueue(sub_id_hash.clone(), pb.channel_hash, pb.blob, limit);
                         }
                     }
                     return;
@@ -1199,7 +1197,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 );
                 if let Err(e) = packet.send() {
                     log(
-                        &format!("[deferred] send to {} failed: {e}",
+                        format!("[deferred] send to {} failed: {e}",
                             hexrep(&sub_id_hash, false)),
                         LOG_WARNING,
                         false,
@@ -1286,7 +1284,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             || guard.config.trusted_backup_peers.iter().any(|h| h == &owner_hash);
         if !trusted {
             log(
-                &format!("[backup] rejected BACKUP_PUSH from untrusted owner {}",
+                format!("[backup] rejected BACKUP_PUSH from untrusted owner {}",
                     hexrep(&owner_hash, false)),
                 LOG_WARNING, false, false,
             );
@@ -1299,7 +1297,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             }
         }
         log(
-            &format!("[backup] registered {} backup sub(s) from owner {}",
+            format!("[backup] registered {} backup sub(s) from owner {}",
                 pairs.len(), hexrep(&owner_hash, false)),
             LOG_NOTICE, false, false,
         );
@@ -1435,7 +1433,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                     LOG_WARNING, false, false);
                 return;
             }
-            log(&format!("[channel] stamp accepted (cost>={min_cost})"),
+            log(format!("[channel] stamp accepted (cost>={min_cost})"),
                 LOG_DEBUG, false, false);
 
             (&data[..16], &data[16..stamp_start])
@@ -1462,7 +1460,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                             for sub_hash in &missed {
                                 let limit = guard.config.policy_for(sub_hash)
                                     .deferred_queue_limit;
-                                let _ = deferred.enqueue(
+                                deferred.enqueue(
                                     sub_hash.clone(),
                                     channel_hash.to_vec(),
                                     inner_blob.to_vec(),
@@ -1502,7 +1500,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         if let Ok(guard) = sub_node.lock() {
             if !guard.config.policy_for(&subscriber_hash).allow_subscription {
                 log(
-                    &format!(
+                    format!(
                         "[rfed] subscription denied for {} (policy)",
                         reticulum_rust::hexrep(&subscriber_hash, false),
                     ),
@@ -1635,7 +1633,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
         if let Err(reason) = validate_relay_hash(&relay_hash) {
             log(
-                &format!("[rfed] notify registration rejected: {reason}"),
+                format!("[rfed] notify registration rejected: {reason}"),
                 LOG_WARNING,
                 false,
                 false,
@@ -1655,7 +1653,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             // Enforce per-tier notify registration policy.
             if !guard.config.policy_for(&subscriber_hash).allow_notify_registration {
                 log(
-                    &format!(
+                    format!(
                         "[rfed] notify registration denied for {} (policy)",
                         reticulum_rust::hexrep(&subscriber_hash, false),
                     ),

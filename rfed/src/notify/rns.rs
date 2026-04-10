@@ -58,7 +58,7 @@ pub fn dispatch(
         std::thread::sleep(RETRY_DELAY);
         if !try_send(&dest_hex, &sub_hash, sender_hash.as_deref(), channel_hash.as_deref()) {
             log(
-                &format!(
+                format!(
                     "[notify/rns] relay {dest_hex} unreachable after retry; \
                      delivery will proceed via deferred queue / LXMF pull",
                 ),
@@ -89,7 +89,7 @@ fn try_send(
         Ok(b) if b.len() == 16 => b,
         _ => {
             log(
-                &format!(
+                format!(
                     "[notify/rns] invalid dest hash for {}",
                     hexrep(sub_hash, false),
                 ),
@@ -105,7 +105,7 @@ fn try_send(
     if !Transport::has_path(&dest_hash) {
         Transport::request_path(&dest_hash, None, None, None, None);
         log(
-            &format!(
+            format!(
                 "[notify/rns] no path to {dest_hex}, path request issued",
             ),
             LOG_DEBUG,
@@ -122,7 +122,7 @@ fn try_send(
         None => {
             Transport::request_path(&dest_hash, None, None, None, None);
             log(
-                &format!(
+                format!(
                     "[notify/rns] identity not cached for {dest_hex}, path request issued",
                 ),
                 LOG_DEBUG,
@@ -142,7 +142,7 @@ fn try_send(
         Ok(d) => d,
         Err(e) => {
             log(
-                &format!("[notify/rns] dest build error for {dest_hex}: {e}"),
+                format!("[notify/rns] dest build error for {dest_hex}: {e}"),
                 LOG_WARNING,
                 false,
                 false,
@@ -187,7 +187,7 @@ fn try_send(
     match pkt.send() {
         Ok(_) => {
             log(
-                &format!(
+                format!(
                     "[notify/rns] wake sent to {dest_hex} for {}",
                     hexrep(sub_hash, false),
                 ),
@@ -199,7 +199,7 @@ fn try_send(
         }
         Err(e) => {
             log(
-                &format!(
+                format!(
                     "[notify/rns] send failed for {dest_hex}: {e}",
                 ),
                 LOG_WARNING,

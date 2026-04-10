@@ -16,7 +16,6 @@
 //!   2. For each subscriber, send a Reticulum packet carrying the inner blob.
 //!   3. Fire registered delivery hooks (notify adapters).
 
-use std::sync::{Arc, Mutex};
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
@@ -24,7 +23,6 @@ use reticulum_rust::packet::{Packet, DATA, NONE, HEADER_1, FLAG_UNSET};
 use reticulum_rust::transport::Transport;
 use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_WARNING};
 
-use crate::deferred_queue::DeferredQueue;
 use crate::notify::HookRegistry;
 use crate::subscription::SubscriptionTable;
 
@@ -47,7 +45,7 @@ pub fn fanout_blob(
 
     if subscribers.is_empty() {
         log(
-            &format!(
+            format!(
                 "[fanout] no subscribers for channel {}",
                 hexrep(channel_dest_hash, false)
             ),
@@ -59,7 +57,7 @@ pub fn fanout_blob(
     }
 
     log(
-        &format!(
+        format!(
             "[fanout] delivering blob ({} bytes) to {} subscriber(s) on channel {}",
             inner_blob.len(),
             subscribers.len(),
@@ -78,7 +76,7 @@ pub fn fanout_blob(
         if let Some(owner) = owner_hash {
             if Identity::recall(owner).is_some() {
                 log(
-                    &format!(
+                    format!(
                         "[fanout] backup sub {} suppressed — owner reachable",
                         hexrep(sub_hash, false)
                     ),
@@ -89,7 +87,7 @@ pub fn fanout_blob(
                 continue;
             }
             log(
-                &format!(
+                format!(
                     "[fanout] backup sub {} — owner offline, delivering",
                     hexrep(sub_hash, false)
                 ),
@@ -107,7 +105,7 @@ pub fn fanout_blob(
             Some(id) => id,
             None => {
                 log(
-                    &format!(
+                    format!(
                         "[fanout] subscriber {} unknown — will defer",
                         hexrep(sub_hash, false)
                     ),
@@ -135,7 +133,7 @@ pub fn fanout_blob(
                 // even though the subscriber is unreachable.
                 if !Transport::has_path(&dest.hash) {
                     log(
-                        &format!(
+                        format!(
                             "[fanout] no path to subscriber {} delivery — will defer",
                             hexrep(sub_hash, false)
                         ),
@@ -162,7 +160,7 @@ pub fn fanout_blob(
                 match packet.send() {
                     Err(e) => {
                         log(
-                            &format!("[fanout] send to {} failed: {e} — will defer", hexrep(sub_hash, false)),
+                            format!("[fanout] send to {} failed: {e} — will defer", hexrep(sub_hash, false)),
                             LOG_WARNING,
                             false,
                             false,
@@ -174,7 +172,7 @@ pub fn fanout_blob(
                         // session is gone but the path entry still exists).  Treat as
                         // delivery failure and defer the blob.
                         log(
-                            &format!("[fanout] no interface for {} — will defer", hexrep(sub_hash, false)),
+                            format!("[fanout] no interface for {} — will defer", hexrep(sub_hash, false)),
                             LOG_WARNING,
                             false,
                             false,
@@ -188,7 +186,7 @@ pub fn fanout_blob(
             }
             Err(e) => {
                 log(
-                    &format!(
+                    format!(
                         "[fanout] failed to build destination for {}: {e}",
                         hexrep(sub_hash, false)
                     ),

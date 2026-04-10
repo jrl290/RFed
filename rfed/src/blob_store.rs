@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
-use reticulum_rust::{hexrep, log, LOG_NOTICE};
+use reticulum_rust::{log, LOG_NOTICE};
 
 const BLOB_TTL_SECS: f64 = 30.0 * 24.0 * 3600.0; // evict blobs older than 30 days
 const EVICT_CHECK_INTERVAL_SECS: f64 = 3600.0;    // check for expired blobs at most once per hour
@@ -159,7 +159,7 @@ impl BlobStore {
         }
         if count > 0 {
             log(
-                &format!("[blob_store] evicted {count} expired blob(s)"),
+                format!("[blob_store] evicted {count} expired blob(s)"),
                 LOG_NOTICE, false, false,
             );
         }
@@ -192,7 +192,7 @@ impl BlobStore {
         }
         if evicted > 0 {
             log(
-                &format!("[blob_store] evicted {evicted} blob(s) to free space"),
+                format!("[blob_store] evicted {evicted} blob(s) to free space"),
                 LOG_NOTICE, false, false,
             );
         }

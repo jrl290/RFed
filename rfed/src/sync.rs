@@ -33,7 +33,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
+use reticulum_rust::{log, hexrep, LOG_NOTICE, LOG_WARNING};
 
 #[allow(unused_imports)]  // re-exported for use by destinations.rs
 pub use reticulum_rust::transport::Transport;
@@ -174,7 +174,7 @@ impl FedSync {
         }
         let peer = self.peers.entry(dest_hash.clone()).or_insert_with(|| {
             log(
-                &format!("[sync] new peer: {}", hexrep(&dest_hash, false)),
+                format!("[sync] new peer: {}", hexrep(&dest_hash, false)),
                 LOG_NOTICE,
                 false,
                 false,
@@ -205,7 +205,7 @@ impl FedSync {
         let pruned = before - self.peers.len();
         if pruned > 0 {
             log(
-                &format!("[sync] pruned {pruned} stale peer(s)"),
+                format!("[sync] pruned {pruned} stale peer(s)"),
                 LOG_NOTICE, false, false,
             );
         }
@@ -226,7 +226,7 @@ impl FedSync {
         for hash in self.static_peers.clone() {
             let peer = self.peers.entry(hash.clone()).or_insert_with(|| {
                 log(
-                    &format!("[sync] seeding static peer {}", hexrep(&hash, false)),
+                    format!("[sync] seeding static peer {}", hexrep(&hash, false)),
                     LOG_NOTICE, false, false,
                 );
                 FedPeer::new(hash)
@@ -249,11 +249,11 @@ impl FedSync {
         match rmp_serde::to_vec(&peers) {
             Ok(bytes) => {
                 if let Err(e) = std::fs::write(path, &bytes) {
-                    log(&format!("[sync] failed to save peer state: {e}"),
+                    log(format!("[sync] failed to save peer state: {e}"),
                         LOG_WARNING, false, false);
                 }
             }
-            Err(e) => log(&format!("[sync] peer state encode error: {e}"),
+            Err(e) => log(format!("[sync] peer state encode error: {e}"),
                 LOG_WARNING, false, false),
         }
     }
@@ -270,7 +270,7 @@ impl FedSync {
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => {
-                log(&format!("[sync] failed to read peer state: {e}"),
+                log(format!("[sync] failed to read peer state: {e}"),
                     LOG_WARNING, false, false);
                 return;
             }
@@ -281,10 +281,10 @@ impl FedSync {
                     self.peers.entry(p.destination_hash.clone())
                         .or_insert(p);
                 }
-                log(&format!("[sync] loaded {} peer(s) from disk", self.peers.len()),
+                log(format!("[sync] loaded {} peer(s) from disk", self.peers.len()),
                     LOG_NOTICE, false, false);
             }
-            Err(e) => log(&format!("[sync] peer state decode error: {e}"),
+            Err(e) => log(format!("[sync] peer state decode error: {e}"),
                 LOG_WARNING, false, false),
         }
     }
@@ -407,7 +407,7 @@ impl FedSync {
             if let Some(limit) = self.transfer_limit_bytes {
                 if total_sent + meta.size as u64 > limit as u64 {
                     log(
-                        &format!("[sync] transfer limit reached ({}/{}B) — truncating response",
+                        format!("[sync] transfer limit reached ({}/{}B) — truncating response",
                             total_sent, limit as u64),
                         LOG_NOTICE, false, false,
                     );
@@ -418,7 +418,7 @@ impl FedSync {
             if let Some(limit) = self.sync_limit_bytes {
                 if self.sync_bytes_sent + meta.size as u64 > limit as u64 {
                     log(
-                        &format!("[sync] sync limit reached ({}/{}B) — refusing until next period",
+                        format!("[sync] sync limit reached ({}/{}B) — refusing until next period",
                             self.sync_bytes_sent, limit as u64),
                         LOG_NOTICE, false, false,
                     );
@@ -498,7 +498,7 @@ impl FedSync {
                     Ok(_) => ingested.push((channel_hash, blob)),
                     Err(e) => {
                         log(
-                            &format!("[sync] ingest error: {e}"),
+                            format!("[sync] ingest error: {e}"),
                             LOG_WARNING,
                             false,
                             false,
