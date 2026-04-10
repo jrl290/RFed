@@ -13,8 +13,9 @@ reticulum_rust = { path = "../../Reticulum-rust", default-features = false }
 # MessagePack — pinned to match workspace
 rmpv = "=1.0.0"
 
-# HTTP/2 client for APNs (rustls avoids needing OpenSSL on the host)
-reqwest = { version = "0.12", features = ["rustls-tls", "http2", "blocking", "json"] }
+# HTTP/2 client for APNs — webpki-roots bundles Mozilla certs so the binary
+# works in a FROM-scratch container with no system cert store.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2", "blocking", "json"] }
 
 # ES256 signing (Apple p8 keys are P-256 / ECDSA-SHA256)
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }

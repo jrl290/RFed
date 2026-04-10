@@ -30,3 +30,4 @@ peers.rmp
 utilities/apns_bridge.conf
 utilities/*.p8
 __pycache__/
+apns-bridge/apns_bridge
