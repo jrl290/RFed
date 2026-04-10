@@ -18,22 +18,17 @@ jobs:
     steps:
       - name: Checkout RFed-rust (this repo)
         uses: actions/checkout@v4
-        # Checked out at $GITHUB_WORKSPACE = /home/runner/work/RFed/RFed/
 
       # The Cargo.toml path deps use "../../Reticulum-rust" and "../../LXMF-rust"
-      # relative to RFed-rust/rfed/, which resolves to the sibling dirs one level
-      # above $GITHUB_WORKSPACE.
-      - name: Checkout Reticulum-rust (Rusticulum)
-        uses: actions/checkout@v4
-        with:
-          repository: jrl290/Rusticulum
-          path: ../Reticulum-rust
-
-      - name: Checkout LXMF-rust
-        uses: actions/checkout@v4
-        with:
-          repository: jrl290/LXMF-rust
-          path: ../LXMF-rust
+      # relative to each crate dir.  From apns-bridge/Cargo.toml that resolves to
+      # $GITHUB_WORKSPACE/../Reticulum-rust = /home/runner/work/RFed/Reticulum-rust.
+      # actions/checkout refuses paths outside the workspace, so we use git clone.
+      - name: Clone sibling dependencies (outside workspace)
+        run: |
+          git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
+            "${{ github.workspace }}/../Reticulum-rust"
+          git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
+            "${{ github.workspace }}/../LXMF-rust"
 
       - name: Install system dependencies
         run: |
