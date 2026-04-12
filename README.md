@@ -247,7 +247,7 @@ RFed depends on two local Rust crates that must be cloned as siblings:
 parent/
 ├── Reticulum-rust/    ← reticulum_rust crate
 ├── LXMF-rust/         ← lxmf_rust crate
-└── ReticulumFederation/  ← this repo (RFed)
+└── RFed-rust/  ← this repo (RFed)
     ├── Cargo.toml
     ├── rfed/
     │   ├── Cargo.toml

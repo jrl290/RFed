@@ -2039,6 +2039,7 @@ dependencies = [
  "bzip2",
  "cbc",
  "chrono",
+ "ctrlc",
  "ed25519-dalek",
  "futures",
  "hkdf",
