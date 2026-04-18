@@ -1535,8 +1535,11 @@ impl LxmfPropagationNode {
         peer.link = Some(link_handle);
         peer.state = PropPeer::LINK_ESTABLISHING;
         peer.last_offer = offer_ids;
-        peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
-        peer.next_sync_attempt = now() + peer.sync_backoff;
+        // Do NOT increment sync_backoff here.  It is incremented in the
+        // link_closed callback (covering both successful and failed syncs),
+        // and reset to 0 by the link_established callback on success.
+        // Adding it a second time here would double-count on every failed
+        // sync cycle, causing exponential (2× linear) back-off growth.
 
         log(
             format!("[lxmf.prop] initiating sync with {}", hexrep(peer_hash, false)),
