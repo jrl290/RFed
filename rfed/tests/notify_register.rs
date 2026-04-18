@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::{Link, RequestReceipt, MODE_AES256_CBC, register_runtime_link};
+use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC, register_runtime_link_handle};
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::Transport;
 
@@ -113,27 +113,23 @@ fn main() {
     .expect("create destination");
 
     let link = Link::new_outbound(dest, MODE_AES256_CBC).expect("create link");
-    let link_arc = Arc::new(Mutex::new(link));
+    let link_handle = LinkHandle::spawn(link);
 
     let done = Arc::new(AtomicBool::new(false));
 
     // Set up the link_established callback.
     {
-        let la_real = Arc::clone(&link_arc);
         let identity_for_cb = our_identity.clone();
         let done_est = Arc::clone(&done);
+        let lh_est = link_handle.clone();
 
-        let mut guard = link_arc.lock().unwrap();
-
-        guard.callbacks.link_established = Some(Arc::new(move |_la| {
+        link_handle.set_link_established_callback(Some(Arc::new(move |_la| {
             eprintln!("[test] Link established!");
 
             // Identify ourselves so the remote side has our identity.
-            if let Ok(mut l) = la_real.lock() {
-                match l.identify(&identity_for_cb) {
-                    Ok(()) => eprintln!("[test] identify sent OK"),
-                    Err(e) => eprintln!("[test] identify error: {e}"),
-                }
+            match lh_est.identify(&identity_for_cb) {
+                Ok(()) => eprintln!("[test] identify sent OK"),
+                Err(e) => eprintln!("[test] identify error: {e}"),
             }
 
             // Give rfed time to process the identify proof before sending request.
@@ -182,37 +178,35 @@ fn main() {
                 });
 
             // Send the request on the link.
-            if let Ok(l) = la_real.lock() {
-                match l.request(
-                    REGISTER_PATH.to_string(),
-                    payload,
-                    Some(response_cb),
-                    Some(failed_cb),
-                    None,
-                ) {
-                    Ok(_) => eprintln!("[test] Request sent to {REGISTER_PATH}"),
-                    Err(e) => {
-                        eprintln!("[test] Request send error: {e}");
-                        done_est.store(true, Ordering::Relaxed);
-                    }
+            match lh_est.request(
+                REGISTER_PATH.to_string(),
+                payload,
+                Some(response_cb),
+                Some(failed_cb),
+                None,
+            ) {
+                Ok(_) => eprintln!("[test] Request sent to {REGISTER_PATH}"),
+                Err(e) => {
+                    eprintln!("[test] Request send error: {e}");
+                    done_est.store(true, Ordering::Relaxed);
                 }
             }
-        }));
+        })));
 
         // Set up link_closed callback.
         let done_closed = Arc::clone(&done);
-        guard.callbacks.link_closed = Some(Arc::new(move |_| {
+        link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
             eprintln!("[test] Link closed");
             done_closed.store(true, Ordering::Relaxed);
-        }));
+        })));
 
         // Initiate the link handshake.
-        if let Err(e) = guard.initiate() {
+        if let Err(e) = link_handle.initiate() {
             eprintln!("[test] FAIL: link initiate error: {e}");
             std::process::exit(1);
         }
     }
-    register_runtime_link(Arc::clone(&link_arc));
+    register_runtime_link_handle(link_handle.clone());
     eprintln!("[test] Link handshake initiated, waiting for establishment...");
 
     // Wait for completion (up to 60 s).
@@ -227,9 +221,7 @@ fn main() {
     }
 
     // Teardown.
-    if let Ok(mut l) = link_arc.lock() {
-        l.teardown();
-    }
+    link_handle.teardown();
     thread::sleep(Duration::from_millis(500));
     eprintln!("[test] Done.");
 }

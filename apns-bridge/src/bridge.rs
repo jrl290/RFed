@@ -12,7 +12,7 @@ use rmpv::Value;
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::Link;
+use reticulum_rust::link::{Link, LinkHandle};
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::Transport;
 
@@ -81,15 +81,13 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
     // Link-established callback — rfed nodes may also open a Link first
     {
         let state2 = Arc::clone(&state);
-        notify_dest.set_link_established_callback(Some(Arc::new(move |link: Arc<Mutex<Link>>| {
+        notify_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
             let s = Arc::clone(&state2);
-            if let Ok(mut guard) = link.lock() {
-                guard.callbacks.packet = Some(Arc::new(move |data: &[u8], _pkt| {
-                    let raw = data.to_vec();
-                    let s2 = Arc::clone(&s);
-                    thread::spawn(move || dispatch_wake(raw, &s2));
-                }));
-            }
+            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+                let raw = data.to_vec();
+                let s2 = Arc::clone(&s);
+                thread::spawn(move || dispatch_wake(raw, &s2));
+            })));
         })));
     }
 

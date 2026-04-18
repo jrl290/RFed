@@ -49,7 +49,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lxmf_rust::lx_stamper;
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::{Link, MODE_AES256_CBC, RequestReceipt, register_runtime_link};
+use reticulum_rust::link::{Link, LinkHandle, MODE_AES256_CBC, RequestReceipt, register_runtime_link_handle};
 use reticulum_rust::packet::Packet;
 use reticulum_rust::transport::{AnnounceHandler, AnnounceCallback, Transport};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING, LOG_ERROR};
@@ -170,7 +170,7 @@ pub struct PropPeer {
     /// The last set of IDs we offered — used to reconcile the response.
     pub last_offer: Vec<Vec<u8>>,
     /// Active outbound link to this peer (if currently established).
-    pub link: Option<Arc<Mutex<Link>>>,
+    pub link: Option<LinkHandle>,
     /// Current sync state machine position (see `IDLE`, `LINK_ESTABLISHING`, etc.).
     pub state: u8,
 }
@@ -928,25 +928,23 @@ impl LxmfPropagationNode {
 
     // ── Link established ─────────────────────────────────────────────────────
 
-    fn link_established(&mut self, link: Arc<Mutex<Link>>) {
+    fn link_established(&mut self, link: LinkHandle) {
         log("[lxmf.prop] link established", LOG_DEBUG, false, false);
 
         let weak = self.self_handle.clone();
-        if let Ok(mut link_guard) = link.lock() {
-            link_guard.callbacks.packet = Some(Arc::new({
-                let weak = weak.clone();
-                move |data, packet| {
-                    if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                        if let Ok(mut node) = arc.lock() {
-                            node.on_propagation_packet(data, packet);
-                        }
+        link.set_packet_callback(Some(Arc::new({
+            let weak = weak.clone();
+            move |data, packet| {
+                if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
+                    if let Ok(mut node) = arc.lock() {
+                        node.on_propagation_packet(data, packet);
                     }
                 }
-            }));
+            }
+        })));
 
-            // Accept resources for large batch transfers from peers
-            link_guard.resource_strategy = reticulum_rust::link::ACCEPT_APP;
-        }
+        // Accept resources for large batch transfers from peers
+        link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
     }
 
     // ── Packet handler (client PUTs) ─────────────────────────────────────────
@@ -1483,59 +1481,58 @@ impl LxmfPropagationNode {
         };
 
         let link_arc = Arc::new(Mutex::new(link));
+        let link_handle = LinkHandle::from_arc(link_arc);
         let weak = self.self_handle.clone();
         let peer_hash_clone = peer_hash.to_vec();
         let offer_ids_clone = offer_ids.clone();
 
         // Set up link established callback to send the offer
-        if let Ok(mut link_guard) = link_arc.lock() {
-            let link_clone = Arc::clone(&link_arc);
-            let weak2 = weak.clone();
-            let peer_hash2 = peer_hash_clone.clone();
-            let offer_ids2 = offer_ids_clone.clone();
+        let lh_est = link_handle.clone();
+        let weak2 = weak.clone();
+        let peer_hash2 = peer_hash_clone.clone();
+        let offer_ids2 = offer_ids_clone.clone();
 
-            link_guard.callbacks.link_established = Some(Arc::new(move |_| {
-                if let Some(arc) = weak2.as_ref().and_then(|w| w.upgrade()) {
-                    if let Ok(mut node) = arc.lock() {
-                        if let Some(peer) = node.peers.get_mut(&peer_hash2) {
-                            peer.state = PropPeer::LINK_READY;
-                            peer.alive = true;
-                            peer.last_heard = now();
-                            peer.sync_backoff = 0.0;
-                        }
-
-                        // Send the offer request
-                        node.send_offer_on_link(&link_clone, &peer_hash2, &offer_ids2);
+        link_handle.set_link_established_callback(Some(Arc::new(move |_| {
+            if let Some(arc) = weak2.as_ref().and_then(|w| w.upgrade()) {
+                if let Ok(mut node) = arc.lock() {
+                    if let Some(peer) = node.peers.get_mut(&peer_hash2) {
+                        peer.state = PropPeer::LINK_READY;
+                        peer.alive = true;
+                        peer.last_heard = now();
+                        peer.sync_backoff = 0.0;
                     }
-                }
-            }));
 
-            let weak3 = weak.clone();
-            let peer_hash3 = peer_hash_clone.clone();
-            link_guard.callbacks.link_closed = Some(Arc::new(move |_| {
-                if let Some(arc) = weak3.as_ref().and_then(|w| w.upgrade()) {
-                    if let Ok(mut node) = arc.lock() {
-                        if let Some(peer) = node.peers.get_mut(&peer_hash3) {
-                            peer.link = None;
-                            if peer.state != PropPeer::IDLE {
-                                peer.state = PropPeer::IDLE;
-                                peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
-                                peer.next_sync_attempt = now() + peer.sync_backoff;
-                            }
-                        }
-                    }
+                    // Send the offer request
+                    node.send_offer_on_link(&lh_est, &peer_hash2, &offer_ids2);
                 }
-            }));
-
-            if let Err(e) = link_guard.initiate() {
-                log(format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
-                return;
             }
+        })));
+
+        let weak3 = weak.clone();
+        let peer_hash3 = peer_hash_clone.clone();
+        link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
+            if let Some(arc) = weak3.as_ref().and_then(|w| w.upgrade()) {
+                if let Ok(mut node) = arc.lock() {
+                    if let Some(peer) = node.peers.get_mut(&peer_hash3) {
+                        peer.link = None;
+                        if peer.state != PropPeer::IDLE {
+                            peer.state = PropPeer::IDLE;
+                            peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
+                            peer.next_sync_attempt = now() + peer.sync_backoff;
+                        }
+                    }
+                }
+            }
+        })));
+
+        if let Err(e) = link_handle.initiate() {
+            log(format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
+            return;
         }
 
-        register_runtime_link(Arc::clone(&link_arc));
+        register_runtime_link_handle(link_handle.clone());
 
-        peer.link = Some(link_arc);
+        peer.link = Some(link_handle);
         peer.state = PropPeer::LINK_ESTABLISHING;
         peer.last_offer = offer_ids;
         peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
@@ -1551,7 +1548,7 @@ impl LxmfPropagationNode {
     ///
     /// Sets up response/failure callbacks that drive the rest of the sync
     /// session (handle_offer_response → send_messages_to_peer).
-    fn send_offer_on_link(&mut self, link: &Arc<Mutex<Link>>, peer_hash: &[u8], offer_ids: &[Vec<u8>]) {
+    fn send_offer_on_link(&mut self, link: &LinkHandle, peer_hash: &[u8], offer_ids: &[Vec<u8>]) {
         let peer = match self.peers.get_mut(peer_hash) {
             Some(p) => p,
             None => return,
@@ -1599,22 +1596,20 @@ impl LxmfPropagationNode {
             }
         }));
 
-        if let Ok(link_guard) = link.lock() {
-            match link_guard.request(
-                OFFER_PATH.to_string(),
-                offer_data,
-                response_cb,
-                failed_cb,
-                None,
-            ) {
-                Ok(_) => {
-                    peer.state = PropPeer::REQUEST_SENT;
-                }
-                Err(e) => {
-                    log(format!("[lxmf.prop] offer request failed: {e}"), LOG_WARNING, false, false);
-                    peer.state = PropPeer::IDLE;
-                    peer.link = None;
-                }
+        match link.request(
+            OFFER_PATH.to_string(),
+            offer_data,
+            response_cb,
+            failed_cb,
+            None,
+        ) {
+            Ok(_) => {
+                peer.state = PropPeer::REQUEST_SENT;
+            }
+            Err(e) => {
+                log(format!("[lxmf.prop] offer request failed: {e}"), LOG_WARNING, false, false);
+                peer.state = PropPeer::IDLE;
+                peer.link = None;
             }
         }
     }
@@ -1777,11 +1772,7 @@ impl LxmfPropagationNode {
         // callbacks.packet handler (on_propagation_packet), NOT to any request
         // handler — which is what we need for the client PUT wire format.
         {
-            let link_guard = match link.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            match link_guard.send_packet(&transfer_data) {
+            match link.send_packet(&transfer_data) {
                 Ok(_) => {
                     log(
                         format!("[lxmf.prop] sent {} message(s) to peer {}", msg_count, peer_hash_str),
@@ -1802,9 +1793,7 @@ impl LxmfPropagationNode {
         // buffer on the TCP interface before the LINKCLOSE is sent.
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(150));
-            if let Ok(mut guard) = link.lock() {
-                guard.teardown();
-            }
+            link.teardown();
         });
     }
 
