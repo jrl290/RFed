@@ -1265,11 +1265,12 @@ impl LxmfPropagationNode {
             );
             // Check if peer needs a peering key — spawn background generation
             let identity_clone = guard.identity.clone();
-            if let Some(peer) = guard.peers.get_mut(&peer_hash) {
-                if !peer.sync_ready() {
-                    Self::spawn_peering_key_gen(arc, &peer_hash, &identity_clone);
-                    return;
-                }
+            let sync_ready = guard.peers.get(&peer_hash).map(|p| p.sync_ready()).unwrap_or(true);
+            if !sync_ready {
+                // Must drop guard before spawn_peering_key_gen, which re-acquires the lock
+                drop(guard);
+                Self::spawn_peering_key_gen(arc, &peer_hash, &identity_clone);
+                return;
             }
 
             // Initiate sync
@@ -1285,6 +1286,8 @@ impl LxmfPropagationNode {
             .collect();
 
         let identity_clone = guard.identity.clone();
+        // Must drop guard before spawn_peering_key_gen, which re-acquires the lock
+        drop(guard);
         for hash in &needs_keys {
             Self::spawn_peering_key_gen(arc, hash, &identity_clone);
         }
