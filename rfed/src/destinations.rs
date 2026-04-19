@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::{self, Identity};
-use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC, STATE_CLOSED, register_runtime_link_handle};
+use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC, register_runtime_link_handle};
 use reticulum_rust::lxstamper::LXStamper;
 use reticulum_rust::transport::{AnnounceHandler, Transport};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
@@ -111,8 +111,8 @@ pub struct FedNode {
     pub notify_dest: Destination,
 
     /// Active outbound sync links keyed by peer destination hash.
-    /// Pruned each tick_sync — entries whose link has reached STATE_CLOSED
-    /// are removed so a new link can be opened on the next attempt.
+    /// Pruned each tick_sync — dead links are removed so a new link can be
+    /// opened on the next attempt.
     pub sync_links: HashMap<Vec<u8>, LinkHandle>,
 
     /// Pending (subscriber_hash, channel_hash) pairs awaiting backup delivery to
@@ -293,9 +293,7 @@ impl FedNode {
         // Prune links that have closed since the last tick.
         // Retaining only live links prevents stale entries from blocking
         // new connection attempts.
-        self.sync_links.retain(|_, link| {
-            link.is_alive()
-        });
+        self.sync_links.retain(|_, link| link.is_alive());
 
         let due: Vec<Vec<u8>> = if let Ok(mut s) = self.sync.lock() {
             s.tick()
@@ -359,24 +357,24 @@ impl FedNode {
                 }
             };
 
-            let link_arc = Arc::new(Mutex::new(link));
-            let link_handle = LinkHandle::from_arc(link_arc);
+            let handle = LinkHandle::spawn(link);
+            register_runtime_link_handle(handle.clone());
             let node_weak = self.self_handle.as_ref().cloned();
             let ph = peer_hash.clone();
 
             // link_established → start the OFFER → MESSAGE_GET session.
+            // The callback receives the live LinkHandle `h` from the actor.
             let pw_est = node_weak.clone();
             let ph_est = ph.clone();
-            let lh_est = link_handle.clone();
-            link_handle.set_link_established_callback(Some(Arc::new(move |_la| {
-                run_sync_session(lh_est.clone(), ph_est.clone(), pw_est.clone());
+            handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
+                run_sync_session(h, ph_est.clone(), pw_est.clone());
             })));
 
             // link_closed → clean up the sync link entry so tick_sync knows
             // the link is dead and a new attempt may be scheduled.
             let pw_cls = node_weak.clone();
             let ph_cls = ph.clone();
-            link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
+            handle.set_link_closed_callback(Some(Arc::new(move |_: LinkHandle| {
                 if let Some(arc) = pw_cls.as_ref().and_then(|w| w.upgrade()) {
                     if let Ok(mut node) = arc.lock() {
                         node.sync_links.remove(&ph_cls);
@@ -384,20 +382,19 @@ impl FedNode {
                 }
             })));
 
-            if let Err(e) = link_handle.initiate() {
-                log(format!("[sync] initiate failed for {}: {e}", hexrep(&peer_hash, false)),
-                    LOG_WARNING, false, false);
+            if let Err(e) = handle.initiate() {
+                log(format!("[sync] link initiate failed for {}: {e}",
+                    hexrep(&peer_hash, false)), LOG_WARNING, false, false);
                 continue;
             }
 
-            register_runtime_link_handle(link_handle.clone());
             log(format!("[sync] link opening to {}", hexrep(&peer_hash, false)),
                 LOG_DEBUG, false, false);
 
             if let Ok(mut s) = self.sync.lock() {
                 s.sync_started(&peer_hash);
             }
-            self.sync_links.insert(peer_hash, link_handle);
+            self.sync_links.insert(peer_hash, handle);
         }
     }
 
@@ -743,23 +740,27 @@ fn run_sync_session(
             teardown_sync(&la_fail, &nw_fail, &ph_fail, false);
         });
 
-    let _ = link_handle.request(
+    if link_handle.request(
         crate::sync::OFFER_PATH.to_string(),
         offer_payload,
         Some(offer_response),
         Some(offer_failed),
         None,
-    );
+    ).is_err() {
+        log(format!("[sync] link gone for {} — tearing down",
+            hexrep(&peer_hash, false)), LOG_WARNING, false, false);
+        teardown_sync(&link_handle, &node_weak, &peer_hash, false);
+    }
 }
 
 /// Tear down a sync link and record the outcome in FedSync.
 fn teardown_sync(
-    link_handle: &LinkHandle,
+    link: &LinkHandle,
     node_weak: &Option<Weak<Mutex<FedNode>>>,
     peer_hash: &[u8],
     success: bool,
 ) {
-    link_handle.teardown();
+    link.teardown();
     if let Some(arc) = node_weak.as_ref().and_then(|w| w.upgrade()) {
         if let Ok(node) = arc.lock() {
             if let Ok(mut s) = node.sync.lock() {
@@ -846,40 +847,32 @@ fn push_subscriptions_to_backup(
         }
     };
 
-    let link_arc = Arc::new(Mutex::new(link));
-    let link_handle = LinkHandle::from_arc(link_arc);
+    let handle = LinkHandle::spawn(link);
+    register_runtime_link_handle(handle.clone());
     let payload = rmp_serde::to_vec(&pairs).unwrap_or_default();
 
-    // The caller passes our_identity directly (the BACKUP_PUSH handler
-    // derives the owner_hash from the caller identity).  We must NOT try to
-    // lock node_weak here — tick_backup_delivery already holds that lock,
-    // so attempting to lock again would deadlock.
-
+    // The callback body uses the live LinkHandle `h` passed by the actor,
+    // avoiding the old Arc<Mutex<Link>> pattern entirely.
     let payload_for_est = payload.clone();
-    let lh_est = link_handle.clone();
-    link_handle.set_link_established_callback(Some(Arc::new(move |_la: LinkHandle| {
+    handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
         // Identify first so the remote side knows our identity.
-        let _ = lh_est.identify(&our_identity);
+        let _ = h.identify(&our_identity);
         let pay = payload_for_est.clone();
-        let lh_ok  = lh_est.clone();
-        let lh_err = lh_est.clone();
+        let h_ok  = h.clone();
+        let h_err = h.clone();
         let ok_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |_| {
             log("[backup] backup push accepted by peer", LOG_NOTICE, false, false);
-            lh_ok.teardown();
+            h_ok.teardown();
         });
         let err_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |_| {
             log("[backup] backup push rejected by peer", LOG_WARNING, false, false);
-            lh_err.teardown();
+            h_err.teardown();
         });
-        let _ = lh_est.request(
+        let _result = h.request(
             BACKUP_PUSH_PATH.to_string(), pay, Some(ok_cb), Some(err_cb), None,
         );
     })));
-    if let Err(e) = link_handle.initiate() {
-        log(format!("[backup] link initiate failed: {e}"), LOG_WARNING, false, false);
-        return;
-    }
-    register_runtime_link_handle(link_handle.clone());
+    let _ = handle.initiate();
 }
 
 /// Scan backup subscriptions held by this node.  For each owner node whose

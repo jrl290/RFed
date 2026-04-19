@@ -169,7 +169,7 @@ pub struct PropPeer {
     pub transferring: Option<Vec<Vec<u8>>>,
     /// The last set of IDs we offered — used to reconcile the response.
     pub last_offer: Vec<Vec<u8>>,
-    /// Active outbound link to this peer (if currently established).
+    /// Active outbound link handle to this peer (if currently established).
     pub link: Option<LinkHandle>,
     /// Current sync state machine position (see `IDLE`, `LINK_ESTABLISHING`, etc.).
     pub state: u8,
@@ -1483,19 +1483,18 @@ impl LxmfPropagationNode {
             }
         };
 
-        let link_arc = Arc::new(Mutex::new(link));
-        let link_handle = LinkHandle::from_arc(link_arc);
+        let handle = LinkHandle::spawn(link);
+        register_runtime_link_handle(handle.clone());
         let weak = self.self_handle.clone();
         let peer_hash_clone = peer_hash.to_vec();
         let offer_ids_clone = offer_ids.clone();
 
-        // Set up link established callback to send the offer
-        let lh_est = link_handle.clone();
+        // Set up link established callback to send the offer.
+        // The callback receives the live LinkHandle `h` from the actor.
         let weak2 = weak.clone();
         let peer_hash2 = peer_hash_clone.clone();
         let offer_ids2 = offer_ids_clone.clone();
-
-        link_handle.set_link_established_callback(Some(Arc::new(move |_| {
+        handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
             if let Some(arc) = weak2.as_ref().and_then(|w| w.upgrade()) {
                 if let Ok(mut node) = arc.lock() {
                     if let Some(peer) = node.peers.get_mut(&peer_hash2) {
@@ -1505,15 +1504,15 @@ impl LxmfPropagationNode {
                         peer.sync_backoff = 0.0;
                     }
 
-                    // Send the offer request
-                    node.send_offer_on_link(&lh_est, &peer_hash2, &offer_ids2);
+                    // Send the offer request using the live handle from the actor.
+                    node.send_offer_on_link(&h, &peer_hash2, &offer_ids2);
                 }
             }
         })));
 
         let weak3 = weak.clone();
         let peer_hash3 = peer_hash_clone.clone();
-        link_handle.set_link_closed_callback(Some(Arc::new(move |_| {
+        handle.set_link_closed_callback(Some(Arc::new(move |_h: LinkHandle| {
             if let Some(arc) = weak3.as_ref().and_then(|w| w.upgrade()) {
                 if let Ok(mut node) = arc.lock() {
                     if let Some(peer) = node.peers.get_mut(&peer_hash3) {
@@ -1528,14 +1527,12 @@ impl LxmfPropagationNode {
             }
         })));
 
-        if let Err(e) = link_handle.initiate() {
+        if let Err(e) = handle.initiate() {
             log(format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
             return;
         }
 
-        register_runtime_link_handle(link_handle.clone());
-
-        peer.link = Some(link_handle);
+        peer.link = Some(handle);
         peer.state = PropPeer::LINK_ESTABLISHING;
         peer.last_offer = offer_ids;
         // Do NOT increment sync_backoff here.  It is incremented in the
@@ -1777,30 +1774,24 @@ impl LxmfPropagationNode {
         // Send as a raw link DATA packet.  This routes to the remote's
         // callbacks.packet handler (on_propagation_packet), NOT to any request
         // handler — which is what we need for the client PUT wire format.
-        {
-            match link.send_packet(&transfer_data) {
-                Ok(_) => {
-                    log(
-                        format!("[lxmf.prop] sent {} message(s) to peer {}", msg_count, peer_hash_str),
-                        LOG_NOTICE, false, false,
-                    );
-                }
-                Err(e) => {
-                    log(format!("[lxmf.prop] message send failed for {peer_hash_str}: {e}"),
-                        LOG_WARNING, false, false);
-                }
+        match link.send_packet(&transfer_data) {
+            Ok(_) => {
+                log(
+                    format!("[lxmf.prop] sent {} message(s) to peer {}", msg_count, peer_hash_str),
+                    LOG_NOTICE, false, false,
+                );
+            }
+            Err(e) => {
+                log(format!("[lxmf.prop] message send failed for {peer_hash_str}: {e}"),
+                    LOG_WARNING, false, false);
             }
         }
 
-        // Tear down the link in a background thread.  We cannot call teardown()
-        // here because the PropagationNode mutex is held by the current call
-        // stack, and the link_closed callback would attempt to re-acquire it
-        // (deadlock).  A short delay ensures the DATA packet clears the send
-        // buffer on the TCP interface before the LINKCLOSE is sent.
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(150));
-            link.teardown();
-        });
+        // Teardown is fire-and-forget: LinkHandle::teardown() sends a message
+        // to the actor queue and returns immediately.  The link_closed callback
+        // fires on a new thread after the PropagationNode mutex has been
+        // released, so there is no deadlock risk.
+        link.teardown();
     }
 
     // ── Persistence ──────────────────────────────────────────────────────────
