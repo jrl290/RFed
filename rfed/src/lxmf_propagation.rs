@@ -1484,7 +1484,6 @@ impl LxmfPropagationNode {
         };
 
         let handle = LinkHandle::spawn(link);
-        register_runtime_link_handle(handle.clone());
         let weak = self.self_handle.clone();
         let peer_hash_clone = peer_hash.to_vec();
         let offer_ids_clone = offer_ids.clone();
@@ -1531,6 +1530,8 @@ impl LxmfPropagationNode {
             log(format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
             return;
         }
+        // Register AFTER initiate() so link_id is populated in the handle.
+        register_runtime_link_handle(handle.clone());
 
         peer.link = Some(handle);
         peer.state = PropPeer::LINK_ESTABLISHING;

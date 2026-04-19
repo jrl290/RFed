@@ -358,7 +358,6 @@ impl FedNode {
             };
 
             let handle = LinkHandle::spawn(link);
-            register_runtime_link_handle(handle.clone());
             let node_weak = self.self_handle.as_ref().cloned();
             let ph = peer_hash.clone();
 
@@ -387,6 +386,8 @@ impl FedNode {
                     hexrep(&peer_hash, false)), LOG_WARNING, false, false);
                 continue;
             }
+            // Register AFTER initiate() so link_id is populated in the handle.
+            register_runtime_link_handle(handle.clone());
 
             log(format!("[sync] link opening to {}", hexrep(&peer_hash, false)),
                 LOG_DEBUG, false, false);
@@ -848,7 +849,6 @@ fn push_subscriptions_to_backup(
     };
 
     let handle = LinkHandle::spawn(link);
-    register_runtime_link_handle(handle.clone());
     let payload = rmp_serde::to_vec(&pairs).unwrap_or_default();
 
     // The callback body uses the live LinkHandle `h` passed by the actor,
@@ -873,6 +873,8 @@ fn push_subscriptions_to_backup(
         );
     })));
     let _ = handle.initiate();
+    // Register AFTER initiate() so link_id is populated in the handle.
+    register_runtime_link_handle(handle);
 }
 
 /// Scan backup subscriptions held by this node.  For each owner node whose
