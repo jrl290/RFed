@@ -21,7 +21,7 @@ use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::{Packet, DATA, NONE, HEADER_1, FLAG_UNSET};
 use reticulum_rust::transport::Transport;
-use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_WARNING};
+use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::notify::HookRegistry;
 use crate::subscription::SubscriptionTable;
@@ -185,7 +185,19 @@ pub fn fanout_blob(
                         );
                         missed.push(sub_hash.clone());
                     }
-                    Ok(Some(_)) => {}
+                    Ok(Some(_)) => {
+                        log(
+                            format!(
+                                "[FANOUT] SENT channel={} sub={} payload_bytes={}",
+                                hexrep(channel_dest_hash, false),
+                                hexrep(sub_hash, false),
+                                inner_blob.len() + channel_dest_hash.len(),
+                            ),
+                            reticulum_rust::LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                    }
                 }
                 // Also fire delivery hooks (notify adapters etc.)
                 hook_registry.on_deliver(sub_hash, inner_blob);

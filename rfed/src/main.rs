@@ -250,12 +250,10 @@ fn main() -> Result<(), String> {
     // ── Default policy ────────────────────────────────────────────────
     let default_stamp_cost: Option<u32> =
         arg_value(&args, "--stamp-cost").and_then(|s| s.parse().ok())
-        .or(cfg.default_policy.stamp_cost)
-        .or(Some(16));
+        .or(cfg.default_policy.stamp_cost);
     let default_stamp_flex: Option<u32> =
         arg_value(&args, "--stamp-flexibility").and_then(|s| s.parse().ok())
-        .or(cfg.default_policy.stamp_flexibility)
-        .or(Some(3));
+        .or(cfg.default_policy.stamp_flexibility);
     let default_deferred_limit: usize =
         cfg.default_policy.deferred_queue_limit.unwrap_or(256);
     let default_allow_notify_reg: bool =

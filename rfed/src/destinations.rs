@@ -1472,6 +1472,14 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 let subs  = guard.subscription_table.lock().ok();
                 let hooks = guard.hook_registry.lock().ok();
                 if let (Some(subs), Some(hooks)) = (subs, hooks) {
+                    log(
+                        format!("[CHANNEL-RX] channel={} blob_bytes={} → fanning out to {} subscriber(s)",
+                            hexrep(channel_hash, false),
+                            inner_blob.len(),
+                            subs.get_subscribers_with_owner(channel_hash).len(),
+                        ),
+                        LOG_NOTICE, false, false,
+                    );
                     let missed = fanout::fanout_blob(inner_blob, channel_hash, &subs, &hooks);
                     if !missed.is_empty() {
                         if let Ok(mut deferred) = guard.deferred_queue.lock() {
@@ -1543,8 +1551,21 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                     }
                 }
             }
+            // Response: [true, stamp_cost_or_nil]
+            // stamp_cost is None when disabled so client can skip PoW.
+            let cost = guard.config.default_policy.stamp_cost;
+            let resp = rmpv::Value::Array(vec![
+                rmpv::Value::Boolean(true),
+                match cost {
+                    Some(c) => rmpv::Value::Integer(rmpv::Integer::from(c as i64)),
+                    None    => rmpv::Value::Nil,
+                },
+            ]);
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &resp).unwrap_or_default();
+            return buf;
         }
-        rmp_serde::to_vec(&true).unwrap_or_default()
+        rmp_serde::to_vec(&false).unwrap_or_default()
     });
 
     // UNSUBSCRIBE
