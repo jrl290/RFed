@@ -46,6 +46,46 @@ fn decode_msgpack_bin(data: &[u8]) -> Vec<u8> {
     }
 }
 
+/// Parse and verify a signed payload: msgpack fixarray-3 [bin/str value, bin(64) pubkey, bin(64) sig].
+///
+/// Returns `(value_bytes, subscriber_identity_hash)` on success, or an error string.
+/// The subscriber hash is derived from the pubkey using `Identity::from_public_key` — identical
+/// to how Reticulum derives it, so no separate identity-lookup is needed.
+fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut cur = Cursor::new(data);
+    let top = rmpv::decode::read_value(&mut cur)
+        .map_err(|e| format!("msgpack decode: {e}"))?;
+    let arr = match top {
+        rmpv::Value::Array(a) if a.len() == 3 => a,
+        _ => return Err(format!("expected fixarray-3, got {:?}", top)),
+    };
+
+    let value: Vec<u8> = match &arr[0] {
+        rmpv::Value::Binary(b) => b.clone(),
+        rmpv::Value::String(s) => s.as_bytes().to_vec(),
+        other => return Err(format!("payload[0] not bin/str: {:?}", other)),
+    };
+    let pubkey: Vec<u8> = match &arr[1] {
+        rmpv::Value::Binary(b) => b.clone(),
+        _ => return Err("payload[1] not bin (pubkey)".into()),
+    };
+    let sig: Vec<u8> = match &arr[2] {
+        rmpv::Value::Binary(b) => b.clone(),
+        _ => return Err("payload[2] not bin (sig)".into()),
+    };
+
+    if pubkey.len() != 64 { return Err(format!("pubkey len {} != 64", pubkey.len())); }
+    if sig.len()    != 64 { return Err(format!("sig len {} != 64", sig.len())); }
+
+    let id = Identity::from_public_key(&pubkey)
+        .map_err(|e| format!("from_public_key: {e}"))?;
+    if !id.validate(&sig, &value) {
+        return Err("signature verification failed".into());
+    }
+    let subscriber_hash = id.hash.ok_or("identity has no hash after from_public_key")?;
+    Ok((value, subscriber_hash))
+}
+
 use crate::config::NodeConfig;
 use crate::deferred_queue::DeferredQueue;
 use crate::fanout;
@@ -1459,16 +1499,19 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // SUBSCRIBE — client registers (subscriber_hash, channel_hash).
     let sub_node = Arc::clone(node);
     let subscribe_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                      caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        // data = msgpack bin(16) — channel hash sent by Python as bytes
-        let channel_hash: Vec<u8> = decode_msgpack_bin(data);
+                                      _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+        // Payload: fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig].
+        // Subscriber identity is derived from pubkey; sig proves key ownership.
+        let (channel_hash, subscriber_hash) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] subscribe_cb: {e}"), LOG_WARNING, false, false);
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
+        };
+
         if channel_hash.len() != 16 {
-            return rmp_serde::to_vec(&false).unwrap_or_default();
-        }
-        let subscriber_hash = caller
-            .and_then(|id| id.hash.clone())
-            .unwrap_or_default();
-        if subscriber_hash.is_empty() {
+            log(format!("[rfed] subscribe_cb: bad channel_hash len={}", channel_hash.len()), LOG_WARNING, false, false);
             return rmp_serde::to_vec(&false).unwrap_or_default();
         }
         if let Ok(guard) = sub_node.lock() {
@@ -1503,11 +1546,11 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // UNSUBSCRIBE
     let unsub_node = Arc::clone(node);
     let unsubscribe_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                        caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let channel_hash: Vec<u8> = decode_msgpack_bin(data);
-        let subscriber_hash = caller
-            .and_then(|id| id.hash.clone())
-            .unwrap_or_default();
+                                        _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+        let (channel_hash, subscriber_hash) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
+        };
         if let Ok(guard) = unsub_node.lock() {
             if let Ok(mut subs) = guard.subscription_table.lock() {
                 subs.unsubscribe(&subscriber_hash, &channel_hash);
@@ -1592,16 +1635,20 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // the lxmf.delivery dest hash from message headers) can look up the relay.
     let reg_node = Arc::clone(node);
     let register_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                      caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        // The Link request framework unpacks the outer msgpack array and delivers
-        // the data element's raw bytes.  When the sender encodes a String via
-        // rmp_serde::to_vec the framework round-trips it, so `data` is plain UTF-8.
-        // Try msgpack first (Python clients), then raw UTF-8.
-        let relay_hash: String = rmp_serde::from_slice(data)
-            .or_else(|_| String::from_utf8(data.to_vec()).map_err(|e| e.to_string()))
+                                      _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+        // Payload: fixarray-3 [str(relayHex), bin(64) pubkey, bin(64) sig].
+        // Subscriber identity is derived from pubkey; sig proves key ownership.
+        let (value_bytes, subscriber_hash) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] notify/register: {e}"), LOG_WARNING, false, false);
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
+        };
+        let relay_hash = String::from_utf8(value_bytes)
             .unwrap_or_default();
         if relay_hash.is_empty() {
-            log("[rfed] notify/register: empty or un-decodable relay hash", LOG_WARNING, false, false);
+            log("[rfed] notify/register: empty relay hash", LOG_WARNING, false, false);
             return rmp_serde::to_vec(&false).unwrap_or_default();
         }
 
@@ -1614,14 +1661,6 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             );
             return rmp_serde::to_vec(&false).unwrap_or_default();
         }
-
-        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
-            Some(h) => h,
-            None => {
-                log("[rfed] notify/register: caller identity hash is None", LOG_WARNING, false, false);
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-        };
 
         if let Ok(guard) = reg_node.lock() {
             // Enforce per-tier notify registration policy.
@@ -1657,17 +1696,15 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // Payload: msgpack String, same 32-char hex format as REGISTER.
     let unreg_node = Arc::clone(node);
     let unregister_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                        caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let relay_hash: String = rmp_serde::from_slice(data)
-            .or_else(|_| String::from_utf8(data.to_vec()).map_err(|e| e.to_string()))
-            .unwrap_or_default();
+                                        _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+        let (value_bytes, subscriber_hash) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
+        };
+        let relay_hash = String::from_utf8(value_bytes).unwrap_or_default();
         if relay_hash.is_empty() {
             return rmp_serde::to_vec(&false).unwrap_or_default();
         }
-        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
-            Some(h) => h,
-            None => return rmp_serde::to_vec(&false).unwrap_or_default(),
-        };
         if let Ok(guard) = unreg_node.lock() {
             if let Ok(mut notify) = guard.notify_registry.lock() {
                 notify.unregister(&subscriber_hash, &relay_hash);
@@ -1679,11 +1716,13 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // NOTIFY_CLEAR — remove ALL relay registrations for the caller.
     // No payload required.
     let clear_node = Arc::clone(node);
-    let clear_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
-                                    caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
-            Some(h) => h,
-            None => return rmp_serde::to_vec(&false).unwrap_or_default(),
+    let clear_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                    _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+        // For clear, payload is fixarray-3 [str(""), bin(64) pubkey, bin(64) sig_over_empty].
+        // We only need the subscriber hash from the verified pubkey.
+        let (_value, subscriber_hash) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
         if let Ok(guard) = clear_node.lock() {
             if let Ok(mut notify) = guard.notify_registry.lock() {
