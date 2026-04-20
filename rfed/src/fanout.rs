@@ -145,9 +145,15 @@ pub fn fanout_blob(
                     continue;
                 }
 
+                // Delivery packet payload: channel_hash(16) | inner_blob
+                // The subscriber's onRfedBlob handler reads the first 16 bytes as
+                // the channel hash, then passes the remainder to dispatchBlob.
+                let mut payload = channel_dest_hash.to_vec();
+                payload.extend_from_slice(inner_blob);
+
                 let mut packet = Packet::new(
                     Some(dest),
-                    inner_blob.to_vec(),
+                    payload,
                     DATA,
                     NONE,
                     reticulum_rust::transport::BROADCAST,

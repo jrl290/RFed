@@ -1197,9 +1197,13 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
 
             let hooks = guard.hook_registry.lock().ok();
             for pb in &pending {
+                // Delivery packet payload: channel_hash(16) | inner_blob
+                // Matches the format expected by the subscriber's onRfedBlob handler.
+                let mut payload = pb.channel_hash.clone();
+                payload.extend_from_slice(&pb.blob);
                 let mut packet = reticulum_rust::packet::Packet::new(
                     Some(dest.clone()),
-                    pb.blob.clone(),
+                    payload,
                     reticulum_rust::packet::DATA,
                     reticulum_rust::packet::NONE,
                     reticulum_rust::transport::BROADCAST,
