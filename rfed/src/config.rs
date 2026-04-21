@@ -23,6 +23,9 @@ pub struct TierPolicy {
     /// Maximum blobs held in the deferred delivery queue for a subscriber
     /// on this tier while they are offline.
     pub deferred_queue_limit: usize,
+    /// Maximum blobs returned in a single PULL response for this tier.
+    /// `None` means unlimited (drain the entire queue in one request).
+    pub deferred_pull_batch_limit: Option<usize>,
     /// Whether subscribers on this tier may register for notify relays.
     pub allow_notify_registration: bool,
     /// Whether subscribers on this tier may subscribe to channels.
@@ -38,6 +41,7 @@ impl Default for TierPolicy {
             stamp_cost: Some(16),
             stamp_flexibility: Some(3),
             deferred_queue_limit: 256,
+            deferred_pull_batch_limit: None,
             allow_notify_registration: true,
             allow_subscription: true,
             trusted_backup_only: false,
@@ -52,6 +56,7 @@ impl TierPolicy {
             stamp_cost: Some(8),
             stamp_flexibility: Some(2),
             deferred_queue_limit: 1024,
+            deferred_pull_batch_limit: None,
             allow_notify_registration: true,
             allow_subscription: true,
             trusted_backup_only: false,

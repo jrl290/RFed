@@ -91,6 +91,10 @@ pub trait DeliveryHook: Send + Sync {
 pub struct NotifyRegistration {
     /// 16-byte truncated RNS destination hash of the subscriber.
     pub subscriber_hash: Vec<u8>,
+    /// 16-byte channel hash this registration covers, or `None` for LXMF
+    /// propagation notifications (global, not channel-specific).
+    #[serde(default)]
+    pub channel_hash: Option<Vec<u8>>,
     /// 32-char lowercase hex destination hash of the notify relay node.
     pub relay_hash: String,
     /// When the registration was last updated (Unix timestamp).
@@ -118,19 +122,25 @@ impl NotifyRegistry {
         NotifyRegistry { registrations, file_path }
     }
 
-    /// Register or refresh a notify relay for a subscriber.
+    /// Register or refresh a notify relay for `(subscriber_hash, channel_hash)`.
     ///
-    /// If the subscriber already has a registration for this exact relay hash
-    /// the timestamp is refreshed.  Otherwise a new entry is appended.
-    /// A subscriber may register multiple relay hashes simultaneously.
-    pub fn register(&mut self, subscriber_hash: Vec<u8>, relay_hash: String) {
+    /// `channel_hash` is `None` for LXMF propagation notifications and
+    /// `Some(16-byte hash)` for a specific rfed.channel subscription.
+    ///
+    /// If the exact `(subscriber, channel, relay)` triple already exists the
+    /// timestamp is refreshed.  Otherwise a new entry is appended.
+    /// A subscriber may register multiple relay hashes for the same channel.
+    pub fn register(&mut self, subscriber_hash: Vec<u8>, channel_hash: Option<Vec<u8>>, relay_hash: String) {
         if let Some(existing) = self.registrations.iter_mut().find(|r| {
-            r.subscriber_hash == subscriber_hash && r.relay_hash == relay_hash
+            r.subscriber_hash == subscriber_hash
+                && r.channel_hash == channel_hash
+                && r.relay_hash == relay_hash
         }) {
             existing.registered = now();
         } else {
             self.registrations.push(NotifyRegistration {
                 subscriber_hash,
+                channel_hash,
                 relay_hash,
                 registered: now(),
             });
@@ -138,18 +148,20 @@ impl NotifyRegistry {
         let _ = self.save();
     }
 
-    /// Remove a specific relay registration for a subscriber.
-    pub fn unregister(&mut self, subscriber_hash: &[u8], relay_hash: &str) {
+    /// Remove a specific relay registration for `(subscriber_hash, channel_hash)`.
+    pub fn unregister(&mut self, subscriber_hash: &[u8], channel_hash: Option<&[u8]>, relay_hash: &str) {
         let before = self.registrations.len();
         self.registrations.retain(|r| {
-            !(r.subscriber_hash.as_slice() == subscriber_hash && r.relay_hash == relay_hash)
+            !(r.subscriber_hash.as_slice() == subscriber_hash
+              && r.channel_hash.as_deref() == channel_hash
+              && r.relay_hash == relay_hash)
         });
         if self.registrations.len() != before {
             let _ = self.save();
         }
     }
 
-    /// Remove ALL relay registrations for a subscriber.
+    /// Remove ALL relay registrations for a subscriber (all channels + LXMF).
     pub fn clear(&mut self, subscriber_hash: &[u8]) {
         let before = self.registrations.len();
         self.registrations.retain(|r| r.subscriber_hash.as_slice() != subscriber_hash);
@@ -158,11 +170,17 @@ impl NotifyRegistry {
         }
     }
 
-    /// Lookup all registrations for a subscriber.
-    pub fn get(&self, subscriber_hash: &[u8]) -> Vec<&NotifyRegistration> {
+    /// Lookup all registrations for `(subscriber_hash, channel_hash)`.
+    ///
+    /// Pass `channel_hash = None` to match LXMF propagation registrations.
+    /// Pass `channel_hash = Some(hash)` to match a specific rfed.channel.
+    pub fn get_for_channel<'a>(&'a self, subscriber_hash: &[u8], channel_hash: Option<&[u8]>) -> Vec<&'a NotifyRegistration> {
         self.registrations
             .iter()
-            .filter(|r| r.subscriber_hash.as_slice() == subscriber_hash)
+            .filter(|r| {
+                r.subscriber_hash.as_slice() == subscriber_hash
+                    && r.channel_hash.as_deref() == channel_hash
+            })
             .collect()
     }
 

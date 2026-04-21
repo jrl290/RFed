@@ -740,7 +740,7 @@ fn run_sync_session(
                                             // Fire notify wake-ups for deferred subscribers.
                                             if let Ok(notify) = guard.notify_registry.lock() {
                                                 for sub_hash in &missed {
-                                                    for reg in notify.get(sub_hash) {
+                                                    for reg in notify.get_for_channel(sub_hash, Some(channel_hash)) {
                                                         dispatch_notify(reg, None, Some(channel_hash));
                                                     }
                                                 }
@@ -1017,7 +1017,7 @@ fn backup_delivery_tick(
                 );
                 adopted.push((sub_hash.clone(), ch_hash.clone()));
                 if let Ok(notify) = notify_registry.lock() {
-                    for reg in notify.get(sub_hash.as_slice()) {
+                    for reg in notify.get_for_channel(sub_hash.as_slice(), Some(ch_hash.as_slice())) {
                         dispatch_notify(reg, None, Some(ch_hash.as_slice()));
                     }
                 }
@@ -1497,7 +1497,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                         // Fire notify wake-ups for deferred subscribers.
                         if let Ok(notify) = guard.notify_registry.lock() {
                             for sub_hash in &missed {
-                                for reg in notify.get(sub_hash) {
+                                for reg in notify.get_for_channel(sub_hash, Some(channel_hash)) {
                                     dispatch_notify(reg, None, Some(channel_hash));
                                 }
                             }
@@ -1619,8 +1619,13 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             None => return Vec::new(),
         };
         if let Ok(guard) = pull_node.lock() {
+            let batch_limit = guard.config.policy_for(&subscriber_hash).deferred_pull_batch_limit;
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                let pending = deferred.drain(&subscriber_hash);
+                let pending = if let Some(limit) = batch_limit {
+                    deferred.drain_batch(&subscriber_hash, limit)
+                } else {
+                    deferred.drain(&subscriber_hash)
+                };
                 // Build msgpack array-of-[bin(channel_hash), bin(blob)] pairs
                 // using rmpv so Python receives proper bytes objects, not lists.
                 let pairs_val: Vec<rmpv::Value> = pending
@@ -1670,8 +1675,26 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return rmp_serde::to_vec(&false).unwrap_or_default();
             }
         };
-        let relay_hash = String::from_utf8(value_bytes)
-            .unwrap_or_default();
+        // value_bytes is msgpack [str(relay_hex), bin(16 channel_hash) | nil].
+        // Fall back to treating the raw bytes as a UTF-8 relay hex string for
+        // backward compatibility with pre-channel clients (channel = None).
+        let (relay_hash, channel_hash_opt): (String, Option<Vec<u8>>) = {
+            let mut cur = Cursor::new(&value_bytes[..]);
+            match rmpv::decode::read_value(&mut cur) {
+                Ok(rmpv::Value::Array(mut arr)) if arr.len() >= 2 => {
+                    let relay = match arr.remove(0) {
+                        rmpv::Value::String(s) => s.into_str().unwrap_or_default().to_string(),
+                        _ => String::new(),
+                    };
+                    let ch = match arr.remove(0) {
+                        rmpv::Value::Binary(b) if b.len() == 16 => Some(b),
+                        _ => None,
+                    };
+                    (relay, ch)
+                }
+                _ => (String::from_utf8(value_bytes).unwrap_or_default(), None),
+            }
+        };
         if relay_hash.is_empty() {
             log("[rfed] notify/register: empty relay hash", LOG_WARNING, false, false);
             return rmp_serde::to_vec(&false).unwrap_or_default();
@@ -1702,23 +1725,23 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return rmp_serde::to_vec(&false).unwrap_or_default();
             }
             if let Ok(mut notify) = guard.notify_registry.lock() {
-                // Register against the identity hash (for non-LXMF uses).
-                notify.register(subscriber_hash.clone(), relay_hash.clone());
-                // Also register against the lxmf.delivery destination hash.
-                // LXMF messages carry the lxmf.delivery dest hash (not the
-                // identity hash) in their first 16 bytes, so the propagation
-                // handler needs this derived hash in the registry to match.
-                let lxmf_delivery_hash = Destination::hash(
-                    Some(&subscriber_hash), "lxmf", &["delivery"],
-                );
-                notify.register(lxmf_delivery_hash, relay_hash);
+                if let Some(ref ch) = channel_hash_opt {
+                    // Per-channel registration: key = (subscriber_hash, channel_hash).
+                    notify.register(subscriber_hash.clone(), Some(ch.clone()), relay_hash);
+                } else {
+                    // LXMF registration: key = (lxmf.delivery dest hash, None).
+                    let lxmf_delivery_hash = Destination::hash(
+                        Some(&subscriber_hash), "lxmf", &["delivery"],
+                    );
+                    notify.register(lxmf_delivery_hash, None, relay_hash);
+                }
             }
         }
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
 
     // NOTIFY_UNREGISTER — remove a specific relay hash for the caller.
-    // Payload: msgpack String, same 32-char hex format as REGISTER.
+    // Payload: msgpack [str(relay_hex), bin(16 channel_hash) | nil], same as REGISTER.
     let unreg_node = Arc::clone(node);
     let unregister_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                         _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
@@ -1726,13 +1749,36 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
-        let relay_hash = String::from_utf8(value_bytes).unwrap_or_default();
+        let (relay_hash, channel_hash_opt): (String, Option<Vec<u8>>) = {
+            let mut cur = Cursor::new(&value_bytes[..]);
+            match rmpv::decode::read_value(&mut cur) {
+                Ok(rmpv::Value::Array(mut arr)) if arr.len() >= 2 => {
+                    let relay = match arr.remove(0) {
+                        rmpv::Value::String(s) => s.into_str().unwrap_or_default().to_string(),
+                        _ => String::new(),
+                    };
+                    let ch = match arr.remove(0) {
+                        rmpv::Value::Binary(b) if b.len() == 16 => Some(b),
+                        _ => None,
+                    };
+                    (relay, ch)
+                }
+                _ => (String::from_utf8(value_bytes).unwrap_or_default(), None),
+            }
+        };
         if relay_hash.is_empty() {
             return rmp_serde::to_vec(&false).unwrap_or_default();
         }
         if let Ok(guard) = unreg_node.lock() {
             if let Ok(mut notify) = guard.notify_registry.lock() {
-                notify.unregister(&subscriber_hash, &relay_hash);
+                if let Some(ref ch) = channel_hash_opt {
+                    notify.unregister(&subscriber_hash, Some(ch.as_slice()), &relay_hash);
+                } else {
+                    let lxmf_delivery_hash = Destination::hash(
+                        Some(&subscriber_hash), "lxmf", &["delivery"],
+                    );
+                    notify.unregister(&lxmf_delivery_hash, None, &relay_hash);
+                }
             }
         }
         rmp_serde::to_vec(&true).unwrap_or_default()

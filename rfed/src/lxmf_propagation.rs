@@ -996,7 +996,7 @@ impl LxmfPropagationNode {
             if lxmf_data.len() >= DESTINATION_LENGTH {
                 let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
                 if let Ok(reg) = self.registry.lock() {
-                    let regs = reg.get(dest_hash);
+                    let regs = reg.get_for_channel(dest_hash, None);
                     if !regs.is_empty() {
                         // Extract sender hash if the message is long enough.
                         let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
@@ -1952,8 +1952,7 @@ impl LxmfPropagationNode {
                 if lxmf_data.len() >= DESTINATION_LENGTH {
                     let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
                     if let Ok(reg) = self.registry.lock() {
-                        let regs = reg.get(dest_hash);
-                        for registration in &regs {
+                        let regs = reg.get_for_channel(dest_hash, None);                        for registration in &regs {
                             let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
                                 Some(&lxmf_data[DESTINATION_LENGTH..DESTINATION_LENGTH * 2])
                             } else {

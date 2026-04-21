@@ -256,6 +256,8 @@ fn main() -> Result<(), String> {
         .or(cfg.default_policy.stamp_flexibility);
     let default_deferred_limit: usize =
         cfg.default_policy.deferred_queue_limit.unwrap_or(256);
+    let default_deferred_pull_limit: Option<usize> =
+        cfg.default_policy.deferred_pull_batch_limit;
     let default_allow_notify_reg: bool =
         cfg.default_policy.allow_notify_registration.unwrap_or(true);
     let default_allow_sub: bool =
@@ -270,6 +272,8 @@ fn main() -> Result<(), String> {
         cfg.vip_policy.stamp_flexibility.or(Some(2));
     let vip_deferred_limit: usize =
         cfg.vip_policy.deferred_queue_limit.unwrap_or(1024);
+    let vip_deferred_pull_limit: Option<usize> =
+        cfg.vip_policy.deferred_pull_batch_limit;
     let vip_allow_notify_reg: bool =
         cfg.vip_policy.allow_notify_registration.unwrap_or(true);
     let vip_allow_sub: bool =
@@ -491,6 +495,7 @@ fn main() -> Result<(), String> {
             stamp_cost: default_stamp_cost,
             stamp_flexibility: default_stamp_flex,
             deferred_queue_limit: default_deferred_limit,
+            deferred_pull_batch_limit: default_deferred_pull_limit,
             allow_notify_registration: default_allow_notify_reg,
             allow_subscription: default_allow_sub,
             trusted_backup_only: default_trusted_backup_only,
@@ -499,6 +504,7 @@ fn main() -> Result<(), String> {
             stamp_cost: vip_stamp_cost,
             stamp_flexibility: vip_stamp_flex,
             deferred_queue_limit: vip_deferred_limit,
+            deferred_pull_batch_limit: vip_deferred_pull_limit,
             allow_notify_registration: vip_allow_notify_reg,
             allow_subscription: vip_allow_sub,
             trusted_backup_only: vip_trusted_backup_only,

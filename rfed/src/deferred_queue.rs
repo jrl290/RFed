@@ -156,6 +156,28 @@ impl DeferredQueue {
         self.queue.values().map(|v| v.len()).sum()
     }
 
+    /// Drain at most `max` pending blobs for `subscriber_hash`.
+    ///
+    /// Unlike `drain`, this leaves any excess entries in the queue so the
+    /// subscriber can retrieve them on a subsequent PULL.  The caller is
+    /// responsible for actually delivering the returned blobs; if delivery
+    /// fails they may re-enqueue with `enqueue`.
+    pub fn drain_batch(&mut self, subscriber_hash: &[u8], max: usize) -> Vec<PendingBlob> {
+        let bucket = match self.queue.get_mut(subscriber_hash) {
+            Some(b) => b,
+            None => return Vec::new(),
+        };
+        let n = bucket.len().min(max);
+        let removed: Vec<PendingBlob> = bucket.drain(..n).collect();
+        if bucket.is_empty() {
+            self.queue.remove(subscriber_hash);
+        }
+        if !removed.is_empty() {
+            let _ = self.save();
+        }
+        removed
+    }
+
     /// Whether there are any pending entries for `subscriber_hash`.
     pub fn has_pending(&self, subscriber_hash: &[u8]) -> bool {
         self.queue.get(subscriber_hash).map(|v| !v.is_empty()).unwrap_or(false)
