@@ -137,6 +137,8 @@ pub struct FedSync {
     pub max_peering_cost: u32,
     pub transfer_limit_bytes: Option<f64>,
     pub sync_limit_bytes: Option<f64>,
+    /// Local node's rfed.node destination hash. Used to ignore self-announces.
+    pub local_node_hash: Option<Vec<u8>>,
     pub from_static_only: bool,
     pub static_peers: Vec<Vec<u8>>,
     /// Where to persist peer sync state across restarts.
@@ -159,6 +161,7 @@ impl FedSync {
             max_peering_cost: 26,
             transfer_limit_bytes: None,
             sync_limit_bytes: None,
+            local_node_hash: None,
             from_static_only: false,
             static_peers: Vec::new(),
             peer_state_file: None,
@@ -167,8 +170,22 @@ impl FedSync {
         }
     }
 
+    /// Set the local node destination hash so self-announces can be ignored.
+    pub fn set_local_node_hash(&mut self, hash: Vec<u8>) {
+        self.local_node_hash = Some(hash);
+    }
+
     /// Called by the rfed.node announce handler when a peer is seen.
     pub fn peer_heard(&mut self, dest_hash: Vec<u8>, peering_cost: Option<u32>) {
+        if self.local_node_hash.as_ref().is_some_and(|h| h == &dest_hash) {
+            log(
+                format!("[sync] ignoring self announce: {}", hexrep(&dest_hash, false)),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+            return;
+        }
         if self.from_static_only && !self.static_peers.iter().any(|p| p == &dest_hash) {
             return;
         }

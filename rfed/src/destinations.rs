@@ -243,6 +243,10 @@ impl FedNode {
             vec!["notify".to_string()],
         )?;;
 
+        if let Ok(mut s) = sync.lock() {
+            s.set_local_node_hash(node_dest.hash.clone());
+        }
+
         Ok(FedNode {
             identity,
             config,
@@ -1098,6 +1102,10 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             let peering_cost = ann.as_ref().and_then(|a| a.stamp_cost);
             if let Some(arc) = node_weak.upgrade() {
                 if let Ok(guard) = arc.lock() {
+                    // Never sync with ourselves — skip our own announce.
+                    if dest_hash == guard.node_dest.hash.as_slice() {
+                        return;
+                    }
                     if let Ok(mut s) = guard.sync.lock() { s.peer_heard(dest_hash.to_vec(), peering_cost); }
                 }
             }
