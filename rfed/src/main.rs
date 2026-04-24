@@ -158,7 +158,7 @@ fn write_status_file(
         }
         let mut iface_entry = format!(
             "    {{\n      \"name\": \"{}\",\n      \"connected\": {},",
-            iface.name, !iface.detached
+            iface.name, iface.online
         );
         if let Some(addr) = &iface.address {
             iface_entry.push_str(&format!("\n      \"address\": \"{}\",", addr));
@@ -657,6 +657,10 @@ fn main() -> Result<(), String> {
     }
 
     let mut last_announce     = Instant::now();
+    let mut last_startup_reannounce = Instant::now();
+    let mut startup_reannounce_count: u8 = 0;
+    let startup_reannounce_max: u8 = 4;
+    let startup_reannounce_interval = Duration::from_secs(15);
     let mut last_evict        = Instant::now();
     let mut last_backup_tick  = Instant::now();
     let evict_interval        = Duration::from_secs(3600);
@@ -700,6 +704,20 @@ fn main() -> Result<(), String> {
                 lxmf_propagation::LxmfPropagationNode::announce(prop);
             }
             last_announce = Instant::now();
+        }
+
+        // Startup burst: re-announce a few times early to improve path discovery.
+        if startup_reannounce_count < startup_reannounce_max
+            && last_startup_reannounce.elapsed() >= startup_reannounce_interval
+        {
+            if let Ok(guard) = node.lock() {
+                guard.announce();
+            }
+            if let Some(ref prop) = lxmf_prop_arc {
+                lxmf_propagation::LxmfPropagationNode::announce(prop);
+            }
+            startup_reannounce_count = startup_reannounce_count.saturating_add(1);
+            last_startup_reannounce = Instant::now();
         }
 
         // Drive pending peer sync sessions
