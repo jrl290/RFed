@@ -149,34 +149,94 @@ fn write_status_file(
     let uptime_secs = startup.elapsed().as_secs();
     let name = &guard.config.display_name;
 
-    let json = format!(
-        concat!(
-            "{{\n",
-            "  \"node_name\": \"{}\",\n",
-            "  \"identity\": \"{}\",\n",
-            "  \"destinations\": {{\n",
-            "    \"rfed.node\": \"{}\",\n",
-            "    \"rfed.delivery\": \"{}\",\n",
-            "    \"rfed.channel\": \"{}\",\n",
-            "    \"rfed.notify\": \"{}\",\n",
-            "    \"lxmf.propagation\": \"{}\"\n",
-            "  }},\n",
-            "  \"stats\": {{\n",
-            "    \"uptime_secs\": {},\n",
-            "    \"subscribers\": {},\n",
-            "    \"blobs\": {},\n",
-            "    \"notify_registrations\": {}\n",
-            "  }}\n",
-            "}}\n"
-        ),
-        name, identity_hash,
-        hexrep(&guard.node_dest.hash, false),
-        hexrep(&guard.delivery_dest.hash, false),
-        hexrep(&guard.channel_dest.hash, false),
-        hexrep(&guard.notify_dest.hash, false),
-        prop_hash,
-        uptime_secs, sub_count, blob_count, notify_count,
-    );
+    // Build interfaces JSON array
+    let snap = get_state_snapshot();
+    let mut interfaces_json = String::new();
+    for (i, iface) in snap.interfaces.iter().enumerate() {
+        if i > 0 {
+            interfaces_json.push_str(",\n");
+        }
+        let mut iface_entry = format!(
+            "    {{\n      \"name\": \"{}\",\n      \"connected\": {},",
+            iface.name, !iface.detached
+        );
+        if let Some(addr) = &iface.address {
+            iface_entry.push_str(&format!("\n      \"address\": \"{}\",", addr));
+        }
+        if let Some(port) = iface.port {
+            iface_entry.push_str(&format!("\n      \"port\": {},", port));
+        }
+        iface_entry.push_str(&format!(
+            "\n      \"rx_bytes\": {},\n      \"tx_bytes\": {}\n    }}",
+            iface.rxb, iface.txb
+        ));
+        interfaces_json.push_str(&iface_entry);
+    }
+
+    let json = if interfaces_json.is_empty() {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"node_name\": \"{}\",\n",
+                "  \"identity\": \"{}\",\n",
+                "  \"destinations\": {{\n",
+                "    \"rfed.node\": \"{}\",\n",
+                "    \"rfed.delivery\": \"{}\",\n",
+                "    \"rfed.channel\": \"{}\",\n",
+                "    \"rfed.notify\": \"{}\",\n",
+                "    \"lxmf.propagation\": \"{}\"\n",
+                "  }},\n",
+                "  \"interfaces\": [],\n",
+                "  \"stats\": {{\n",
+                "    \"uptime_secs\": {},\n",
+                "    \"subscribers\": {},\n",
+                "    \"blobs\": {},\n",
+                "    \"notify_registrations\": {}\n",
+                "  }}\n",
+                "}}\n"
+            ),
+            name, identity_hash,
+            hexrep(&guard.node_dest.hash, false),
+            hexrep(&guard.delivery_dest.hash, false),
+            hexrep(&guard.channel_dest.hash, false),
+            hexrep(&guard.notify_dest.hash, false),
+            prop_hash,
+            uptime_secs, sub_count, blob_count, notify_count,
+        )
+    } else {
+        format!(
+            concat!(
+                "{{\n",
+                "  \"node_name\": \"{}\",\n",
+                "  \"identity\": \"{}\",\n",
+                "  \"destinations\": {{\n",
+                "    \"rfed.node\": \"{}\",\n",
+                "    \"rfed.delivery\": \"{}\",\n",
+                "    \"rfed.channel\": \"{}\",\n",
+                "    \"rfed.notify\": \"{}\",\n",
+                "    \"lxmf.propagation\": \"{}\"\n",
+                "  }},\n",
+                "  \"interfaces\": [\n",
+                "{}\n",
+                "  ],\n",
+                "  \"stats\": {{\n",
+                "    \"uptime_secs\": {},\n",
+                "    \"subscribers\": {},\n",
+                "    \"blobs\": {},\n",
+                "    \"notify_registrations\": {}\n",
+                "  }}\n",
+                "}}\n"
+            ),
+            name, identity_hash,
+            hexrep(&guard.node_dest.hash, false),
+            hexrep(&guard.delivery_dest.hash, false),
+            hexrep(&guard.channel_dest.hash, false),
+            hexrep(&guard.notify_dest.hash, false),
+            prop_hash,
+            interfaces_json,
+            uptime_secs, sub_count, blob_count, notify_count,
+        )
+    };
 
     let path = config_dir.join("status.json");
     let _ = fs::write(&path, json);
