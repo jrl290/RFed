@@ -295,6 +295,14 @@ impl FedSync {
         match rmp_serde::from_slice::<Vec<FedPeer>>(&bytes) {
             Ok(peers) => {
                 for p in peers {
+                    // Skip self-entry that may have been persisted before the
+                    // self-announce guard was introduced.
+                    if self.local_node_hash.as_ref().is_some_and(|h| h == &p.destination_hash) {
+                        log(format!("[sync] skipping self-entry in loaded peer state: {}",
+                                hexrep(&p.destination_hash, false)),
+                            LOG_NOTICE, false, false);
+                        continue;
+                    }
                     self.peers.entry(p.destination_hash.clone())
                         .or_insert(p);
                 }
