@@ -158,22 +158,40 @@ The sender derives the channel's X25519 public key from the channel name and enc
 
 > **Note:** The current channel wire format does not include sender authentication.
 > Any party that knows the channel name can publish. Sender identity verification
-> is planned by adopting LXMF as the inner payload format, which provides Ed25519
-> signatures, source identity, timestamps, and structured fields — identical to
-> how LXMF propagation authenticates senders without the propagation node seeing
-> message content.
+> is provided by carrying every channel message as an LXMF-rust
+> `LXMessage::pack(PROPAGATED)` block as the inner_blob: Ed25519 signature,
+> source identity hash, timestamp, and structured fields — identical to how
+> LXMF propagation nodes authenticate senders without seeing message content.
 
 The sender transmits to the node's `rfed.channel` destination:
 
 ```
-[ channel_hash (16 bytes) | inner_blob (encrypted) | PoW stamp ]
+[ channel_hash (16 bytes) | inner_blob | PoW stamp ]
 ```
+
+**inner_blob is an LXMF lxmf_data tail.** The full `[channel_hash | inner_blob]`
+span is exactly the bytes `LXMessage::pack(PROPAGATED)` produces starting at
+the destination_hash:
+
+```
+lxmf_data = [ channel_hash(16) | EC_encrypted(
+                  source_hash (16) || signature (64) || msgpack_payload
+              ) ]
+```
+
+The channel identity (which holds both the X25519 encryption key and the
+Ed25519 verification baseline) is derived deterministically from the channel
+name. Subscribers EC-decrypt the encrypted tail and feed the reconstructed
+canonical block to `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which
+validates the signature against the cached sender identity. If the sender has
+not announced and isn't in the cache, the message is rejected as
+`SOURCE_UNKNOWN`.
 
 | Data | Encrypted? | Visible to rfed node? |
 |------|-----------|----------------------|
 | Channel hash | No (routing label) | **Yes** — used for storage and fanout lookup |
-| Inner blob content | Yes (to channel pubkey) | **No** — opaque ciphertext |
-| Sender identity | Not in wire format | **No** — not included in current protocol (planned via LXMF inner format) |
+| Inner blob (LXMF EC ciphertext) | Yes (to channel X25519 key) | **No** — opaque ciphertext |
+| Sender identity / signature | Yes (inside LXMF EC ciphertext) | **No** |
 | PoW stamp | No | **Yes** — validated then stripped before storage |
 
 #### Step 2 — Node stores the blob

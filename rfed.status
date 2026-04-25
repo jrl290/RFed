@@ -1,0 +1,27 @@
+{
+  "node_name": "rfed",
+  "identity": "7e5ff856dc2aa0fbc9fc8831b62d2834",
+  "destinations": {
+    "rfed.node": "8772cfeaee0489ba496c4b229e849472",
+    "rfed.delivery": "589aa0087c3476aac542e8b6f1c9bc08",
+    "rfed.channel": "2b8f4b464f8c0c8fb2c314321ac040b5",
+    "rfed.notify": "c23df05c18280f147d14b3227c18bfc8",
+    "lxmf.propagation": "0f75ac15961b7d2b1577a57bdb1fda3c"
+  },
+  "interfaces": [
+    {
+      "name": "RMap TCP Transport",
+      "connected": true,
+      "address": "rmap.world",
+      "port": 4242,
+      "rx_bytes": 0,
+      "tx_bytes": 0
+    }
+  ],
+  "stats": {
+    "uptime_secs": 5302,
+    "subscribers": 3,
+    "blobs": 480883,
+    "notify_registrations": 1
+  }
+}

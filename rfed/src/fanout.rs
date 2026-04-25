@@ -146,8 +146,15 @@ pub fn fanout_blob(
                 }
 
                 // Delivery packet payload: channel_hash(16) | inner_blob
-                // The subscriber's onRfedBlob handler reads the first 16 bytes as
-                // the channel hash, then passes the remainder to dispatchBlob.
+                //
+                // CHANNEL MESSAGES ARE LXMF PACKAGES.  inner_blob is the
+                // LXMF-rust LXMessage::pack(PROPAGATED) output starting AFTER
+                // the destination_hash, so [channel_hash | inner_blob] is a
+                // full LXMF `lxmf_data` block — the same bytes an LXMF
+                // propagation node stores and delivers.  RFed never reads
+                // inside it; subscribers reconstruct lxmf_data by prepending
+                // channel_hash and call
+                // `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`.
                 let mut payload = channel_dest_hash.to_vec();
                 payload.extend_from_slice(inner_blob);
 

@@ -29,6 +29,20 @@ use reticulum_rust::transport::{AnnounceHandler, Transport, BROADCAST};
 use sha2::{Digest, Sha256};
 use reticulum_rust::lxstamper::LXStamper;
 use reticulum_rust::identity::full_hash;
+use lxmf_rust::lx_message::LXMessage;
+
+// CHANNEL MESSAGES ARE LXMF PACKAGES.
+// Wire format on the rfed.channel SEND payload:
+//     [ channel_hash(16) | EC_encrypted(
+//           source_hash(16) || signature(64) || msgpack_payload
+//       ) | optional_pow_stamp(32) ]
+// where the [..] up to (but not including) the stamp IS the LXMF
+// `lxmf_data` produced by `LXMessage::pack(PROPAGATED)` starting at the
+// destination_hash. RFed routes it opaquely. Receivers decrypt the
+// EC-encrypted tail with the channel identity and feed the reconstructed
+// [dest|src|sig|payload] block to `LXMessage::unpack_from_bytes(_,
+// Some(PROPAGATED))` which validates the signature against the cached
+// source identity.
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -92,33 +106,50 @@ fn build_subscribe_payload(identity: &Identity, channel_hash: &[u8]) -> Vec<u8> 
     p
 }
 
-/// Inner plaintext sent by the sender (matches iOS dispatchDecryptedInner format):
-/// sender_hash(16) | ts_ms_be(8) | pubkey(64) | sig(64) | content_utf8
-/// sig = Ed25519(sender_hash || ts_ms_be || content)
-fn build_inner_plaintext(sender: &Identity, content: &str) -> Vec<u8> {
-    let sender_hash = sender.hash.as_ref().expect("sender hash");
-    let mut sender_hash_16 = sender_hash.clone();
-    sender_hash_16.resize(16, 0);
+/// Build an LXMF channel message and return the on-wire `lxmf_data`.
+/// Output format = `[channel_hash(16) | EC_encrypted(source_hash || sig || payload)]`,
+/// i.e. the bytes `LXMessage::pack(PROPAGATED)` produces starting at the
+/// destination_hash. (Re-encrypts the post-destination section ourselves
+/// since `pn_encrypted_data` is private — same EC scheme.)
+fn build_lxmf_data(channel_name: &str, sender: &Identity, content: &str) -> Vec<u8> {
+    let mut channel_dest = Destination::new_outbound(
+        Some(make_channel_identity(channel_name)),
+        DestinationType::Single,
+        "lxmf".to_string(),
+        vec!["delivery".to_string()],
+    )
+    .expect("channel dest");
+    let sender_dest = Destination::new_outbound(
+        Some(sender.clone()),
+        DestinationType::Single,
+        "lxmf".to_string(),
+        vec!["delivery".to_string()],
+    )
+    .expect("sender dest");
 
-    let ts_bytes = now_ms().to_be_bytes();
-    let content_bytes = content.as_bytes();
-    let pubkey = sender.get_public_key().expect("sender pubkey");
-
-    // Signable matches iOS: sender_hash(16) || ts(8) || content
-    let mut signable = Vec::new();
-    signable.extend_from_slice(&sender_hash_16);
-    signable.extend_from_slice(&ts_bytes);
-    signable.extend_from_slice(content_bytes);
-    let sig = sender.sign(&signable);
-
-    let mut inner = Vec::new();
-    inner.extend_from_slice(&sender_hash_16);
-    inner.extend_from_slice(&ts_bytes);
-    inner.extend_from_slice(&pubkey);
-    inner.extend_from_slice(&sig);
-    inner.extend_from_slice(content_bytes);
-    inner
+    let mut msg = LXMessage::new(
+        Some(channel_dest.clone()),
+        Some(sender_dest),
+        Some(content.as_bytes().to_vec()),
+        Some(Vec::new()),
+        None,
+        Some(LXMessage::PROPAGATED),
+        None, None, None, false,
+    )
+    .expect("LXMessage::new");
+    msg.pack(false).expect("LXMessage::pack");
+    let packed = msg.packed.as_ref().expect("packed buffer");
+    let pn_enc = channel_dest
+        .encrypt(&packed[LXMessage::DESTINATION_LENGTH..])
+        .expect("channel encrypt");
+    let mut lxmf_data = packed[..LXMessage::DESTINATION_LENGTH].to_vec();
+    lxmf_data.extend_from_slice(&pn_enc);
+    lxmf_data
 }
+
+// Suppress unused-warning until/unless the test relies on it.
+#[allow(dead_code)]
+fn _ts_unused() -> u64 { now_ms() }
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
@@ -245,35 +276,44 @@ fn main() {
         move |data: &[u8], _pkt: &reticulum_rust::packet::Packet| {
             eprintln!("[recv] delivery packet: {} bytes  first16={}", data.len(),
                 hex(&data[..data.len().min(16)]));
-            // Payload from rfed fanout: channel_hash(16) | inner_blob_ciphertext
+            // Payload from rfed fanout: [channel_hash(16) | inner_blob],
+            // where the entire span (channel_hash || inner_blob) is an
+            // LXMF lxmf_data block. Reconstruct it and feed to the LXMF
+            // unpacker (which EC-decrypts with the channel identity and
+            // validates the Ed25519 signature against the cached source
+            // identity).
             if data.len() <= 16 {
                 eprintln!("[recv] too short, ignoring");
                 return;
             }
-            let inner_ct = &data[16..];
-            let mut ch = make_channel_identity(&ch_name_cb);
-            match ch.decrypt(inner_ct) {
-                Ok(plain) => {
-                    // inner plaintext: sender_hash(16) | ts(8) | pubkey(64) | sig(64) | content
-                    let header = 16 + 8 + 64 + 64;
-                    if plain.len() <= header {
-                        eprintln!("[recv] decrypted but too short ({} bytes)", plain.len());
-                        return;
-                    }
-                    let msg_sender_hash = &plain[..16];
-                    // Only accept messages from our own test sender.
-                    if msg_sender_hash != expected_sender_hash.as_slice() {
-                        eprintln!("[recv] decrypted OK but sender={} (not ours), skipping",
-                            hex(msg_sender_hash));
-                        return;
-                    }
-                    let text = String::from_utf8_lossy(&plain[header..]).into_owned();
-                    eprintln!("[recv] decrypted from our sender: '{text}'");
-                    *recv_content_w.lock().unwrap() = Some(text);
-                    recv_done_w.store(true, Ordering::Relaxed);
+            let mut id = make_channel_identity(&ch_name_cb);
+            let dest_hash = &data[..16];
+            let encrypted = &data[16..];
+            let decrypted = match id.decrypt(encrypted) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[recv] EC decrypt FAILED (foreign msg?): {e}");
+                    return;
                 }
-                Err(e) => eprintln!("[recv] decrypt FAILED (foreign msg?): {e}"),
+            };
+            let mut full = dest_hash.to_vec();
+            full.extend_from_slice(&decrypted);
+            let msg = match LXMessage::unpack_from_bytes(&full, Some(LXMessage::PROPAGATED)) {
+                Ok(m) => m,
+                Err(e) => { eprintln!("[recv] LXMF unpack FAILED: {e}"); return; }
+            };
+            let mut msg_sender_hash = msg.source_hash.clone();
+            msg_sender_hash.resize(16, 0);
+            if msg_sender_hash != expected_sender_hash {
+                eprintln!("[recv] LXMF OK but sender={} (not ours), skipping",
+                    hex(&msg_sender_hash));
+                return;
             }
+            let text = String::from_utf8_lossy(&msg.content).into_owned();
+            eprintln!("[recv] LXMF unpacked from our sender: sig_ok={} content='{text}'",
+                msg.signature_validated);
+            *recv_content_w.lock().unwrap() = Some(text);
+            recv_done_w.store(true, Ordering::Relaxed);
         },
     )));
 
@@ -445,16 +485,18 @@ fn main() {
     )
     .expect("rebuild rfed.channel dest for send");
 
-    let inner_pt   = build_inner_plaintext(&sender, &message);
-    let ciphertext = ch_id.encrypt(&inner_pt).expect("channel encrypt");
-    eprintln!("[send] inner_pt_len={} ciphertext_len={}", inner_pt.len(), ciphertext.len());
+    // Build the LXMF lxmf_data — already begins with channel_hash, so it IS
+    // the wire payload (sans optional stamp).
+    let lxmf_data = build_lxmf_data(&channel_name, &sender, &message);
+    eprintln!("[send] lxmf_data_len={}", lxmf_data.len());
+    debug_assert_eq!(&lxmf_data[..16], ch_hash.as_slice(),
+        "LXMF dest_hash must equal channel_hash");
 
     // Packet payload:
-    //   stamp_cost=None  → channel_hash(16) | ciphertext   (no stamp; rfed doesn't strip)
-    //   stamp_cost=Some(0) → channel_hash(16) | ciphertext | stamp(32 zeros)  (trivial stamp)
-    //   stamp_cost=Some(n) → channel_hash(16) | ciphertext | stamp(32 PoW)    (real stamp)
-    let mut payload = ch_hash.clone();
-    payload.extend_from_slice(&ciphertext);
+    //   stamp_cost=None  → lxmf_data                     (no stamp)
+    //   stamp_cost=Some(0) → lxmf_data | stamp(32 zeros) (trivial stamp)
+    //   stamp_cost=Some(n) → lxmf_data | stamp(32 PoW)   (real stamp)
+    let mut payload = lxmf_data;
     if let Some(cost) = stamp_cost {
         let material = &payload; // ch_hash || ciphertext
         let transient_id = full_hash(material);

@@ -9,6 +9,17 @@
 //!                    (SEND packet, SUBSCRIBE / UNSUBSCRIBE requests)
 //!   rfed.notify    — Notify registration (REGISTER / UNREGISTER / CLEAR requests)
 //!
+//! # Inner-blob format (CHANNEL MESSAGES ARE LXMF PACKAGES)
+//!
+//! Every channel `inner_blob` is the EXACT byte format produced by
+//! `lxmf_rust::LXMessage::pack(PROPAGATED)` starting at the destination_hash.
+//! That is, the full `[channel_hash | inner_blob]` span = LXMF `lxmf_data`:
+//!     [ channel_hash(16) | EC_encrypted(source_hash || signature || msgpack_payload) ]
+//! RFed treats it OPAQUELY — never decrypts, parses, or modifies it.
+//! Receivers feed the reconstructed canonical block to
+//! `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which validates the
+//! Ed25519 signature against the cached source identity.
+//!
 //! # Delivery model
 //!
 //! The blob store (keyed by channel_hash) is used **only** for inter-node sync.
