@@ -208,35 +208,51 @@ multi-hop routed).
   LXMF propagation node carries:**
 
   ```
-  inner_blob = EC_encrypted( [optional source-identity prelude] || source_hash(16) || signature(64) || msgpack_payload )
+  inner_blob = EC_encrypted( source_hash(16) || signature(64) || msgpack_payload )
   ```
 
   Immutable — RFed treats it OPAQUELY and never decrypts, parses or
-  modifies it.
+  modifies it. The contents and any application-layer prelude are
+  purely a sender↔subscriber concern.
 
-  **SOURCE-IDENTITY PRELUDE (Retichat extension, application-layer,
-  RFed-agnostic):** When present (detected by the 4-byte ASCII magic
-  `"RTID"` at the start of the decrypted plaintext), the EC plaintext
-  is `b"RTID"(4) || sender_identity_pub(64) || lxmf_tail`. The 64
-  bytes are the format produced by Reticulum-rust's
-  `Identity::get_public_key()` (32 X25519 enc pub || 32 Ed25519 sign
-  pub). Receivers MUST verify `truncated_hash(identity_pub) ==
-  source_hash` (the next 16 bytes after the prelude), then call
-  `Identity::remember_destination(source_hash, identity_pub, None)`
-  before invoking `LXMessage::unpack_from_bytes` — this guarantees the
-  signature validates without depending on a prior LXMF announce. RFed
-  never sees the prelude (it's inside the EC envelope).
+  #### LXMF Channel Source-Identity Prelude (LXMF channels only)
 
-  **Why this exists:** Channel pub/sub means the sender and receivers
-  may have no prior history — the sender's `lxmf.delivery` identity is
-  not in the receiver's known-destinations cache, so
-  `LXMessage::unpack_from_bytes(PROPAGATED)` would emit
-  `unverified_reason = SOURCE_UNKNOWN` for every message until/unless
-  the sender happens to also announce. Embedding the proof inline
-  removes that dependency.
+  When the channel payload is an LXMF `PROPAGATED` message, the sender
+  MUST prepend a source-identity prelude inside the EC plaintext so the
+  receiver can validate the Ed25519 signature without depending on a
+  prior LXMF announce. This is **specific to LXMF channel messages** —
+  RFed-level routing, peering and the PoW stamp contract are unaffected
+  (the prelude is inside the EC envelope and never visible to RFed).
 
-  Legacy (no prelude) inner_blobs remain accepted; receivers fall back
-  to the announce-based recall path in that case.
+  Required EC plaintext layout for LXMF channels:
+
+  ```
+  [ b"RTID" (4)
+  | sender_identity_pub (64)   # Identity::get_public_key() = X25519_pub(32) || Ed25519_pub(32)
+  | source_hash (16)
+  | signature (64)
+  | msgpack_payload ]
+  ```
+
+  Receiver requirements (LXMF channel ingest):
+  1. Verify `decrypted_plaintext[..4] == b"RTID"`. If not, reject the
+     message — there is no non-prelude form for LXMF channel messages.
+  2. Verify `truncated_hash(sender_identity_pub) == source_hash`. If
+     not, reject the message (do NOT poison the identity cache with a
+     forged binding).
+  3. Call `Identity::remember_destination(source_hash,
+     sender_identity_pub, None)` to install the sender's identity in
+     the known-destinations cache.
+  4. Reconstruct the canonical LXMF block by prepending the
+     `lxmf.delivery` destination_hash for the channel identity, then
+     pass to `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`. The
+     Ed25519 signature now validates against the just-registered source
+     identity.
+
+  Non-LXMF channel payloads (if any future channel app wants a
+  different inner format) are out of scope for this section and may use
+  any application-defined plaintext layout the channel subscribers
+  agree on.
 
   The channel identity (which holds both the X25519 encryption key and
   the Ed25519 verification baseline) is derived deterministically from
