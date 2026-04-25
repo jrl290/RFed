@@ -309,6 +309,27 @@ impl FedNode {
         });
     }
 
+    /// Announce only the three lightweight service destinations (channel,
+    /// delivery, notify) without the heavyweight rfed.node payload.
+    ///
+    /// Call on a short interval (e.g. every 15 minutes) to keep paths alive
+    /// within the Reticulum path TTL (~1 hour).  Unlike `announce()`, this
+    /// does NOT re-broadcast the node identity or subscription manifest.
+    pub fn announce_services(&self) {
+        let weak = self.self_handle.clone();
+        thread::spawn(move || {
+            if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
+                if let Ok(mut node) = arc.lock() {
+                    let _ = node.channel_dest.announce(None, false, None, None, true);
+                    let _ = node.delivery_dest.announce(None, false, None, None, true);
+                    let _ = node.notify_dest.announce(None, false, None, None, true);
+                    log("[rfed] service paths refreshed (channel/delivery/notify)",
+                        LOG_NOTICE, false, false);
+                }
+            }
+        });
+    }
+
     /// Explicitly persist all in-memory state to disk.
     ///
     /// Called during graceful shutdown so that no pending mutations are lost.
@@ -1823,4 +1844,96 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     )?;
     Transport::register_destination(guard.notify_dest.clone());
     Ok(())
+}
+
+#[cfg(test)]
+mod hash_tests {
+    //! Pin the on-the-wire destination hashes for `rfed.{node,delivery,channel,notify}`.
+    //!
+    //! These hashes are part of the protocol: every client computes them from
+    //! the server identity hash to pick the right inbox. If `Destination::hash`,
+    //! `APP_NAME`, or any aspect string ever changes, this test must fail loudly
+    //! before a new build ships.
+    //!
+    //! The expected values were independently derived from the canonical formula:
+    //!     name_hash = sha256("rfed.<aspect>")[..10]
+    //!     dest_hash = sha256(name_hash || identity_hash)[..16]
+    //! using identity hash `c287b844b2b6f8d6013b0a962eb2107b`.
+    //!
+    //! The test also guards against accidental collision with the well-known
+    //! `rnstransport.path.request` control hash, which is what tripped us up
+    //! during a long debugging session.
+
+    use super::APP_NAME;
+    use reticulum_rust::destination::Destination;
+
+    /// Fixed identity hash used for hash derivation in this test.
+    /// (Truncated 128-bit identity hash — same shape Reticulum uses everywhere.)
+    const TEST_IDENTITY_HASH: [u8; 16] = [
+        0xc2, 0x87, 0xb8, 0x44, 0xb2, 0xb6, 0xf8, 0xd6,
+        0x01, 0x3b, 0x0a, 0x96, 0x2e, 0xb2, 0x10, 0x7b,
+    ];
+
+    /// Hash of the network-wide `rnstransport.path.request` control destination.
+    /// The rfed aspects MUST NOT collide with this.
+    const RNS_PATH_REQUEST_HASH_HEX: &str = "6b9f66014d9853faab220fba47d02761";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    fn dest_hash(aspect: &str) -> Vec<u8> {
+        Destination::hash(Some(&TEST_IDENTITY_HASH), APP_NAME, &[aspect])
+    }
+
+    #[test]
+    fn app_name_is_rfed() {
+        assert_eq!(APP_NAME, "rfed", "rfed APP_NAME constant must remain \"rfed\"");
+    }
+
+    #[test]
+    fn rfed_node_hash_is_pinned() {
+        assert_eq!(hex(&dest_hash("node")), "0ae25bc66f4cd593dcf7028c50b5a06c");
+    }
+
+    #[test]
+    fn rfed_delivery_hash_is_pinned() {
+        assert_eq!(hex(&dest_hash("delivery")), "bc675d73690974e490e261ec19b4c5d7");
+    }
+
+    #[test]
+    fn rfed_channel_hash_is_pinned() {
+        assert_eq!(hex(&dest_hash("channel")), "b95521001a9c9af5bc0e33904bca56fb");
+    }
+
+    #[test]
+    fn rfed_notify_hash_is_pinned() {
+        assert_eq!(hex(&dest_hash("notify")), "9233db1eefe3c75832ead85956111fbe");
+    }
+
+    #[test]
+    fn rfed_hashes_do_not_collide_with_rns_path_request() {
+        for aspect in ["node", "delivery", "channel", "notify"] {
+            let h = hex(&dest_hash(aspect));
+            assert_ne!(
+                h, RNS_PATH_REQUEST_HASH_HEX,
+                "rfed.{aspect} hash must not collide with rnstransport.path.request"
+            );
+        }
+    }
+
+    #[test]
+    fn rfed_hashes_are_pairwise_distinct() {
+        let aspects = ["node", "delivery", "channel", "notify"];
+        for i in 0..aspects.len() {
+            for j in (i + 1)..aspects.len() {
+                assert_ne!(
+                    dest_hash(aspects[i]),
+                    dest_hash(aspects[j]),
+                    "rfed.{} and rfed.{} must hash to distinct destinations",
+                    aspects[i], aspects[j],
+                );
+            }
+        }
+    }
 }

@@ -661,6 +661,14 @@ fn main() -> Result<(), String> {
     let mut startup_reannounce_count: u8 = 0;
     let startup_reannounce_max: u8 = 4;
     let startup_reannounce_interval = Duration::from_secs(15);
+    // Lightweight service-path refresh: re-announce channel/delivery/notify every
+    // 15 minutes so paths survive within the Reticulum path TTL (1 hour).  This
+    // is independent of the full rfed.node announce interval which defaults to 6h.
+    let service_announce_interval = std::cmp::min(
+        announce_interval,
+        Duration::from_secs(15 * 60),
+    );
+    let mut last_service_announce = Instant::now();
     let mut last_evict        = Instant::now();
     let mut last_backup_tick  = Instant::now();
     let evict_interval        = Duration::from_secs(3600);
@@ -704,6 +712,18 @@ fn main() -> Result<(), String> {
                 lxmf_propagation::LxmfPropagationNode::announce(prop);
             }
             last_announce = Instant::now();
+            // Full announce already covers service dests; reset service timer.
+            last_service_announce = Instant::now();
+        }
+
+        // Lightweight service-path refresh (channel/delivery/notify only).
+        // Runs every 15 min to keep paths alive within the Reticulum 1-hour TTL,
+        // independently of the longer rfed.node announce interval.
+        if last_service_announce.elapsed() >= service_announce_interval {
+            if let Ok(guard) = node.lock() {
+                guard.announce_services();
+            }
+            last_service_announce = Instant::now();
         }
 
         // Startup burst: re-announce a few times early to improve path discovery.
@@ -718,6 +738,7 @@ fn main() -> Result<(), String> {
             }
             startup_reannounce_count = startup_reannounce_count.saturating_add(1);
             last_startup_reannounce = Instant::now();
+            last_service_announce = Instant::now();
         }
 
         // Drive pending peer sync sessions
