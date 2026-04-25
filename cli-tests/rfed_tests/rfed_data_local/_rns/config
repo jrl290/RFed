@@ -1,0 +1,50 @@
+# rfed — local macOS instance config
+# Apps connect to 192.168.2.120:4242 instead of the RPi
+
+[reticulum]
+  share_instance = No
+  enable_transport = Yes
+  panic_on_interface_error = No
+
+[interfaces]
+
+  [[RPi Upstream Interface]]
+    type = TCPClientInterface
+    enabled = Yes
+    target_host = 192.168.2.107
+    target_port = 4242
+
+  [[RMap Upstream Interface]]
+    type = TCPClientInterface
+    enabled = Yes
+    target_host = rmap.world
+    target_port = 4242
+
+  [[Beleth Clearnet TCP]]
+    type = TCPClientInterface
+    enabled = Yes
+    target_host = rns.beleth.net
+    target_port = 4242
+
+  [[LAN TCP Server]]
+    type = TCPServerInterface
+    enabled = Yes
+    listen_ip = 0.0.0.0
+    listen_port = 4242
+
+[node]
+
+  name                         = rfed-local
+  announce_interval_minutes    = 1
+  announce_at_start            = yes
+  lxmf_propagation             = yes
+  lxmf_propagation_autopeer    = yes
+
+[storage]
+
+  limit_mb = 500
+
+[policy.default]
+
+  allow_notify_registration = yes
+  allow_subscription        = yes

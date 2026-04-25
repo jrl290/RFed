@@ -1,0 +1,17 @@
+{
+  "node_name": "rfed-backup-node",
+  "identity": "7d8fbab8049922d4929607e2819371b7",
+  "destinations": {
+    "rfed.node": "cd6266f8c880d5627c133d2a569711cf",
+    "rfed.delivery": "3ed9e092bc110c6eb45f042504a4d8e2",
+    "rfed.channel": "cbde04be947b7e9cd8df7e92157e67ac",
+    "rfed.notify": "2880226677991fa0617541a43d51dbc7",
+    "lxmf.propagation": ""
+  },
+  "stats": {
+    "uptime_secs": 121,
+    "subscribers": 1,
+    "blobs": 5,
+    "notify_registrations": 0
+  }
+}

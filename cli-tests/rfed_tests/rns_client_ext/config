@@ -1,0 +1,15 @@
+[reticulum]
+  enable_transport = no
+  share_instance = no
+  instance_name = rfed_ext_client
+
+[logging]
+  loglevel = 5
+
+[interfaces]
+
+  [[TCP Client Interface]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = 192.168.2.107
+    target_port = 4242

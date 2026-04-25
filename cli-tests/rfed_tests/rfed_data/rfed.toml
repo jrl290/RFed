@@ -1,0 +1,26 @@
+# rfed.toml — Integration test configuration
+# Minimal config for local test harness:
+#   - stamp_cost = 0 so test publisher can use trivial zero-byte stamps
+#   - lxmf_propagation = true so notify wake-up tests work end-to-end
+#   - short announce interval for fast test convergence
+
+[node]
+name                      = "rfed-test"
+announce_interval_minutes = 1
+announce_at_start         = true
+lxmf_propagation          = true
+
+[storage]
+limit_mb = 100
+
+[policy.default]
+stamp_cost              = 0   # any stamp accepted (16 zero bytes satisfy cost >= 0)
+stamp_flexibility       = 0
+allow_notify_registration = true
+allow_subscription      = true
+
+[policy.vip]
+stamp_cost              = 0
+stamp_flexibility       = 0
+allow_notify_registration = true
+allow_subscription      = true

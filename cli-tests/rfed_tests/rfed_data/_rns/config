@@ -1,0 +1,34 @@
+[reticulum]
+  share_instance = No
+  enable_transport = Yes
+  panic_on_interface_error = No
+
+[interfaces]
+
+  [[Test TCP Server]]
+    type = TCPServerInterface
+    enabled = Yes
+    listen_ip = 0.0.0.0
+    listen_port = 57607
+
+  [[Uplink to backbone]]
+    type = TCPClientInterface
+    enabled = Yes
+    target_host = 192.168.2.107
+    target_port = 4242
+
+[node]
+  name                      = rfed-e2e-test
+  announce_interval_minutes = 1
+  announce_at_start         = yes
+  lxmf_propagation          = yes
+
+[storage]
+
+[peering]
+
+[policy.default]
+  stamp_cost = 0
+
+[policy.vip]
+  stamp_cost = 0

@@ -1,0 +1,17 @@
+[reticulum]
+# Local transport router for rfed integration tests.
+# All rfed test processes connect to this node as clients.
+enable_transport = yes
+share_instance = no
+instance_name = rfed_test_rnsd
+
+[logging]
+  loglevel = 3
+
+[interfaces]
+
+  [[TCP Server Interface]]
+    type = TCPServerInterface
+    enabled = yes
+    listen_ip = 127.0.0.1
+    listen_port = 4243

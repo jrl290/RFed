@@ -1,0 +1,15 @@
+[reticulum]
+  enable_transport = no
+  share_instance = no
+  instance_name = rfed_beleth_client
+
+[logging]
+  loglevel = 5
+
+[interfaces]
+
+  [[Beleth Clearnet TCP]]
+    type = TCPClientInterface
+    enabled = yes
+    target_host = rns.beleth.net
+    target_port = 4242
