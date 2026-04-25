@@ -482,6 +482,24 @@ fn main() -> Result<(), String> {
         }
     }
 
+    // ── Global panic hook ────────────────────────────────────────────
+    // Captures panics from any background thread and prints them with a
+    // timestamp to stderr (visible in Portainer / docker logs) before the
+    // process exits.  Without this, thread panics are silent in rfed.log.
+    std::panic::set_hook(Box::new(|info| {
+        let location = info.location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "(non-string payload)".to_string()
+        };
+        eprintln!("[rfed] PANIC at {location}: {msg}");
+    }));
+
     // ── Ctrl-C handler ───────────────────────────────────────────────
     let interrupted = Arc::new(AtomicBool::new(false));
     {
@@ -671,6 +689,8 @@ fn main() -> Result<(), String> {
     let mut last_service_announce = Instant::now();
     let mut last_evict        = Instant::now();
     let mut last_backup_tick  = Instant::now();
+    let mut last_heartbeat    = Instant::now();
+    let heartbeat_interval    = Duration::from_secs(5 * 60);
     let evict_interval        = Duration::from_secs(3600);
     let backup_tick_interval  = Duration::from_secs(BACKUP_TICK_SECS);
     let evict_max_age         = 7.0 * 24.0 * 3600.0_f64;
@@ -775,6 +795,19 @@ fn main() -> Result<(), String> {
                 }
             }
             last_evict = Instant::now();
+        }
+
+        // Periodic heartbeat — confirms the process is alive and provides
+        // a fine-grained timestamp for diagnosing unexpected deaths.
+        if last_heartbeat.elapsed() >= heartbeat_interval {
+            let snap = reticulum_rust::transport::get_state_snapshot();
+            eprintln!(
+                "[rfed] heartbeat uptime={:.1}h links={} paths={}",
+                startup.elapsed().as_secs_f64() / 3600.0,
+                snap.link_table_len,
+                snap.path_table.len(),
+            );
+            last_heartbeat = Instant::now();
         }
 
         thread::sleep(Duration::from_millis(500));
