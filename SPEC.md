@@ -316,7 +316,16 @@ multi-hop routed).
 **rfed.delivery** (subscriber → node):
 | Path | Caller | Payload | Response |
 |------|--------|---------|----------|
-| `/rfed/pull` | Subscriber | `msgpack bin(16)` subscriber_hash | `msgpack [blob, ...]` |
+| `/rfed/pull` | Subscriber | *(empty — caller authenticated by link identity)* | `msgpack [ [[bin(16) channel_hash, bin blob], …], bool more_pending ]` |
+
+**PULL paging** (user-initiated; mirrors chat-history "Load earlier
+messages"): each call drains at most one page (`deferred_pull_batch_limit`
+or `DEFAULT_PULL_PAGE_SIZE = 25`) and returns `more_pending = true` when
+additional entries remain for the caller. The client offers another
+page-load action while `more_pending` is true and stops once it is false.
+Drain is destructive on the server side — once a page has been returned
+those blobs are gone from this node and will only re-arrive via fanout
+from another session or sync from the origin.
 
 **rfed.notify** (subscriber → node):
 | Path | Caller | Payload | Response |

@@ -142,6 +142,13 @@ const NODE_ANNOUNCE_DELAY: u64 = 2;
 /// zero bits); these expansion rounds just bind the workblock to the blob hash.
 const STAMP_EXPAND_ROUNDS: u32 = 16;
 
+/// Default page size for `/rfed/pull` when the per-tier policy does not set
+/// `deferred_pull_batch_limit`.  PULL is user-initiated paging (mirrors chat
+/// history "Load earlier messages"): each request returns at most this many
+/// pending blobs plus a `more_pending` flag so the client knows whether to
+/// offer another page.
+const DEFAULT_PULL_PAGE_SIZE: usize = 25;
+
 // ── FedNode ──────────────────────────────────────────────────────────────────
 
 /// Central state for a running Federation Node.
@@ -1650,16 +1657,22 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // PULL — client proves key ownership via the request's authenticated caller.
     //
-    // The server drains the deferred queue for the caller and returns all
-    // pending inner blobs as a msgpack list of [channel_hash, blob] pairs.
+    // **User-initiated paging** (mirrors the chat-history "Load earlier
+    // messages" UX): each PULL drains at most one page of pending inner blobs
+    // for the caller and returns a `more_pending` flag so the client knows
+    // whether to offer another page.  Page size = policy
+    // `deferred_pull_batch_limit` if set, else `DEFAULT_PULL_PAGE_SIZE`.
     //
-    // Draining is atomic from the caller's perspective: the blobs are removed
-    // on return.  If the client crashes before processing, the blobs will have
-    // been delivered by live fanout to any other session, or will re-arrive via
-    // a future sync from the origin node.
+    // Draining is atomic from the caller's perspective: the returned blobs are
+    // removed before the response is sent.  If the client crashes before
+    // processing the bytes, those blobs are gone from this node and can only
+    // be recovered via fanout from another session or sync from the origin.
     //
-    // Wire format (response): msgpack [[bin(16), bin], ...] — each sub-array
-    // is [channel_hash, blob].  Uses rmpv so Python receives `bytes` objects.
+    // Wire format (response): msgpack 2-fixarray
+    //     [ Array([ [bin(16) channel_hash, bin(*) blob], ... ]),
+    //       Bool(more_pending) ]
+    // The previous "flat array of pairs" format is gone — clients MUST decode
+    // the 2-element envelope.  Uses rmpv so Python receives proper bytes.
     let pull_node = Arc::clone(node);
     let pull_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
                                   caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
@@ -1668,15 +1681,13 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             None => return Vec::new(),
         };
         if let Ok(guard) = pull_node.lock() {
-            let batch_limit = guard.config.policy_for(&subscriber_hash).deferred_pull_batch_limit;
+            let page_size = guard.config
+                .policy_for(&subscriber_hash)
+                .deferred_pull_batch_limit
+                .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                let pending = if let Some(limit) = batch_limit {
-                    deferred.drain_batch(&subscriber_hash, limit)
-                } else {
-                    deferred.drain(&subscriber_hash)
-                };
-                // Build msgpack array-of-[bin(channel_hash), bin(blob)] pairs
-                // using rmpv so Python receives proper bytes objects, not lists.
+                let pending = deferred.drain_batch(&subscriber_hash, page_size);
+                let more_pending = deferred.has_pending(&subscriber_hash);
                 let pairs_val: Vec<rmpv::Value> = pending
                     .into_iter()
                     .map(|pb| rmpv::Value::Array(vec![
@@ -1684,8 +1695,12 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                         rmpv::Value::Binary(pb.blob),
                     ]))
                     .collect();
+                let envelope = rmpv::Value::Array(vec![
+                    rmpv::Value::Array(pairs_val),
+                    rmpv::Value::Boolean(more_pending),
+                ]);
                 let mut buf = Vec::new();
-                let _ = rmpv::encode::write_value(&mut buf, &rmpv::Value::Array(pairs_val));
+                let _ = rmpv::encode::write_value(&mut buf, &envelope);
                 return buf;
             }
         }
