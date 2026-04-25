@@ -229,6 +229,33 @@ multi-hop routed).
   stripped on ingest; only the clean inner_blob (= LXMF lxmf_data tail) is
   stored and synced.
 
+  **PoW STAMP CONTRACT (must hold across rfed + retichat-ffi + iOS forever):**
+  * Material that the stamp is bound to:
+    `material = channel_id_hash(16) || inner_blob`
+    (i.e. `data[..data.len() - LXStamper::STAMP_SIZE]` as the SEND
+    handler sees it).
+  * `transient_id = identity::full_hash(material)`
+  * `workblock    = LXStamper::stamp_workblock(transient_id, 16)`
+    — `STAMP_EXPAND_ROUNDS` MUST stay 16 on both sides.  Bumping it
+    silently invalidates every previously-cached client `stamp_cost`
+    and every in-flight stamp.  Don't.
+  * Required PoW value: `LXStamper::stamp_value(workblock, stamp) >= cost`
+    where `cost = stamp_cost - stamp_flexibility` (clamped at 0).
+  * `stamp_cost` is advertised by `/rfed/subscribe`'s response
+    `[true, stamp_cost_or_nil]`. There is no other authoritative source;
+    rfed announces do not currently carry it.
+  * `Some(0)` in node config == disabled (same as `None`). Both subscribe
+    response and SEND validation MUST honor this.
+  * Clients MUST refresh their cached `stamp_cost` by re-issuing
+    `/rfed/subscribe` at least once per app session AND on every SEND
+    rejection, to recover from operator-side cost changes.
+
+  See `RFed-rust/rfed/src/config.rs` (TierPolicy section, *HISTORICAL
+  FAILURE MODES*), `Retichat-ios/rust/retichat-ffi/src/lib.rs`
+  (`retichat_compute_channel_stamp`), and
+  `Retichat-ios/Retichat/Services/RfedChannelClient.swift`
+  (`refreshStampCost`, `trySend`).
+
 ### MESSAGE_GET Response (blob stream)
 
 ```

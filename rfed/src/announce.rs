@@ -2,6 +2,8 @@
 //!
 //! Format: msgpack array  `[display_name: bin, stamp_cost: uint|nil, protocol_version: uint]`
 //!
+//! `stamp_cost` is `nil` when channel-SEND PoW is disabled (the default).
+//!
 //! This mirrors the LXMF propagation node announce format so that future
 //! tools that already parse LXMF announces can easily support rfed nodes.
 

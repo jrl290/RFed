@@ -35,6 +35,56 @@ pub struct TierPolicy {
     pub trusted_backup_only: bool,
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  ANTI-SPAM POW STAMPS — DO NOT BREAK THIS AGAIN
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Channel SEND packets carry a PoW stamp to deter spam. The wire format is:
+//
+//     [ channel_id_hash(16) | inner_blob(*) | stamp(LXStamper::STAMP_SIZE) ]
+//
+// Stamp material binds the stamp to this exact (channel_hash || inner_blob)
+// payload — recompute by `LXStamper::stamp_workblock(full_hash(material), 16)`.
+//
+// `stamp_cost`        — required PoW leading-zero bits (None or 0 = disabled)
+// `stamp_flexibility` — accept stamps down to `stamp_cost - flexibility`
+//
+// CONTRACT (must hold across rfed + retichat-ffi + iOS forever):
+//   1. The advertised cost in `[bool, stamp_cost_or_nil]` from
+//      `/rfed/subscribe` IS the cost the client must produce.
+//   2. RFed validates with the SAME workblock the client used:
+//        transient_id = identity::full_hash(channel_hash || inner_blob)
+//        workblock    = LXStamper::stamp_workblock(transient_id, 16)
+//      `STAMP_EXPAND_ROUNDS` MUST stay 16 on both sides — bumping it
+//      silently invalidates every previously-cached stamp_cost.
+//   3. `flexibility` must be respected on validation; otherwise stamps
+//      generated against an older `stamp_cost` are wrongly rejected.
+//   4. `Some(0)` in config means "disabled" — same as `None`. Both
+//      subscribe response (returns nil) and SEND validation (skipped)
+//      MUST honor this. Required to prevent a 0-cost foot-gun.
+//   5. If the operator changes `stamp_cost`, every subscriber MUST
+//      re-subscribe to learn the new value (cached `stampCost` on the
+//      client is stale otherwise → all SENDs rejected).
+//
+// SEE ALSO:
+//   * SPEC.md §"3. Wire Formats / SEND Packet" and §"17. Capabilities"
+//   * README.md §"Channel Messages on the Wire"
+//   * rfed/src/destinations.rs (channel SEND handler ~line 1480)
+//   * Reticulum-rust/src/lxstamper.rs (LXStamper)
+//   * Retichat-ios/rust/retichat-ffi/src/lib.rs `retichat_compute_channel_stamp`
+//   * Retichat-ios/Retichat/Services/RfedChannelClient.swift `sendMessage`
+//   * /memories/repo/retichat-rfed-channel-integration.md
+//
+// HISTORICAL FAILURE MODES (do not repeat):
+//   * Cached client `stampCost=8` against rfed running cost=16 → all SENDs
+//     rejected. Fix: client always re-subscribes on app start AND on the
+//     first SEND failure of the session. (See `RfedChannelClient`.)
+//   * Bumping STAMP_EXPAND_ROUNDS without bumping protocol_version →
+//     silently invalidates every existing stamp. Don't.
+//   * Forgetting `Some(0)==None` → 0-cost server still requires a stamp.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
 impl Default for TierPolicy {
     fn default() -> Self {
         TierPolicy {

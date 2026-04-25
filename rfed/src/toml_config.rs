@@ -280,6 +280,10 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
 
 [policy.default]
 
+  # ── PoW stamps on channel SEND are DISABLED BY DEFAULT ──────────
+  # Leave `stamp_cost` unset (or set to 0) to keep channel SEND
+  # PoW-free. Subscribe responses then return nil for stamp_cost so
+  # clients skip stamping entirely. Opt-in by setting a value > 0.
   # stamp_cost                = 16
   # stamp_flexibility         = 3
   # deferred_queue_limit      = 256
@@ -290,6 +294,8 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
 
 [policy.vip]
 
+  # See [policy.default] for stamp semantics; stamps are disabled
+  # by default for VIPs as well.
   # stamp_cost                = 4
   # stamp_flexibility         = 2
   # deferred_queue_limit      = 2048

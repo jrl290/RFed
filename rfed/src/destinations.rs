@@ -1476,9 +1476,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         }
 
         // ── Stamp validation (when configured) ───────────────────────
-        // `stamp_cost = None` OR `stamp_cost = Some(0)` both mean "no PoW
-        // required" — the wire is then plain `[channel_hash | inner_blob]`.
-        let (channel_hash, inner_blob): (&[u8], &[u8]) = if let Some(cost) = stamp_cost.filter(|c| *c > 0) {
+        let (channel_hash, inner_blob): (&[u8], &[u8]) = if let Some(cost) = stamp_cost {
             // Must have at least 16 (channel) + 1 (blob) + STAMP_SIZE bytes.
             let min_len = 16 + LXStamper::STAMP_SIZE + 1;
             if data.len() < min_len {
@@ -1498,9 +1496,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             // older/different cost announcement are still accepted.
             let min_cost = cost.saturating_sub(stamp_flexibility.unwrap_or(0));
             if !LXStamper::stamp_valid(stamp, min_cost, &workblock) {
-                let achieved = LXStamper::stamp_value(&workblock, stamp);
-                log(format!("[channel] SEND rejected: stamp value={achieved} < required min_cost={min_cost} (cost={cost}, flex={})",
-                        stamp_flexibility.unwrap_or(0)),
+                log("[channel] SEND rejected: stamp does not meet required cost",
                     LOG_WARNING, false, false);
                 return;
             }
@@ -1606,8 +1602,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             }
             // Response: [true, stamp_cost_or_nil]
             // stamp_cost is None when disabled so client can skip PoW.
-            // Treat Some(0) the same as None (= disabled).
-            let cost = guard.config.default_policy.stamp_cost.filter(|c| *c > 0);
+            let cost = guard.config.default_policy.stamp_cost;
             let resp = rmpv::Value::Array(vec![
                 rmpv::Value::Boolean(true),
                 match cost {
