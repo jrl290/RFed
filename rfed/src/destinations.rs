@@ -9,16 +9,25 @@
 //!                    (SEND packet, SUBSCRIBE / UNSUBSCRIBE requests)
 //!   rfed.notify    — Notify registration (REGISTER / UNREGISTER / CLEAR requests)
 //!
-//! # Inner-blob format (CHANNEL MESSAGES ARE LXMF PACKAGES)
+//! # Wire format (CHANNEL MESSAGES ARE LXMF PACKAGES)
 //!
-//! Every channel `inner_blob` is the EXACT byte format produced by
-//! `lxmf_rust::LXMessage::pack(PROPAGATED)` starting at the destination_hash.
-//! That is, the full `[channel_hash | inner_blob]` span = LXMF `lxmf_data`:
-//!     [ channel_hash(16) | EC_encrypted(source_hash || signature || msgpack_payload) ]
-//! RFed treats it OPAQUELY — never decrypts, parses, or modifies it.
-//! Receivers feed the reconstructed canonical block to
-//! `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which validates the
-//! Ed25519 signature against the cached source identity.
+//! Channel send/fanout packet payload:
+//!     [ channel_id_hash(16) | inner_blob(*) ]
+//!
+//! * `channel_id_hash` is the channel **identity hash** — i.e. what
+//!   subscribers register with `/rfed/subscribe`, what RFed routes on
+//!   in `subscription_table`, and what the Retichat clients call
+//!   `Channel.id`. RFed never inspects, decrypts or re-derives this.
+//! * `inner_blob` is byte-identical to the EC-encrypted authentication
+//!   payload `lxmf_rust::LXMessage::pack(PROPAGATED)` produces — the
+//!   tail after the destination_hash:
+//!     `EC_encrypted(source_hash || signature || msgpack_payload)`.
+//!   Receivers reconstruct the canonical LXMF block by prepending the
+//!   `lxmf.delivery` destination_hash for the channel identity (re-derived
+//!   from the channel name) and feed that to
+//!   `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which validates
+//!   the Ed25519 signature against the cached source identity.
+//! RFed treats `inner_blob` OPAQUELY — never decrypts, parses, or modifies it.
 //!
 //! # Delivery model
 //!

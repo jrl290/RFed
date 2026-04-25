@@ -145,15 +145,18 @@ pub fn fanout_blob(
                     continue;
                 }
 
-                // Delivery packet payload: channel_hash(16) | inner_blob
+                // Delivery packet payload: channel_id_hash(16) | inner_blob
                 //
-                // CHANNEL MESSAGES ARE LXMF PACKAGES.  inner_blob is the
-                // LXMF-rust LXMessage::pack(PROPAGATED) output starting AFTER
-                // the destination_hash, so [channel_hash | inner_blob] is a
-                // full LXMF `lxmf_data` block — the same bytes an LXMF
-                // propagation node stores and delivers.  RFed never reads
-                // inside it; subscribers reconstruct lxmf_data by prepending
-                // channel_hash and call
+                // CHANNEL MESSAGES ARE LXMF PACKAGES.  channel_id_hash is the
+                // channel **identity hash** (the routing label subscribers
+                // signed in /rfed/subscribe).  inner_blob is the EC-encrypted
+                // authentication payload from `LXMessage::pack(PROPAGATED)` —
+                // i.e. EC_encrypted(source_hash || signature || msgpack_payload),
+                // byte-identical to what an LXMF propagation node carries.
+                // RFed never reads inside inner_blob.  Subscribers reconstruct
+                // the canonical LXMF block by prepending the lxmf.delivery
+                // destination_hash for the channel identity (re-derived from
+                // the channel name) and call
                 // `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`.
                 let mut payload = channel_dest_hash.to_vec();
                 payload.extend_from_slice(inner_blob);

@@ -200,26 +200,31 @@ multi-hop routed).
 └──────────────────┴──────────────────────┴──────────────┘
 ```
 
-- **channel_hash**: 16-byte destination hash of the target channel.
-- **inner_blob**: **An LXMF-rust `LXMessage::pack(PROPAGATED)` output —
-  the EXACT same byte format an LXMF propagation node stores and delivers.**
-  Immutable — never modified by the node. The full
-  `[channel_hash | inner_blob]` span IS the LXMF `lxmf_data`:
+- **channel_hash**: 16-byte channel **identity hash** of the target
+  channel — the routing label RFed uses (subscribers signed it during
+  `/rfed/subscribe`).
+- **inner_blob**: **The EC-encrypted authentication payload from
+  `lxmf_rust::LXMessage::pack(PROPAGATED)` — byte-identical to what an
+  LXMF propagation node carries:**
 
   ```
-  lxmf_data = [ channel_hash(16) | EC_encrypted(
-                    source_hash (16) || signature (64) || msgpack_payload
-                ) ]
+  inner_blob = EC_encrypted( source_hash(16) || signature(64) || msgpack_payload )
   ```
 
-  The channel's destination hash is the channel_hash; the channel identity
-  (which holds both the X25519 encryption key and the Ed25519 verification
-  baseline) is derived deterministically from the channel name as
+  Immutable — RFed treats it OPAQUELY and never decrypts, parses or
+  modifies it.
+
+  The channel identity (which holds both the X25519 encryption key and
+  the Ed25519 verification baseline) is derived deterministically from
+  the channel name as
   `seed = sha256(name); private_key_bundle = seed || seed`. Any subscriber
-  holding the channel name can EC-decrypt the encrypted tail and feed the
-  reconstructed `[dest|src|sig|payload]` block to
-  `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which validates the
-  Ed25519 signature against the cached source identity.
+  holding the channel name can re-derive the channel identity, EC-decrypt
+  the inner_blob, and reconstruct the canonical LXMF block by prepending
+  the `lxmf.delivery` destination_hash for the channel identity (= the
+  hash a receiver sees if they treat the channel identity as an LXMF
+  delivery destination), then feed the result to
+  `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which validates
+  the Ed25519 signature against the cached source identity.
 - **stamp**: Proof-of-work stamp appended by the sender. Validated and
   stripped on ingest; only the clean inner_blob (= LXMF lxmf_data tail) is
   stored and synced.

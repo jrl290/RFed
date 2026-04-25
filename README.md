@@ -169,22 +169,26 @@ The sender transmits to the node's `rfed.channel` destination:
 [ channel_hash (16 bytes) | inner_blob | PoW stamp ]
 ```
 
-**inner_blob is an LXMF lxmf_data tail.** The full `[channel_hash | inner_blob]`
-span is exactly the bytes `LXMessage::pack(PROPAGATED)` produces starting at
-the destination_hash:
+**channel_hash is the channel _identity hash_** — the routing label
+RFed uses (subscribers signed it during `/rfed/subscribe`). **inner_blob
+is the EC-encrypted authentication payload** from
+`LXMessage::pack(PROPAGATED)` — byte-identical to what an LXMF
+propagation node carries:
 
 ```
-lxmf_data = [ channel_hash(16) | EC_encrypted(
-                  source_hash (16) || signature (64) || msgpack_payload
-              ) ]
+inner_blob = EC_encrypted(
+    source_hash (16) || signature (64) || msgpack_payload
+)
 ```
 
 The channel identity (which holds both the X25519 encryption key and the
-Ed25519 verification baseline) is derived deterministically from the channel
-name. Subscribers EC-decrypt the encrypted tail and feed the reconstructed
-canonical block to `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which
-validates the signature against the cached sender identity. If the sender has
-not announced and isn't in the cache, the message is rejected as
+Ed25519 verification baseline) is derived deterministically from the
+channel name. Subscribers re-derive the channel identity, EC-decrypt the
+inner_blob, and reconstruct the canonical LXMF block by prepending the
+`lxmf.delivery` destination_hash for the channel identity, then feed the
+result to `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`, which
+validates the signature against the cached sender identity. If the sender
+has not announced and isn't in the cache, the message is rejected as
 `SOURCE_UNKNOWN`.
 
 | Data | Encrypted? | Visible to rfed node? |

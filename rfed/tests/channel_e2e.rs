@@ -106,14 +106,20 @@ fn build_subscribe_payload(identity: &Identity, channel_hash: &[u8]) -> Vec<u8> 
     p
 }
 
-/// Build an LXMF channel message and return the on-wire `lxmf_data`.
-/// Output format = `[channel_hash(16) | EC_encrypted(source_hash || sig || payload)]`,
-/// i.e. the bytes `LXMessage::pack(PROPAGATED)` produces starting at the
-/// destination_hash. (Re-encrypts the post-destination section ourselves
-/// since `pn_encrypted_data` is private — same EC scheme.)
-fn build_lxmf_data(channel_name: &str, sender: &Identity, content: &str) -> Vec<u8> {
+/// Build the on-wire payload for an LXMF channel message.
+///
+/// Output: [ channel_id_hash(16) | EC_encrypted(source_hash || sig || payload) ]
+///
+/// `channel_id_hash` is the channel identity hash (= what RFed routes on
+/// and what subscribers signed during /rfed/subscribe). The EC-encrypted
+/// tail carries the LXMF authentication payload that
+/// `LXMessage::pack(PROPAGATED)` produces. (We re-encrypt `packed[16..]`
+/// ourselves since `pn_encrypted_data` is private — same EC scheme.)
+fn build_wire_payload(channel_name: &str, sender: &Identity, content: &str) -> Vec<u8> {
+    let ch_id = make_channel_identity(channel_name);
+    let id_hash = ch_id.hash.clone().expect("channel id hash");
     let mut channel_dest = Destination::new_outbound(
-        Some(make_channel_identity(channel_name)),
+        Some(ch_id),
         DestinationType::Single,
         "lxmf".to_string(),
         vec!["delivery".to_string()],
@@ -142,9 +148,9 @@ fn build_lxmf_data(channel_name: &str, sender: &Identity, content: &str) -> Vec<
     let pn_enc = channel_dest
         .encrypt(&packed[LXMessage::DESTINATION_LENGTH..])
         .expect("channel encrypt");
-    let mut lxmf_data = packed[..LXMessage::DESTINATION_LENGTH].to_vec();
-    lxmf_data.extend_from_slice(&pn_enc);
-    lxmf_data
+    let mut wire = id_hash;
+    wire.extend_from_slice(&pn_enc);
+    wire
 }
 
 // Suppress unused-warning until/unless the test relies on it.
@@ -276,18 +282,16 @@ fn main() {
         move |data: &[u8], _pkt: &reticulum_rust::packet::Packet| {
             eprintln!("[recv] delivery packet: {} bytes  first16={}", data.len(),
                 hex(&data[..data.len().min(16)]));
-            // Payload from rfed fanout: [channel_hash(16) | inner_blob],
-            // where the entire span (channel_hash || inner_blob) is an
-            // LXMF lxmf_data block. Reconstruct it and feed to the LXMF
-            // unpacker (which EC-decrypts with the channel identity and
-            // validates the Ed25519 signature against the cached source
-            // identity).
+            // Payload from rfed fanout: [channel_id_hash(16) | EC_tail].
+            // We discard the wire prefix, EC-decrypt the tail with the
+            // channel identity, prepend the LXMF lxmf.delivery dest_hash
+            // (= what the sender signed in pack()), and feed the canonical
+            // block to LXMessage::unpack_from_bytes.
             if data.len() <= 16 {
                 eprintln!("[recv] too short, ignoring");
                 return;
             }
             let mut id = make_channel_identity(&ch_name_cb);
-            let dest_hash = &data[..16];
             let encrypted = &data[16..];
             let decrypted = match id.decrypt(encrypted) {
                 Ok(p) => p,
@@ -296,7 +300,13 @@ fn main() {
                     return;
                 }
             };
-            let mut full = dest_hash.to_vec();
+            let lxmf_dest = Destination::new_outbound(
+                Some(make_channel_identity(&ch_name_cb)),
+                DestinationType::Single,
+                "lxmf".to_string(),
+                vec!["delivery".to_string()],
+            ).expect("channel dest").hash.clone();
+            let mut full = lxmf_dest;
             full.extend_from_slice(&decrypted);
             let msg = match LXMessage::unpack_from_bytes(&full, Some(LXMessage::PROPAGATED)) {
                 Ok(m) => m,
@@ -485,18 +495,18 @@ fn main() {
     )
     .expect("rebuild rfed.channel dest for send");
 
-    // Build the LXMF lxmf_data — already begins with channel_hash, so it IS
-    // the wire payload (sans optional stamp).
-    let lxmf_data = build_lxmf_data(&channel_name, &sender, &message);
-    eprintln!("[send] lxmf_data_len={}", lxmf_data.len());
-    debug_assert_eq!(&lxmf_data[..16], ch_hash.as_slice(),
-        "LXMF dest_hash must equal channel_hash");
+    // Build the wire payload [channel_id_hash(16) | EC_tail] — the
+    // identity-hash prefix is what RFed's subscription_table routes on.
+    let wire_payload = build_wire_payload(&channel_name, &sender, &message);
+    eprintln!("[send] wire_payload_len={}", wire_payload.len());
+    debug_assert_eq!(&wire_payload[..16], ch_hash.as_slice(),
+        "wire prefix must equal channel identity hash");
 
     // Packet payload:
-    //   stamp_cost=None  → lxmf_data                     (no stamp)
-    //   stamp_cost=Some(0) → lxmf_data | stamp(32 zeros) (trivial stamp)
-    //   stamp_cost=Some(n) → lxmf_data | stamp(32 PoW)   (real stamp)
-    let mut payload = lxmf_data;
+    //   stamp_cost=None  → wire_payload                     (no stamp)
+    //   stamp_cost=Some(0) → wire_payload | stamp(32 zeros) (trivial stamp)
+    //   stamp_cost=Some(n) → wire_payload | stamp(32 PoW)   (real stamp)
+    let mut payload = wire_payload;
     if let Some(cost) = stamp_cost {
         let material = &payload; // ch_hash || ciphertext
         let transient_id = full_hash(material);
