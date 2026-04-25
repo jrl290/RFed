@@ -34,6 +34,143 @@ central coordinator. Any node can join or leave the federation at any time.
 
 ---
 
+### TL-DR Summary
+- Channel participants get the plaintext address which translates into the public and private keys
+- Sender creates an LXMF packet addressed to and encrypted for the channel. Now it includes the prelude for ID verification
+- Sender wraps that packet in a Reticulum packet addressed to his RFed node
+- RFed node unwraps the packet and rewraps it in a Reticulum packet addressed to each subscriber
+- The subscriber unwraps the packet and gets the LXMF packet addressed to the channel
+- The subscriber uses the Channel credentials to decrypt the message. He has the prelude and signing from the sender to verify the identity of the sender
+
+---
+
+## CANONICAL WIRE FORMAT — ULTIMATE AUTHORITY
+
+> **THIS SECTION IS THE ONE TRUE SOURCE OF TRUTH FOR THE CHANNEL
+> MESSAGE FORMAT. If any other section, comment, or document
+> disagrees with this one, this section wins and the other one is a
+> bug. Update this section *first*, then propagate.**
+
+### The four nested envelopes (sender → subscriber)
+
+A channel message is a propagation-style LXMF message wrapped in two
+Reticulum hops (sender → RFed node, RFed node → each subscriber). All
+encryption is asymmetric (`DestinationType::Single`); RFed is dumb and
+never decrypts the payload.
+
+```
+Layer 4 (innermost — application):
+    plaintext = [ "RTID"(4) | sender_identity_pub(64) | LXMF_tail ]
+    where
+        sender_identity_pub = Identity::get_public_key()           (32 X25519 enc || 32 Ed25519 sign)
+        LXMF_tail           = source_hash(16) | signature(64) | msgpack_payload
+        source_hash         = the sender's lxmf.delivery DESTINATION hash
+                            = truncated_hash( name_hash("lxmf.delivery") || identity_hash )
+                              — NOT truncated_hash(sender_identity_pub).
+
+Layer 3 (LXMF EC envelope, addressed to the CHANNEL identity):
+    inner_blob = EC_encrypt( channel_identity.X25519_pub , plaintext )
+               = ephemeral_pub(32) | ciphertext | hmac
+    Channel identity is derived deterministically from the channel name —
+    see §1. Channel Hash Derivation. All subscribers + the sender hold
+    the channel private key.
+
+Layer 2 (RFed wire payload, what the sender PUTs to /rfed/send):
+    rfed_payload = [ channel_hash(16) | inner_blob | stamp(32) ]
+    channel_hash = the channel's identity hash (16 B), used by RFed
+                   purely as a routing label; subscribers proved knowledge
+                   of it via signed /rfed/subscribe.
+    stamp        = LXMF PoW stamp over
+                   sha256( channel_hash(16) || inner_blob ), with
+                   STAMP_EXPAND_ROUNDS = 16 (see PoW STAMP CONTRACT below).
+
+Layer 1 (Reticulum transport — first hop):
+    Reticulum DATA packet, DestinationType::Single, addressed to
+    rfed.send (the RFed node's send endpoint). RFed decrypts the outer
+    Reticulum envelope with its node identity, validates the stamp,
+    strips it, and stores `inner_blob` keyed by channel_hash.
+
+Layer 1' (Reticulum transport — fanout hop, one per subscriber):
+    For every subscriber S of channel_hash, RFed sends a Reticulum
+    DATA packet, DestinationType::Single, addressed to S's
+    rfed.delivery endpoint, with payload:
+        [ channel_hash(16) | inner_blob ]
+    (No stamp on the fanout hop — stamp was already validated at ingest.)
+```
+
+### Subscriber decode (exact inverse)
+
+1. Reticulum decrypts the outer packet with the subscriber's node
+   identity → exposes `[ channel_hash(16) | inner_blob ]`.
+2. Look up `channel_hash` in the subscriber's local channel table to
+   find the matching channel name and re-derive the channel identity
+   (private key + public key) per §1.
+3. EC-decrypt `inner_blob` with the **channel** private key → recover
+   the Layer-4 plaintext.
+4. Verify magic `"RTID"` and split off the 64-byte
+   `sender_identity_pub`. **Do NOT compare
+   `truncated_hash(sender_identity_pub)` against `source_hash` — those
+   are different hashes.** `source_hash` is the lxmf.delivery
+   destination hash; the bare identity hash is just one of its inputs.
+5. Call `Identity::remember_destination(source_hash, sender_identity_pub, None)`
+   to populate Reticulum's known-destinations cache.
+6. Prepend the channel's `lxmf.delivery` destination hash to the
+   LXMF tail and feed to
+   `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`.
+7. LXMF Ed25519 signature validation runs against the just-cached
+   `sender_identity_pub`. **This is the integrity check** — a forged
+   `sender_identity_pub` produces `SIGNATURE_INVALID`. Cache poisoning
+   by an unauthorised party is impossible because reaching step 3
+   already required the channel EC private key.
+
+### Why the prelude exists
+
+Without it, `LXMessage::unpack(PROPAGATED)` rejects the message as
+`SOURCE_UNKNOWN` whenever the sender's `lxmf.delivery` announce hasn't
+recently traversed the receiver — the same announce-timing flakiness
+that plagues regular LXMF ("have to be online at the right moment").
+The prelude embeds the sender pubkey inside the EC envelope, so
+signature validation works on the very first message a receiver ever
+sees, period.
+
+### Invariants you may NOT break
+
+- **Magic** is the four ASCII bytes `"RTID"`. Not `"RTI "`, not
+  little-endian, not length-prefixed.
+- **`sender_identity_pub` is 64 bytes** in `Identity::get_public_key()`
+  layout. `Identity::from_public_key` is its inverse.
+- **`source_hash` is the destination hash, not the identity hash.**
+  Repeat: `truncated_hash(name_hash || identity_hash)`, not
+  `truncated_hash(public_key)`.
+- **The prelude is mandatory.** No legacy fallback path. Receivers
+  MUST refuse blobs without `"RTID"`.
+- **RFed never inspects the prelude** — it lives inside the EC
+  envelope. RFed only sees `[ channel_hash | inner_blob | stamp ]`.
+- **`STAMP_EXPAND_ROUNDS = 16`** on every implementation, forever.
+  Bumping it silently invalidates every cached `stamp_cost` and
+  every in-flight stamp.
+- **`stamp_cost` is owned exclusively by `/rfed/subscribe`'s
+  `[true, cost_or_nil]` reply.** `Some(0)` means disabled, identical
+  to `None`. Re-subscribe per session and on every SEND rejection.
+
+### Bytes-on-the-wire reference (typical)
+
+```
+sizeof channel_hash      = 16
+sizeof prelude magic     =  4   ("RTID")
+sizeof sender_id_pub     = 64
+sizeof source_hash       = 16
+sizeof signature         = 64
+sizeof stamp             = 32
+→ inner_blob = ECC overhead(~48) + 4 + 64 + 16 + 64 + msgpack_payload
+→ rfed_payload = 16 + inner_blob + 32
+```
+
+A "hello" message of ~7 bytes UTF-8 produces `inner_blob ≈ 256`,
+`rfed_payload ≈ 304` — confirmed in retichat.log April 25 2026.
+
+---
+
 ## Table of Contents
 
 1. [Channel Hash Derivation](#1-channel-hash-derivation)
@@ -219,12 +356,21 @@ multi-hop routed).
   ASCII magic `"RTID"` followed by 64 bytes of sender identity public
   key (the format produced by Reticulum-rust's
   `Identity::get_public_key()` — 32 X25519 enc pub || 32 Ed25519 sign
-  pub), then the LXMF tail. Receivers MUST verify
-  `truncated_hash(identity_pub) == source_hash` (the next 16 bytes
-  after the prelude — refuse if mismatched, do not poison cache), then
-  call `Identity::remember_destination(source_hash, identity_pub,
-  None)` before invoking `LXMessage::unpack_from_bytes`. RFed never
-  sees the prelude (it's inside the EC envelope).
+  pub), then the LXMF tail. Receivers MUST call
+  `Identity::remember_destination(source_hash, identity_pub, None)`
+  with `source_hash` taken verbatim from the LXMF tail, then invoke
+  `LXMessage::unpack_from_bytes`. **Do NOT pre-check
+  `truncated_hash(identity_pub) == source_hash`** — `source_hash` is
+  the lxmf.delivery DESTINATION hash, not the bare identity hash, so
+  that equality never holds and would reject every legitimate
+  message. The integrity guarantee is provided by LXMF's own Ed25519
+  signature validation (forged `identity_pub` → `SIGNATURE_INVALID`),
+  and cache poisoning is impossible because reaching this code path
+  required the channel EC private key (i.e. authorised subscriber).
+  RFed never sees the prelude (it's inside the EC envelope). See the
+  **CANONICAL WIRE FORMAT** section at the top of this file for the
+  full layered diagram and decode procedure — that section is
+  authoritative.
 
   **Why this exists:** Channel pub/sub means the sender and receivers
   may have no prior history — the sender's `lxmf.delivery` identity is
