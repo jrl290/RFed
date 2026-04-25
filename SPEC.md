@@ -208,11 +208,35 @@ multi-hop routed).
   LXMF propagation node carries:**
 
   ```
-  inner_blob = EC_encrypted( source_hash(16) || signature(64) || msgpack_payload )
+  inner_blob = EC_encrypted( [optional source-identity prelude] || source_hash(16) || signature(64) || msgpack_payload )
   ```
 
   Immutable — RFed treats it OPAQUELY and never decrypts, parses or
   modifies it.
+
+  **SOURCE-IDENTITY PRELUDE (Retichat extension, application-layer,
+  RFed-agnostic):** When present (detected by the 4-byte ASCII magic
+  `"RTID"` at the start of the decrypted plaintext), the EC plaintext
+  is `b"RTID"(4) || sender_identity_pub(64) || lxmf_tail`. The 64
+  bytes are the format produced by Reticulum-rust's
+  `Identity::get_public_key()` (32 X25519 enc pub || 32 Ed25519 sign
+  pub). Receivers MUST verify `truncated_hash(identity_pub) ==
+  source_hash` (the next 16 bytes after the prelude), then call
+  `Identity::remember_destination(source_hash, identity_pub, None)`
+  before invoking `LXMessage::unpack_from_bytes` — this guarantees the
+  signature validates without depending on a prior LXMF announce. RFed
+  never sees the prelude (it's inside the EC envelope).
+
+  **Why this exists:** Channel pub/sub means the sender and receivers
+  may have no prior history — the sender's `lxmf.delivery` identity is
+  not in the receiver's known-destinations cache, so
+  `LXMessage::unpack_from_bytes(PROPAGATED)` would emit
+  `unverified_reason = SOURCE_UNKNOWN` for every message until/unless
+  the sender happens to also announce. Embedding the proof inline
+  removes that dependency.
+
+  Legacy (no prelude) inner_blobs remain accepted; receivers fall back
+  to the announce-based recall path in that case.
 
   The channel identity (which holds both the X25519 encryption key and
   the Ed25519 verification baseline) is derived deterministically from
