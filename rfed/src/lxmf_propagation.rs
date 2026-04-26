@@ -943,8 +943,43 @@ impl LxmfPropagationNode {
             }
         })));
 
-        // Accept resources for large batch transfers from peers
+        // Accept resources for large batch transfers from peers/clients.
+        // The wire format inside the assembled resource is identical to the
+        // single-packet propagation payload (msgpack [timebase, [messages]]),
+        // so the concluded callback dispatches into the same ingest helper.
         link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
+
+        // Resource-advertised callback: just a notification hook (presence
+        // of a `resource` callback is what enables ACCEPT_APP acceptance).
+        // Resource-concluded callback: invoked once the multi-segment
+        // transfer is fully assembled. Decode and ingest the same way as
+        // single-packet inbound propagation data.
+        let weak_concluded = self.self_handle.clone();
+        link.set_resource_callbacks(
+            Some(Arc::new(|_resource| {
+                // Accept all advertised propagation resources.
+            })),
+            None,
+            Some(Arc::new(move |resource| {
+                let data: Vec<u8> = match resource.lock() {
+                    Ok(r) => {
+                        if r.status != reticulum_rust::resource::ResourceStatus::Complete {
+                            return;
+                        }
+                        match r.data.clone() {
+                            Some(d) => d,
+                            None => return,
+                        }
+                    }
+                    Err(_) => return,
+                };
+                if let Some(arc) = weak_concluded.as_ref().and_then(|w| w.upgrade()) {
+                    if let Ok(mut node) = arc.lock() {
+                        node.ingest_propagation_bytes(&data);
+                    }
+                }
+            })),
+        );
     }
 
     // ── Packet handler (client PUTs) ─────────────────────────────────────────
@@ -954,6 +989,14 @@ impl LxmfPropagationNode {
     // Each lxmf_payload has the destination hash in the first 16 bytes.
 
     fn on_propagation_packet(&mut self, data: &[u8], _packet: &Packet) {
+        self.ingest_propagation_bytes(data);
+    }
+
+    /// Decode and ingest a propagation payload. Shared between the
+    /// single-packet inbound path (`on_propagation_packet`) and the
+    /// resource-concluded path for multi-segment batch transfers from
+    /// peers/clients. Wire format: msgpack [timebase, [lxmf_data, ...]].
+    fn ingest_propagation_bytes(&mut self, data: &[u8]) {
         let items = match read_value(&mut Cursor::new(data)) {
             Ok(Value::Array(a)) => a,
             _ => {
