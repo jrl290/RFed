@@ -222,3 +222,159 @@ impl DeferredQueue {
         Ok(())
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+//
+// Regression tests for the paged PULL semantics added when "PULL never gets
+// drained" was fixed.  The contract that MUST hold:
+//
+//   * `drain_batch(sub, max)` removes AT MOST `max` blobs from the FRONT of
+//     the bucket and returns them in FIFO order.
+//   * After draining, `has_pending(sub)` reflects whether anything remains —
+//     this is the `more_pending` flag the server returns to the client.
+//   * Drain is destructive; bytes returned to one PULL caller cannot be
+//     re-served to a subsequent PULL on the same subscriber.
+//   * An empty/missing bucket yields `Vec::new()` and `has_pending=false`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn tmp_path() -> PathBuf {
+        let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "rfed_deferred_test_{}_{}.rmp",
+            std::process::id(),
+            n
+        ))
+    }
+
+    fn fresh_queue() -> DeferredQueue {
+        let p = tmp_path();
+        let _ = std::fs::remove_file(&p);
+        DeferredQueue::load(p)
+    }
+
+    fn enqueue_n(q: &mut DeferredQueue, sub: &[u8], chan: &[u8], n: usize) {
+        for i in 0..n {
+            q.enqueue(sub.to_vec(), chan.to_vec(), vec![i as u8], 1024);
+        }
+    }
+
+    #[test]
+    fn drain_batch_returns_at_most_max_in_fifo_order() {
+        let mut q = fresh_queue();
+        let sub = vec![0xAAu8; 16];
+        let chan = vec![0xBBu8; 16];
+        enqueue_n(&mut q, &sub, &chan, 30);
+
+        let page = q.drain_batch(&sub, 25);
+        assert_eq!(page.len(), 25, "first page should contain exactly 25");
+        // FIFO: oldest first → blob bytes should be 0..=24.
+        for (i, pb) in page.iter().enumerate() {
+            assert_eq!(pb.blob, vec![i as u8]);
+            assert_eq!(pb.channel_hash, chan);
+        }
+        assert!(q.has_pending(&sub), "5 entries remain after first page");
+
+        let page2 = q.drain_batch(&sub, 25);
+        assert_eq!(page2.len(), 5, "second page returns the remainder");
+        for (i, pb) in page2.iter().enumerate() {
+            assert_eq!(pb.blob, vec![(25 + i) as u8]);
+        }
+        assert!(!q.has_pending(&sub), "queue exhausted after final page");
+    }
+
+    #[test]
+    fn drain_batch_is_destructive() {
+        // Once a PULL has drained N blobs, a second PULL with the same `max`
+        // MUST NOT return the same bytes again.
+        let mut q = fresh_queue();
+        let sub = vec![0x11u8; 16];
+        let chan = vec![0x22u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 5);
+
+        let first = q.drain_batch(&sub, 3);
+        let second = q.drain_batch(&sub, 3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 2);
+        // No overlap.
+        let first_bytes: Vec<u8> = first.iter().map(|b| b.blob[0]).collect();
+        let second_bytes: Vec<u8> = second.iter().map(|b| b.blob[0]).collect();
+        for b in &second_bytes {
+            assert!(!first_bytes.contains(b), "byte {b} returned twice");
+        }
+        assert!(!q.has_pending(&sub));
+    }
+
+    #[test]
+    fn drain_batch_empty_bucket_yields_empty_and_no_pending() {
+        let mut q = fresh_queue();
+        let sub = vec![0xCCu8; 16];
+        assert_eq!(q.drain_batch(&sub, 25).len(), 0);
+        assert!(!q.has_pending(&sub));
+    }
+
+    #[test]
+    fn drain_batch_max_zero_returns_nothing_and_preserves_bucket() {
+        let mut q = fresh_queue();
+        let sub = vec![0xDDu8; 16];
+        let chan = vec![0xEEu8; 16];
+        enqueue_n(&mut q, &sub, &chan, 4);
+
+        let page = q.drain_batch(&sub, 0);
+        assert_eq!(page.len(), 0);
+        assert!(q.has_pending(&sub), "max=0 must not drain anything");
+        assert_eq!(q.total_len(), 4);
+    }
+
+    #[test]
+    fn has_pending_is_per_subscriber() {
+        let mut q = fresh_queue();
+        let sub_a = vec![1u8; 16];
+        let sub_b = vec![2u8; 16];
+        let chan = vec![3u8; 16];
+        enqueue_n(&mut q, &sub_a, &chan, 2);
+        assert!(q.has_pending(&sub_a));
+        assert!(!q.has_pending(&sub_b));
+    }
+
+    #[test]
+    fn drain_batch_does_not_affect_other_subscribers() {
+        let mut q = fresh_queue();
+        let sub_a = vec![0xA1u8; 16];
+        let sub_b = vec![0xB2u8; 16];
+        let chan = vec![0xC3u8; 16];
+        enqueue_n(&mut q, &sub_a, &chan, 5);
+        enqueue_n(&mut q, &sub_b, &chan, 7);
+
+        let _ = q.drain_batch(&sub_a, 100);
+        assert!(!q.has_pending(&sub_a));
+        assert!(q.has_pending(&sub_b));
+        assert_eq!(q.total_len(), 7);
+    }
+
+    #[test]
+    fn enqueue_persists_and_reload_preserves_order() {
+        let p = tmp_path();
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut q = DeferredQueue::load(p.clone());
+            let sub = vec![0xFFu8; 16];
+            let chan = vec![0x00u8; 16];
+            for i in 0..3u8 {
+                q.enqueue(sub.clone(), chan.clone(), vec![i], 1024);
+            }
+        }
+        let mut q2 = DeferredQueue::load(p.clone());
+        let sub = vec![0xFFu8; 16];
+        let page = q2.drain_batch(&sub, 10);
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].blob, vec![0]);
+        assert_eq!(page[2].blob, vec![2]);
+        let _ = std::fs::remove_file(&p);
+    }
+}

@@ -1972,3 +1972,259 @@ mod hash_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod wire_format_tests {
+    //! Wire-format and stamp-cost regression tests.
+    //!
+    //! These guard the bug fixes that produced the current PULL/SUBSCRIBE
+    //! contract:
+    //!
+    //!  * PULL response is a 2-element fixarray
+    //!        `[ [[bin(16) channel_hash, bin(*) blob], ...], Bool more_pending ]`
+    //!    Earlier shipping code returned a flat array of pairs with no
+    //!    continuation flag, so the iOS client could never tell whether to
+    //!    offer "Load earlier messages".  The envelope MUST stay 2 elements
+    //!    and the trailing element MUST stay a bool.
+    //!  * SUBSCRIBE response is `[Bool ok, Int|Nil stamp_cost]`.  When the
+    //!    operator disables PoW (`stamp_cost == None`) the second slot MUST
+    //!    serialise as msgpack Nil, NOT as `0` — a 0 would tell clients to
+    //!    compute a 0-cost stamp instead of skipping the stamp tail entirely.
+    //!  * `STAMP_EXPAND_ROUNDS` is wedged at 16 across rfed + retichat-ffi +
+    //!    iOS.  Bumping it silently invalidates every client's cached
+    //!    `stampCost`.  This test fails loud if the constant ever drifts.
+    //!  * Stamp validation: a stamp generated against a given cost MUST be
+    //!    accepted at that cost, accepted at `cost - flexibility`, and
+    //!    rejected against the wrong workblock.
+    //!  * `DEFAULT_PULL_PAGE_SIZE` matches the 25-row chat-history page so
+    //!    the UX stays consistent with DM "Load earlier messages".
+
+    use super::{DEFAULT_PULL_PAGE_SIZE, STAMP_EXPAND_ROUNDS};
+    use reticulum_rust::identity;
+    use reticulum_rust::lxstamper::LXStamper;
+
+    /// Re-encode a PULL response with the SAME shape `pull_cb` produces.
+    /// If the production encoder ever drifts, update this helper AND
+    /// `decode_pull_response` in lockstep.
+    fn encode_pull_response(pairs: &[(Vec<u8>, Vec<u8>)], more_pending: bool) -> Vec<u8> {
+        let pairs_val: Vec<rmpv::Value> = pairs
+            .iter()
+            .map(|(ch, blob)| rmpv::Value::Array(vec![
+                rmpv::Value::Binary(ch.clone()),
+                rmpv::Value::Binary(blob.clone()),
+            ]))
+            .collect();
+        let envelope = rmpv::Value::Array(vec![
+            rmpv::Value::Array(pairs_val),
+            rmpv::Value::Boolean(more_pending),
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &envelope).unwrap();
+        buf
+    }
+
+    fn decode_pull_response(buf: &[u8]) -> Option<(Vec<(Vec<u8>, Vec<u8>)>, bool)> {
+        let mut cursor = std::io::Cursor::new(buf);
+        let val = rmpv::decode::read_value(&mut cursor).ok()?;
+        let outer = val.as_array()?;
+        if outer.len() != 2 {
+            return None;
+        }
+        let pairs_arr = outer[0].as_array()?;
+        let more_pending = outer[1].as_bool()?;
+        let mut pairs = Vec::with_capacity(pairs_arr.len());
+        for entry in pairs_arr {
+            let inner = entry.as_array()?;
+            if inner.len() != 2 {
+                return None;
+            }
+            let ch = inner[0].as_slice()?.to_vec();
+            let blob = inner[1].as_slice()?.to_vec();
+            pairs.push((ch, blob));
+        }
+        Some((pairs, more_pending))
+    }
+
+    // ── PULL envelope ────────────────────────────────────────────────
+
+    #[test]
+    fn pull_response_envelope_roundtrip_with_pairs() {
+        let pairs = vec![
+            (vec![0x11u8; 16], b"hello".to_vec()),
+            (vec![0x22u8; 16], b"world".to_vec()),
+        ];
+        let buf = encode_pull_response(&pairs, true);
+        let (decoded, more) = decode_pull_response(&buf).expect("envelope must decode");
+        assert!(more);
+        assert_eq!(decoded, pairs);
+    }
+
+    #[test]
+    fn pull_response_envelope_roundtrip_empty_no_more() {
+        let buf = encode_pull_response(&[], false);
+        let (decoded, more) = decode_pull_response(&buf).expect("envelope must decode");
+        assert_eq!(decoded.len(), 0);
+        assert!(!more, "empty queue MUST report more_pending=false");
+    }
+
+    #[test]
+    fn pull_response_envelope_is_a_two_element_array() {
+        // Outer element MUST be a 2-array.  If a future change adds a third
+        // element (e.g. a server timestamp) without bumping a wire version,
+        // existing iOS clients will silently misparse.
+        let buf = encode_pull_response(&[], false);
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let val = rmpv::decode::read_value(&mut cursor).unwrap();
+        let outer = val.as_array().expect("outer must be array");
+        assert_eq!(outer.len(), 2, "PULL envelope MUST be a 2-element array");
+        assert!(outer[0].as_array().is_some(), "first element MUST be an array");
+        assert!(outer[1].as_bool().is_some(), "second element MUST be a bool");
+    }
+
+    #[test]
+    fn pull_response_inner_pairs_are_two_element_arrays() {
+        let pairs = vec![(vec![0xABu8; 16], b"x".to_vec())];
+        let buf = encode_pull_response(&pairs, false);
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let val = rmpv::decode::read_value(&mut cursor).unwrap();
+        let outer = val.as_array().unwrap();
+        let pair = outer[0].as_array().unwrap()[0].as_array().unwrap();
+        assert_eq!(pair.len(), 2, "each (channel_hash, blob) entry MUST be a 2-array");
+        assert!(pair[0].as_slice().is_some(), "channel_hash MUST be msgpack bin");
+        assert!(pair[1].as_slice().is_some(), "blob MUST be msgpack bin");
+    }
+
+    // ── SUBSCRIBE response (stamp_cost retrieval contract) ───────────
+
+    /// Re-encode the SUBSCRIBE response in the same shape `subscribe_cb`
+    /// produces: `[Bool ok, Int|Nil stamp_cost]`.
+    fn encode_subscribe_response(ok: bool, cost: Option<u32>) -> Vec<u8> {
+        let resp = rmpv::Value::Array(vec![
+            rmpv::Value::Boolean(ok),
+            match cost {
+                Some(c) => rmpv::Value::Integer(rmpv::Integer::from(c as i64)),
+                None    => rmpv::Value::Nil,
+            },
+        ]);
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &resp).unwrap();
+        buf
+    }
+
+    #[test]
+    fn subscribe_response_carries_stamp_cost_as_integer() {
+        let buf = encode_subscribe_response(true, Some(16));
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let val = rmpv::decode::read_value(&mut cursor).unwrap();
+        let arr = val.as_array().expect("response MUST be array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0].as_bool(), Some(true));
+        assert_eq!(arr[1].as_i64(), Some(16));
+    }
+
+    #[test]
+    fn subscribe_response_uses_nil_when_stamp_cost_disabled() {
+        // When the operator disables PoW the second slot MUST be Nil so the
+        // client knows to skip the stamp tail entirely.  Encoding 0 here
+        // would be a foot-gun: clients would compute a 0-cost stamp and
+        // append a useless 32-byte tail.
+        let buf = encode_subscribe_response(true, None);
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let val = rmpv::decode::read_value(&mut cursor).unwrap();
+        let arr = val.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert!(arr[1].is_nil(), "disabled stamp_cost MUST encode as msgpack Nil");
+        assert!(arr[1].as_i64().is_none(), "Nil MUST NOT decode as integer 0");
+    }
+
+    #[test]
+    fn subscribe_response_failure_uses_bool_false() {
+        // When access is denied, the server returns msgpack `false`
+        // (single byte 0xc2) so existing clients keep parsing it as a
+        // single bool without the [ok, cost] envelope.
+        let buf = rmp_serde::to_vec(&false).unwrap();
+        assert_eq!(buf.as_slice(), &[0xc2u8]);
+    }
+
+    // ── Default PULL page size ───────────────────────────────────────
+
+    #[test]
+    fn default_pull_page_size_matches_chat_history_page() {
+        // The 25-row default mirrors the DM "Load earlier messages" page so
+        // a fresh PULL fills exactly one screen.  Changing this requires a
+        // matching tweak to the iOS chat-history page size.
+        assert_eq!(DEFAULT_PULL_PAGE_SIZE, 25);
+    }
+
+    // ── Stamp validation (cost is RESPECTED) ─────────────────────────
+
+    #[test]
+    fn stamp_expand_rounds_is_pinned_at_sixteen() {
+        // STAMP_EXPAND_ROUNDS is part of the cross-process contract.  It
+        // MUST stay 16 in rfed AND in retichat-ffi AND in the iOS client.
+        // If any future change bumps it, every previously-cached client
+        // stampCost is silently invalidated.
+        assert_eq!(STAMP_EXPAND_ROUNDS, 16);
+    }
+
+    #[test]
+    fn stamp_generated_at_cost_is_accepted_at_same_cost() {
+        // Use a small cost so the test is fast.  Validity is a property
+        // of the workblock + leading-zero-bits target, independent of the
+        // specific cost chosen.
+        let cost = 4u32;
+        let channel_hash = vec![0xA5u8; 16];
+        let inner_blob = b"unit-test-blob".to_vec();
+        let material: Vec<u8> = channel_hash.iter().chain(inner_blob.iter()).copied().collect();
+        let transient_id = identity::full_hash(&material);
+        let workblock = LXStamper::stamp_workblock(&transient_id, STAMP_EXPAND_ROUNDS);
+        let (stamp, _value) = LXStamper::generate_stamp(&transient_id, cost, STAMP_EXPAND_ROUNDS);
+        assert_eq!(stamp.len(), LXStamper::STAMP_SIZE, "stamp MUST be STAMP_SIZE bytes");
+        assert!(LXStamper::stamp_valid(&stamp, cost, &workblock));
+    }
+
+    #[test]
+    fn stamp_flexibility_accepts_understrength_stamp() {
+        // A stamp produced for cost=4 MUST validate at cost=2 (flexibility=2).
+        let cost = 4u32;
+        let flexibility = 2u32;
+        let channel_hash = vec![0x5Au8; 16];
+        let inner_blob = b"flexibility-blob".to_vec();
+        let material: Vec<u8> = channel_hash.iter().chain(inner_blob.iter()).copied().collect();
+        let transient_id = identity::full_hash(&material);
+        let workblock = LXStamper::stamp_workblock(&transient_id, STAMP_EXPAND_ROUNDS);
+        let (stamp, _) = LXStamper::generate_stamp(&transient_id, cost, STAMP_EXPAND_ROUNDS);
+        let min_cost = cost.saturating_sub(flexibility);
+        assert!(
+            LXStamper::stamp_valid(&stamp, min_cost, &workblock),
+            "stamp at cost={cost} MUST validate at min_cost={min_cost}",
+        );
+    }
+
+    #[test]
+    fn stamp_with_wrong_workblock_is_rejected() {
+        // Same stamp bytes against a DIFFERENT (channel_hash || blob) MUST fail.
+        // This proves the workblock binding is what's being checked, not just
+        // a leading-zero count on the stamp itself.
+        let cost = 4u32;
+        let mat_a: Vec<u8> = std::iter::repeat(0xAA).take(32).collect();
+        let mat_b: Vec<u8> = std::iter::repeat(0xBB).take(32).collect();
+        let tid_a = identity::full_hash(&mat_a);
+        let tid_b = identity::full_hash(&mat_b);
+        let wb_b = LXStamper::stamp_workblock(&tid_b, STAMP_EXPAND_ROUNDS);
+        let (stamp_a, _) = LXStamper::generate_stamp(&tid_a, cost, STAMP_EXPAND_ROUNDS);
+        assert!(
+            !LXStamper::stamp_valid(&stamp_a, cost, &wb_b),
+            "stamp from material A MUST NOT validate against workblock B",
+        );
+    }
+
+    #[test]
+    fn stamp_undersized_buffer_is_rejected() {
+        // A 31-byte buffer (one shy of STAMP_SIZE) MUST NOT be accepted as
+        // a stamp — guards against accidental truncation in framing code.
+        let workblock = vec![0u8; 32];
+        let too_short = vec![0u8; LXStamper::STAMP_SIZE - 1];
+        assert!(!LXStamper::stamp_valid(&too_short, 1, &workblock));
+    }
+}

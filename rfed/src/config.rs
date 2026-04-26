@@ -220,3 +220,119 @@ impl NodeConfig {
         self.config_dir.join("peers.rmp")
     }
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+//
+// Stamp-cost retrieval tests.  The contract these tests guard is the
+// "ANTI-SPAM POW STAMPS — DO NOT BREAK THIS AGAIN" block above:
+//
+//   * Default tier MUST advertise a non-zero `stamp_cost` and non-zero
+//     `stamp_flexibility` so SUBSCRIBE responses tell clients the right
+//     PoW target and SEND validation has the right floor.
+//   * VIP tier MUST be a relaxation, not a tightening (lower cost, larger
+//     queue) — bumping VIP cost above default would punish privileged users.
+//   * `policy_for(vip_hash)` MUST return the VIP policy; everyone else falls
+//     through to the default policy.
+//   * `deferred_pull_batch_limit` defaults to None (server falls back to
+//     `DEFAULT_PULL_PAGE_SIZE`).  Per-tier override is wired through
+//     `policy_for(...).deferred_pull_batch_limit`.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_config(default: TierPolicy, vip: TierPolicy, vips: Vec<Vec<u8>>) -> NodeConfig {
+        NodeConfig {
+            config_dir: PathBuf::from("/tmp/rfed_test_cfg"),
+            rns_config_dir: None,
+            identity_file: PathBuf::from("/tmp/rfed_test_cfg/identity"),
+            display_name: "test".into(),
+            announce_interval_secs: 600,
+            announce_at_start: false,
+            default_policy: default,
+            vip_policy: vip,
+            vip_subscribers: vips,
+            peering_cost: None,
+            storage_limit_bytes: 0,
+            transfer_limit_bytes: None,
+            sync_limit_bytes: None,
+            static_peers: Vec::new(),
+            from_static_only: false,
+            trusted_backup_peers: Vec::new(),
+            primary_node: None,
+            secondary_nodes: Vec::new(),
+            owner_offline_secs: 90.0,
+            lxmf_propagation_enabled: false,
+            lxmf_propagation_autopeer: false,
+            lxmf_propagation_peers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn default_tier_advertises_nonzero_stamp_cost_and_flexibility() {
+        let p = TierPolicy::default();
+        let cost = p.stamp_cost.expect("default tier MUST set stamp_cost");
+        assert!(cost > 0, "default stamp_cost must be > 0 (Some(0)==disabled foot-gun)");
+        let flex = p.stamp_flexibility.expect("default tier MUST set stamp_flexibility");
+        assert!(flex > 0, "default stamp_flexibility must be > 0 to tolerate stale clients");
+        assert!(flex < cost, "flexibility must not exceed cost");
+    }
+
+    #[test]
+    fn vip_tier_relaxes_default_tier() {
+        let d = TierPolicy::default();
+        let v = TierPolicy::vip_default();
+        let dc = d.stamp_cost.unwrap();
+        let vc = v.stamp_cost.unwrap();
+        assert!(vc <= dc, "VIP stamp_cost must not exceed default ({vc} > {dc})");
+        assert!(
+            v.deferred_queue_limit >= d.deferred_queue_limit,
+            "VIP deferred_queue_limit must not be smaller than default",
+        );
+    }
+
+    #[test]
+    fn deferred_pull_batch_limit_defaults_to_none() {
+        // None means the server uses DEFAULT_PULL_PAGE_SIZE.  If a future
+        // change sets a default here, update the destinations.rs constant
+        // documentation in lockstep.
+        assert!(TierPolicy::default().deferred_pull_batch_limit.is_none());
+        assert!(TierPolicy::vip_default().deferred_pull_batch_limit.is_none());
+    }
+
+    #[test]
+    fn policy_for_returns_vip_for_listed_hashes() {
+        let vip_hash = vec![0xAAu8; 16];
+        let other_hash = vec![0xBBu8; 16];
+        let cfg = empty_config(
+            TierPolicy::default(),
+            TierPolicy::vip_default(),
+            vec![vip_hash.clone()],
+        );
+        let vip_cost = cfg.policy_for(&vip_hash).stamp_cost.unwrap();
+        let other_cost = cfg.policy_for(&other_hash).stamp_cost.unwrap();
+        assert_eq!(vip_cost, TierPolicy::vip_default().stamp_cost.unwrap());
+        assert_eq!(other_cost, TierPolicy::default().stamp_cost.unwrap());
+        assert_ne!(vip_cost, other_cost, "VIP and default tiers must differ in this fixture");
+    }
+
+    #[test]
+    fn policy_for_pull_batch_limit_override_is_honored() {
+        // Simulate an operator setting a per-VIP page size override.
+        let mut vip = TierPolicy::vip_default();
+        vip.deferred_pull_batch_limit = Some(50);
+        let vip_hash = vec![0x77u8; 16];
+        let cfg = empty_config(TierPolicy::default(), vip, vec![vip_hash.clone()]);
+
+        assert_eq!(
+            cfg.policy_for(&vip_hash).deferred_pull_batch_limit,
+            Some(50),
+            "VIP override must be exposed via policy_for so destinations.rs picks it up",
+        );
+        assert_eq!(
+            cfg.policy_for(&[0u8; 16]).deferred_pull_batch_limit,
+            None,
+            "non-VIP tier must continue returning None (uses DEFAULT_PULL_PAGE_SIZE)",
+        );
+    }
+}
