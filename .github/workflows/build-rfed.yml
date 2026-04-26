@@ -6,7 +6,13 @@ on:
     branches: [main, master]
     paths:
       - 'rfed/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/build-rfed.yml'
+  # NOTE: rfed depends on sibling repos (Rusticulum, LXMF-rust) via path deps
+  # cloned at build time. Pushes to those repos do NOT trigger this workflow.
+  # To force a rebuild after a sibling-repo fix, run workflow_dispatch from
+  # the Actions tab, or push an empty commit to a path listed above.
 
 permissions:
   contents: read
