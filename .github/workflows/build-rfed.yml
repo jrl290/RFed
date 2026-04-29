@@ -30,7 +30,12 @@ jobs:
 
       - name: Clone sibling dependencies (outside workspace)
         run: |
-          git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
+          # LXMF-rust depends on transport_publish_destination /
+          # transport_unpublish_destination, which currently live on the
+          # feature/rnode-callback-ffi branch of Reticulum-rust.  Pin to that
+          # branch until those symbols land on main.
+          git clone --depth 1 --branch feature/rnode-callback-ffi \
+            https://github.com/jrl290/Rusticulum.git \
             "${{ github.workspace }}/../Reticulum-rust"
           git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
             "${{ github.workspace }}/../LXMF-rust"

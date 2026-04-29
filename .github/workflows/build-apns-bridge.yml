@@ -29,7 +29,11 @@ jobs:
       # actions/checkout refuses paths outside the workspace, so we use git clone.
       - name: Clone sibling dependencies (outside workspace)
         run: |
-          git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
+          # Pin Reticulum-rust to feature/rnode-callback-ffi until the
+          # transport_publish_destination / transport_unpublish_destination
+          # symbols (consumed by LXMF-rust) land on main.
+          git clone --depth 1 --branch feature/rnode-callback-ffi \
+            https://github.com/jrl290/Rusticulum.git \
             "${{ github.workspace }}/../Reticulum-rust"
           git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
             "${{ github.workspace }}/../LXMF-rust"
