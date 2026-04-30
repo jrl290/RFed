@@ -39,7 +39,7 @@
 //! outbound links to send OFFER requests.  The remote responds with which
 //! transient_ids it wants, and we transfer those messages via resource.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -329,6 +329,14 @@ pub struct LxmfPropagationNode {
     // ── Peer tracking ─────────────────────────────────────────────────
     pub peers: HashMap<Vec<u8>, PropPeer>,
 
+    /// Dedup guard: peer hashes for which a peering-key PoW thread is
+    /// currently in flight.  Without this, tick_sync (every ~6 s) re-spawns
+    /// cost-N stamp generation for every peer whose key isn't cached yet,
+    /// saturating CPU with redundant PoW work.  Insert before spawning,
+    /// remove when the thread completes (success or failure).
+    /// // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md (no duplicate work)
+    pub in_flight_keys: HashSet<Vec<u8>>,
+
     // ── State files ───────────────────────────────────────────────────
     pub storage_path: PathBuf,
 
@@ -393,6 +401,7 @@ impl LxmfPropagationNode {
             messagestore_path,
             entries: HashMap::new(),
             peers: HashMap::new(),
+            in_flight_keys: HashSet::new(),
             storage_path,
             messages_received: 0,
             messages_served: 0,
@@ -1360,10 +1369,17 @@ impl LxmfPropagationNode {
     fn spawn_peering_key_gen(arc: &Arc<Mutex<Self>>, peer_hash: &[u8], router_identity: &Identity) {
         // Collect all inputs we need under the lock
         let (peering_cost, identity_hash, router_hash, dest_hash) = {
-            let guard = match arc.lock() {
+            let mut guard = match arc.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
+            // Dedup: skip if a generation thread is already running for this peer.
+            // tick_sync runs every ~6 s; cost-N PoW takes seconds. Without this
+            // guard, concurrent generations stack up and pin the CPU.
+            // // NEVER REMOVE EVER
+            if guard.in_flight_keys.contains(peer_hash) {
+                return;
+            }
             let peer = match guard.peers.get(peer_hash) {
                 Some(p) => p,
                 None => return,
@@ -1393,7 +1409,10 @@ impl LxmfPropagationNode {
                 Some(h) => h.clone(),
                 None => return,
             };
-            (peering_cost, identity_hash, router_hash, peer.destination_hash.clone())
+            let dest_hash = peer.destination_hash.clone();
+            // Mark in-flight before releasing the lock so concurrent callers bail.
+            guard.in_flight_keys.insert(dest_hash.clone());
+            (peering_cost, identity_hash, router_hash, dest_hash)
         };
         // Lock is dropped here — generate stamp without holding it
 
@@ -1412,10 +1431,12 @@ impl LxmfPropagationNode {
                 peering_cost,
                 lx_stamper::WORKBLOCK_EXPAND_ROUNDS_PEERING,
             );
-            if value >= peering_cost {
-                if let Some(key) = key {
-                    if let Some(arc) = weak.upgrade() {
-                        if let Ok(mut guard) = arc.lock() {
+            if let Some(arc) = weak.upgrade() {
+                if let Ok(mut guard) = arc.lock() {
+                    // Always clear the in-flight marker, success or failure.
+                    guard.in_flight_keys.remove(&dest_hash);
+                    if value >= peering_cost {
+                        if let Some(key) = key {
                             if let Some(peer) = guard.peers.get_mut(&dest_hash) {
                                 peer.peering_key = Some((key, value));
                                 log(
