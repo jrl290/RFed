@@ -643,23 +643,31 @@ fn main() -> Result<(), String> {
         None
     };
 
-    // ── Initial announce ─────────────────────────────────────────────
-    let announce_interval = Duration::from_secs(
-        node.lock().map_err(|_| "lock")?.config.announce_interval_secs
-    );
-
-    if announce_at_start {
-        thread::sleep(Duration::from_secs(3));
-        if let Ok(guard) = node.lock() {
-            guard.announce();
-        }
-        eprintln!("[rfed] Initial announce queued");
-    } else {
-        // Even without announce, wait a moment for interfaces to connect.
-        thread::sleep(Duration::from_secs(3));
+    // ── Publish destinations + initial announce ───────────────────────
+    //
+    // `Transport::publish_destination` opts each destination into the
+    // announce daemon: it auto-re-announces once on every interface
+    // false→true online transition AND on every `refresh_interval` tick.
+    // No sleeps, no startup-burst, no periodic main-loop announce ticks
+    // (see DESIGN_PRINCIPLES.md §3-§4).
+    if let Ok(guard) = node.lock() {
+        guard.publish_destinations();
+    }
+    if let Some(ref prop) = lxmf_prop_arc {
+        lxmf_propagation::LxmfPropagationNode::publish_destination(prop);
     }
 
-    // ── Delayed network status (interfaces have had time to connect) ────
+    if announce_at_start {
+        if let Ok(mut guard) = node.lock() {
+            guard.announce();
+        }
+        if let Some(ref prop) = lxmf_prop_arc {
+            lxmf_propagation::LxmfPropagationNode::announce(prop);
+        }
+        eprintln!("[rfed] Initial announce sent");
+    }
+
+    // ── Network status ─────────────────────────────────────────────────
     {
         let snap = get_state_snapshot();
         eprintln!("[rfed] ── Network status ──");
@@ -674,19 +682,6 @@ fn main() -> Result<(), String> {
         eprintln!("[rfed]   Known paths: {}", snap.path_table.len());
     }
 
-    let mut last_announce     = Instant::now();
-    let mut last_startup_reannounce = Instant::now();
-    let mut startup_reannounce_count: u8 = 0;
-    let startup_reannounce_max: u8 = 4;
-    let startup_reannounce_interval = Duration::from_secs(15);
-    // Lightweight service-path refresh: re-announce channel/delivery/notify every
-    // 15 minutes so paths survive within the Reticulum path TTL (1 hour).  This
-    // is independent of the full rfed.node announce interval which defaults to 6h.
-    let service_announce_interval = std::cmp::min(
-        announce_interval,
-        Duration::from_secs(15 * 60),
-    );
-    let mut last_service_announce = Instant::now();
     let mut last_evict        = Instant::now();
     let mut last_backup_tick  = Instant::now();
     let mut last_heartbeat    = Instant::now();
@@ -723,43 +718,9 @@ fn main() -> Result<(), String> {
             return Ok(());
         }
 
-        // Periodic re-announce
-        if last_announce.elapsed() >= announce_interval {
-            if let Ok(guard) = node.lock() {
-                guard.announce();
-            }
-            if let Some(ref prop) = lxmf_prop_arc {
-                lxmf_propagation::LxmfPropagationNode::announce(prop);
-            }
-            last_announce = Instant::now();
-            // Full announce already covers service dests; reset service timer.
-            last_service_announce = Instant::now();
-        }
-
-        // Lightweight service-path refresh (channel/delivery/notify only).
-        // Runs every 15 min to keep paths alive within the Reticulum 1-hour TTL,
-        // independently of the longer rfed.node announce interval.
-        if last_service_announce.elapsed() >= service_announce_interval {
-            if let Ok(guard) = node.lock() {
-                guard.announce_services();
-            }
-            last_service_announce = Instant::now();
-        }
-
-        // Startup burst: re-announce a few times early to improve path discovery.
-        if startup_reannounce_count < startup_reannounce_max
-            && last_startup_reannounce.elapsed() >= startup_reannounce_interval
-        {
-            if let Ok(guard) = node.lock() {
-                guard.announce();
-            }
-            if let Some(ref prop) = lxmf_prop_arc {
-                lxmf_propagation::LxmfPropagationNode::announce(prop);
-            }
-            startup_reannounce_count = startup_reannounce_count.saturating_add(1);
-            last_startup_reannounce = Instant::now();
-            last_service_announce = Instant::now();
-        }
+        // Periodic re-announces are handled by Transport::publish_destination
+        // (registered at startup): up-edge on interface online + refresh
+        // interval per destination. No bespoke timers here.
 
         // Drive pending peer sync sessions
         if let Ok(mut guard) = node.lock() {

@@ -49,7 +49,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lxmf_rust::lx_stamper;
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::{Link, LinkHandle, MODE_AES256_CBC, RequestReceipt, register_runtime_link_handle};
+use reticulum_rust::link::{Link, LinkHandle, MODE_AES256_CBC, RequestReceipt};
 use reticulum_rust::packet::Packet;
 use reticulum_rust::transport::{AnnounceHandler, AnnounceCallback, Transport};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING, LOG_ERROR};
@@ -86,8 +86,6 @@ pub const PEER_SYNC_INTERVAL_SECS: f64 = 6.0;
 pub const SYNC_BACKOFF_STEP_SECS: f64 = 12.0 * 60.0;
 /// Max time a peer is unreachable before removal (14 days).
 pub const MAX_UNREACHABLE_SECS: f64 = 14.0 * 24.0 * 3600.0;
-/// Delay before announce on startup.
-pub const NODE_ANNOUNCE_DELAY_SECS: u64 = 20;
 /// Peer OFFER request path.
 pub const OFFER_PATH: &str = "/offer";
 /// Client/peer GET request path.
@@ -528,18 +526,30 @@ impl LxmfPropagationNode {
     }
 
     pub fn announce(arc: &Arc<Mutex<Self>>) {
-        let weak = Arc::downgrade(arc);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs(NODE_ANNOUNCE_DELAY_SECS));
-            if let Some(arc) = weak.upgrade() {
-                if let Ok(mut guard) = arc.lock() {
-                    let app_data = guard.build_app_data();
-                    guard.destination.set_default_app_data(Some(app_data.clone()));
-                    let _ = guard.destination.announce(Some(&app_data), false, None, None, true);
-                    log("[lxmf.prop] announced propagation node", LOG_NOTICE, false, false);
-                }
-            }
-        });
+        if let Ok(mut guard) = arc.lock() {
+            let app_data = guard.build_app_data();
+            guard.destination.set_default_app_data(Some(app_data.clone()));
+            let _ = guard.destination.announce(Some(&app_data), false, None, None, true);
+            log("[lxmf.prop] announced propagation node", LOG_NOTICE, false, false);
+        }
+    }
+
+    /// Opt the propagation destination into Transport's announce daemon
+    /// so it is automatically re-announced on every interface up-edge
+    /// and every `SERVICE_REFRESH_INTERVAL_SECS` (15min) thereafter.
+    /// See DESIGN_PRINCIPLES.md §3-§4.
+    pub fn publish_destination(arc: &Arc<Mutex<Self>>) {
+        use reticulum_rust::transport::Transport;
+        if let Ok(guard) = arc.lock() {
+            let app_data = guard.build_app_data();
+            Transport::publish_destination(
+                guard.destination.hash.clone(),
+                Some(Duration::from_secs(
+                    crate::destinations::SERVICE_REFRESH_INTERVAL_SECS,
+                )),
+                Some(app_data),
+            );
+        }
     }
 
     // ── Announce handler (discover peers) ─────────────────────────────────────
@@ -677,8 +687,17 @@ impl LxmfPropagationNode {
                 peer.propagation_transfer_limit = Some(transfer_limit);
                 peer.propagation_sync_limit = sync_limit.or(Some(transfer_limit));
                 peer.metadata = Some(metadata);
-                peer.sync_backoff = 0.0;
-                peer.next_sync_attempt = 0.0;
+                // NOTE: deliberately do NOT reset `sync_backoff` /
+                // `next_sync_attempt` here.  Mesh peers re-announce every
+                // ~30-60 s, so wiping the backoff on every announce defeats
+                // it entirely — observed in production: a peer that fails
+                // 39 LRs in a row keeps getting hammered with one LR per
+                // announce because each `updated peer` zeroed the backoff.
+                // Backoff is owned exclusively by the link-result path:
+                //   * cleared to 0 in the link_established callback
+                //     (real evidence the path works), or
+                //   * incremented in the link_closed callback (real
+                //     evidence the path failed).
                 log(
                     format!("[lxmf.prop] updated peer {}", hexrep(&destination_hash, false)),
                     LOG_NOTICE, false, false,
@@ -1573,8 +1592,10 @@ impl LxmfPropagationNode {
             log(format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
             return;
         }
-        // Register AFTER initiate() so link_id is populated in the handle.
-        register_runtime_link_handle(handle.clone());
+        // The link actor registers the runtime handle itself inside
+        // LinkMsg::Initiate once the real link_id is derived (see
+        // Reticulum-rust/src/link.rs).  An external register here would
+        // produce a redundant "(replaced existing entry)" log per LR.
 
         peer.link = Some(handle);
         peer.state = PropPeer::LINK_ESTABLISHING;
@@ -1616,10 +1637,19 @@ impl LxmfPropagationNode {
         // Set up response callback
         let weak = self.self_handle.clone();
         let peer_hash_clone = peer_hash.to_vec();
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        let offer_sent_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
         let response_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>> = Some(Arc::new({
             let weak = weak.clone();
             let ph = peer_hash_clone.clone();
             move |receipt: RequestReceipt| {
+                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+                reticulum_rust::send_assertion::assert_send_completed_in_time(
+                    "lxmf.propagation.offer", offer_sent_at,
+                );
                 if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
                     if let Ok(mut node) = arc.lock() {
                         node.handle_offer_response(&ph, receipt);

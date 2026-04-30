@@ -42,12 +42,11 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, Weak};
-use std::thread;
 use std::time::Duration;
 
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::{self, Identity};
-use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC, register_runtime_link_handle};
+use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC};
 use reticulum_rust::lxstamper::LXStamper;
 use reticulum_rust::transport::{AnnounceHandler, Transport};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
@@ -134,8 +133,11 @@ pub const CAPABILITIES_PATH: &str = "/rfed/capabilities";
 /// RNS app namespace for all rfed destinations.
 pub const APP_NAME: &str = "rfed";
 
-/// Delay before the first announce fires (seconds).  Matches lxmd convention.
-const NODE_ANNOUNCE_DELAY: u64 = 2;
+/// Service-path refresh interval (seconds).  Channel/delivery/notify/
+/// lxmf.propagation are kept fresh on every directly-connected interface
+/// well within the Reticulum 1-hour path TTL so clients never have to learn
+/// them via stale federation-flooded copies.
+pub const SERVICE_REFRESH_INTERVAL_SECS: u64 = 15 * 60;
 
 /// Number of workblock expansion rounds for rfed stamp PoW.
 /// The actual anti-spam difficulty is controlled by `stamp_cost` (required leading
@@ -295,66 +297,55 @@ impl FedNode {
         })
     }
 
-    /// Broadcast the rfed.node announce with current app_data.
+    /// Broadcast the rfed.node announce + the three service announces
+    /// (channel, delivery, notify) immediately and synchronously.
     ///
-    /// The announce is delayed by `NODE_ANNOUNCE_DELAY` seconds on a background
-    /// thread to let interfaces settle.  Also announces the three service
-    /// destinations (channel, delivery, notify) so clients can discover them.
-    pub fn announce(&self) {
-        let _app_data = announce::encode_node_announce(
+    /// No sleeps, no spawned threads, no fixed delay before the first send
+    /// (see DESIGN_PRINCIPLES.md §3).  Periodic refresh and on-interface-up
+    /// re-announce are handled by `publish_destinations()` registering with
+    /// `Transport`'s announce daemon.
+    pub fn announce(&mut self) {
+        let app_data = announce::encode_node_announce(
             &self.config.display_name,
             self.config.default_policy.stamp_cost,
         );
-        let weak = self.self_handle.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(NODE_ANNOUNCE_DELAY));
-            // The actual announce is done from enable() where we hold the Arc.
-            // This stub fires the delay then re-locks via the weak handle.
-            if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                if let Ok(mut node) = arc.lock() {
-                    let ad = announce::encode_node_announce(
-                        &node.config.display_name,
-                        node.config.default_policy.stamp_cost,
-                    );
-                    node.node_dest.set_default_app_data(Some(ad.clone()));
-                    let _ = node.node_dest.announce(Some(&ad), false, None, None, true);
-                    log(
-                        format!("[rfed] announced node {}", hexrep(
-                            &node.node_dest.hash
-                        , false)),
-                        LOG_NOTICE,
-                        false,
-                        false,
-                    );
-                    // Announce service destinations so clients can discover
-                    // them via path requests without knowing the hash in advance.
-                    let _ = node.channel_dest.announce(None, false, None, None, true);
-                    let _ = node.delivery_dest.announce(None, false, None, None, true);
-                    let _ = node.notify_dest.announce(None, false, None, None, true);
-                }
-            }
-        });
+        self.node_dest.set_default_app_data(Some(app_data.clone()));
+        let _ = self.node_dest.announce(Some(&app_data), false, None, None, true);
+        log(
+            format!("[rfed] announced node {}", hexrep(&self.node_dest.hash, false)),
+            LOG_NOTICE, false, false,
+        );
+        // Service destinations: clients can discover them via path requests
+        // without knowing the hash in advance.
+        let _ = self.channel_dest.announce(None, false, None, None, true);
+        let _ = self.delivery_dest.announce(None, false, None, None, true);
+        let _ = self.notify_dest.announce(None, false, None, None, true);
     }
 
-    /// Announce only the three lightweight service destinations (channel,
-    /// delivery, notify) without the heavyweight rfed.node payload.
+    /// Opt all four locally-registered destinations into Transport's
+    /// announce daemon so they are automatically re-announced:
+    ///   * once on every false→true online transition of any interface, and
+    ///   * every `refresh_interval` thereafter.
     ///
-    /// Call on a short interval (e.g. every 15 minutes) to keep paths alive
-    /// within the Reticulum path TTL (~1 hour).  Unlike `announce()`, this
-    /// does NOT re-broadcast the node identity or subscription manifest.
-    pub fn announce_services(&self) {
-        let weak = self.self_handle.clone();
-        thread::spawn(move || {
-            if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                if let Ok(mut node) = arc.lock() {
-                    let _ = node.channel_dest.announce(None, false, None, None, true);
-                    let _ = node.delivery_dest.announce(None, false, None, None, true);
-                    let _ = node.notify_dest.announce(None, false, None, None, true);
-                    log("[rfed] service paths refreshed (channel/delivery/notify)",
-                        LOG_NOTICE, false, false);
-                }
-            }
-        });
+    /// rfed.node refreshes at the configured `announce_interval_secs`
+    /// (default 6h); the three service destinations refresh every
+    /// `SERVICE_REFRESH_INTERVAL_SECS` (15min) so they always stay fresh
+    /// inside the Reticulum 1-hour path TTL.
+    pub fn publish_destinations(&self) {
+        use reticulum_rust::transport::Transport;
+        let app_data = announce::encode_node_announce(
+            &self.config.display_name,
+            self.config.default_policy.stamp_cost,
+        );
+        Transport::publish_destination(
+            self.node_dest.hash.clone(),
+            Some(Duration::from_secs(self.config.announce_interval_secs)),
+            Some(app_data),
+        );
+        let svc = Some(Duration::from_secs(SERVICE_REFRESH_INTERVAL_SECS));
+        Transport::publish_destination(self.channel_dest.hash.clone(), svc, None);
+        Transport::publish_destination(self.delivery_dest.hash.clone(), svc, None);
+        Transport::publish_destination(self.notify_dest.hash.clone(), svc, None);
     }
 
     /// Explicitly persist all in-memory state to disk.
@@ -478,8 +469,8 @@ impl FedNode {
                     hexrep(&peer_hash, false)), LOG_WARNING, false, false);
                 continue;
             }
-            // Register AFTER initiate() so link_id is populated in the handle.
-            register_runtime_link_handle(handle.clone());
+            // Link actor registers itself in LinkMsg::Initiate.  An external
+            // register here would emit "(replaced existing entry)" per LR.
 
             log(format!("[sync] link opening to {}", hexrep(&peer_hash, false)),
                 LOG_DEBUG, false, false);
@@ -965,8 +956,9 @@ fn push_subscriptions_to_backup(
         );
     })));
     let _ = handle.initiate();
-    // Register AFTER initiate() so link_id is populated in the handle.
-    register_runtime_link_handle(handle);
+    // Link actor registers itself in LinkMsg::Initiate; no external
+    // register call needed.
+    let _ = handle;
 }
 
 /// Scan backup subscriptions held by this node.  For each owner node whose
