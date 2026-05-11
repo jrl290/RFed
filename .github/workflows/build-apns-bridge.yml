@@ -30,21 +30,13 @@ jobs:
       #   $GITHUB_WORKSPACE/../LXMF-rust      = /home/runner/work/RFed/LXMF-rust
       #   $GITHUB_WORKSPACE/../app-links      = /home/runner/work/RFed/app-links
       # actions/checkout refuses paths outside the workspace, so we use git clone.
-      # app-links currently requires an explicit repo-read token in CI.
       - name: Clone sibling dependencies (outside workspace)
-        env:
-          APP_LINKS_REPO_TOKEN: ${{ secrets.APP_LINKS_REPO_TOKEN }}
         run: |
           git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
             "${{ github.workspace }}/../Reticulum-rust"
           git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
             "${{ github.workspace }}/../LXMF-rust"
-          if [ -z "$APP_LINKS_REPO_TOKEN" ]; then
-            echo "APP_LINKS_REPO_TOKEN secret is required to clone jrl290/app-links in CI" >&2
-            exit 1
-          fi
-          git clone --depth 1 \
-            "https://x-access-token:${APP_LINKS_REPO_TOKEN}@github.com/jrl290/app-links.git" \
+          git clone --depth 1 https://github.com/jrl290/app-links.git \
             "${{ github.workspace }}/../app-links"
 
       - name: Install system dependencies

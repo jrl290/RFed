@@ -32,19 +32,12 @@ jobs:
       # rfed -> ../../Reticulum-rust and ../../LXMF-rust, while LXMF-rust also
       # requires ../app-links after the app_links crate split.
       - name: Clone sibling dependencies (outside workspace)
-        env:
-          APP_LINKS_REPO_TOKEN: ${{ secrets.APP_LINKS_REPO_TOKEN }}
         run: |
           git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
             "${{ github.workspace }}/../Reticulum-rust"
           git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
             "${{ github.workspace }}/../LXMF-rust"
-          if [ -z "$APP_LINKS_REPO_TOKEN" ]; then
-            echo "APP_LINKS_REPO_TOKEN secret is required to clone jrl290/app-links in CI" >&2
-            exit 1
-          fi
-          git clone --depth 1 \
-            "https://x-access-token:${APP_LINKS_REPO_TOKEN}@github.com/jrl290/app-links.git" \
+          git clone --depth 1 https://github.com/jrl290/app-links.git \
             "${{ github.workspace }}/../app-links"
           # lxmf_rust depends on reticulum_rust with default features, which pulls
           # in btleplug -> libdbus-sys.  Patch it to disable before building.
