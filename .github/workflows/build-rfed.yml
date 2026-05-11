@@ -28,12 +28,17 @@ jobs:
       - name: Checkout RFed-rust (this repo)
         uses: actions/checkout@v4
 
+      # The crate path deps resolve to sibling repos outside this workspace:
+      # rfed -> ../../Reticulum-rust and ../../LXMF-rust, while LXMF-rust also
+      # requires ../app-links after the app_links crate split.
       - name: Clone sibling dependencies (outside workspace)
         run: |
           git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
             "${{ github.workspace }}/../Reticulum-rust"
           git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
             "${{ github.workspace }}/../LXMF-rust"
+          git clone --depth 1 https://github.com/jrl290/app-links.git \
+            "${{ github.workspace }}/../app-links"
           # lxmf_rust depends on reticulum_rust with default features, which pulls
           # in btleplug -> libdbus-sys.  Patch it to disable before building.
           sed -i 's|reticulum_rust = { path = "../Reticulum-rust" }|reticulum_rust = { path = "../Reticulum-rust", default-features = false }|' \

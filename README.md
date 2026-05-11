@@ -39,7 +39,7 @@ RFed extends beyond LXMF with **named channels**, **explicit subscriptions**, **
 ### Prerequisites
 
 - Rust 1.70+ toolchain
-- [reticulum_rust](https://github.com/your-org/reticulum-rust) and [lxmf_rust](https://github.com/your-org/lxmf-rust) cloned alongside this repo (see [Dependencies](#dependencies))
+- [reticulum_rust](https://github.com/your-org/reticulum-rust), [lxmf_rust](https://github.com/your-org/lxmf-rust), and [app_links](https://github.com/jrl290/app-links) cloned alongside this repo (see [Dependencies](#dependencies))
 
 ### Build
 
@@ -263,12 +263,13 @@ The rfed node is a **courier, not a reader**. It repackages and propagates chann
 
 ## Dependencies
 
-RFed depends on two local Rust crates that must be cloned as siblings:
+RFed depends on two direct local crates, and `lxmf_rust` now has a sibling path dependency on `app_links`, so all three repos must be cloned side-by-side:
 
 ```
 parent/
 ├── Reticulum-rust/    ← reticulum_rust crate
 ├── LXMF-rust/         ← lxmf_rust crate
+├── app-links/         ← app_links crate
 └── RFed-rust/  ← this repo (RFed)
     ├── Cargo.toml
     ├── rfed/
@@ -282,6 +283,7 @@ parent/
 |-------|---------|
 | `reticulum_rust` | Rust Reticulum transport layer |
 | `lxmf_rust` | LXMF message handling & PN stamps |
+| `app_links` | Shared app-link types used transitively by `lxmf_rust` |
 
 All other dependencies are pulled from crates.io automatically by Cargo.
 
