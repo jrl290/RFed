@@ -4,6 +4,19 @@ name: Build apns_bridge (Linux)
 # that touches the apns-bridge source.
 on:
   workflow_dispatch:
+    inputs:
+      reticulum_ref:
+        description: Rusticulum ref to build against (branch, tag, or commit)
+        required: false
+        default: ''
+      lxmf_ref:
+        description: LXMF-rust ref to build against (branch, tag, or commit)
+        required: false
+        default: ''
+      app_links_ref:
+        description: app-links ref to build against (branch, tag, or commit)
+        required: false
+        default: ''
   push:
     branches: [main, master]
     paths:
@@ -23,6 +36,32 @@ jobs:
       - name: Checkout RFed-rust (this repo)
         uses: actions/checkout@v4
 
+      - name: Resolve sibling dependency refs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          source apns-bridge/dependency-refs.env
+
+          if [[ -n "${{ inputs.reticulum_ref }}" ]]; then
+            RETICULUM_REF="${{ inputs.reticulum_ref }}"
+          fi
+          if [[ -n "${{ inputs.lxmf_ref }}" ]]; then
+            LXMF_REF="${{ inputs.lxmf_ref }}"
+          fi
+          if [[ -n "${{ inputs.app_links_ref }}" ]]; then
+            APP_LINKS_REF="${{ inputs.app_links_ref }}"
+          fi
+
+          {
+            echo "RETICULUM_REPO=$RETICULUM_REPO"
+            echo "RETICULUM_REF=$RETICULUM_REF"
+            echo "LXMF_REPO=$LXMF_REPO"
+            echo "LXMF_REF=$LXMF_REF"
+            echo "APP_LINKS_REPO=$APP_LINKS_REPO"
+            echo "APP_LINKS_REF=$APP_LINKS_REF"
+          } >> "$GITHUB_ENV"
+
       # The crate path deps resolve to sibling repos outside this workspace:
       # apns-bridge -> ../../Reticulum-rust, and LXMF-rust -> ../app-links.
       # From apns-bridge/Cargo.toml that ultimately means:
@@ -31,13 +70,39 @@ jobs:
       #   $GITHUB_WORKSPACE/../app-links      = /home/runner/work/RFed/app-links
       # actions/checkout refuses paths outside the workspace, so we use git clone.
       - name: Clone sibling dependencies (outside workspace)
+        shell: bash
         run: |
-          git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
-            "${{ github.workspace }}/../Reticulum-rust"
-          git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
-            "${{ github.workspace }}/../LXMF-rust"
-          git clone --depth 1 https://github.com/jrl290/app-links.git \
-            "${{ github.workspace }}/../app-links"
+          set -euo pipefail
+
+          checkout_ref() {
+            local repo="$1"
+            local ref="$2"
+            local target="$3"
+
+            rm -rf "$target"
+            git init "$target"
+            git -C "$target" remote add origin "$repo"
+            git -C "$target" fetch --depth 1 origin "$ref"
+            git -C "$target" checkout --detach FETCH_HEAD
+          }
+
+          checkout_ref "$RETICULUM_REPO" "$RETICULUM_REF" "${{ github.workspace }}/../Reticulum-rust"
+          checkout_ref "$LXMF_REPO" "$LXMF_REF" "${{ github.workspace }}/../LXMF-rust"
+          checkout_ref "$APP_LINKS_REPO" "$APP_LINKS_REF" "${{ github.workspace }}/../app-links"
+
+          {
+            echo "RETICULUM_RESOLVED_SHA=$(git -C "${{ github.workspace }}/../Reticulum-rust" rev-parse HEAD)"
+            echo "LXMF_RESOLVED_SHA=$(git -C "${{ github.workspace }}/../LXMF-rust" rev-parse HEAD)"
+            echo "APP_LINKS_RESOLVED_SHA=$(git -C "${{ github.workspace }}/../app-links" rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
+
+      - name: Show sibling dependency revisions
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Rusticulum : $RETICULUM_REF -> $RETICULUM_RESOLVED_SHA"
+          echo "LXMF-rust  : $LXMF_REF -> $LXMF_RESOLVED_SHA"
+          echo "app-links  : $APP_LINKS_REF -> $APP_LINKS_RESOLVED_SHA"
 
       - name: Install system dependencies
         run: |
@@ -108,6 +173,14 @@ jobs:
           context: apns-bridge
           file: apns-bridge/Dockerfile
           push: true
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.reticulum.ref=${{ env.RETICULUM_REF }}
+            io.reticulum.sha=${{ env.RETICULUM_RESOLVED_SHA }}
+            io.lxmf.ref=${{ env.LXMF_REF }}
+            io.lxmf.sha=${{ env.LXMF_RESOLVED_SHA }}
+            io.app-links.ref=${{ env.APP_LINKS_REF }}
+            io.app-links.sha=${{ env.APP_LINKS_RESOLVED_SHA }}
           tags: |
             ghcr.io/${{ github.repository_owner }}/apns_bridge:latest
             ghcr.io/${{ github.repository_owner }}/apns_bridge:${{ github.sha }}
