@@ -9,19 +9,31 @@ use std::sync::Mutex;
 use serde_json::{json, Value};
 
 use crate::config::ApnsConfig;
+use crate::db::ApnsEnv;
 use crate::jwt::ApnsJwt;
 
 const PROD_HOST:    &str = "https://api.push.apple.com";
 const SANDBOX_HOST: &str = "https://api.sandbox.push.apple.com";
 
+/// Per-environment APNs endpoint state.  The same `.p8` key works for both
+/// gateways but each provider connection still needs its own JWT signer
+/// (Apple keys the auth tokens to the gateway pool).
+struct EnvClient {
+    host:   &'static str,
+    jwt:    Mutex<ApnsJwt>,
+    client: reqwest::blocking::Client,
+}
+
 pub struct ApnsSender {
-    jwt:         Mutex<ApnsJwt>,
     bundle_id:   String,
-    host:        String,
     push_type:   String,
     alert_title: String,
     alert_body:  String,
-    client:      reqwest::blocking::Client,
+    prod:        EnvClient,
+    sandbox:     EnvClient,
+    /// Default environment used when a registration omits the `env` field
+    /// (kept for backward compatibility with v1 clients).
+    default_env: ApnsEnv,
 }
 
 pub struct SendResult {
@@ -32,46 +44,76 @@ pub struct SendResult {
 
 impl ApnsSender {
     pub fn new(cfg: &ApnsConfig, key_file: &Path) -> Result<Self, String> {
-        let jwt = ApnsJwt::from_file(key_file, &cfg.key_id, &cfg.team_id, cfg.token_ttl)?;
-        let host = if cfg.sandbox {
-            SANDBOX_HOST.to_string()
-        } else {
-            PROD_HOST.to_string()
+        let mk_client = || {
+            reqwest::blocking::ClientBuilder::new()
+                .use_rustls_tls()
+                .http2_prior_knowledge()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| format!("failed to build HTTP client: {e}"))
         };
-        let client = reqwest::blocking::ClientBuilder::new()
-            .use_rustls_tls()
-            .http2_prior_knowledge()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+        let prod = EnvClient {
+            host:   PROD_HOST,
+            jwt:    Mutex::new(ApnsJwt::from_file(
+                key_file, &cfg.key_id, &cfg.team_id, cfg.token_ttl,
+            )?),
+            client: mk_client()?,
+        };
+        let sandbox = EnvClient {
+            host:   SANDBOX_HOST,
+            jwt:    Mutex::new(ApnsJwt::from_file(
+                key_file, &cfg.key_id, &cfg.team_id, cfg.token_ttl,
+            )?),
+            client: mk_client()?,
+        };
+
+        let default_env = if cfg.sandbox { ApnsEnv::Sandbox } else { ApnsEnv::Production };
+
         Ok(ApnsSender {
-            jwt: Mutex::new(jwt),
-            bundle_id: cfg.bundle_id.clone(),
-            host,
-            push_type: cfg.push_type.clone(),
+            bundle_id:   cfg.bundle_id.clone(),
+            push_type:   cfg.push_type.clone(),
             alert_title: cfg.alert_title.clone(),
-            alert_body: cfg.alert_body.clone(),
-            client,
+            alert_body:  cfg.alert_body.clone(),
+            prod,
+            sandbox,
+            default_env,
         })
     }
 
-    /// Send a push notification.  Returns success flag, HTTP status code, and optional reason.
+    /// Default environment for tokens registered without an explicit `env`
+    /// field (used to back-fill v1-protocol registrations).
+    pub fn default_env(&self) -> ApnsEnv {
+        self.default_env
+    }
+
+    fn endpoint(&self, env: ApnsEnv) -> &EnvClient {
+        match env {
+            ApnsEnv::Production => &self.prod,
+            ApnsEnv::Sandbox    => &self.sandbox,
+        }
+    }
+
+    /// Send a push notification through the gateway matching `env`.
+    /// Returns success flag, HTTP status code, and optional reason.
     pub fn send(
         &self,
         apns_token:   &str,
+        env:          ApnsEnv,
         receiver_hex: &str,
         sender_hex:   Option<&str>,
         channel_hex:  Option<&str>,
     ) -> SendResult {
-        let url = format!("{}/3/device/{}", self.host, apns_token);
+        let ep  = self.endpoint(env);
+        let url = format!("{}/3/device/{}", ep.host, apns_token);
         let body = self.build_payload(receiver_hex, sender_hex, channel_hex);
 
         let token = {
-            let mut jwt = self.jwt.lock().unwrap_or_else(|e| e.into_inner());
+            let mut jwt = ep.jwt.lock().unwrap_or_else(|e| e.into_inner());
             jwt.get().to_string()
         };
 
-        let resp = self
+        let resp = ep
             .client
             .post(&url)
             .header("Authorization", format!("bearer {token}"))

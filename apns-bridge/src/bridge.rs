@@ -18,7 +18,7 @@ use reticulum_rust::transport::Transport;
 
 use crate::apns::ApnsSender;
 use crate::config::BridgeConfig;
-use crate::db::TokenDB;
+use crate::db::{ApnsEnv, TokenDB};
 
 const NOTIFY_APP:    &str = "rfed";
 const NOTIFY_ASPECT: &str = "notify";
@@ -226,7 +226,7 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
           sender_hex.as_deref().unwrap_or("-"),
           channel_hex.as_deref().unwrap_or("-"));
 
-    let apns_token = match state.db.lock().unwrap().get_token(&receiver_hex) {
+    let (apns_token, env) = match state.db.lock().unwrap().get_token(&receiver_hex) {
         Ok(Some(t)) => t,
         Ok(None) => {
             info!("NOTIFY #{n} skipped   receiver={receiver_hex} (no APNs token registered)");
@@ -240,6 +240,7 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
 
     let result = state.apns.send(
         &apns_token,
+        env,
         &receiver_hex,
         sender_hex.as_deref(),
         channel_hex.as_deref(),
@@ -247,16 +248,17 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
 
     if result.success {
         let pushed = state.push_count.fetch_add(1, Ordering::Relaxed) + 1;
-        info!("NOTIFY #{n} pushed    receiver={receiver_hex} → APNs OK  (total pushed: {pushed})");
+        info!("NOTIFY #{n} pushed    receiver={receiver_hex} env={} → APNs OK  (total pushed: {pushed})",
+              env.as_db_str());
     } else if ApnsSender::should_invalidate(result.http_code, result.reason.as_deref()) {
         let failed = state.push_fail.fetch_add(1, Ordering::Relaxed) + 1;
-        state.db.lock().unwrap().invalidate_token(&apns_token).ok();
-        warn!("NOTIFY #{n} purged    receiver={receiver_hex} — stale token (reason={:?}), total failed: {failed}",
-              result.reason);
+        state.db.lock().unwrap().invalidate_token(&apns_token, env).ok();
+        warn!("NOTIFY #{n} purged    receiver={receiver_hex} env={} — stale token (reason={:?}), total failed: {failed}",
+              env.as_db_str(), result.reason);
     } else {
         let failed = state.push_fail.fetch_add(1, Ordering::Relaxed) + 1;
-        error!("NOTIFY #{n} FAILED    receiver={receiver_hex} — HTTP {} reason={:?}  (total failed: {failed})",
-               result.http_code, result.reason);
+        error!("NOTIFY #{n} FAILED    receiver={receiver_hex} env={} — HTTP {} reason={:?}  (total failed: {failed})",
+               env.as_db_str(), result.http_code, result.reason);
     }
 }
 
@@ -286,10 +288,19 @@ fn try_handle_register(data: &[u8], state: &BridgeState) -> Result<(), String> {
                 return Err("apns_token must be 64-char lowercase hex".to_string());
             }
             let token_lower = token.to_lowercase();
+
+            // Optional `env` field (v2 protocol).  Falls back to the
+            // bridge's configured default for v1 clients that don't send it.
+            let env = match map_get_str(&map, "env") {
+                Some(s) => ApnsEnv::parse(&s)
+                    .ok_or_else(|| format!("env must be 'sandbox' or 'production', got {s:?}"))?,
+                None => state.apns.default_env(),
+            };
+
             state.db.lock().unwrap()
-                .register(&sub_hex, &token_lower)
+                .register(&sub_hex, &token_lower, env)
                 .map_err(|e| format!("db register error: {e}"))?;
-            info!("Register: token stored for {sub_hex}");
+            info!("Register: token stored for {sub_hex} env={}", env.as_db_str());
         }
         None => {
             // Unregister
