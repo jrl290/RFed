@@ -7,14 +7,6 @@ edition = "2021"
 name = "rfed"
 path = "src/main.rs"
 
-[[bin]]
-name = "rfed_notify_test"
-path = "tests/notify_register.rs"
-
-[[bin]]
-name = "rfed_channel_e2e"
-path = "tests/channel_e2e.rs"
-
 [dependencies]
 reticulum_rust = { path = "../../Reticulum-rust", default-features = false }
 lxmf_rust      = { path = "../../LXMF-rust" }

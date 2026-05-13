@@ -151,26 +151,7 @@ fn try_send(
         }
     };
 
-    let mut entries = vec![
-        (
-            rmpv::Value::String("receiver".into()),
-            rmpv::Value::Binary(sub_hash.to_vec()),
-        ),
-    ];
-    if let Some(s) = sender {
-        entries.push((
-            rmpv::Value::String("sender".into()),
-            rmpv::Value::Binary(s.to_vec()),
-        ));
-    }
-    if let Some(c) = channel {
-        entries.push((
-            rmpv::Value::String("channel".into()),
-            rmpv::Value::Binary(c.to_vec()),
-        ));
-    }
-    let mut payload = Vec::new();
-    let _ = rmpv::encode::write_value(&mut payload, &rmpv::Value::Map(entries));
+    let payload = encode_wake_payload(sub_hash, sender, channel);
     let mut pkt = Packet::new(
         Some(dest),
         payload,
@@ -208,6 +189,85 @@ fn try_send(
             );
             false
         }
+    }
+}
+
+fn encode_wake_payload(
+    sub_hash: &[u8],
+    sender: Option<&[u8]>,
+    channel: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut entries = vec![
+        (
+            rmpv::Value::String("receiver".into()),
+            rmpv::Value::Binary(sub_hash.to_vec()),
+        ),
+    ];
+    if let Some(s) = sender {
+        entries.push((
+            rmpv::Value::String("sender".into()),
+            rmpv::Value::Binary(s.to_vec()),
+        ));
+    }
+    if let Some(c) = channel {
+        entries.push((
+            rmpv::Value::String("channel".into()),
+            rmpv::Value::Binary(c.to_vec()),
+        ));
+    }
+    let mut payload = Vec::new();
+    let _ = rmpv::encode::write_value(&mut payload, &rmpv::Value::Map(entries));
+    payload
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use rmpv::decode::read_value;
+    use rmpv::Value;
+
+    use super::encode_wake_payload;
+
+    fn map_entry<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+        map.iter()
+            .find(|(candidate, _)| candidate.as_str() == Some(key))
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn wake_payload_uses_binary_hash_fields() {
+        let receiver = [0x11u8; 16];
+        let sender = [0x22u8; 16];
+        let channel = [0x33u8; 16];
+
+        let payload = encode_wake_payload(&receiver, Some(&sender), Some(&channel));
+        let value = read_value(&mut Cursor::new(payload)).expect("decode wake payload");
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+
+        assert_eq!(map_entry(&map, "receiver"), Some(&Value::Binary(receiver.to_vec())));
+        assert_eq!(map_entry(&map, "sender"), Some(&Value::Binary(sender.to_vec())));
+        assert_eq!(map_entry(&map, "channel"), Some(&Value::Binary(channel.to_vec())));
+    }
+
+    #[test]
+    fn wake_payload_omits_optional_fields_when_absent() {
+        let receiver = [0x44u8; 16];
+
+        let payload = encode_wake_payload(&receiver, None, None);
+        let value = read_value(&mut Cursor::new(payload)).expect("decode wake payload");
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+
+        assert_eq!(map.len(), 1);
+        assert_eq!(map_entry(&map, "receiver"), Some(&Value::Binary(receiver.to_vec())));
+        assert_eq!(map_entry(&map, "sender"), None);
+        assert_eq!(map_entry(&map, "channel"), None);
     }
 }
 

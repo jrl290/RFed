@@ -5,9 +5,9 @@
 //! 3. Sender identity encrypts and sends a channel message.
 //! 4. Verifies the receiver decrypts the message correctly.
 //!
-//! Usage:
-//!   rfed_channel_e2e --rfed-port <port> [--channel-name <name>]
-//!                    [--message <text>] [--timeout <secs>]
+//! Run with:
+//!   cargo run --example rfed_channel_e2e -- --rfed-port <port>
+//!       [--channel-name <name>] [--message <text>] [--timeout <secs>]
 //!
 //! Exit 0 = PASS, exit 1 = FAIL.
 
@@ -233,7 +233,7 @@ fn main() {
     // ── Crypto self-test ────────────────────────────────────────────────────
     {
         let test_plain = b"channel-e2e-selftest";
-        let mut enc = make_channel_identity(&channel_name);
+        let enc = make_channel_identity(&channel_name);
         match enc.encrypt(test_plain) {
             Ok(ct) => {
                 let mut dec = make_channel_identity(&channel_name);

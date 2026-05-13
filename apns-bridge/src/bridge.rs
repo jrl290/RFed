@@ -330,3 +330,64 @@ fn map_get_str(map: &[(Value, Value)], key: &str) -> Option<String> {
 fn hex_dest(dest: &Destination) -> String {
     hex::encode(&dest.hash)
 }
+
+#[cfg(test)]
+mod tests {
+    use rmpv::encode::write_value;
+    use rmpv::Value;
+
+    use super::{map_get_bin, parse_msgpack_map};
+
+    fn encode_map(entries: Vec<(Value, Value)>) -> Vec<u8> {
+        let mut payload = Vec::new();
+        write_value(&mut payload, &Value::Map(entries)).expect("encode msgpack map");
+        payload
+    }
+
+    #[test]
+    fn wake_parser_accepts_binary_receiver_field() {
+        let receiver = vec![0x55u8; 16];
+        let payload = encode_map(vec![
+            (
+                Value::String("receiver".into()),
+                Value::Binary(receiver.clone()),
+            ),
+        ]);
+
+        let map = parse_msgpack_map(&payload).expect("parse wake map");
+        assert_eq!(map_get_bin(&map, "receiver"), Some(receiver));
+    }
+
+    #[test]
+    fn wake_parser_rejects_string_receiver_field() {
+        let payload = encode_map(vec![
+            (
+                Value::String("receiver".into()),
+                Value::String("00112233445566778899aabbccddeeff".into()),
+            ),
+        ]);
+
+        let map = parse_msgpack_map(&payload).expect("parse wake map");
+        assert_eq!(map_get_bin(&map, "receiver"), None);
+    }
+
+    #[test]
+    fn registration_parser_accepts_binary_subscriber_hash() {
+        let subscriber = vec![0x66u8; 16];
+        let payload = encode_map(vec![
+            (
+                Value::String("subscriber_hash".into()),
+                Value::Binary(subscriber.clone()),
+            ),
+            (
+                Value::String("apns_token".into()),
+                Value::String(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                ),
+            ),
+        ]);
+
+        let map = parse_msgpack_map(&payload).expect("parse registration map");
+        assert_eq!(map_get_bin(&map, "subscriber_hash"), Some(subscriber));
+    }
+}

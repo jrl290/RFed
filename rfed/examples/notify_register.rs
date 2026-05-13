@@ -5,11 +5,14 @@
 //! 3. Creates a Link, identifies with a throwaway identity.
 //! 4. Sends /rfed/notify/register with Retichat's hash as the relay dest.
 //! 5. Prints the boolean response from rfed.
+//!
+//! Run with:
+//!   cargo run --example notify_register --
 
 use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;

@@ -424,23 +424,13 @@ class ApnsBridge:
 
     def _dispatch_wake(self, raw: bytes) -> None:
         try:
-            data = msgpack.unpackb(raw, raw=False)
+            receiver_hex, sender_hex, channel_hex = _decode_wake_payload(raw)
+        except ValueError as exc:
+            log.warning("Wake: %s", exc)
+            return
         except Exception as exc:
             log.warning("Wake: bad msgpack: %s", exc)
             return
-
-        if not isinstance(data, dict):
-            log.warning("Wake: payload is not a map")
-            return
-
-        receiver_bytes = data.get("receiver")
-        if not isinstance(receiver_bytes, (bytes, bytearray)) or len(receiver_bytes) != 16:
-            log.warning("Wake: missing valid 'receiver' key")
-            return
-
-        receiver_hex = receiver_bytes.hex()
-        sender_hex   = _opt_hash_hex(data.get("sender"))
-        channel_hex  = _opt_hash_hex(data.get("channel"))
 
         self._notify_count += 1
         log.info("NOTIFY #%d received  receiver=%s sender=%s channel=%s",
@@ -481,22 +471,10 @@ class ApnsBridge:
           unregister: {"subscriber_hash": bin(16)}   (no "apns_token" key)
         """
         try:
-            payload = msgpack.unpackb(bytes(message), raw=False)
-            if not isinstance(payload, dict):
-                raise ValueError("payload must be a msgpack map")
-
-            sub_bytes = payload.get("subscriber_hash")
-            if not isinstance(sub_bytes, (bytes, bytearray)) or len(sub_bytes) != 16:
-                raise ValueError("subscriber_hash must be 16 bytes")
-
-            sub_hex    = sub_bytes.hex()
-            apns_token = payload.get("apns_token")
+            sub_hex, apns_token = _decode_registration_payload(message)
 
             if apns_token is not None:
                 # Register / refresh
-                if not isinstance(apns_token, str) or len(apns_token) != 64 \
-                        or not all(c in "0123456789abcdef" for c in apns_token):
-                    raise ValueError("apns_token must be 64-char lowercase hex")
                 self._db.register(sub_hex, apns_token)
                 log.info("Register: token stored for %s", sub_hex)
             else:
@@ -515,6 +493,40 @@ def _opt_hash_hex(val) -> Optional[str]:
     if isinstance(val, (bytes, bytearray)) and len(val) == 16:
         return val.hex()
     return None
+
+
+def _decode_wake_payload(raw: bytes) -> tuple[str, Optional[str], Optional[str]]:
+    data = msgpack.unpackb(raw, raw=False)
+    if not isinstance(data, dict):
+        raise ValueError("payload is not a map")
+
+    receiver_bytes = data.get("receiver")
+    if not isinstance(receiver_bytes, (bytes, bytearray)) or len(receiver_bytes) != 16:
+        raise ValueError("missing valid 'receiver' key")
+
+    return (
+        receiver_bytes.hex(),
+        _opt_hash_hex(data.get("sender")),
+        _opt_hash_hex(data.get("channel")),
+    )
+
+
+def _decode_registration_payload(raw: bytes) -> tuple[str, Optional[str]]:
+    payload = msgpack.unpackb(bytes(raw), raw=False)
+    if not isinstance(payload, dict):
+        raise ValueError("payload must be a msgpack map")
+
+    sub_bytes = payload.get("subscriber_hash")
+    if not isinstance(sub_bytes, (bytes, bytearray)) or len(sub_bytes) != 16:
+        raise ValueError("subscriber_hash must be 16 bytes")
+
+    apns_token = payload.get("apns_token")
+    if apns_token is not None:
+        if not isinstance(apns_token, str) or len(apns_token) != 64 \
+                or not all(c in "0123456789abcdef" for c in apns_token):
+            raise ValueError("apns_token must be 64-char lowercase hex")
+
+    return sub_bytes.hex(), apns_token
 
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
