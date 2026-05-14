@@ -72,6 +72,7 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
     {
         let state2 = Arc::clone(&state);
         notify_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+            debug!("[rfed.notify] inbound packet from transport, size={}", data.len());
             let raw = data.to_vec();
             let s = Arc::clone(&state2);
             thread::spawn(move || dispatch_wake(raw, &s));
@@ -82,8 +83,10 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
     {
         let state2 = Arc::clone(&state);
         notify_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
+            debug!("[rfed.notify] link established");
             let s = Arc::clone(&state2);
             link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+                debug!("[rfed.notify] inbound packet from link, size={}", data.len());
                 let raw = data.to_vec();
                 let s2 = Arc::clone(&s);
                 thread::spawn(move || dispatch_wake(raw, &s2));
@@ -202,10 +205,12 @@ fn load_or_create_identity(path_str: &str) -> Result<Identity, String> {
 // ── Wake packet dispatch ──────────────────────────────────────────────────────
 
 fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
+    debug!("[dispatch_wake] inbound packet received, size={} bytes", raw.len());
+    
     let map = match parse_msgpack_map(&raw) {
         Some(m) => m,
         None => {
-            warn!("Wake: cannot parse msgpack map");
+            warn!("[dispatch_wake] cannot parse msgpack map (raw_size={})", raw.len());
             return;
         }
     };
@@ -213,7 +218,7 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
     let receiver = match map_get_bin(&map, "receiver") {
         Some(b) if b.len() == 16 => b,
         _ => {
-            warn!("Wake: missing valid 'receiver' key");
+            warn!("[dispatch_wake] missing valid 'receiver' key");
             return;
         }
     };

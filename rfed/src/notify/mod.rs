@@ -45,6 +45,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE};
 use serde::{Deserialize, Serialize};
 
 pub mod rns;
@@ -244,5 +245,17 @@ pub fn dispatch_notify(
     sender: Option<&[u8]>,
     channel: Option<&[u8]>,
 ) {
+    log(
+        format!(
+            "[notify] dispatch START relay={} subscriber={} sender={} channel={}",
+            &reg.relay_hash,
+            hexrep(&reg.subscriber_hash, false),
+            sender.map(|s| hexrep(s, false)).unwrap_or_else(|| "(none)".to_string()),
+            channel.map(|c| hexrep(c, false)).unwrap_or_else(|| "(none)".to_string()),
+        ),
+        LOG_DEBUG,
+        false,
+        false,
+    );
     rns::dispatch(reg, sender, channel);
 }

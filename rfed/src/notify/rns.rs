@@ -50,11 +50,32 @@ pub fn dispatch(
     let sender_hash = sender.map(|s| s.to_vec());
     let channel_hash = channel.map(|c| c.to_vec());
 
+    log(
+        format!(
+            "[notify/rns] dispatch thread spawned for relay={} subscriber={}",
+            &dest_hex,
+            hexrep(&sub_hash, false),
+        ),
+        LOG_DEBUG,
+        false,
+        false,
+    );
+
     std::thread::spawn(move || {
         if try_send(&dest_hex, &sub_hash, sender_hash.as_deref(), channel_hash.as_deref()) {
             return;
         }
         // First attempt failed — wait for path convergence and retry once.
+        log(
+            format!(
+                "[notify/rns] first attempt failed for relay={}, scheduling retry in {}s",
+                &dest_hex,
+                RETRY_DELAY.as_secs(),
+            ),
+            LOG_DEBUG,
+            false,
+            false,
+        );
         std::thread::sleep(RETRY_DELAY);
         if !try_send(&dest_hex, &sub_hash, sender_hash.as_deref(), channel_hash.as_deref()) {
             log(
