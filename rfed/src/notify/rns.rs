@@ -72,7 +72,7 @@ pub fn dispatch(
                 &dest_hex,
                 RETRY_DELAY.as_secs(),
             ),
-            LOG_DEBUG,
+            LOG_NOTICE,
             false,
             false,
         );
@@ -129,7 +129,7 @@ fn try_send(
             format!(
                 "[notify/rns] no path to {dest_hex}, path request issued",
             ),
-            LOG_DEBUG,
+            LOG_NOTICE,
             false,
             false,
         );
@@ -146,7 +146,7 @@ fn try_send(
                 format!(
                     "[notify/rns] identity not cached for {dest_hex}, path request issued",
                 ),
-                LOG_DEBUG,
+                LOG_NOTICE,
                 false,
                 false,
             );

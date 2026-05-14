@@ -67,10 +67,11 @@ fn decode_msgpack_bin(data: &[u8]) -> Vec<u8> {
 
 /// Parse and verify a signed payload: msgpack fixarray-3 [bin/str value, bin(64) pubkey, bin(64) sig].
 ///
-/// Returns `(value_bytes, subscriber_identity_hash)` on success, or an error string.
+/// Returns `(value_bytes, subscriber_identity_hash, public_key)` on success,
+/// or an error string.
 /// The subscriber hash is derived from the pubkey using `Identity::from_public_key` — identical
 /// to how Reticulum derives it, so no separate identity-lookup is needed.
-fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     let mut cur = Cursor::new(data);
     let top = rmpv::decode::read_value(&mut cur)
         .map_err(|e| format!("msgpack decode: {e}"))?;
@@ -102,7 +103,7 @@ fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
         return Err("signature verification failed".into());
     }
     let subscriber_hash = id.hash.ok_or("identity has no hash after from_public_key")?;
-    Ok((value, subscriber_hash))
+    Ok((value, subscriber_hash, pubkey))
 }
 
 use crate::config::NodeConfig;
@@ -1562,7 +1563,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                                       _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
         // Payload: fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig].
         // Subscriber identity is derived from pubkey; sig proves key ownership.
-        let (channel_hash, subscriber_hash) = match verify_signed_payload(data) {
+        let (channel_hash, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(e) => {
                 log(format!("[rfed] subscribe_cb: {e}"), LOG_WARNING, false, false);
@@ -1620,7 +1621,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let unsub_node = Arc::clone(node);
     let unsubscribe_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                         _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let (channel_hash, subscriber_hash) = match verify_signed_payload(data) {
+        let (channel_hash, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
@@ -1724,7 +1725,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                                       _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
         // Payload: fixarray-3 [str(relayHex), bin(64) pubkey, bin(64) sig].
         // Subscriber identity is derived from pubkey; sig proves key ownership.
-        let (value_bytes, subscriber_hash) = match verify_signed_payload(data) {
+        let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(e) => {
                 log(format!("[rfed] notify/register: {e}"), LOG_WARNING, false, false);
@@ -1766,6 +1767,30 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             return rmp_serde::to_vec(&false).unwrap_or_default();
         }
 
+        let relay_hash_bytes: Vec<u8> = match (0..relay_hash.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&relay_hash[i..i + 2], 16))
+            .collect::<Result<Vec<u8>, _>>()
+        {
+            Ok(bytes) if bytes.len() == 16 => bytes,
+            _ => {
+                log(
+                    format!("[rfed] notify/register: invalid relay hash {relay_hash}"),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
+        };
+
+        // Registration already proves ownership of the subscriber key, and the
+        // relay destination is derived from that same identity. Seed the relay
+        // destination cache immediately so fire-and-forget wake dispatch does
+        // not depend on a separate relay announce having been seen first.
+        let _ = Identity::remember_destination(&relay_hash_bytes, &pubkey, None);
+        Transport::request_path(&relay_hash_bytes, None, None, None, None);
+
         if let Ok(guard) = reg_node.lock() {
             // Enforce per-tier notify registration policy.
             if !guard.config.policy_for(&subscriber_hash).allow_notify_registration {
@@ -1783,13 +1808,35 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             if let Ok(mut notify) = guard.notify_registry.lock() {
                 if let Some(ref ch) = channel_hash_opt {
                     // Per-channel registration: key = (subscriber_hash, channel_hash).
-                    notify.register(subscriber_hash.clone(), Some(ch.clone()), relay_hash);
+                    notify.register(subscriber_hash.clone(), Some(ch.clone()), relay_hash.clone());
+                    log(
+                        format!(
+                            "[rfed] notify/register stored channel subscriber={} channel={} relay={}",
+                            reticulum_rust::hexrep(&subscriber_hash, false),
+                            reticulum_rust::hexrep(ch, false),
+                            relay_hash,
+                        ),
+                        LOG_NOTICE,
+                        false,
+                        false,
+                    );
                 } else {
                     // LXMF registration: key = (lxmf.delivery dest hash, None).
                     let lxmf_delivery_hash = Destination::hash(
                         Some(&subscriber_hash), "lxmf", &["delivery"],
                     );
-                    notify.register(lxmf_delivery_hash, None, relay_hash);
+                    notify.register(lxmf_delivery_hash.clone(), None, relay_hash.clone());
+                    log(
+                        format!(
+                            "[rfed] notify/register stored lxmf subscriber={} delivery={} relay={}",
+                            reticulum_rust::hexrep(&subscriber_hash, false),
+                            reticulum_rust::hexrep(&lxmf_delivery_hash, false),
+                            relay_hash,
+                        ),
+                        LOG_NOTICE,
+                        false,
+                        false,
+                    );
                 }
             }
         }
@@ -1801,7 +1848,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let unreg_node = Arc::clone(node);
     let unregister_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                         _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let (value_bytes, subscriber_hash) = match verify_signed_payload(data) {
+        let (value_bytes, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
@@ -1847,7 +1894,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                                     _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
         // For clear, payload is fixarray-3 [str(""), bin(64) pubkey, bin(64) sig_over_empty].
         // We only need the subscriber hash from the verified pubkey.
-        let (_value, subscriber_hash) = match verify_signed_payload(data) {
+        let (_value, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };

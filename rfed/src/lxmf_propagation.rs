@@ -1075,7 +1075,7 @@ impl LxmfPropagationNode {
                                 regs.len(),
                                 hexrep(dest_hash, false),
                             ),
-                            LOG_DEBUG, false, false,
+                            LOG_NOTICE, false, false,
                         );
                         // Extract sender hash if the message is long enough.
                         let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
@@ -1093,7 +1093,7 @@ impl LxmfPropagationNode {
                                 "[lxmf.prop] NO notify registrations found for recipient {}",
                                 hexrep(dest_hash, false),
                             ),
-                            LOG_DEBUG, false, false,
+                            LOG_NOTICE, false, false,
                         );
                     }
                 }
