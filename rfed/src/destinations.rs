@@ -306,9 +306,12 @@ impl FedNode {
     /// re-announce are handled by `publish_destinations()` registering with
     /// `Transport`'s announce daemon.
     pub fn announce(&mut self) {
+        // Treat stamp_cost=0 as disabled (same as None) to avoid accidental
+        // stamp-tail stripping when operators mean "no PoW required".
+        let announce_stamp_cost = self.config.default_policy.stamp_cost.filter(|c| *c > 0);
         let app_data = announce::encode_node_announce(
             &self.config.display_name,
-            self.config.default_policy.stamp_cost,
+            announce_stamp_cost,
         );
         self.node_dest.set_default_app_data(Some(app_data.clone()));
         let _ = self.node_dest.announce(Some(&app_data), false, None, None, true);
@@ -334,9 +337,12 @@ impl FedNode {
     /// inside the Reticulum 1-hour path TTL.
     pub fn publish_destinations(&self) {
         use reticulum_rust::transport::Transport;
+        // Keep channel/node announce stamp policy aligned with SEND parsing:
+        // only positive costs mean "stamp required".
+        let announce_stamp_cost = self.config.default_policy.stamp_cost.filter(|c| *c > 0);
         let app_data = announce::encode_node_announce(
             &self.config.display_name,
-            self.config.default_policy.stamp_cost,
+            announce_stamp_cost,
         );
         Transport::publish_destination(
             self.node_dest.hash.clone(),
@@ -1420,7 +1426,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         // Anti-spam parameters.
         caps.push((
             rmpv::Value::String("stamp_cost".into()),
-            match cfg.default_policy.stamp_cost {
+            match cfg.default_policy.stamp_cost.filter(|c| *c > 0) {
                 Some(c) => rmpv::Value::Integer(c.into()),
                 None    => rmpv::Value::Nil,
             },
@@ -1457,15 +1463,20 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // Snapshot anti-spam knobs once — both are Copy so no lock required later.
     let (stamp_cost, stamp_flexibility) = {
         let guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
-        (guard.config.default_policy.stamp_cost, guard.config.default_policy.stamp_flexibility)
+        (
+            // stamp_cost=0 is semantically disabled and must not trigger
+            // stamp-tail parsing.
+            guard.config.default_policy.stamp_cost.filter(|c| *c > 0),
+            guard.config.default_policy.stamp_flexibility,
+        )
     };
 
     // SEND — fire-and-forget packet; payload is the inner blob (± stamp).
     //
-    // Wire format WITHOUT stamp (stamp_cost == None):
+    // Wire format WITHOUT stamp (stamp_cost == None or Some(0)):
     //   channel_hash(16) | inner_blob(*)
     //
-    // Wire format WITH stamp (stamp_cost is Some):
+    // Wire format WITH stamp (stamp_cost is Some(>0)):
     //   channel_hash(16) | inner_blob(*) | stamp(LXStamper::STAMP_SIZE)
     //
     // When a stamp is required the node validates PoW before accepting the blob.
@@ -1603,8 +1614,9 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 }
             }
             // Response: [true, stamp_cost_or_nil]
-            // stamp_cost is None when disabled so client can skip PoW.
-            let cost = guard.config.default_policy.stamp_cost;
+            // stamp_cost is Nil when disabled (including configured 0) so
+            // clients skip the stamp tail entirely.
+            let cost = guard.config.default_policy.stamp_cost.filter(|c| *c > 0);
             let resp = rmpv::Value::Array(vec![
                 rmpv::Value::Boolean(true),
                 match cost {
