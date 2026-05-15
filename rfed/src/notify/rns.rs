@@ -19,16 +19,14 @@
 //! The relay destination is `rfed.notify` (`app_name="rfed"`, `aspects=["notify"]`).
 //!
 //! # Retry & fallback
-//! If no path to the relay exists, a path request is issued and dispatch is
-//! retried once after a short delay.  If the retry also fails, the notify is
-//! dropped — the subscriber will receive their messages via the normal
-//! deferred-queue flush (triggered by their next announce) or via LXMF
-//! propagation pull on their client, whichever comes first.
+//! Notify uses AppLinks for the actual send path so the relay wake rides the
+//! same short-lived, proof-backed link machinery as other app-driven traffic.
+//! A single delayed retry is still scheduled if the first send exhausts the
+//! AppLinks tier chain without a delivery proof.
 
-use reticulum_rust::destination::{Destination, DestinationType};
-use reticulum_rust::identity::Identity;
-use reticulum_rust::packet::{self, Packet};
-use reticulum_rust::transport::{self, Transport};
+use std::sync::Arc;
+
+use app_links::AppLinks;
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use super::NotifyRegistration;
@@ -45,14 +43,17 @@ pub fn dispatch(
     sender: Option<&[u8]>,
     channel: Option<&[u8]>,
 ) {
+    let dest_hash = match decode_relay_hash(&reg.relay_hash, &reg.subscriber_hash) {
+        Some(hash) => hash,
+        None => return,
+    };
     let dest_hex = reg.relay_hash.clone();
     let sub_hash = reg.subscriber_hash.clone();
-    let sender_hash = sender.map(|s| s.to_vec());
-    let channel_hash = channel.map(|c| c.to_vec());
+    let payload = encode_wake_payload(&sub_hash, sender, channel);
 
     log(
         format!(
-            "[notify/rns] dispatch thread spawned for relay={} subscriber={}",
+            "[notify/rns] dispatch queued for relay={} subscriber={}",
             &dest_hex,
             hexrep(&sub_hash, false),
         ),
@@ -61,53 +62,23 @@ pub fn dispatch(
         false,
     );
 
-    std::thread::spawn(move || {
-        if try_send(&dest_hex, &sub_hash, sender_hash.as_deref(), channel_hash.as_deref()) {
-            return;
-        }
-        // First attempt failed — wait for path convergence and retry once.
-        log(
-            format!(
-                "[notify/rns] first attempt failed for relay={}, scheduling retry in {}s",
-                &dest_hex,
-                RETRY_DELAY.as_secs(),
-            ),
-            LOG_NOTICE,
-            false,
-            false,
-        );
-        std::thread::sleep(RETRY_DELAY);
-        if !try_send(&dest_hex, &sub_hash, sender_hash.as_deref(), channel_hash.as_deref()) {
-            log(
-                format!(
-                    "[notify/rns] relay {dest_hex} unreachable after retry; \
-                     delivery will proceed via deferred queue / LXMF pull",
-                ),
-                LOG_DEBUG,
-                false,
-                false,
-            );
-        }
-    });
+    send_with_app_links(dest_hash, dest_hex, sub_hash, payload, 0);
 }
 
 /// Retry delay between the first and second dispatch attempt.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// Try to send a single wake packet.  Returns `true` on success.
-fn try_send(
+fn decode_relay_hash(
     dest_hex: &str,
     sub_hash: &[u8],
-    sender: Option<&[u8]>,
-    channel: Option<&[u8]>,
-) -> bool {
+) -> Option<Vec<u8>> {
     // Decode the 32-char hex hash into 16 bytes.
-    let dest_hash: Vec<u8> = match (0..dest_hex.len())
+    match (0..dest_hex.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&dest_hex[i..i + 2], 16))
         .collect::<Result<Vec<_>, _>>()
     {
-        Ok(b) if b.len() == 16 => b,
+        Ok(b) if b.len() == 16 => Some(b),
         _ => {
             log(
                 format!(
@@ -118,99 +89,102 @@ fn try_send(
                 false,
                 false,
             );
-            return false;
+            None
         }
-    };
+    }
+}
 
-    // If no path is known, request one and bail.
-    if !Transport::has_path(&dest_hash) {
-        Transport::request_path(&dest_hash, None, None, None, None);
+fn send_with_app_links(
+    dest_hash: Vec<u8>,
+    dest_hex: String,
+    sub_hash: Vec<u8>,
+    payload: Vec<u8>,
+    attempt: usize,
+) {
+    AppLinks::open(&dest_hash, "rfed", &["notify"]);
+
+    log(
+        format!(
+            "[notify/rns] app-link wake attempt={} relay={} subscriber={}",
+            attempt + 1,
+            dest_hex,
+            hexrep(&sub_hash, false),
+        ),
+        LOG_DEBUG,
+        false,
+        false,
+    );
+
+    let delivered_dest_hex = dest_hex.clone();
+    let delivered_sub_hash = sub_hash.clone();
+    let on_delivered: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
         log(
             format!(
-                "[notify/rns] no path to {dest_hex}, path request issued",
+                "[notify/rns] wake delivered to {} for {}",
+                delivered_dest_hex,
+                hexrep(&delivered_sub_hash, false),
             ),
             LOG_NOTICE,
             false,
             false,
         );
-        return false;
-    }
+    });
 
-    // Recall the identity for the destination (needed to build a
-    // Single-type outbound destination and encrypt the packet).
-    let identity = match Identity::recall(&dest_hash) {
-        Some(id) => id,
-        None => {
-            Transport::request_path(&dest_hash, None, None, None, None);
+    let on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(|| {});
+
+    let on_failed: Arc<dyn Fn() + Send + Sync + 'static> = if attempt == 0 {
+        let retry_dest_hash = dest_hash.clone();
+        let retry_dest_hex = dest_hex.clone();
+        let retry_sub_hash = sub_hash.clone();
+        let retry_payload = payload.clone();
+        Arc::new(move || {
             log(
                 format!(
-                    "[notify/rns] identity not cached for {dest_hex}, path request issued",
+                    "[notify/rns] first attempt failed for relay={}, scheduling retry in {}s",
+                    retry_dest_hex,
+                    RETRY_DELAY.as_secs(),
                 ),
                 LOG_NOTICE,
                 false,
                 false,
             );
-            return false;
-        }
-    };
-
-    let dest = match Destination::new_outbound(
-        Some(identity),
-        DestinationType::Single,
-        "rfed".to_string(),
-        vec!["notify".to_string()],
-    ) {
-        Ok(d) => d,
-        Err(e) => {
+            let retry_dest_hash = retry_dest_hash.clone();
+            let retry_dest_hex = retry_dest_hex.clone();
+            let retry_sub_hash = retry_sub_hash.clone();
+            let retry_payload = retry_payload.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(RETRY_DELAY);
+                send_with_app_links(
+                    retry_dest_hash,
+                    retry_dest_hex,
+                    retry_sub_hash,
+                    retry_payload,
+                    1,
+                );
+            });
+        })
+    } else {
+        let failed_dest_hex = dest_hex.clone();
+        Arc::new(move || {
             log(
-                format!("[notify/rns] dest build error for {dest_hex}: {e}"),
-                LOG_WARNING,
+                format!(
+                    "[notify/rns] relay {failed_dest_hex} unreachable after retry; \
+                     delivery will proceed via deferred queue / LXMF pull",
+                ),
+                LOG_DEBUG,
                 false,
                 false,
             );
-            return false;
-        }
+        })
     };
 
-    let payload = encode_wake_payload(sub_hash, sender, channel);
-    let mut pkt = Packet::new(
-        Some(dest),
+    AppLinks::send(
+        &dest_hash,
         payload,
-        packet::DATA,
-        packet::NONE,
-        transport::BROADCAST,
-        packet::HEADER_1,
-        None,
-        None,
-        false,
-        packet::FLAG_UNSET,
+        on_delivered,
+        on_propagation_needed,
+        on_failed,
     );
-
-    match pkt.send() {
-        Ok(_) => {
-            log(
-                format!(
-                    "[notify/rns] wake sent to {dest_hex} for {}",
-                    hexrep(sub_hash, false),
-                ),
-                LOG_NOTICE,
-                false,
-                false,
-            );
-            true
-        }
-        Err(e) => {
-            log(
-                format!(
-                    "[notify/rns] send failed for {dest_hex}: {e}",
-                ),
-                LOG_WARNING,
-                false,
-                false,
-            );
-            false
-        }
-    }
 }
 
 fn encode_wake_payload(

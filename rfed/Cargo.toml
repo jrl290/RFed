@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 reticulum_rust = { path = "../../Reticulum-rust", default-features = false }
 lxmf_rust      = { path = "../../LXMF-rust" }
+app_links      = { path = "../../app-links" }
 
 rmp          = "0.8.14"
 rmpv         = "=1.0.0"

@@ -2096,6 +2096,7 @@ dependencies = [
 name = "rfed"
 version = "0.1.0"
 dependencies = [
+ "app_links",
  "base64",
  "configparser",
  "ctrlc",
