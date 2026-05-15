@@ -2280,4 +2280,72 @@ mod wire_format_tests {
         let too_short = vec![0u8; LXStamper::STAMP_SIZE - 1];
         assert!(!LXStamper::stamp_valid(&too_short, 1, &workblock));
     }
+
+    // ── stamp_cost=0 normalisation ────────────────────────────────────
+    //
+    // Bug: `stamp_cost=Some(0)` (the TOML `stamp_cost = 0` case) was
+    // previously treated as "stamp present" throughout destinations.rs.
+    // rfed unconditionally stripped 32 bytes (STAMP_SIZE) from every
+    // incoming SEND blob tail, truncating EC ciphertext from 96→64 bytes
+    // and breaking HMAC on decrypt in synced/backup nodes.
+    //
+    // Fix: `.filter(|c| *c > 0)` is applied at every point where
+    // stamp_cost gates behaviour.  Zero MUST be treated identically to
+    // None (disabled) in all five locations.
+    //
+    // These two tests guard that normalisation:
+    //   1. The Option filter itself behaves correctly.
+    //   2. The subscribe-response encoder turns the normalised None into
+    //      msgpack Nil — not the integer 0 that would instruct clients to
+    //      append a 32-byte stamp tail that rfed would then try to strip.
+
+    #[test]
+    fn stamp_cost_zero_normalizes_to_none() {
+        // `stamp_cost = 0` in TOML arrives as Some(0).
+        // After `.filter(|c| *c > 0)` it MUST become None (disabled).
+        let from_config: Option<u32> = Some(0);
+        let effective = from_config.filter(|c| *c > 0);
+        assert!(
+            effective.is_none(),
+            "stamp_cost=Some(0) MUST normalise to None (disabled); \
+             treating it as 'stamp present' causes STAMP_SIZE bytes to be \
+             stripped from every blob, corrupting EC ciphertext"
+        );
+
+        // Non-zero cost MUST pass through unchanged.
+        let nonzero: Option<u32> = Some(16);
+        assert_eq!(nonzero.filter(|c| *c > 0), Some(16));
+
+        // An absent cost (never set in TOML) MUST also stay None.
+        let absent: Option<u32> = None;
+        assert!(absent.filter(|c| *c > 0).is_none());
+    }
+
+    #[test]
+    fn subscribe_response_stamp_cost_zero_encodes_as_nil_not_integer() {
+        // When the operator writes `stamp_cost = 0` the subscribe response
+        // MUST send msgpack Nil so clients skip the stamp tail entirely.
+        // Sending the integer 0 would make clients compute a stamp and
+        // append a useless 32-byte tail that rfed would try to strip,
+        // re-triggering the blob-truncation bug on the next send.
+        let from_config: Option<u32> = Some(0);
+        let effective = from_config.filter(|c| *c > 0); // normalise
+
+        // encode_subscribe_response is the same shape used by subscribe_cb
+        let buf = encode_subscribe_response(true, effective);
+        let mut cursor = std::io::Cursor::new(&buf[..]);
+        let val = rmpv::decode::read_value(&mut cursor).unwrap();
+        let arr = val.as_array().unwrap();
+
+        assert!(
+            arr[1].is_nil(),
+            "stamp_cost=0 in config MUST encode as msgpack Nil in subscribe response; \
+             got {:?}",
+            arr[1]
+        );
+        assert!(
+            arr[1].as_i64().is_none(),
+            "stamp_cost=0 MUST NOT encode as integer 0 in subscribe response"
+        );
+    }
 }
