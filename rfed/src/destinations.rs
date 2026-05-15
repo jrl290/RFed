@@ -341,10 +341,12 @@ impl FedNode {
         Transport::publish_destination(
             self.node_dest.hash.clone(),
             Some(Duration::from_secs(self.config.announce_interval_secs)),
-            Some(app_data),
+            Some(app_data.clone()),
         );
         let svc = Some(Duration::from_secs(SERVICE_REFRESH_INTERVAL_SECS));
-        Transport::publish_destination(self.channel_dest.hash.clone(), svc, None);
+        // Publish the channel SEND stamp policy on rfed.channel itself so
+        // senders can autoconfigure before their first fire-and-forget send.
+        Transport::publish_destination(self.channel_dest.hash.clone(), svc, Some(app_data));
         Transport::publish_destination(self.delivery_dest.hash.clone(), svc, None);
         Transport::publish_destination(self.notify_dest.hash.clone(), svc, None);
     }
