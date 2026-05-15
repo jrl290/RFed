@@ -19,14 +19,17 @@
 //! The relay destination is `rfed.notify` (`app_name="rfed"`, `aspects=["notify"]`).
 //!
 //! # Retry & fallback
-//! Notify uses AppLinks for the actual send path so the relay wake rides the
-//! same short-lived, proof-backed link machinery as other app-driven traffic.
-//! A single delayed retry is still scheduled if the first send exhausts the
-//! AppLinks tier chain without a delivery proof.
+//! Notify uses direct RNS packet send to `rfed.notify` so relay nodes that
+//! only register a destination packet callback (no link handlers) still
+//! receive wake packets.
+//! A single delayed retry is scheduled if the first send cannot complete.
 
 use std::sync::Arc;
 
-use app_links::AppLinks;
+use reticulum_rust::destination::{Destination, DestinationType};
+use reticulum_rust::identity::Identity;
+use reticulum_rust::packet::{self, Packet};
+use reticulum_rust::transport::{self, Transport};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use super::NotifyRegistration;
@@ -101,11 +104,9 @@ fn send_with_app_links(
     payload: Vec<u8>,
     attempt: usize,
 ) {
-    AppLinks::open(&dest_hash, "rfed", &["notify"]);
-
     log(
         format!(
-            "[notify/rns] app-link wake attempt={} relay={} subscriber={}",
+            "[notify/rns] wake attempt={} relay={} subscriber={}",
             attempt + 1,
             dest_hex,
             hexrep(&sub_hash, false),
@@ -115,76 +116,138 @@ fn send_with_app_links(
         false,
     );
 
-    let delivered_dest_hex = dest_hex.clone();
-    let delivered_sub_hash = sub_hash.clone();
-    let on_delivered: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(move || {
-        log(
-            format!(
-                "[notify/rns] wake delivered to {} for {}",
-                delivered_dest_hex,
-                hexrep(&delivered_sub_hash, false),
-            ),
-            LOG_NOTICE,
-            false,
-            false,
+    // If no path is known yet, request one and retry once.
+    if !Transport::has_path(&dest_hash) {
+        Transport::request_path(&dest_hash, None, None, None, None);
+        retry_or_drop(
+            dest_hash,
+            dest_hex,
+            sub_hash,
+            payload,
+            attempt,
+            "no path to relay",
         );
-    });
+        return;
+    }
 
-    let on_propagation_needed: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(|| {});
+    // Destination identity is required to build an encrypted SINGLE outbound
+    // destination. If unavailable, request path/announce and retry once.
+    let identity = match Identity::recall(&dest_hash) {
+        Some(id) => id,
+        None => {
+            Transport::request_path(&dest_hash, None, None, None, None);
+            retry_or_drop(
+                dest_hash,
+                dest_hex,
+                sub_hash,
+                payload,
+                attempt,
+                "identity not cached for relay",
+            );
+            return;
+        }
+    };
 
-    let on_failed: Arc<dyn Fn() + Send + Sync + 'static> = if attempt == 0 {
-        let retry_dest_hash = dest_hash.clone();
-        let retry_dest_hex = dest_hex.clone();
-        let retry_sub_hash = sub_hash.clone();
-        let retry_payload = payload.clone();
-        Arc::new(move || {
+    let dest = match Destination::new_outbound(
+        Some(identity),
+        DestinationType::Single,
+        "rfed".to_string(),
+        vec!["notify".to_string()],
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            retry_or_drop(
+                dest_hash,
+                dest_hex,
+                sub_hash,
+                payload,
+                attempt,
+                &format!("destination build failed: {e}"),
+            );
+            return;
+        }
+    };
+
+    let mut pkt = Packet::new(
+        Some(dest),
+        payload.clone(),
+        packet::DATA,
+        packet::NONE,
+        transport::BROADCAST,
+        packet::HEADER_1,
+        None,
+        None,
+        false,
+        packet::FLAG_UNSET,
+    );
+
+    match pkt.send() {
+        Ok(_) => {
             log(
                 format!(
-                    "[notify/rns] first attempt failed for relay={}, scheduling retry in {}s",
-                    retry_dest_hex,
-                    RETRY_DELAY.as_secs(),
+                    "[notify/rns] wake sent to {} for {}",
+                    dest_hex,
+                    hexrep(&sub_hash, false),
                 ),
                 LOG_NOTICE,
                 false,
                 false,
             );
-            let retry_dest_hash = retry_dest_hash.clone();
-            let retry_dest_hex = retry_dest_hex.clone();
-            let retry_sub_hash = retry_sub_hash.clone();
-            let retry_payload = retry_payload.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(RETRY_DELAY);
-                send_with_app_links(
-                    retry_dest_hash,
-                    retry_dest_hex,
-                    retry_sub_hash,
-                    retry_payload,
-                    1,
-                );
-            });
-        })
-    } else {
-        let failed_dest_hex = dest_hex.clone();
-        Arc::new(move || {
-            log(
-                format!(
-                    "[notify/rns] relay {failed_dest_hex} unreachable after retry; \
-                     delivery will proceed via deferred queue / LXMF pull",
-                ),
-                LOG_DEBUG,
-                false,
-                false,
+        }
+        Err(e) => {
+            retry_or_drop(
+                dest_hash,
+                dest_hex,
+                sub_hash,
+                payload,
+                attempt,
+                &format!("send failed: {e}"),
             );
-        })
-    };
+        }
+    }
+}
 
-    AppLinks::send(
-        &dest_hash,
-        payload,
-        on_delivered,
-        on_propagation_needed,
-        on_failed,
-    );
+fn retry_or_drop(
+    dest_hash: Vec<u8>,
+    dest_hex: String,
+    sub_hash: Vec<u8>,
+    payload: Vec<u8>,
+    attempt: usize,
+    reason: &str,
+) {
+    if attempt == 0 {
+        log(
+            format!(
+                "[notify/rns] first attempt failed for relay={} ({reason}), scheduling retry in {}s",
+                dest_hex,
+                RETRY_DELAY.as_secs(),
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+
+        std::thread::spawn(move || {
+            std::thread::sleep(RETRY_DELAY);
+            send_with_app_links(
+                dest_hash,
+                dest_hex,
+                sub_hash,
+                payload,
+                1,
+            );
+        });
+    } else {
+        log(
+            format!(
+                "[notify/rns] relay {dest_hex} unreachable after retry ({reason}); \
+                 delivery will proceed via deferred queue / LXMF pull",
+            ),
+            LOG_DEBUG,
+            false,
+            false,
+        );
+    }
 }
 
 fn encode_wake_payload(
