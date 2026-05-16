@@ -44,10 +44,12 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use app_links::{self as rns_app_links, AppLinks};
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::{self, Identity};
 use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC};
 use reticulum_rust::lxstamper::LXStamper;
+use reticulum_rust::packet::Packet;
 use reticulum_rust::transport::{AnnounceHandler, Transport};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
@@ -104,6 +106,196 @@ fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Str
     }
     let subscriber_hash = id.hash.ok_or("identity has no hash after from_public_key")?;
     Ok((value, subscriber_hash, pubkey))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NotifyCommandKind {
+    Register,
+    Unregister,
+    Clear,
+}
+
+struct NotifyCommand {
+    kind: NotifyCommandKind,
+    relay_hash: Option<String>,
+    channel_hash: Option<Vec<u8>>,
+}
+
+fn parse_notify_legacy_value(value_bytes: &[u8]) -> (String, Option<Vec<u8>>) {
+    let mut cur = Cursor::new(value_bytes);
+    match rmpv::decode::read_value(&mut cur) {
+        Ok(rmpv::Value::Array(mut arr)) if arr.len() >= 2 => {
+            let relay = match arr.remove(0) {
+                rmpv::Value::String(s) => s.into_str().unwrap_or_default().to_string(),
+                _ => String::new(),
+            };
+            let ch = match arr.remove(0) {
+                rmpv::Value::Binary(b) if b.len() == 16 => Some(b),
+                _ => None,
+            };
+            (relay, ch)
+        }
+        _ => (String::from_utf8(value_bytes.to_vec()).unwrap_or_default(), None),
+    }
+}
+
+fn parse_notify_command(
+    value_bytes: &[u8],
+    default_kind: Option<NotifyCommandKind>,
+) -> Result<NotifyCommand, String> {
+    if default_kind == Some(NotifyCommandKind::Clear) && value_bytes.is_empty() {
+        return Ok(NotifyCommand {
+            kind: NotifyCommandKind::Clear,
+            relay_hash: None,
+            channel_hash: None,
+        });
+    }
+
+    let mut cur = Cursor::new(value_bytes);
+    if let Ok(rmpv::Value::Array(mut arr)) = rmpv::decode::read_value(&mut cur) {
+        if arr.len() >= 3 {
+            if let rmpv::Value::String(op) = arr.remove(0) {
+                let kind = match op.into_str().unwrap_or_default().as_ref() {
+                    "register" => NotifyCommandKind::Register,
+                    "unregister" => NotifyCommandKind::Unregister,
+                    "clear" => NotifyCommandKind::Clear,
+                    other => return Err(format!("unknown notify op '{other}'")),
+                };
+                if let Some(expected) = default_kind {
+                    if expected != kind {
+                        return Err(format!(
+                            "notify op mismatch: payload={:?} handler={:?}",
+                            kind, expected
+                        ));
+                    }
+                }
+                let relay_hash = match arr.remove(0) {
+                    rmpv::Value::String(s) => {
+                        let relay = s.into_str().unwrap_or_default().to_string();
+                        if relay.is_empty() { None } else { Some(relay) }
+                    }
+                    rmpv::Value::Nil => None,
+                    _ => None,
+                };
+                let channel_hash = match arr.remove(0) {
+                    rmpv::Value::Binary(b) if b.len() == 16 => Some(b),
+                    _ => None,
+                };
+                return Ok(NotifyCommand {
+                    kind,
+                    relay_hash,
+                    channel_hash,
+                });
+            }
+        }
+    }
+
+    let kind = default_kind.ok_or("notify DATA payload missing op")?;
+    let (relay_hash, channel_hash) = parse_notify_legacy_value(value_bytes);
+    Ok(NotifyCommand {
+        kind,
+        relay_hash: if relay_hash.is_empty() { None } else { Some(relay_hash) },
+        channel_hash,
+    })
+}
+
+fn handle_notify_command(
+    node: &Arc<Mutex<FedNode>>,
+    command: NotifyCommand,
+    subscriber_hash: Vec<u8>,
+    pubkey: Option<Vec<u8>>,
+) -> Result<(), String> {
+    match command.kind {
+        NotifyCommandKind::Register => {
+            let relay_hash = command
+                .relay_hash
+                .ok_or("notify/register: empty relay hash")?;
+
+            validate_relay_hash(&relay_hash)
+                .map_err(|reason| format!("notify registration rejected: {reason}"))?;
+
+            let relay_hash_bytes: Vec<u8> = match (0..relay_hash.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&relay_hash[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+            {
+                Ok(bytes) if bytes.len() == 16 => bytes,
+                _ => return Err(format!("notify/register: invalid relay hash {relay_hash}")),
+            };
+
+            let pubkey = pubkey.ok_or("notify/register: missing pubkey")?;
+            let _ = Identity::remember_destination(&relay_hash_bytes, &pubkey, None);
+            Transport::request_path(&relay_hash_bytes, None, None, None, None);
+
+            if let Ok(guard) = node.lock() {
+                if !guard.config.policy_for(&subscriber_hash).allow_notify_registration {
+                    return Err(format!(
+                        "notify registration denied for {} (policy)",
+                        reticulum_rust::hexrep(&subscriber_hash, false),
+                    ));
+                }
+                if let Ok(mut notify) = guard.notify_registry.lock() {
+                    if let Some(ref ch) = command.channel_hash {
+                        notify.register(subscriber_hash.clone(), Some(ch.clone()), relay_hash.clone());
+                        log(
+                            format!(
+                                "[rfed] notify/register stored channel subscriber={} channel={} relay={}",
+                                reticulum_rust::hexrep(&subscriber_hash, false),
+                                reticulum_rust::hexrep(ch, false),
+                                relay_hash,
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                    } else {
+                        let lxmf_delivery_hash = Destination::hash(
+                            Some(&subscriber_hash), "lxmf", &["delivery"],
+                        );
+                        notify.register(lxmf_delivery_hash.clone(), None, relay_hash.clone());
+                        log(
+                            format!(
+                                "[rfed] notify/register stored lxmf subscriber={} delivery={} relay={}",
+                                reticulum_rust::hexrep(&subscriber_hash, false),
+                                reticulum_rust::hexrep(&lxmf_delivery_hash, false),
+                                relay_hash,
+                            ),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NotifyCommandKind::Unregister => {
+            let relay_hash = command
+                .relay_hash
+                .ok_or("notify/unregister: empty relay hash")?;
+            if let Ok(guard) = node.lock() {
+                if let Ok(mut notify) = guard.notify_registry.lock() {
+                    if let Some(ref ch) = command.channel_hash {
+                        notify.unregister(&subscriber_hash, Some(ch.as_slice()), &relay_hash);
+                    } else {
+                        let lxmf_delivery_hash = Destination::hash(
+                            Some(&subscriber_hash), "lxmf", &["delivery"],
+                        );
+                        notify.unregister(&lxmf_delivery_hash, None, &relay_hash);
+                    }
+                }
+            }
+            Ok(())
+        }
+        NotifyCommandKind::Clear => {
+            if let Ok(guard) = node.lock() {
+                if let Ok(mut notify) = guard.notify_registry.lock() {
+                    notify.clear(&subscriber_hash);
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 use crate::config::NodeConfig;
@@ -399,13 +591,12 @@ impl FedNode {
                 continue;
             }
 
-            // Ensure we have a path; if not, request one and try again shortly.
-            // Do not penalise with sync_err/backoff — a missing path is a
-            // transient routing condition, not a sync failure.
-            if !Transport::has_path(&peer_hash) {
-                Transport::request_path(&peer_hash, None, None, None, None);
+            // One-shot rfed.node sync sessions still create a fresh request/
+            // response link, but AppLinks owns the liveness race that decides
+            // when that one-shot can start.
+            AppLinks::open(&peer_hash, APP_NAME, &["node"]);
+            if AppLinks::status(&peer_hash) != rns_app_links::APP_LINK_ACTIVE {
                 if let Ok(mut s) = self.sync.lock() {
-                    // Reschedule for a short retry, not a full backoff cycle.
                     if let Some(p) = s.peers.get_mut(&peer_hash) {
                         p.next_sync_attempt = crate::sync::now_secs() + 5.0;
                     }
@@ -882,8 +1073,8 @@ fn push_subscriptions_to_backup(
     node_weak: Option<Weak<Mutex<FedNode>>>,
     our_identity: Identity,
 ) {
-    if !Transport::has_path(&backup_hash) {
-        Transport::request_path(&backup_hash, None, None, None, None);
+    AppLinks::open(&backup_hash, APP_NAME, &["node"]);
+    if AppLinks::status(&backup_hash) != rns_app_links::APP_LINK_ACTIVE {
         log("[backup] no path to backup node — will retry on next tick",
             LOG_DEBUG, false, false);
         if let Some(arc) = node_weak.as_ref().and_then(|w| w.upgrade()) {
@@ -1725,6 +1916,27 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 // ── rfed.notify ──────────────────────────────────────────────────────────────
 
 fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
+    let packet_node = Arc::clone(node);
+    let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> = Arc::new(move |data, _packet| {
+        let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] notify packet: {e}"), LOG_WARNING, false, false);
+                return;
+            }
+        };
+        let command = match parse_notify_command(&value_bytes, None) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                log(format!("[rfed] notify packet: {e}"), LOG_WARNING, false, false);
+                return;
+            }
+        };
+        if let Err(e) = handle_notify_command(&packet_node, command, subscriber_hash, Some(pubkey)) {
+            log(format!("[rfed] notify packet: {e}"), LOG_WARNING, false, false);
+        }
+    });
+
     // NOTIFY_REGISTER — client sends a 32-char hex relay destination hash.
     // Multiple calls with different hashes register additional relays for the
     // same subscriber; duplicate hashes refresh the timestamp only.
@@ -1737,8 +1949,6 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let reg_node = Arc::clone(node);
     let register_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                       _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        // Payload: fixarray-3 [str(relayHex), bin(64) pubkey, bin(64) sig].
-        // Subscriber identity is derived from pubkey; sig proves key ownership.
         let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(e) => {
@@ -1746,113 +1956,16 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return rmp_serde::to_vec(&false).unwrap_or_default();
             }
         };
-        // value_bytes is msgpack [str(relay_hex), bin(16 channel_hash) | nil].
-        // Fall back to treating the raw bytes as a UTF-8 relay hex string for
-        // backward compatibility with pre-channel clients (channel = None).
-        let (relay_hash, channel_hash_opt): (String, Option<Vec<u8>>) = {
-            let mut cur = Cursor::new(&value_bytes[..]);
-            match rmpv::decode::read_value(&mut cur) {
-                Ok(rmpv::Value::Array(mut arr)) if arr.len() >= 2 => {
-                    let relay = match arr.remove(0) {
-                        rmpv::Value::String(s) => s.into_str().unwrap_or_default().to_string(),
-                        _ => String::new(),
-                    };
-                    let ch = match arr.remove(0) {
-                        rmpv::Value::Binary(b) if b.len() == 16 => Some(b),
-                        _ => None,
-                    };
-                    (relay, ch)
-                }
-                _ => (String::from_utf8(value_bytes).unwrap_or_default(), None),
-            }
-        };
-        if relay_hash.is_empty() {
-            log("[rfed] notify/register: empty relay hash", LOG_WARNING, false, false);
-            return rmp_serde::to_vec(&false).unwrap_or_default();
-        }
-
-        if let Err(reason) = validate_relay_hash(&relay_hash) {
-            log(
-                format!("[rfed] notify registration rejected: {reason}"),
-                LOG_WARNING,
-                false,
-                false,
-            );
-            return rmp_serde::to_vec(&false).unwrap_or_default();
-        }
-
-        let relay_hash_bytes: Vec<u8> = match (0..relay_hash.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&relay_hash[i..i + 2], 16))
-            .collect::<Result<Vec<u8>, _>>()
-        {
-            Ok(bytes) if bytes.len() == 16 => bytes,
-            _ => {
-                log(
-                    format!("[rfed] notify/register: invalid relay hash {relay_hash}"),
-                    LOG_WARNING,
-                    false,
-                    false,
-                );
+        let command = match parse_notify_command(&value_bytes, Some(NotifyCommandKind::Register)) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                log(format!("[rfed] notify/register: {e}"), LOG_WARNING, false, false);
                 return rmp_serde::to_vec(&false).unwrap_or_default();
             }
         };
-
-        // Registration already proves ownership of the subscriber key, and the
-        // relay destination is derived from that same identity. Seed the relay
-        // destination cache immediately so fire-and-forget wake dispatch does
-        // not depend on a separate relay announce having been seen first.
-        let _ = Identity::remember_destination(&relay_hash_bytes, &pubkey, None);
-        Transport::request_path(&relay_hash_bytes, None, None, None, None);
-
-        if let Ok(guard) = reg_node.lock() {
-            // Enforce per-tier notify registration policy.
-            if !guard.config.policy_for(&subscriber_hash).allow_notify_registration {
-                log(
-                    format!(
-                        "[rfed] notify registration denied for {} (policy)",
-                        reticulum_rust::hexrep(&subscriber_hash, false),
-                    ),
-                    LOG_WARNING,
-                    false,
-                    false,
-                );
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-            if let Ok(mut notify) = guard.notify_registry.lock() {
-                if let Some(ref ch) = channel_hash_opt {
-                    // Per-channel registration: key = (subscriber_hash, channel_hash).
-                    notify.register(subscriber_hash.clone(), Some(ch.clone()), relay_hash.clone());
-                    log(
-                        format!(
-                            "[rfed] notify/register stored channel subscriber={} channel={} relay={}",
-                            reticulum_rust::hexrep(&subscriber_hash, false),
-                            reticulum_rust::hexrep(ch, false),
-                            relay_hash,
-                        ),
-                        LOG_NOTICE,
-                        false,
-                        false,
-                    );
-                } else {
-                    // LXMF registration: key = (lxmf.delivery dest hash, None).
-                    let lxmf_delivery_hash = Destination::hash(
-                        Some(&subscriber_hash), "lxmf", &["delivery"],
-                    );
-                    notify.register(lxmf_delivery_hash.clone(), None, relay_hash.clone());
-                    log(
-                        format!(
-                            "[rfed] notify/register stored lxmf subscriber={} delivery={} relay={}",
-                            reticulum_rust::hexrep(&subscriber_hash, false),
-                            reticulum_rust::hexrep(&lxmf_delivery_hash, false),
-                            relay_hash,
-                        ),
-                        LOG_NOTICE,
-                        false,
-                        false,
-                    );
-                }
-            }
+        if let Err(e) = handle_notify_command(&reg_node, command, subscriber_hash, Some(pubkey)) {
+            log(format!("[rfed] notify/register: {e}"), LOG_WARNING, false, false);
+            return rmp_serde::to_vec(&false).unwrap_or_default();
         }
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
@@ -1862,41 +1975,16 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let unreg_node = Arc::clone(node);
     let unregister_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                         _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let (value_bytes, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
+        let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
-        let (relay_hash, channel_hash_opt): (String, Option<Vec<u8>>) = {
-            let mut cur = Cursor::new(&value_bytes[..]);
-            match rmpv::decode::read_value(&mut cur) {
-                Ok(rmpv::Value::Array(mut arr)) if arr.len() >= 2 => {
-                    let relay = match arr.remove(0) {
-                        rmpv::Value::String(s) => s.into_str().unwrap_or_default().to_string(),
-                        _ => String::new(),
-                    };
-                    let ch = match arr.remove(0) {
-                        rmpv::Value::Binary(b) if b.len() == 16 => Some(b),
-                        _ => None,
-                    };
-                    (relay, ch)
-                }
-                _ => (String::from_utf8(value_bytes).unwrap_or_default(), None),
-            }
+        let command = match parse_notify_command(&value_bytes, Some(NotifyCommandKind::Unregister)) {
+            Ok(cmd) => cmd,
+            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
-        if relay_hash.is_empty() {
+        if handle_notify_command(&unreg_node, command, subscriber_hash, Some(pubkey)).is_err() {
             return rmp_serde::to_vec(&false).unwrap_or_default();
-        }
-        if let Ok(guard) = unreg_node.lock() {
-            if let Ok(mut notify) = guard.notify_registry.lock() {
-                if let Some(ref ch) = channel_hash_opt {
-                    notify.unregister(&subscriber_hash, Some(ch.as_slice()), &relay_hash);
-                } else {
-                    let lxmf_delivery_hash = Destination::hash(
-                        Some(&subscriber_hash), "lxmf", &["delivery"],
-                    );
-                    notify.unregister(&lxmf_delivery_hash, None, &relay_hash);
-                }
-            }
         }
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
@@ -1906,21 +1994,26 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let clear_node = Arc::clone(node);
     let clear_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                     _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        // For clear, payload is fixarray-3 [str(""), bin(64) pubkey, bin(64) sig_over_empty].
-        // We only need the subscriber hash from the verified pubkey.
-        let (_value, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
+        let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
-        if let Ok(guard) = clear_node.lock() {
-            if let Ok(mut notify) = guard.notify_registry.lock() {
-                notify.clear(&subscriber_hash);
-            }
+        let command = match parse_notify_command(&value_bytes, Some(NotifyCommandKind::Clear)) {
+            Ok(cmd) => cmd,
+            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
+        };
+        if handle_notify_command(&clear_node, command, subscriber_hash, Some(pubkey)).is_err() {
+            return rmp_serde::to_vec(&false).unwrap_or_default();
         }
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
+    guard.notify_dest.set_packet_callback(Some(packet_cb.clone()));
+    let packet_cb_for_link = packet_cb.clone();
+    guard.notify_dest.set_link_established_callback(Some(Arc::new(move |mut link: LinkHandle| {
+        link.set_packet_callback(Some(packet_cb_for_link.clone()));
+    })));
     guard.notify_dest.register_request_handler(
         NOTIFY_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
     )?;
@@ -2023,6 +2116,53 @@ mod hash_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod app_links_tests {
+    #[test]
+    fn one_shot_rfed_node_flows_use_ephemeral_app_links() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs");
+
+        let tick_start = source
+            .find("pub fn tick_sync(&mut self)")
+            .expect("tick_sync present");
+        let push_start = source
+            .find("fn push_subscriptions_to_backup(")
+            .expect("push_subscriptions_to_backup present");
+        let backup_delivery_start = source[push_start..]
+            .find("fn backup_delivery_tick(")
+            .map(|offset| push_start + offset)
+            .expect("backup_delivery_tick present");
+
+        let tick_fragment = &source[tick_start..push_start];
+        assert!(
+            tick_fragment.contains("AppLinks::open(&peer_hash, APP_NAME, &[\"node\"]);"),
+            "tick_sync must route rfed.node readiness through AppLinks::open()"
+        );
+        assert!(
+            tick_fragment.contains(
+                "AppLinks::status(&peer_hash) != rns_app_links::APP_LINK_ACTIVE"
+            ),
+            "tick_sync must wait for the EphemeralLink readiness signal before opening a one-shot sync link"
+        );
+
+        let push_fragment = &source[push_start..backup_delivery_start];
+        assert!(
+            push_fragment.contains("AppLinks::open(&backup_hash, APP_NAME, &[\"node\"]);"),
+            "backup pushes must route rfed.node readiness through AppLinks::open()"
+        );
+        assert!(
+            push_fragment.contains(
+                "AppLinks::status(&backup_hash) != rns_app_links::APP_LINK_ACTIVE"
+            ),
+            "backup pushes must wait for the EphemeralLink readiness signal before opening a one-shot backup link"
+        );
     }
 }
 

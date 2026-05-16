@@ -46,6 +46,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use app_links::AppLinks;
 use lxmf_rust::lx_stamper;
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::Identity;
@@ -167,7 +168,8 @@ pub struct PropPeer {
     pub transferring: Option<Vec<Vec<u8>>>,
     /// The last set of IDs we offered — used to reconcile the response.
     pub last_offer: Vec<Vec<u8>>,
-    /// Active outbound link handle to this peer (if currently established).
+    /// Session-scoped mirror of the active AppLinks-owned link while a sync
+    /// exchange is in flight.
     pub link: Option<LinkHandle>,
     /// Current sync state machine position (see `IDLE`, `LINK_ESTABLISHING`, etc.).
     pub state: u8,
@@ -1470,9 +1472,9 @@ impl LxmfPropagationNode {
     /// Initiate an outbound sync session with a peer.
     ///
     /// Builds an OFFER payload containing unhandled transient_ids (sorted by
-    /// weight = age × size, lightest first) and opens an encrypted Link to
-    /// the peer's lxmf.propagation destination.  The link_established callback
-    /// sends the OFFER request and processes the response.
+    /// weight = age × size, lightest first) and runs the OFFER request over
+    /// the shared AppLinks-owned persistent `lxmf.propagation` link once it is
+    /// active.
     fn initiate_sync(&mut self, peer_hash: &[u8]) {
         log(
             format!("[lxmf.prop] initiate_sync starting for {}", hexrep(peer_hash, false)),
@@ -1490,35 +1492,9 @@ impl LxmfPropagationNode {
             return;
         }
 
-        // Check path
-        if !Transport::has_path(peer_hash) {
-            log("[lxmf.prop] sync: no path, requesting", LOG_DEBUG, false, false);
-            Transport::request_path(peer_hash, None, None, None, None);
-            return;
-        }
-
-        // Recall identity and build destination
-        let identity = match Identity::recall(peer_hash) {
-            Some(id) => id,
-            None => {
-                log("[lxmf.prop] sync: cannot recall identity, requesting path", LOG_DEBUG, false, false);
-                Transport::request_path(peer_hash, None, None, None, None);
-                return;
-            }
-        };
-        let destination = match Destination::new_outbound(
-            Some(identity),
-            DestinationType::Single,
-            LXMF_APP.to_string(),
-            vec![PROP_ASPECT.to_string()],
-        ) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-
-        // Build offer: [peering_key, [transient_ids...]]
-        let (peering_key, _) = match &peer.peering_key {
-            Some(pk) => pk.clone(),
+        // Build offer candidates from the current peer state.
+        match &peer.peering_key {
+            Some(_) => {}
             None => return,
         };
 
@@ -1565,87 +1541,31 @@ impl LxmfPropagationNode {
             return;
         }
 
-        // Build the offer msgpack
-        let offer = Value::Array(vec![
-            Value::Binary(peering_key),
-            Value::Array(offer_ids.iter().map(|id| Value::Binary(id.clone())).collect()),
-        ]);
-        let mut offer_data = Vec::new();
-        let _ = write_value(&mut offer_data, &offer);
-
-        // Create outbound link
-        let link = match Link::new_outbound(destination, MODE_AES256_CBC) {
-            Ok(l) => l,
-            Err(e) => {
-                log(format!("[lxmf.prop] link creation failed: {e}"), LOG_WARNING, false, false);
-                return;
-            }
-        };
-
-        let handle = LinkHandle::spawn(link);
-        let weak = self.self_handle.clone();
-        let peer_hash_clone = peer_hash.to_vec();
-        let offer_ids_clone = offer_ids.clone();
-
-        // Set up link established callback to send the offer.
-        // The callback receives the live LinkHandle `h` from the actor.
-        let weak2 = weak.clone();
-        let peer_hash2 = peer_hash_clone.clone();
-        let offer_ids2 = offer_ids_clone.clone();
-        handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
-            if let Some(arc) = weak2.as_ref().and_then(|w| w.upgrade()) {
-                if let Ok(mut node) = arc.lock() {
-                    if let Some(peer) = node.peers.get_mut(&peer_hash2) {
-                        peer.state = PropPeer::LINK_READY;
-                        peer.alive = true;
-                        peer.last_heard = now();
-                        peer.sync_backoff = 0.0;
-                    }
-
-                    // Send the offer request using the live handle from the actor.
-                    node.send_offer_on_link(&h, &peer_hash2, &offer_ids2);
-                }
-            }
-        })));
-
-        let weak3 = weak.clone();
-        let peer_hash3 = peer_hash_clone.clone();
-        handle.set_link_closed_callback(Some(Arc::new(move |_h: LinkHandle| {
-            if let Some(arc) = weak3.as_ref().and_then(|w| w.upgrade()) {
-                if let Ok(mut node) = arc.lock() {
-                    if let Some(peer) = node.peers.get_mut(&peer_hash3) {
-                        peer.link = None;
-                        if peer.state != PropPeer::IDLE {
-                            peer.state = PropPeer::IDLE;
-                            peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
-                            peer.next_sync_attempt = now() + peer.sync_backoff;
-                        }
-                    }
-                }
-            }
-        })));
-
-        if let Err(e) = handle.initiate() {
-            log(format!("[lxmf.prop] link initiate failed: {e}"), LOG_WARNING, false, false);
+        if let Some(handle) = AppLinks::get_handle(peer_hash)
+            .filter(|link| link.status() == reticulum_rust::link::STATE_ACTIVE)
+        {
+            log(
+                format!(
+                    "[lxmf.prop] reusing AppLinks persistent link for {}",
+                    hexrep(peer_hash, false),
+                ),
+                LOG_DEBUG,
+                false,
+                false,
+            );
+            self.send_offer_on_link(&handle, peer_hash, &offer_ids);
             return;
         }
-        // The link actor registers the runtime handle itself inside
-        // LinkMsg::Initiate once the real link_id is derived (see
-        // Reticulum-rust/src/link.rs).  An external register here would
-        // produce a redundant "(replaced existing entry)" log per LR.
 
-        peer.link = Some(handle);
-        peer.state = PropPeer::LINK_ESTABLISHING;
-        peer.last_offer = offer_ids;
-        // Do NOT increment sync_backoff here.  It is incremented in the
-        // link_closed callback (covering both successful and failed syncs),
-        // and reset to 0 by the link_established callback on success.
-        // Adding it a second time here would double-count on every failed
-        // sync cycle, causing exponential (2× linear) back-off growth.
-
+        AppLinks::open_persistent(peer_hash, LXMF_APP, &[PROP_ASPECT]);
         log(
-            format!("[lxmf.prop] initiating sync with {}", hexrep(peer_hash, false)),
-            LOG_DEBUG, false, false,
+            format!(
+                "[lxmf.prop] requested AppLinks persistent open for {}",
+                hexrep(peer_hash, false),
+            ),
+            LOG_DEBUG,
+            false,
+            false,
         );
     }
 
@@ -1658,6 +1578,13 @@ impl LxmfPropagationNode {
             Some(p) => p,
             None => return,
         };
+
+        peer.link = Some(link.clone());
+        peer.last_offer = offer_ids.to_vec();
+        peer.state = PropPeer::LINK_READY;
+        peer.alive = true;
+        peer.last_heard = now();
+        peer.sync_backoff = 0.0;
 
         let (peering_key, _) = match &peer.peering_key {
             Some(pk) => pk.clone(),
@@ -1698,7 +1625,9 @@ impl LxmfPropagationNode {
         let failed_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>> = Some(Arc::new({
             let weak = weak.clone();
             let ph = peer_hash_clone.clone();
+            let link = link.clone();
             move |_receipt: RequestReceipt| {
+                link.teardown();
                 if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
                     if let Ok(mut node) = arc.lock() {
                         if let Some(peer) = node.peers.get_mut(&ph) {
@@ -1722,6 +1651,7 @@ impl LxmfPropagationNode {
             }
             Err(e) => {
                 log(format!("[lxmf.prop] offer request failed: {e}"), LOG_WARNING, false, false);
+                link.teardown();
                 peer.state = PropPeer::IDLE;
                 peer.link = None;
             }
@@ -1825,9 +1755,7 @@ impl LxmfPropagationNode {
         // Reset peer state for next cycle
         if let Some(peer) = self.peers.get_mut(peer_hash) {
             peer.state = PropPeer::IDLE;
-            if peer.link.is_some() {
-                // Keep link alive briefly for the peer to send back
-            }
+            peer.link = None;
         }
     }
 
@@ -1895,14 +1823,13 @@ impl LxmfPropagationNode {
             Err(e) => {
                 log(format!("[lxmf.prop] message send failed for {peer_hash_str}: {e}"),
                     LOG_WARNING, false, false);
+                link.teardown();
             }
         }
 
-        // Teardown is fire-and-forget: LinkHandle::teardown() sends a message
-        // to the actor queue and returns immediately.  The link_closed callback
-        // fires on a new thread after the PropagationNode mutex has been
-        // released, so there is no deadlock risk.
-        link.teardown();
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            peer.link = None;
+        }
     }
 
     // ── Persistence ──────────────────────────────────────────────────────────
@@ -2144,4 +2071,38 @@ fn encode_value(value: Value) -> Vec<u8> {
 /// Encode an error code (0xF0–0xFF) as a msgpack Integer.
 fn encode_error(code: u8) -> Vec<u8> {
     encode_value(Value::Integer((code as i64).into()))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn initiate_sync_uses_persistent_app_links() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/lxmf_propagation.rs"
+        ))
+        .expect("read lxmf_propagation.rs");
+
+        let start = source
+            .find("fn initiate_sync(&mut self, peer_hash: &[u8])")
+            .expect("initiate_sync present");
+        let end = source[start..]
+            .find("fn send_offer_on_link")
+            .map(|offset| start + offset)
+            .expect("send_offer_on_link present");
+        let fragment = &source[start..end];
+
+        assert!(
+            fragment.contains("AppLinks::get_handle(peer_hash)"),
+            "RFed propagation peer sync must reuse the AppLinks-owned persistent handle"
+        );
+        assert!(
+            fragment.contains("AppLinks::open_persistent(peer_hash, LXMF_APP, &[PROP_ASPECT]);"),
+            "RFed propagation peer sync must request a persistent AppLinks propagation link"
+        );
+        assert!(
+            !fragment.contains("Link::new_outbound"),
+            "RFed propagation peer sync must not construct raw outbound links directly"
+        );
+    }
 }
