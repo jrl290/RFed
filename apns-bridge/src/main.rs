@@ -5,9 +5,15 @@
 //! Usage:
 //!   apns_bridge [--config apns_bridge.conf] [--debug]
 //!
-//! The config file is the same INI format as the Python version:
-//!   [bridge]  identity_path, db_path, rns_config | rns_tcp_host/port
-//!   [apns]    key_file, key_id, team_id, bundle_id, sandbox, push_type, ...
+//! The config file uses Reticulum's native config layout:
+//!   [reticulum]  Reticulum core settings
+//!   [interfaces] Native `[[Interface]]` entries (TCPClientInterface, etc.)
+//!   [bridge]     identity_path, db_path
+//!   [apns]       key_file, key_id, team_id, bundle_id, sandbox, push_type, ...
+//!
+//! Legacy bridge-only transport keys (`rns_config`, `rns_tcp_host`,
+//! `rns_tcp_port`, `rns_tcp_endpoints`) are still accepted for compatibility,
+//! but new configs should define interfaces under `[interfaces]` like rfed/rnsd.
 //!
 //! Compile for Linux x86_64 (shared hosting):
 //!   cargo build --release -p apns-bridge --target x86_64-unknown-linux-musl
@@ -45,7 +51,7 @@ fn main() {
                 println!("rfed APNs Push Bridge\n");
                 println!("Usage: apns_bridge [--config <file>] [--debug]");
                 println!("       apns_bridge --help\n");
-                println!("  --config <file>  Path to INI config file (default: ./apns_bridge.conf)");
+                println!("  --config <file>  Path to config file (default: ./apns_bridge.conf)");
                 println!("  --debug          Enable debug-level logging");
                 process::exit(0);
             }
@@ -68,7 +74,7 @@ fn main() {
     let config_file = Path::new(&config_path);
     if !config_file.exists() {
         error!(
-            "Config file not found: {}\nCopy apns_bridge.conf.example → apns_bridge.conf and fill in.",
+            "Config file not found: {}\nCreate apns_bridge.conf with [reticulum], [interfaces], [bridge], and [apns] sections.",
             config_path
         );
         process::exit(1);

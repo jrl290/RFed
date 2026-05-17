@@ -149,43 +149,93 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
 fn init_reticulum(cfg: &BridgeConfig) -> Result<std::path::PathBuf, String> {
     if let Some(rns_config) = &cfg.rns_config {
         let dir = std::path::PathBuf::from(rns_config);
+        info!("Using external Reticulum config dir {}", dir.display());
         Reticulum::init(Some(dir.clone()), None, None, None, false, None)
             .map_err(|e| format!("Reticulum init failed: {e}"))?;
         return Ok(dir);
     }
 
-    // Build a minimal config dir next to the identity file
-    let identity_path = std::path::Path::new(&cfg.identity_path);
-    let config_dir = identity_path
-        .parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("reticulum");
-    std::fs::create_dir_all(&config_dir)
-        .map_err(|e| format!("cannot create reticulum dir: {e}"))?;
+    let endpoints = cfg.legacy_tcp_endpoints();
+    if cfg.has_legacy_tcp_config() {
+        if endpoints.is_empty() {
+            return Err(
+                "legacy bridge transport config is incomplete; use bridge.rns_config or native [reticulum]/[interfaces] sections instead".to_string(),
+            );
+        }
 
-    let config_text = if let (Some(host), Some(port)) = (&cfg.rns_tcp_host, cfg.rns_tcp_port) {
-        format!(
-            "[reticulum]\n  enable_transport = false\n  share_instance = false\n\n\
-             [interfaces]\n\n  [[ApnsBridgeTCP]]\n    type = TCPClientInterface\n\
-             enabled = yes\n    target_host = {host}\n    target_port = {port}\n"
-        )
-    } else {
-        // Default interface (localhost shared instance)
-        "[reticulum]\n  enable_transport = false\n  share_instance = true\n".to_string()
-    };
+        warn!(
+            "bridge.rns_tcp_host / rns_tcp_port / rns_tcp_endpoints is deprecated; use native [interfaces] entries in the main config file"
+        );
 
-    let config_file = config_dir.join("config");
-    std::fs::write(&config_file, &config_text)
-        .map_err(|e| format!("cannot write reticulum config: {e}"))?;
+        // Compatibility path: synthesize a minimal Reticulum config next to the
+        // identity file for older bridge configs that still use bridge.rns_tcp_*.
+        let identity_path = std::path::Path::new(&cfg.identity_path);
+        let config_dir = identity_path
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("reticulum");
+        std::fs::create_dir_all(&config_dir)
+            .map_err(|e| format!("cannot create reticulum dir: {e}"))?;
 
-    if let Some(host) = &cfg.rns_tcp_host {
+        let mut config_text = String::new();
+        config_text.push_str("[reticulum]\n  enable_transport = false\n  share_instance = false\n\n");
+        config_text.push_str("[interfaces]\n");
+        for (idx, (host, port)) in endpoints.iter().enumerate() {
+            config_text.push_str(&format!(
+                "\n  [[ApnsBridgeTCP{n}]]\n    type = TCPClientInterface\n    target_host = {host}\n    target_port = {port}\n    enabled = yes\n",
+                n = idx + 1,
+            ));
+        }
+
+        let config_file = config_dir.join("config");
+        std::fs::write(&config_file, &config_text)
+            .map_err(|e| format!("cannot write reticulum config: {e}"))?;
+
+        let summary = endpoints
+            .iter()
+            .map(|(h, p)| format!("{h}:{p}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         info!(
-            "Using TCP interface → {}:{} (configdir: {})",
-            host,
-            cfg.rns_tcp_port.unwrap_or(4242),
-            config_dir.display()
+            "Using {} legacy TCP interface(s) → {} (configdir: {})",
+            endpoints.len(),
+            summary,
+            config_dir.display(),
+        );
+
+        Reticulum::init(Some(config_dir.clone()), None, None, None, false, None)
+            .map_err(|e| format!("Reticulum init failed: {e}"))?;
+        return Ok(config_dir);
+    }
+
+    if !cfg.has_native_reticulum_config() {
+        return Err(
+            "config must include native [reticulum] and [interfaces] sections, or use the legacy bridge.rns_config / bridge.rns_tcp_* keys"
+                .to_string(),
         );
     }
+
+    // Preferred path: use the same config file format as rfed/rnsd. Copy the
+    // whole bridge config into a private `_rns/config` so Reticulum reads the
+    // native `[reticulum]` / `[interfaces]` sections directly and ignores the
+    // bridge-specific `[bridge]` / `[apns]` sections.
+    let config_dir = cfg
+        .config_file
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("_rns");
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| format!("cannot create reticulum dir: {e}"))?;
+    let config_file = config_dir.join("config");
+    if cfg.config_file != config_file {
+        std::fs::copy(&cfg.config_file, &config_file)
+            .map_err(|e| format!("cannot prepare reticulum config: {e}"))?;
+    }
+    info!(
+        "Using native Reticulum config from {} (configdir: {})",
+        cfg.config_file.display(),
+        config_dir.display(),
+    );
 
     Reticulum::init(Some(config_dir.clone()), None, None, None, false, None)
         .map_err(|e| format!("Reticulum init failed: {e}"))?;
