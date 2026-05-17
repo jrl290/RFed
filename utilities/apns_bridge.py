@@ -382,8 +382,12 @@ class ApnsBridge:
             APNS_REG_APP, APNS_REG_ASPECT,
         )
         apns_dest.set_packet_callback(self._on_register_packet)
+        apns_dest.set_link_established_callback(self._on_register_link)
         log.info("rfed.apns    hash: %s", RNS.prettyhexrep(apns_dest.hash))
         log.info("Token registry: %d registered", self._db.count())
+    def _on_register_link(self, link: RNS.Link) -> None:
+        """Allow registration over a Link as well as plain packet."""
+        link.set_packet_callback(self._on_register_packet)
 
         notify_dest.announce()
         apns_dest.announce()
