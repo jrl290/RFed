@@ -16,7 +16,7 @@ use reticulum_rust::link::LinkHandle;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::Transport;
 
-use crate::apns::ApnsSender;
+use crate::apns::{ApnsSender, SendResult};
 use crate::config::BridgeConfig;
 use crate::db::{ApnsEnv, TokenDB};
 
@@ -305,28 +305,55 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
         }
     };
 
-    let result = state.apns.send(
-        &apns_token,
-        env,
-        &receiver_hex,
-        sender_hex.as_deref(),
-        channel_hex.as_deref(),
-    );
+    // When the registered env is Sandbox, also push to Production. macOS
+    // Catalyst Debug builds carry aps-environment=development but their
+    // device token is sometimes bound to the production gateway, so the
+    // sandbox push returns 200 OK from Apple while apsd never sees it.
+    // Fanning out covers both binding cases without retrying.
+    let envs: &[ApnsEnv] = match env {
+        ApnsEnv::Sandbox    => &[ApnsEnv::Sandbox, ApnsEnv::Production],
+        ApnsEnv::Production => &[ApnsEnv::Production],
+    };
 
-    if result.success {
-        let pushed = state.push_count.fetch_add(1, Ordering::Relaxed) + 1;
-        info!("NOTIFY #{n} pushed    receiver={receiver_hex} env={} → APNs OK  (total pushed: {pushed})",
-              env.as_db_str());
-    } else if ApnsSender::should_invalidate(result.http_code, result.reason.as_deref()) {
-        let failed = state.push_fail.fetch_add(1, Ordering::Relaxed) + 1;
-        state.db.lock().unwrap().invalidate_token(&apns_token, env).ok();
-        warn!("NOTIFY #{n} purged    receiver={receiver_hex} env={} — stale token (reason={:?}), total failed: {failed}",
-              env.as_db_str(), result.reason);
-    } else {
-        let failed = state.push_fail.fetch_add(1, Ordering::Relaxed) + 1;
-        error!("NOTIFY #{n} FAILED    receiver={receiver_hex} env={} — HTTP {} reason={:?}  (total failed: {failed})",
-               env.as_db_str(), result.http_code, result.reason);
+    let mut primary_result: Option<SendResult> = None;
+    for &send_env in envs {
+        let result = state.apns.send(
+            &apns_token,
+            send_env,
+            &receiver_hex,
+            sender_hex.as_deref(),
+            channel_hex.as_deref(),
+        );
+
+        if result.success {
+            let pushed = state.push_count.fetch_add(1, Ordering::Relaxed) + 1;
+            info!("NOTIFY #{n} pushed    receiver={receiver_hex} env={} → APNs OK  (total pushed: {pushed})",
+                  send_env.as_db_str());
+        } else if ApnsSender::should_invalidate(result.http_code, result.reason.as_deref()) {
+            let failed = state.push_fail.fetch_add(1, Ordering::Relaxed) + 1;
+            // Only purge the stored token if the *registered* env reported the
+            // token as invalid; a BadDeviceToken from the fanout gateway just
+            // means the token doesn't belong to that environment and is
+            // expected for one of the two sends.
+            if send_env == env {
+                state.db.lock().unwrap().invalidate_token(&apns_token, env).ok();
+                warn!("NOTIFY #{n} purged    receiver={receiver_hex} env={} — stale token (reason={:?}), total failed: {failed}",
+                      send_env.as_db_str(), result.reason);
+            } else {
+                info!("NOTIFY #{n} fanout    receiver={receiver_hex} env={} rejected token (reason={:?}) — expected, not purging",
+                      send_env.as_db_str(), result.reason);
+            }
+        } else {
+            let failed = state.push_fail.fetch_add(1, Ordering::Relaxed) + 1;
+            error!("NOTIFY #{n} FAILED    receiver={receiver_hex} env={} — HTTP {} reason={:?}  (total failed: {failed})",
+                   send_env.as_db_str(), result.http_code, result.reason);
+        }
+
+        if send_env == env {
+            primary_result = Some(result);
+        }
     }
+    let _ = primary_result;
 }
 
 // ── Registration packet handler ───────────────────────────────────────────────
