@@ -12,7 +12,7 @@ use rmpv::Value;
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::{Link, LinkHandle};
+use reticulum_rust::link::LinkHandle;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::Transport;
 
@@ -110,6 +110,18 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
         let state2 = Arc::clone(&state);
         apns_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
             handle_register(data, &state2);
+        })));
+    }
+
+    {
+        let state2 = Arc::clone(&state);
+        apns_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
+            debug!("[rfed.apns] link established");
+            let s = Arc::clone(&state2);
+            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+                debug!("[rfed.apns] inbound packet from link, size={}", data.len());
+                handle_register(data, &s);
+            })));
         })));
     }
 
