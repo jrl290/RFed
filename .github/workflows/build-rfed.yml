@@ -13,7 +13,7 @@ on:
   # cloned at build time. Pushes to those repos do NOT trigger this workflow.
   # To force a rebuild after a sibling-repo fix, run workflow_dispatch from
   # the Actions tab, or push an empty commit to a path listed above.
-  # Trigger: pick up Reticulum-rust 0d2a2e5 (request handlers receive LinkHandle).
+  # Trigger: pick up Reticulum-rust d54bb61 (TCP shutdown-on-write-error reconnect fix).
 
 permissions:
   contents: read

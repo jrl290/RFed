@@ -4,7 +4,7 @@
 //!
 //!   rfed.node      — Node announce + peer manifest/sync (OFFER, MESSAGE_GET)
 //!                    Backup push, capabilities query
-//!   rfed.delivery  — Live push channel + legacy inbox-pull compat during soft-cut
+//!   rfed.delivery  — Client inbox pull (PULL request proves private key)
 //!   rfed.channel   — Inbound inner blobs + subscription control
 //!                    (SEND packet, SUBSCRIBE / UNSUBSCRIBE requests)
 //!   rfed.notify    — Notify registration (REGISTER / UNREGISTER / CLEAR requests)
@@ -56,12 +56,6 @@ use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 use crate::announce;
 use crate::blob_store::BlobStore;
 
-type RfedRequestHandler = Arc<
-    dyn Fn(&str, &[u8], &[u8], Option<&Identity>, Option<&LinkHandle>, f64) -> Vec<u8>
-        + Send
-        + Sync,
->;
-
 /// Decode a msgpack binary value (bin8/bin16/bin32) to Vec<u8>.
 /// rmp_serde::from_slice::<Vec<u8>> treats Vec<u8> as a msgpack array;
 /// use this helper when the peer sends raw bytes encoded as msgpack bin.
@@ -71,42 +65,6 @@ fn decode_msgpack_bin(data: &[u8]) -> Vec<u8> {
         Ok(rmpv::Value::Binary(b)) => b,
         _ => Vec::new(),
     }
-}
-
-fn make_pull_request_handler(node: &Arc<Mutex<FedNode>>) -> RfedRequestHandler {
-    let pull_node = Arc::clone(node);
-    Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
-                  caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
-        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
-            Some(h) => h,
-            None => return Vec::new(),
-        };
-        if let Ok(guard) = pull_node.lock() {
-            let page_size = guard.config
-                .policy_for(&subscriber_hash)
-                .deferred_pull_batch_limit
-                .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
-            if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                let pending = deferred.drain_batch(&subscriber_hash, page_size);
-                let more_pending = deferred.has_pending(&subscriber_hash);
-                let pairs_val: Vec<rmpv::Value> = pending
-                    .into_iter()
-                    .map(|pb| rmpv::Value::Array(vec![
-                        rmpv::Value::Binary(pb.channel_hash),
-                        rmpv::Value::Binary(pb.blob),
-                    ]))
-                    .collect();
-                let envelope = rmpv::Value::Array(vec![
-                    rmpv::Value::Array(pairs_val),
-                    rmpv::Value::Boolean(more_pending),
-                ]);
-                let mut buf = Vec::new();
-                let _ = rmpv::encode::write_value(&mut buf, &envelope);
-                return buf;
-            }
-        }
-        Vec::new()
-    })
 }
 
 /// Parse and verify a signed payload: msgpack fixarray-3 [bin/str value, bin(64) pubkey, bin(64) sig].
@@ -2058,8 +2016,6 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
 
-    let pull_cb = make_pull_request_handler(node);
-
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.channel_dest.set_packet_callback(Some(packet_cb.clone()));
     guard.channel_dest.register_request_handler(
@@ -2081,11 +2037,9 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     guard.channel_unsubscribe_dest.register_request_handler(
         UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb), ALLOW_ALL, None, false,
     )?;
-    guard.channel_pull_dest.register_request_handler(
-        PULL_PATH.to_string(), Some(pull_cb), ALLOW_ALL, None, false,
-    )?;
-    // Soft-cut: clients now use rfed.channel.pull for paged inbox fetches,
-    // while legacy rfed.delivery PULL remains wired below for compatibility.
+    // channel_pull_dest: handler not yet wired — channel-history pull is a
+    // future feature distinct from rfed.delivery's inbox PULL. Registered
+    // now so clients can request a path and we reserve the hash slot.
     Transport::register_destination(guard.channel_subscribe_dest.clone());
     Transport::register_destination(guard.channel_unsubscribe_dest.clone());
     Transport::register_destination(guard.channel_publish_dest.clone());
@@ -2114,7 +2068,39 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     //       Bool(more_pending) ]
     // The previous "flat array of pairs" format is gone — clients MUST decode
     // the 2-element envelope.  Uses rmpv so Python receives proper bytes.
-    let pull_cb = make_pull_request_handler(node);
+    let pull_node = Arc::clone(node);
+    let pull_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
+                                  caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        if let Ok(guard) = pull_node.lock() {
+            let page_size = guard.config
+                .policy_for(&subscriber_hash)
+                .deferred_pull_batch_limit
+                .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
+            if let Ok(mut deferred) = guard.deferred_queue.lock() {
+                let pending = deferred.drain_batch(&subscriber_hash, page_size);
+                let more_pending = deferred.has_pending(&subscriber_hash);
+                let pairs_val: Vec<rmpv::Value> = pending
+                    .into_iter()
+                    .map(|pb| rmpv::Value::Array(vec![
+                        rmpv::Value::Binary(pb.channel_hash),
+                        rmpv::Value::Binary(pb.blob),
+                    ]))
+                    .collect();
+                let envelope = rmpv::Value::Array(vec![
+                    rmpv::Value::Array(pairs_val),
+                    rmpv::Value::Boolean(more_pending),
+                ]);
+                let mut buf = Vec::new();
+                let _ = rmpv::encode::write_value(&mut buf, &envelope);
+                return buf;
+            }
+        }
+        Vec::new()
+    });
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.delivery_dest.register_request_handler(

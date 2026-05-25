@@ -10,23 +10,17 @@
   },
   "interfaces": [
     {
-      "name": "RMap",
+      "name": "Beleth TCP Transport",
       "connected": true,
-      "address": "rmap.world",
+      "address": "rns.beleth.net",
       "port": 4242,
       "rx_bytes": 0,
       "tx_bytes": 0
     },
     {
-      "name": "CRN IPv4 / IPv6",
-      "connected": false,
-      "rx_bytes": 0,
-      "tx_bytes": 0
-    },
-    {
-      "name": "Ether Whisperer London",
+      "name": "RMap",
       "connected": true,
-      "address": "132.145.75.143",
+      "address": "rmap.world",
       "port": 4242,
       "rx_bytes": 0,
       "tx_bytes": 0
@@ -40,18 +34,24 @@
       "tx_bytes": 0
     },
     {
-      "name": "Beleth TCP Transport",
+      "name": "Ether Whisperer London",
       "connected": true,
-      "address": "rns.beleth.net",
+      "address": "132.145.75.143",
       "port": 4242,
+      "rx_bytes": 0,
+      "tx_bytes": 0
+    },
+    {
+      "name": "CRN IPv4 / IPv6",
+      "connected": false,
       "rx_bytes": 0,
       "tx_bytes": 0
     }
   ],
   "stats": {
-    "uptime_secs": 51289,
-    "subscribers": 10,
-    "blobs": 481032,
-    "notify_registrations": 10
+    "uptime_secs": 71199,
+    "subscribers": 12,
+    "blobs": 481033,
+    "notify_registrations": 14
   }
 }
