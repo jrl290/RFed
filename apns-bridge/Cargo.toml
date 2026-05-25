@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 reticulum_rust = { path = "../../Reticulum-rust", default-features = false }
+app_links = { path = "../../app-links" }
 
 # MessagePack — pinned to match workspace
 rmpv = "=1.0.0"

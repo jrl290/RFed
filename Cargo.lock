@@ -97,6 +97,7 @@ dependencies = [
 name = "apns-bridge"
 version = "0.1.0"
 dependencies = [
+ "app_links",
  "base64",
  "configparser",
  "ed25519-dalek",
@@ -747,6 +748,27 @@ name = "fallible-streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7360491ce676a36bf9bb3c56c1aa791658183a54d2744120f27285738d90465a"
+
+[[package]]
+name = "fcm-bridge"
+version = "0.1.0"
+dependencies = [
+ "app_links",
+ "base64",
+ "configparser",
+ "ed25519-dalek",
+ "env_logger",
+ "hex",
+ "log",
+ "openssl",
+ "reqwest",
+ "reticulum_rust",
+ "rmpv",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "x25519-dalek",
+]
 
 [[package]]
 name = "ff"

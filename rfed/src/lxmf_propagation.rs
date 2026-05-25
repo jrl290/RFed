@@ -60,6 +60,7 @@ use rmpv::Value;
 
 use crate::config::NodeConfig;
 use crate::notify::NotifyRegistry;
+use crate::stream_registry::{PropagationStreamRegistry, StreamDispatchResult};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -103,6 +104,13 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveDispatchOutcome {
+    Streamed,
+    Notified,
+    None,
 }
 
 // ── PropagationEntry ──────────────────────────────────────────────────────────
@@ -309,6 +317,8 @@ pub struct LxmfPropagationNode {
     pub identity: Identity,
     /// Shared notify registry — checked for every inbound LXMF message.
     registry: Arc<Mutex<NotifyRegistry>>,
+    /// Active rfed.propagation.stream sessions keyed by link.
+    stream_registry: Arc<Mutex<PropagationStreamRegistry>>,
 
     // ── Configuration ─────────────────────────────────────────────────
     pub stamp_cost: u32,
@@ -360,6 +370,7 @@ impl LxmfPropagationNode {
         identity: Identity,
         config: &NodeConfig,
         registry: Arc<Mutex<NotifyRegistry>>,
+        stream_registry: Arc<Mutex<PropagationStreamRegistry>>,
     ) -> Result<Arc<Mutex<Self>>, String> {
         let destination = Destination::new_inbound(
             Some(identity.clone()),
@@ -390,6 +401,7 @@ impl LxmfPropagationNode {
             destination,
             identity,
             registry,
+            stream_registry,
             stamp_cost,
             stamp_flexibility,
             peering_cost: config.peering_cost.unwrap_or(DEFAULT_PEERING_COST),
@@ -450,7 +462,7 @@ impl LxmfPropagationNode {
         let weak_offer = Arc::downgrade(arc);
         guard.destination.register_request_handler(
             OFFER_PATH.to_string(),
-            Some(Arc::new(move |path, data, request_id, remote_identity, requested_at| {
+            Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
                 if let Some(arc) = weak_offer.upgrade() {
                     if let Ok(mut node) = arc.lock() {
                         return node.handle_offer(path, data, request_id, remote_identity, requested_at);
@@ -466,7 +478,7 @@ impl LxmfPropagationNode {
         let weak_get = Arc::downgrade(arc);
         guard.destination.register_request_handler(
             GET_PATH.to_string(),
-            Some(Arc::new(move |path, data, request_id, remote_identity, requested_at| {
+            Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
                 if let Some(arc) = weak_get.upgrade() {
                     if let Ok(mut node) = arc.lock() {
                         return node.handle_get(path, data, request_id, remote_identity, requested_at);
@@ -1055,6 +1067,7 @@ impl LxmfPropagationNode {
         let validated = lx_stamper::validate_pn_stamps(&messages, min_cost);
 
         let mut stored = 0usize;
+        let mut streamed = 0usize;
         let mut notified = 0usize;
 
         for (_transient_id, lxmf_data, stamp_value, stamp_raw) in &validated {
@@ -1063,42 +1076,10 @@ impl LxmfPropagationNode {
                 stored += 1;
             }
 
-            // Fire notify for registered destinations.
-            // The first 16 bytes of lxmf_data are the recipient's dest hash;
-            // bytes 16..32 (when present) are the sender's dest hash.
-            if lxmf_data.len() >= DESTINATION_LENGTH {
-                let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
-                if let Ok(reg) = self.registry.lock() {
-                    let regs = reg.get_for_channel(dest_hash, None);
-                    if !regs.is_empty() {
-                        log(
-                            format!(
-                                "[lxmf.prop] found {} notify registrations for recipient {}",
-                                regs.len(),
-                                hexrep(dest_hash, false),
-                            ),
-                            LOG_NOTICE, false, false,
-                        );
-                        // Extract sender hash if the message is long enough.
-                        let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
-                            Some(&lxmf_data[DESTINATION_LENGTH..DESTINATION_LENGTH * 2])
-                        } else {
-                            None
-                        };
-                        for registration in &regs {
-                            crate::notify::dispatch_notify(registration, sender, None);
-                        }
-                        notified += 1;
-                    } else {
-                        log(
-                            format!(
-                                "[lxmf.prop] NO notify registrations found for recipient {}",
-                                hexrep(dest_hash, false),
-                            ),
-                            LOG_NOTICE, false, false,
-                        );
-                    }
-                }
+            match self.dispatch_live_or_notify(lxmf_data, "") {
+                LiveDispatchOutcome::Streamed => streamed += 1,
+                LiveDispatchOutcome::Notified => notified += 1,
+                LiveDispatchOutcome::None => {}
             }
         }
 
@@ -1106,11 +1087,91 @@ impl LxmfPropagationNode {
         let invalid_stamps = total - validated.len();
         log(
             format!(
-                "[lxmf.prop] processed {} msgs: {} stored, {} notified, {} bad-stamp",
-                total, stored, notified, invalid_stamps,
+                "[lxmf.prop] processed {} msgs: {} stored, {} streamed, {} notified, {} bad-stamp",
+                total, stored, streamed, notified, invalid_stamps,
             ),
             LOG_NOTICE, false, false,
         );
+    }
+
+    fn dispatch_live_or_notify(&self, lxmf_data: &[u8], log_suffix: &str) -> LiveDispatchOutcome {
+        if lxmf_data.len() < DESTINATION_LENGTH {
+            return LiveDispatchOutcome::None;
+        }
+
+        let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
+        let stream_result = self
+            .stream_registry
+            .lock()
+            .ok()
+            .map(|mut registry| registry.dispatch(dest_hash, lxmf_data))
+            .unwrap_or_else(StreamDispatchResult::default);
+
+        if stream_result.delivered() {
+            log(
+                format!(
+                    "[lxmf.prop] streamed recipient {} on {} live link(s){}",
+                    hexrep(dest_hash, false),
+                    stream_result.sent,
+                    log_suffix,
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+            return LiveDispatchOutcome::Streamed;
+        }
+
+        if stream_result.had_sessions() {
+            log(
+                format!(
+                    "[lxmf.prop] propagation.stream delivery failed for recipient {} — notify fallback{}",
+                    hexrep(dest_hash, false),
+                    log_suffix,
+                ),
+                LOG_WARNING,
+                false,
+                false,
+            );
+        }
+
+        if let Ok(reg) = self.registry.lock() {
+            let regs = reg.get_for_channel(dest_hash, None);
+            if !regs.is_empty() {
+                log(
+                    format!(
+                        "[lxmf.prop] found {} notify registrations for recipient {}{}",
+                        regs.len(),
+                        hexrep(dest_hash, false),
+                        log_suffix,
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
+                    Some(&lxmf_data[DESTINATION_LENGTH..DESTINATION_LENGTH * 2])
+                } else {
+                    None
+                };
+                for registration in &regs {
+                    crate::notify::dispatch_notify(registration, sender, None);
+                }
+                return LiveDispatchOutcome::Notified;
+            }
+            log(
+                format!(
+                    "[lxmf.prop] NO notify registrations found for recipient {}{}",
+                    hexrep(dest_hash, false),
+                    log_suffix,
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+        }
+
+        LiveDispatchOutcome::None
     }
 
     // ── OFFER handler ────────────────────────────────────────────────────────
@@ -1981,49 +2042,26 @@ impl LxmfPropagationNode {
         let validated = lx_stamper::validate_pn_stamps(&messages, min_cost);
 
         let mut stored = 0;
+        let mut streamed = 0;
+        let mut notified = 0;
         for (_tid, lxmf_data, stamp_value, stamp_raw) in &validated {
             if self.store_message(lxmf_data, *stamp_value, Some(stamp_raw), from_peer).is_some() {
                 stored += 1;
 
-                // Fire notify for registered destinations
-                if lxmf_data.len() >= DESTINATION_LENGTH {
-                    let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
-                    if let Ok(reg) = self.registry.lock() {
-                        let regs = reg.get_for_channel(dest_hash, None);
-                        if !regs.is_empty() {
-                            log(
-                                format!(
-                                    "[lxmf.prop] found {} notify registrations for recipient {} (peer sync)",
-                                    regs.len(),
-                                    hexrep(dest_hash, false),
-                                ),
-                                LOG_DEBUG, false, false,
-                            );
-                            for registration in &regs {
-                                let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
-                                    Some(&lxmf_data[DESTINATION_LENGTH..DESTINATION_LENGTH * 2])
-                                } else {
-                                    None
-                                };
-                                crate::notify::dispatch_notify(registration, sender, None);
-                            }
-                        } else {
-                            log(
-                                format!(
-                                    "[lxmf.prop] NO notify registrations found for recipient {} (peer sync)",
-                                    hexrep(dest_hash, false),
-                                ),
-                                LOG_DEBUG, false, false,
-                            );
-                        }
-                    }
+                match self.dispatch_live_or_notify(lxmf_data, " (peer sync)") {
+                    LiveDispatchOutcome::Streamed => streamed += 1,
+                    LiveDispatchOutcome::Notified => notified += 1,
+                    LiveDispatchOutcome::None => {}
                 }
             }
         }
 
         if stored > 0 {
             log(
-                format!("[lxmf.prop] ingested {} messages from peer", stored),
+                format!(
+                    "[lxmf.prop] ingested {} messages from peer ({} streamed, {} notified)",
+                    stored, streamed, notified,
+                ),
                 LOG_NOTICE, false, false,
             );
         }

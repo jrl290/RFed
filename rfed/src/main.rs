@@ -9,6 +9,8 @@
 //!   rfed.node      — Federation Node announce and peer sync
 //!   rfed.delivery  — Universal client inbox (all message types exit here)
 //!   rfed.channel   — Channel post inbound + subscription control plane
+//!   rfed.channel.stream      — Live per-channel fanout stream over a persistent Link
+//!   rfed.propagation.stream  — Live LXMF propagation stream over a persistent Link
 //!   rfed.notify    — Notify registration
 //!
 //! Usage:
@@ -56,6 +58,7 @@ mod sync;
 mod toml_config;
 mod destinations;
 mod lxmf_propagation;
+mod stream_registry;
 pub mod notify;
 
 use config::{NodeConfig, TierPolicy};
@@ -184,6 +187,14 @@ fn write_status_file(
                 "    \"rfed.delivery\": \"{}\",\n",
                 "    \"rfed.channel\": \"{}\",\n",
                 "    \"rfed.notify\": \"{}\",\n",
+                "    \"rfed.channel.subscribe\": \"{}\",\n",
+                "    \"rfed.channel.unsubscribe\": \"{}\",\n",
+                "    \"rfed.channel.publish\": \"{}\",\n",
+                "    \"rfed.channel.pull\": \"{}\",\n",
+                "    \"rfed.channel.stream\": \"{}\",\n",
+                "    \"rfed.propagation.stream\": \"{}\",\n",
+                "    \"rfed.notify.register\": \"{}\",\n",
+                "    \"rfed.notify.unregister\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
                 "  \"interfaces\": [],\n",
@@ -200,6 +211,14 @@ fn write_status_file(
             hexrep(&guard.delivery_dest.hash, false),
             hexrep(&guard.channel_dest.hash, false),
             hexrep(&guard.notify_dest.hash, false),
+            hexrep(&guard.channel_subscribe_dest.hash, false),
+            hexrep(&guard.channel_unsubscribe_dest.hash, false),
+            hexrep(&guard.channel_publish_dest.hash, false),
+            hexrep(&guard.channel_pull_dest.hash, false),
+            hexrep(&guard.channel_stream_dest.hash, false),
+            hexrep(&guard.propagation_stream_dest.hash, false),
+            hexrep(&guard.notify_register_dest.hash, false),
+            hexrep(&guard.notify_unregister_dest.hash, false),
             prop_hash,
             uptime_secs, sub_count, blob_count, notify_count,
         )
@@ -214,6 +233,14 @@ fn write_status_file(
                 "    \"rfed.delivery\": \"{}\",\n",
                 "    \"rfed.channel\": \"{}\",\n",
                 "    \"rfed.notify\": \"{}\",\n",
+                "    \"rfed.channel.subscribe\": \"{}\",\n",
+                "    \"rfed.channel.unsubscribe\": \"{}\",\n",
+                "    \"rfed.channel.publish\": \"{}\",\n",
+                "    \"rfed.channel.pull\": \"{}\",\n",
+                "    \"rfed.channel.stream\": \"{}\",\n",
+                "    \"rfed.propagation.stream\": \"{}\",\n",
+                "    \"rfed.notify.register\": \"{}\",\n",
+                "    \"rfed.notify.unregister\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
                 "  \"interfaces\": [\n",
@@ -232,6 +259,14 @@ fn write_status_file(
             hexrep(&guard.delivery_dest.hash, false),
             hexrep(&guard.channel_dest.hash, false),
             hexrep(&guard.notify_dest.hash, false),
+            hexrep(&guard.channel_subscribe_dest.hash, false),
+            hexrep(&guard.channel_unsubscribe_dest.hash, false),
+            hexrep(&guard.channel_publish_dest.hash, false),
+            hexrep(&guard.channel_pull_dest.hash, false),
+            hexrep(&guard.channel_stream_dest.hash, false),
+            hexrep(&guard.propagation_stream_dest.hash, false),
+            hexrep(&guard.notify_register_dest.hash, false),
+            hexrep(&guard.notify_unregister_dest.hash, false),
             prop_hash,
             interfaces_json,
             uptime_secs, sub_count, blob_count, notify_count,
@@ -618,9 +653,15 @@ fn main() -> Result<(), String> {
     let lxmf_prop_arc: Option<Arc<Mutex<lxmf_propagation::LxmfPropagationNode>>> =
     if lxmf_propagation_enabled {
         let notify_reg = node.lock().map_err(|_| "lock")?.notify_registry.clone();
+        let propagation_streams = node.lock().map_err(|_| "lock")?.propagation_streams.clone();
         let node_config = node.lock().map_err(|_| "lock")?.config.clone();
         let prop_identity = node.lock().map_err(|_| "lock")?.identity.clone();
-        let prop = lxmf_propagation::LxmfPropagationNode::new(prop_identity, &node_config, notify_reg)?;
+        let prop = lxmf_propagation::LxmfPropagationNode::new(
+            prop_identity,
+            &node_config,
+            notify_reg,
+            propagation_streams,
+        )?;
         lxmf_propagation::LxmfPropagationNode::enable(&prop)?;
 
         // Register announce handler so we discover other propagation peers

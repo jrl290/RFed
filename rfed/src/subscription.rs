@@ -153,6 +153,14 @@ impl SubscriptionTable {
             .collect()
     }
 
+    /// Whether a subscriber currently has a registration for a channel.
+    pub fn is_subscribed(&self, subscriber_hash: &[u8], channel_hash: &[u8]) -> bool {
+        self.entries.iter().any(|e| {
+            e.subscriber_hash.as_slice() == subscriber_hash
+                && e.channel_hash.as_slice() == channel_hash
+        })
+    }
+
     /// Returns all subscriber hashes with their optional owner hash for a given channel.
     ///
     /// `owner_hash` is `Some(hash)` for backup subscriptions; `None` for primary.

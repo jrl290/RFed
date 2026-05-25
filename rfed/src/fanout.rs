@@ -13,9 +13,13 @@
 //!
 //! The node's only job is:
 //!   1. Look up subscribers for the destination channel.
-//!   2. For each subscriber, send a Reticulum packet carrying the inner blob.
-//!   3. Fire registered delivery hooks (notify adapters).
+//!   2. Prefer any active `rfed.channel.stream` links for that subscriber.
+//!   3. Fall back to the legacy `rfed.delivery` packet path when no stream
+//!      session is active (compatibility during migration).
+//!   4. Fire registered delivery hooks (notify adapters).
 
+
+use std::sync::{Arc, Mutex};
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
@@ -24,6 +28,7 @@ use reticulum_rust::transport::Transport;
 use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::notify::HookRegistry;
+use crate::stream_registry::ChannelStreamRegistry;
 use crate::subscription::SubscriptionTable;
 
 /// rfed app name used to compute destination hashes.
@@ -40,6 +45,7 @@ pub fn fanout_blob(
     channel_dest_hash: &[u8],
     subscription_table: &SubscriptionTable,
     hook_registry: &HookRegistry,
+    channel_streams: Option<&Arc<Mutex<ChannelStreamRegistry>>>,
 ) -> Vec<Vec<u8>> {
     let subscribers = subscription_table.get_subscribers_with_owner(channel_dest_hash);
 
@@ -97,6 +103,42 @@ pub fn fanout_blob(
             );
         }
 
+        let mut payload = channel_dest_hash.to_vec();
+        payload.extend_from_slice(inner_blob);
+
+        if let Some(streams) = channel_streams {
+            if let Ok(mut registry) = streams.lock() {
+                let result = registry.dispatch(sub_hash, channel_dest_hash, &payload);
+                if result.delivered() {
+                    log(
+                        format!(
+                            "[fanout] streamed channel {} to subscriber {} on {} live link(s)",
+                            hexrep(channel_dest_hash, false),
+                            hexrep(sub_hash, false),
+                            result.sent,
+                        ),
+                        LOG_DEBUG,
+                        false,
+                        false,
+                    );
+                    hook_registry.on_deliver(sub_hash, inner_blob);
+                    continue;
+                }
+                if result.had_sessions() {
+                    log(
+                        format!(
+                            "[fanout] stream delivery failed for subscriber {} on channel {} — falling back to legacy delivery",
+                            hexrep(sub_hash, false),
+                            hexrep(channel_dest_hash, false),
+                        ),
+                        LOG_WARNING,
+                        false,
+                        false,
+                    );
+                }
+            }
+        }
+
         // subscriber_hash is the identity hash stored by subscribe_cb.
         // Use recall_from_identity_hash (not recall by destination hash).
         let maybe_identity = Identity::recall_from_identity_hash(sub_hash);
@@ -145,21 +187,9 @@ pub fn fanout_blob(
                     continue;
                 }
 
-                // Delivery packet payload: channel_id_hash(16) | inner_blob
-                //
-                // CHANNEL MESSAGES ARE LXMF PACKAGES.  channel_id_hash is the
-                // channel **identity hash** (the routing label subscribers
-                // signed in /rfed/subscribe).  inner_blob is the EC-encrypted
-                // authentication payload from `LXMessage::pack(PROPAGATED)` —
-                // i.e. EC_encrypted(source_hash || signature || msgpack_payload),
-                // byte-identical to what an LXMF propagation node carries.
-                // RFed never reads inside inner_blob.  Subscribers reconstruct
-                // the canonical LXMF block by prepending the lxmf.delivery
-                // destination_hash for the channel identity (re-derived from
-                // the channel name) and call
-                // `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`.
-                let mut payload = channel_dest_hash.to_vec();
-                payload.extend_from_slice(inner_blob);
+                // Delivery packet payload: channel_id_hash(16) | inner_blob.
+                // This remains as a compatibility fallback while clients migrate
+                // to rfed.channel.stream.
 
                 let mut packet = Packet::new(
                     Some(dest),

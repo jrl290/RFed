@@ -4,7 +4,7 @@
 //!
 //!   rfed.node      — Node announce + peer manifest/sync (OFFER, MESSAGE_GET)
 //!                    Backup push, capabilities query
-//!   rfed.delivery  — Client inbox pull (PULL request proves private key)
+//!   rfed.delivery  — Live push channel + legacy inbox-pull compat during soft-cut
 //!   rfed.channel   — Inbound inner blobs + subscription control
 //!                    (SEND packet, SUBSCRIBE / UNSUBSCRIBE requests)
 //!   rfed.notify    — Notify registration (REGISTER / UNREGISTER / CLEAR requests)
@@ -56,6 +56,12 @@ use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 use crate::announce;
 use crate::blob_store::BlobStore;
 
+type RfedRequestHandler = Arc<
+    dyn Fn(&str, &[u8], &[u8], Option<&Identity>, Option<&LinkHandle>, f64) -> Vec<u8>
+        + Send
+        + Sync,
+>;
+
 /// Decode a msgpack binary value (bin8/bin16/bin32) to Vec<u8>.
 /// rmp_serde::from_slice::<Vec<u8>> treats Vec<u8> as a msgpack array;
 /// use this helper when the peer sends raw bytes encoded as msgpack bin.
@@ -65,6 +71,42 @@ fn decode_msgpack_bin(data: &[u8]) -> Vec<u8> {
         Ok(rmpv::Value::Binary(b)) => b,
         _ => Vec::new(),
     }
+}
+
+fn make_pull_request_handler(node: &Arc<Mutex<FedNode>>) -> RfedRequestHandler {
+    let pull_node = Arc::clone(node);
+    Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
+                  caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        if let Ok(guard) = pull_node.lock() {
+            let page_size = guard.config
+                .policy_for(&subscriber_hash)
+                .deferred_pull_batch_limit
+                .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
+            if let Ok(mut deferred) = guard.deferred_queue.lock() {
+                let pending = deferred.drain_batch(&subscriber_hash, page_size);
+                let more_pending = deferred.has_pending(&subscriber_hash);
+                let pairs_val: Vec<rmpv::Value> = pending
+                    .into_iter()
+                    .map(|pb| rmpv::Value::Array(vec![
+                        rmpv::Value::Binary(pb.channel_hash),
+                        rmpv::Value::Binary(pb.blob),
+                    ]))
+                    .collect();
+                let envelope = rmpv::Value::Array(vec![
+                    rmpv::Value::Array(pairs_val),
+                    rmpv::Value::Boolean(more_pending),
+                ]);
+                let mut buf = Vec::new();
+                let _ = rmpv::encode::write_value(&mut buf, &envelope);
+                return buf;
+            }
+        }
+        Vec::new()
+    })
 }
 
 /// Parse and verify a signed payload: msgpack fixarray-3 [bin/str value, bin(64) pubkey, bin(64) sig].
@@ -106,6 +148,74 @@ fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Str
     }
     let subscriber_hash = id.hash.ok_or("identity has no hash after from_public_key")?;
     Ok((value, subscriber_hash, pubkey))
+}
+
+fn encode_stream_open_response(ok: bool, reason: Option<&str>) -> Vec<u8> {
+    let response = rmpv::Value::Array(vec![
+        rmpv::Value::Boolean(ok),
+        match reason {
+            Some(reason) => rmpv::Value::String(reason.into()),
+            None => rmpv::Value::Nil,
+        },
+    ]);
+    let mut buf = Vec::new();
+    let _ = rmpv::encode::write_value(&mut buf, &response);
+    buf
+}
+
+fn decode_channel_stream_filters(value_bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if value_bytes.len() == 16 {
+        return Ok(vec![value_bytes.to_vec()]);
+    }
+
+    let mut cur = Cursor::new(value_bytes);
+    let value = rmpv::decode::read_value(&mut cur)
+        .map_err(|e| format!("channel stream config decode: {e}"))?;
+    let items = match value {
+        rmpv::Value::Array(items) => items,
+        other => {
+            return Err(format!(
+                "channel stream config must be bin(16) or array of bin(16), got {:?}",
+                other
+            ));
+        }
+    };
+
+    let mut filters = Vec::new();
+    for item in items {
+        let channel_hash = match item {
+            rmpv::Value::Binary(hash) => hash,
+            other => {
+                return Err(format!(
+                    "channel stream config entries must be bin(16), got {:?}",
+                    other
+                ));
+            }
+        };
+        if channel_hash.len() != 16 {
+            return Err(format!(
+                "channel stream config entry len {} != 16",
+                channel_hash.len()
+            ));
+        }
+        if !filters.iter().any(|existing| existing == &channel_hash) {
+            filters.push(channel_hash);
+        }
+    }
+
+    Ok(filters)
+}
+
+fn lxmf_delivery_hash_from_pubkey(pubkey: &[u8]) -> Result<Vec<u8>, String> {
+    let identity = Identity::from_public_key(pubkey)
+        .map_err(|e| format!("from_public_key: {e}"))?;
+    Destination::new_outbound(
+        Some(identity),
+        DestinationType::Single,
+        "lxmf".to_string(),
+        vec!["delivery".to_string()],
+    )
+    .map(|dest| dest.hash)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,6 +413,7 @@ use crate::deferred_queue::DeferredQueue;
 use crate::fanout;
 use crate::lxmf_propagation::LxmfPropagationNode;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
+use crate::stream_registry::{ChannelStreamRegistry, PropagationStreamRegistry};
 use crate::subscription::SubscriptionTable;
 use crate::sync::{FedSync, OFFER_PATH, MESSAGE_GET_PATH, BACKUP_PUSH_PATH};
 
@@ -322,6 +433,10 @@ pub const NOTIFY_UNREGISTER_PATH: &str = "/rfed/notify/unregister";
 pub const NOTIFY_CLEAR_PATH: &str = "/rfed/notify/clear";
 /// Client queries node capabilities and enabled features.
 pub const CAPABILITIES_PATH: &str = "/rfed/capabilities";
+/// Client opens a live per-channel stream on an established link.
+pub const CHANNEL_STREAM_OPEN_PATH: &str = "/rfed/channel/stream/open";
+/// Client opens a live propagation stream on an established link.
+pub const PROPAGATION_STREAM_OPEN_PATH: &str = "/rfed/propagation/stream/open";
 
 /// RNS app namespace for all rfed destinations.
 pub const APP_NAME: &str = "rfed";
@@ -369,8 +484,28 @@ pub struct FedNode {
     // Inbound RNS destinations
     pub node_dest: Destination,
     pub delivery_dest: Destination,
+    /// DEPRECATED — replaced by the four split aspects
+    /// (rfed.channel.{subscribe,unsubscribe,publish,pull}).
+    /// Kept registered for one transition release so in-the-wild Retichat
+    /// builds keep working. Remove after Retichat clients migrate.
+    /// See REFACTOR.md (2026-05-17).
     pub channel_dest: Destination,
+    /// DEPRECATED — replaced by rfed.notify.{register,unregister}.
+    /// See REFACTOR.md (2026-05-17).
     pub notify_dest: Destination,
+
+    // ── New split aspects (REFACTOR.md 2026-05-17) ──────────────────
+    pub channel_subscribe_dest: Destination,
+    pub channel_unsubscribe_dest: Destination,
+    pub channel_publish_dest: Destination,
+    pub channel_pull_dest: Destination,
+    pub notify_register_dest: Destination,
+    pub notify_unregister_dest: Destination,
+    pub channel_stream_dest: Destination,
+    pub propagation_stream_dest: Destination,
+
+    pub channel_streams: Arc<Mutex<ChannelStreamRegistry>>,
+    pub propagation_streams: Arc<Mutex<PropagationStreamRegistry>>,
 
     /// Active outbound sync links keyed by peer destination hash.
     /// Pruned each tick_sync — dead links are removed so a new link can be
@@ -420,6 +555,8 @@ impl FedNode {
         let deferred_queue = Arc::new(Mutex::new(DeferredQueue::load(
             config.deferred_queue_file(),
         )));
+        let channel_streams = Arc::new(Mutex::new(ChannelStreamRegistry::default()));
+        let propagation_streams = Arc::new(Mutex::new(PropagationStreamRegistry::default()));
 
         let mut fed_sync = FedSync::new(
             Arc::clone(&blob_store),
@@ -465,6 +602,27 @@ impl FedNode {
             vec!["notify".to_string()],
         )?;;
 
+        // ── Split aspects (REFACTOR.md 2026-05-17) ──────────────────
+        // Registered alongside the legacy channel/notify destinations so
+        // clients can migrate one at a time. Same identity, distinct aspect
+        // strings → distinct destination hashes on the wire.
+        let mk_inbound = |aspects: Vec<String>| -> Result<Destination, String> {
+            Destination::new_inbound(
+                Some(identity.clone()),
+                DestinationType::Single,
+                APP_NAME.to_string(),
+                aspects,
+            )
+        };
+        let channel_subscribe_dest   = mk_inbound(vec!["channel".into(), "subscribe".into()])?;
+        let channel_unsubscribe_dest = mk_inbound(vec!["channel".into(), "unsubscribe".into()])?;
+        let channel_publish_dest     = mk_inbound(vec!["channel".into(), "publish".into()])?;
+        let channel_pull_dest        = mk_inbound(vec!["channel".into(), "pull".into()])?;
+        let channel_stream_dest      = mk_inbound(vec!["channel".into(), "stream".into()])?;
+        let propagation_stream_dest  = mk_inbound(vec!["propagation".into(), "stream".into()])?;
+        let notify_register_dest     = mk_inbound(vec!["notify".into(), "register".into()])?;
+        let notify_unregister_dest   = mk_inbound(vec!["notify".into(), "unregister".into()])?;
+
         if let Ok(mut s) = sync.lock() {
             s.set_local_node_hash(node_dest.hash.clone());
         }
@@ -478,11 +636,21 @@ impl FedNode {
             notify_registry,
             sync,
             deferred_queue,
+            channel_streams,
+            propagation_streams,
             lxmf_propagation: None,
             node_dest,
             delivery_dest,
             channel_dest,
             notify_dest,
+            channel_subscribe_dest,
+            channel_unsubscribe_dest,
+            channel_publish_dest,
+            channel_pull_dest,
+            channel_stream_dest,
+            propagation_stream_dest,
+            notify_register_dest,
+            notify_unregister_dest,
             sync_links: HashMap::new(),
             pending_backup_pushes: Arc::new(Mutex::new(Vec::new())),
             selected_backups: Vec::new(),
@@ -516,6 +684,20 @@ impl FedNode {
         let _ = self.channel_dest.announce(None, false, None, None, true);
         let _ = self.delivery_dest.announce(None, false, None, None, true);
         let _ = self.notify_dest.announce(None, false, None, None, true);
+        // New split aspects (REFACTOR.md 2026-05-17).  Stamp policy rides on
+        // the publish destination since that's where SEND lands (matches
+        // `publish_destinations()` below).  Set default_app_data so the
+        // Transport announce daemon's interface-up re-announces (which call
+        // `dest.announce(None, ...)`) still carry the stamp policy.
+        self.channel_publish_dest.set_default_app_data(Some(app_data.clone()));
+        let _ = self.channel_subscribe_dest.announce(None, false, None, None, true);
+        let _ = self.channel_unsubscribe_dest.announce(None, false, None, None, true);
+        let _ = self.channel_publish_dest.announce(Some(&app_data), false, None, None, true);
+        let _ = self.channel_pull_dest.announce(None, false, None, None, true);
+        let _ = self.channel_stream_dest.announce(None, false, None, None, true);
+        let _ = self.propagation_stream_dest.announce(None, false, None, None, true);
+        let _ = self.notify_register_dest.announce(None, false, None, None, true);
+        let _ = self.notify_unregister_dest.announce(None, false, None, None, true);
     }
 
     /// Opt all four locally-registered destinations into Transport's
@@ -544,9 +726,19 @@ impl FedNode {
         let svc = Some(Duration::from_secs(SERVICE_REFRESH_INTERVAL_SECS));
         // Publish the channel SEND stamp policy on rfed.channel itself so
         // senders can autoconfigure before their first fire-and-forget send.
-        Transport::publish_destination(self.channel_dest.hash.clone(), svc, Some(app_data));
+        Transport::publish_destination(self.channel_dest.hash.clone(), svc, Some(app_data.clone()));
         Transport::publish_destination(self.delivery_dest.hash.clone(), svc, None);
         Transport::publish_destination(self.notify_dest.hash.clone(), svc, None);
+        // New split aspects (REFACTOR.md 2026-05-17). Stamp policy rides on
+        // the publish destination since that's where SEND lands.
+        Transport::publish_destination(self.channel_subscribe_dest.hash.clone(),   svc, None);
+        Transport::publish_destination(self.channel_unsubscribe_dest.hash.clone(), svc, None);
+        Transport::publish_destination(self.channel_publish_dest.hash.clone(),     svc, Some(app_data));
+        Transport::publish_destination(self.channel_pull_dest.hash.clone(),        svc, None);
+        Transport::publish_destination(self.channel_stream_dest.hash.clone(),      svc, None);
+        Transport::publish_destination(self.propagation_stream_dest.hash.clone(),  svc, None);
+        Transport::publish_destination(self.notify_register_dest.hash.clone(),     svc, None);
+        Transport::publish_destination(self.notify_unregister_dest.hash.clone(),   svc, None);
     }
 
     /// Explicitly persist all in-memory state to disk.
@@ -964,7 +1156,11 @@ fn run_sync_session(
                                 if let (Some(subs), Some(hooks)) = (subs, hooks) {
                                     for (channel_hash, blob) in &ingested {
                                         let missed = fanout::fanout_blob(
-                                            blob, channel_hash, &subs, &hooks,
+                                            blob,
+                                            channel_hash,
+                                            &subs,
+                                            &hooks,
+                                            Some(&guard.channel_streams),
                                         );
                                         if !missed.is_empty() {
                                             if let Ok(mut deferred) = guard.deferred_queue.lock() {
@@ -1279,7 +1475,8 @@ fn backup_delivery_tick(
 ///
 /// Initialization order:
 ///   1. Inject weak self-reference into `FedNode` for callback use.
-///   2. Wire all four destinations (node, channel, delivery, notify).
+///   2. Wire all four destinations (node, channel, delivery, notify)
+///      plus the stream destinations.
 ///   3. Load persisted sync peers and request paths.
 ///   4. Print destination hashes for operator convenience.
 ///   5. Register announce handlers:
@@ -1296,6 +1493,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     wire_channel_destination(&node)?;
     wire_delivery_destination(&node)?;
     wire_notify_destination(&node)?;
+    wire_stream_destinations(&node)?;
 
     // Load persisted peer state and seed static peers, then request paths
     // for all known/static peers so Reticulum starts routing to them.
@@ -1322,6 +1520,14 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             ("delivery", &guard.delivery_dest),
             ("channel",  &guard.channel_dest),
             ("notify",   &guard.notify_dest),
+            ("channel.subscribe",   &guard.channel_subscribe_dest),
+            ("channel.unsubscribe", &guard.channel_unsubscribe_dest),
+            ("channel.publish",     &guard.channel_publish_dest),
+            ("channel.pull",        &guard.channel_pull_dest),
+            ("channel.stream",      &guard.channel_stream_dest),
+            ("propagation.stream",  &guard.propagation_stream_dest),
+            ("notify.register",     &guard.notify_register_dest),
+            ("notify.unregister",   &guard.notify_unregister_dest),
         ] {
             log(
                 format!("[rfed] rfed.{} dest hash: {}", label, hexrep(&dest.hash, false)),
@@ -1488,7 +1694,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let sync_offer = {
         let n = Arc::clone(node);
         Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                       _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                       _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
             let offered: Vec<Vec<u8>> = rmp_serde::from_slice(data).unwrap_or_default();
             if let Ok(s) = n.lock().map(|g| Arc::clone(&g.sync)) {
                 if let Ok(sync) = s.lock() {
@@ -1506,7 +1712,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let sync_get = {
         let n = Arc::clone(node);
         Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                       _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                       _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
             let ids: Vec<Vec<u8>> = rmp_serde::from_slice(data).unwrap_or_default();
             if let Ok(s) = n.lock().map(|g| Arc::clone(&g.sync)) {
                 if let Ok(mut sync) = s.lock() {
@@ -1524,7 +1730,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // produce the matching link authentication.
     let backup_push_node = Arc::clone(node);
     let backup_push_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                        caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                                        caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let owner_hash = match caller {
             Some(id) => match Destination::new_outbound(
                 Some(id.clone()),
@@ -1575,7 +1781,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // breaking older clients (unknown keys are simply ignored).
     let caps_node = Arc::clone(node);
     let capabilities_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
-                                         _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                                         _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let guard = match caps_node.lock() {
             Ok(g) => g,
             Err(_) => return Vec::new(),
@@ -1607,6 +1813,14 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         ));
         caps.push((
             rmpv::Value::String("lxmf_propagation".into()),
+            rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
+        ));
+        caps.push((
+            rmpv::Value::String("channel_stream".into()),
+            rmpv::Value::Boolean(true),
+        ));
+        caps.push((
+            rmpv::Value::String("propagation_stream".into()),
             rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
         ));
         caps.push((
@@ -1733,7 +1947,13 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                         ),
                         LOG_NOTICE, false, false,
                     );
-                    let missed = fanout::fanout_blob(inner_blob, channel_hash, &subs, &hooks);
+                    let missed = fanout::fanout_blob(
+                        inner_blob,
+                        channel_hash,
+                        &subs,
+                        &hooks,
+                        Some(&guard.channel_streams),
+                    );
                     if !missed.is_empty() {
                         if let Ok(mut deferred) = guard.deferred_queue.lock() {
                             for sub_hash in &missed {
@@ -1764,7 +1984,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // SUBSCRIBE — client registers (subscriber_hash, channel_hash).
     let sub_node = Arc::clone(node);
     let subscribe_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                      _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                                      _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         // Payload: fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig].
         // Subscriber identity is derived from pubkey; sig proves key ownership.
         let (channel_hash, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
@@ -1825,7 +2045,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // UNSUBSCRIBE
     let unsub_node = Arc::clone(node);
     let unsubscribe_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                        _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                                        _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let (channel_hash, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
@@ -1838,15 +2058,38 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
 
+    let pull_cb = make_pull_request_handler(node);
+
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
-    guard.channel_dest.set_packet_callback(Some(packet_cb));
+    guard.channel_dest.set_packet_callback(Some(packet_cb.clone()));
     guard.channel_dest.register_request_handler(
-        SUBSCRIBE_PATH.to_string(), Some(subscribe_cb), ALLOW_ALL, None, false,
+        SUBSCRIBE_PATH.to_string(), Some(subscribe_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.channel_dest.register_request_handler(
-        UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb), ALLOW_ALL, None, false,
+        UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb.clone()), ALLOW_ALL, None, false,
     )?;
     Transport::register_destination(guard.channel_dest.clone());
+
+    // ── New split aspects (REFACTOR.md 2026-05-17) ──────────────────
+    // Each new destination carries the intent on the wire. Same callbacks,
+    // distinct destination hashes. SUBSCRIBE/UNSUBSCRIBE paths are reused
+    // since the path string is informational once routed to the right dest.
+    guard.channel_publish_dest.set_packet_callback(Some(packet_cb));
+    guard.channel_subscribe_dest.register_request_handler(
+        SUBSCRIBE_PATH.to_string(), Some(subscribe_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.channel_unsubscribe_dest.register_request_handler(
+        UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.channel_pull_dest.register_request_handler(
+        PULL_PATH.to_string(), Some(pull_cb), ALLOW_ALL, None, false,
+    )?;
+    // Soft-cut: clients now use rfed.channel.pull for paged inbox fetches,
+    // while legacy rfed.delivery PULL remains wired below for compatibility.
+    Transport::register_destination(guard.channel_subscribe_dest.clone());
+    Transport::register_destination(guard.channel_unsubscribe_dest.clone());
+    Transport::register_destination(guard.channel_publish_dest.clone());
+    Transport::register_destination(guard.channel_pull_dest.clone());
     Ok(())
 }
 
@@ -1871,39 +2114,7 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     //       Bool(more_pending) ]
     // The previous "flat array of pairs" format is gone — clients MUST decode
     // the 2-element envelope.  Uses rmpv so Python receives proper bytes.
-    let pull_node = Arc::clone(node);
-    let pull_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
-                                  caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
-        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
-            Some(h) => h,
-            None => return Vec::new(),
-        };
-        if let Ok(guard) = pull_node.lock() {
-            let page_size = guard.config
-                .policy_for(&subscriber_hash)
-                .deferred_pull_batch_limit
-                .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
-            if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                let pending = deferred.drain_batch(&subscriber_hash, page_size);
-                let more_pending = deferred.has_pending(&subscriber_hash);
-                let pairs_val: Vec<rmpv::Value> = pending
-                    .into_iter()
-                    .map(|pb| rmpv::Value::Array(vec![
-                        rmpv::Value::Binary(pb.channel_hash),
-                        rmpv::Value::Binary(pb.blob),
-                    ]))
-                    .collect();
-                let envelope = rmpv::Value::Array(vec![
-                    rmpv::Value::Array(pairs_val),
-                    rmpv::Value::Boolean(more_pending),
-                ]);
-                let mut buf = Vec::new();
-                let _ = rmpv::encode::write_value(&mut buf, &envelope);
-                return buf;
-            }
-        }
-        Vec::new()
-    });
+    let pull_cb = make_pull_request_handler(node);
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.delivery_dest.register_request_handler(
@@ -1948,7 +2159,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // the lxmf.delivery dest hash from message headers) can look up the relay.
     let reg_node = Arc::clone(node);
     let register_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                      _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                                      _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(e) => {
@@ -1974,7 +2185,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // Payload: msgpack [str(relay_hex), bin(16 channel_hash) | nil], same as REGISTER.
     let unreg_node = Arc::clone(node);
     let unregister_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                        _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                                        _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
@@ -1993,7 +2204,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // No payload required.
     let clear_node = Arc::clone(node);
     let clear_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                    _caller: Option<&Identity>, _timeout: f64| -> Vec<u8> {
+                                    _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let (value_bytes, subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
@@ -2015,21 +2226,222 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         link.set_packet_callback(Some(packet_cb_for_link.clone()));
     })));
     guard.notify_dest.register_request_handler(
-        NOTIFY_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+        NOTIFY_REGISTER_PATH.to_string(), Some(register_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.notify_dest.register_request_handler(
-        NOTIFY_UNREGISTER_PATH.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
+        NOTIFY_UNREGISTER_PATH.to_string(), Some(unregister_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.notify_dest.register_request_handler(
         NOTIFY_CLEAR_PATH.to_string(), Some(clear_cb), ALLOW_ALL, None, false,
     )?;
     Transport::register_destination(guard.notify_dest.clone());
+
+    // ── New split aspects (REFACTOR.md 2026-05-17) ──────────────────
+    // Same packet/request callbacks, intent split across two destinations.
+    // NOTIFY_CLEAR remains on legacy notify_dest only — it has no analog in
+    // the new split (clear-all is a maintenance op, not a routing op).
+    guard.notify_register_dest.set_packet_callback(Some(packet_cb.clone()));
+    let packet_cb_for_reg_link = packet_cb.clone();
+    guard.notify_register_dest.set_link_established_callback(Some(Arc::new(move |mut link: LinkHandle| {
+        link.set_packet_callback(Some(packet_cb_for_reg_link.clone()));
+    })));
+    guard.notify_register_dest.register_request_handler(
+        NOTIFY_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+    )?;
+
+    guard.notify_unregister_dest.set_packet_callback(Some(packet_cb.clone()));
+    let packet_cb_for_unreg_link = packet_cb;
+    guard.notify_unregister_dest.set_link_established_callback(Some(Arc::new(move |mut link: LinkHandle| {
+        link.set_packet_callback(Some(packet_cb_for_unreg_link.clone()));
+    })));
+    guard.notify_unregister_dest.register_request_handler(
+        NOTIFY_UNREGISTER_PATH.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
+    )?;
+
+    Transport::register_destination(guard.notify_register_dest.clone());
+    Transport::register_destination(guard.notify_unregister_dest.clone());
+    Ok(())
+}
+
+fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
+    let channel_stream_node = Arc::clone(node);
+    let channel_stream_open = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                             _caller: Option<&Identity>, link: Option<&LinkHandle>,
+                                             _timeout: f64| -> Vec<u8> {
+        let link = match link {
+            Some(link) => link.clone(),
+            None => return encode_stream_open_response(false, Some("no_link")),
+        };
+
+        let (value_bytes, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] channel.stream/open: {e}"), LOG_WARNING, false, false);
+                return encode_stream_open_response(false, Some("bad_signature"));
+            }
+        };
+
+        let channel_hashes = match decode_channel_stream_filters(&value_bytes) {
+            Ok(hashes) => hashes,
+            Err(e) => {
+                log(
+                    format!("[rfed] channel.stream/open config: {e}"),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
+                return encode_stream_open_response(false, Some("bad_channel_config"));
+            }
+        };
+
+        let (subscriptions, stream_registry) = match channel_stream_node.lock() {
+            Ok(guard) => (
+                Arc::clone(&guard.subscription_table),
+                Arc::clone(&guard.channel_streams),
+            ),
+            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+        };
+
+        let subscribed = subscriptions
+            .lock()
+            .ok()
+            .map(|subs| {
+                channel_hashes
+                    .iter()
+                    .all(|channel_hash| subs.is_subscribed(&subscriber_hash, channel_hash))
+            })
+            .unwrap_or(false);
+        if !subscribed {
+            return encode_stream_open_response(false, Some("not_subscribed"));
+        }
+
+        match stream_registry.lock() {
+            Ok(mut registry) => {
+                registry.configure(link.clone(), subscriber_hash.clone(), channel_hashes.clone());
+            }
+            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+        }
+
+        let cleanup_registry = Arc::clone(&stream_registry);
+        link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
+            if let Ok(mut registry) = cleanup_registry.lock() {
+                registry.remove(closed_link.link_id().as_slice());
+            }
+        })));
+
+        log(
+            format!(
+                "[rfed] channel.stream/open configured subscriber={} channels={} link={}",
+                hexrep(&subscriber_hash, false),
+                channel_hashes.len(),
+                hexrep(&link.link_id(), false),
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+
+        encode_stream_open_response(true, None)
+    });
+
+    let propagation_stream_node = Arc::clone(node);
+    let propagation_stream_open = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                                 _caller: Option<&Identity>, link: Option<&LinkHandle>,
+                                                 _timeout: f64| -> Vec<u8> {
+        let link = match link {
+            Some(link) => link.clone(),
+            None => return encode_stream_open_response(false, Some("no_link")),
+        };
+
+        let (delivery_hash, _subscriber_hash, pubkey) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] propagation.stream/open: {e}"), LOG_WARNING, false, false);
+                return encode_stream_open_response(false, Some("bad_signature"));
+            }
+        };
+
+        if delivery_hash.len() != 16 {
+            return encode_stream_open_response(false, Some("bad_delivery_hash"));
+        }
+
+        let expected_delivery_hash = match lxmf_delivery_hash_from_pubkey(&pubkey) {
+            Ok(hash) => hash,
+            Err(e) => {
+                log(format!("[rfed] propagation.stream/open: {e}"), LOG_WARNING, false, false);
+                return encode_stream_open_response(false, Some("bad_pubkey"));
+            }
+        };
+
+        if expected_delivery_hash != delivery_hash {
+            return encode_stream_open_response(false, Some("delivery_mismatch"));
+        }
+
+        let (propagation_enabled, stream_registry) = match propagation_stream_node.lock() {
+            Ok(guard) => (
+                guard.config.lxmf_propagation_enabled,
+                Arc::clone(&guard.propagation_streams),
+            ),
+            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+        };
+
+        if !propagation_enabled {
+            return encode_stream_open_response(false, Some("feature_disabled"));
+        }
+
+        match stream_registry.lock() {
+            Ok(mut registry) => {
+                if let Err(code) = registry.register(link.clone(), delivery_hash.clone()) {
+                    return encode_stream_open_response(false, Some(code));
+                }
+            }
+            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+        }
+
+        let cleanup_registry = Arc::clone(&stream_registry);
+        link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
+            if let Ok(mut registry) = cleanup_registry.lock() {
+                registry.remove(closed_link.link_id().as_slice());
+            }
+        })));
+
+        log(
+            format!(
+                "[rfed] propagation.stream/open linked delivery={} link={}",
+                hexrep(&delivery_hash, false),
+                hexrep(&link.link_id(), false),
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+
+        encode_stream_open_response(true, None)
+    });
+
+    let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
+    guard.channel_stream_dest.register_request_handler(
+        CHANNEL_STREAM_OPEN_PATH.to_string(),
+        Some(channel_stream_open),
+        ALLOW_ALL,
+        None,
+        false,
+    )?;
+    guard.propagation_stream_dest.register_request_handler(
+        PROPAGATION_STREAM_OPEN_PATH.to_string(),
+        Some(propagation_stream_open),
+        ALLOW_ALL,
+        None,
+        false,
+    )?;
+    Transport::register_destination(guard.channel_stream_dest.clone());
+    Transport::register_destination(guard.propagation_stream_dest.clone());
     Ok(())
 }
 
 #[cfg(test)]
 mod hash_tests {
-    //! Pin the on-the-wire destination hashes for `rfed.{node,delivery,channel,notify}`.
+    //! Pin the on-the-wire destination hashes for RFed's stable destination aspects.
     //!
     //! These hashes are part of the protocol: every client computes them from
     //! the server identity hash to pick the right inbox. If `Destination::hash`,
@@ -2065,6 +2477,10 @@ mod hash_tests {
 
     fn dest_hash(aspect: &str) -> Vec<u8> {
         Destination::hash(Some(&TEST_IDENTITY_HASH), APP_NAME, &[aspect])
+    }
+
+    fn dest_hash_multi(aspects: &[&str]) -> Vec<u8> {
+        Destination::hash(Some(&TEST_IDENTITY_HASH), APP_NAME, aspects)
     }
 
     #[test]
@@ -2116,6 +2532,186 @@ mod hash_tests {
                 );
             }
         }
+    }
+
+    // ── New split aspects (REFACTOR.md 2026-05-17) ────────────────────────
+    //
+    // Pinned wire hashes for the six split rfed aspects. Derived from the
+    // canonical formula using `TEST_IDENTITY_HASH`:
+    //     name_hash = sha256("rfed.<a>.<b>")[..10]
+    //     dest_hash = sha256(name_hash || identity_hash)[..16]
+    // If any of these tests fail, an aspect string was renamed and every
+    // client (Python, iOS, Android) must be updated in lock-step.
+
+    #[test]
+    fn rfed_channel_subscribe_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["channel", "subscribe"])),
+            "459193a74f78e63da3d9539a616c827e",
+        );
+    }
+
+    #[test]
+    fn rfed_channel_unsubscribe_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["channel", "unsubscribe"])),
+            "c461e8be136af87fc15350674c689ddc",
+        );
+    }
+
+    #[test]
+    fn rfed_channel_publish_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["channel", "publish"])),
+            "d01e4e99d4c386bc35c96af49020495e",
+        );
+    }
+
+    #[test]
+    fn rfed_channel_pull_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["channel", "pull"])),
+            "a53c83985f076e6c2f00d0244e83b949",
+        );
+    }
+
+    #[test]
+    fn rfed_channel_stream_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["channel", "stream"])),
+            "4b8ea0df6f54a28914d68bf5ee3c54a9",
+        );
+    }
+
+    #[test]
+    fn rfed_propagation_stream_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["propagation", "stream"])),
+            "1c95744608edb6ee17aa3220d93a8ffb",
+        );
+    }
+
+    #[test]
+    fn rfed_notify_register_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["notify", "register"])),
+            "71f8f6c9da1502ddc483f456bdce2e09",
+        );
+    }
+
+    #[test]
+    fn rfed_notify_unregister_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["notify", "unregister"])),
+            "5874773fa010e7fc02bd93d106ea4668",
+        );
+    }
+
+    #[test]
+    fn rfed_split_aspects_distinct_from_legacy() {
+        // Each new two-aspect destination must hash differently from the
+        // legacy single-aspect parent it replaces.
+        assert_ne!(dest_hash_multi(&["channel", "subscribe"]),   dest_hash("channel"));
+        assert_ne!(dest_hash_multi(&["channel", "unsubscribe"]), dest_hash("channel"));
+        assert_ne!(dest_hash_multi(&["channel", "publish"]),     dest_hash("channel"));
+        assert_ne!(dest_hash_multi(&["channel", "pull"]),        dest_hash("channel"));
+        assert_ne!(dest_hash_multi(&["channel", "stream"]),      dest_hash("channel"));
+        assert_ne!(dest_hash_multi(&["notify",  "register"]),    dest_hash("notify"));
+        assert_ne!(dest_hash_multi(&["notify",  "unregister"]),  dest_hash("notify"));
+        for legacy in ["node", "delivery", "channel", "notify"] {
+            assert_ne!(
+                dest_hash_multi(&["propagation", "stream"]),
+                dest_hash(legacy),
+                "rfed.propagation.stream must not collide with rfed.{legacy}",
+            );
+        }
+    }
+
+    #[test]
+    fn rfed_split_aspects_pairwise_distinct() {
+        let split: &[&[&str]] = &[
+            &["channel", "subscribe"],
+            &["channel", "unsubscribe"],
+            &["channel", "publish"],
+            &["channel", "pull"],
+            &["channel", "stream"],
+            &["propagation", "stream"],
+            &["notify",  "register"],
+            &["notify",  "unregister"],
+        ];
+        for i in 0..split.len() {
+            for j in (i + 1)..split.len() {
+                assert_ne!(
+                    dest_hash_multi(split[i]),
+                    dest_hash_multi(split[j]),
+                    "{:?} and {:?} must hash to distinct destinations",
+                    split[i], split[j],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rfed_split_aspects_do_not_collide_with_rns_path_request() {
+        let split: &[&[&str]] = &[
+            &["channel", "subscribe"],
+            &["channel", "unsubscribe"],
+            &["channel", "publish"],
+            &["channel", "pull"],
+            &["channel", "stream"],
+            &["propagation", "stream"],
+            &["notify",  "register"],
+            &["notify",  "unregister"],
+        ];
+        for aspects in split {
+            assert_ne!(
+                hex(&dest_hash_multi(aspects)),
+                RNS_PATH_REQUEST_HASH_HEX,
+                "rfed.{} must not collide with rnstransport.path.request",
+                aspects.join("."),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod stream_config_tests {
+    use super::decode_channel_stream_filters;
+
+    fn encode_filter_list(filters: &[&[u8]]) -> Vec<u8> {
+        let value = rmpv::Value::Array(
+            filters
+                .iter()
+                .map(|hash| rmpv::Value::Binary(hash.to_vec()))
+                .collect(),
+        );
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &value).expect("encode stream filter list");
+        buf
+    }
+
+    #[test]
+    fn channel_stream_filters_accept_legacy_single_hash() {
+        let hash = vec![0x11; 16];
+        let decoded = decode_channel_stream_filters(&hash).expect("decode legacy single hash");
+        assert_eq!(decoded, vec![hash]);
+    }
+
+    #[test]
+    fn channel_stream_filters_accept_config_array_and_dedup() {
+        let first = vec![0x11; 16];
+        let second = vec![0x22; 16];
+        let payload = encode_filter_list(&[&first, &second, &first]);
+        let decoded = decode_channel_stream_filters(&payload).expect("decode config array");
+        assert_eq!(decoded, vec![first, second]);
+    }
+
+    #[test]
+    fn channel_stream_filters_reject_non_16_byte_entries() {
+        let bad = vec![0x33; 15];
+        let payload = encode_filter_list(&[&bad]);
+        let err = decode_channel_stream_filters(&payload).expect_err("reject short entry");
+        assert!(err.contains("!= 16"), "unexpected error: {err}");
     }
 }
 

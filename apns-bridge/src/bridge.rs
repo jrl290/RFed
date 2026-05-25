@@ -1,5 +1,13 @@
-//! Reticulum bridge: wires up `rfed.notify` and `rfed.apns` destinations,
-//! dispatches wake packets to APNs, and handles token registration.
+//! Reticulum bridge: wires up the three canonical `apns.*` destinations used
+//! by the APNs push relay:
+//!   * `apns.relay`      — wake-packet endpoint (rfed → bridge → APNs)
+//!   * `apns.register`   — APNs token registration (client → bridge)
+//!   * `apns.unregister` — APNs token removal       (client → bridge)
+//!
+//! For one transition release the bridge also keeps the legacy `rfed.apns`
+//! registration destination alive as an alias for `apns.register`, so older
+//! clients can still refresh their token while iOS moves to the canonical
+//! `apns.*` naming. The old `rfed.notify` wake destination remains retired.
 
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
@@ -20,10 +28,15 @@ use crate::apns::{ApnsSender, SendResult};
 use crate::config::BridgeConfig;
 use crate::db::{ApnsEnv, TokenDB};
 
-const NOTIFY_APP:    &str = "rfed";
-const NOTIFY_ASPECT: &str = "notify";
-const APNS_APP:      &str = "rfed";
-const APNS_ASPECT:   &str = "apns";
+// Canonical apns-bridge aspects (dot-notation wire names).
+const RELAY_APP:        &str = "apns";
+const RELAY_ASPECT:     &str = "relay";
+const REGISTER_APP:     &str = "apns";
+const REGISTER_ASPECT:  &str = "register";
+const LEGACY_REGISTER_APP: &str = "rfed";
+const LEGACY_REGISTER_ASPECT: &str = "apns";
+const UNREGISTER_APP:   &str = "apns";
+const UNREGISTER_ASPECT: &str = "unregister";
 
 const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(600);
 
@@ -58,35 +71,36 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
         push_fail:    AtomicU64::new(0),
     });
 
-    // ── rfed.notify destination ───────────────────────────────────────────────
-    let mut notify_dest = Destination::new_inbound(
+    // ── apns.relay destination ────────────────────────────────────────────────
+    // Wake-packet endpoint: rfed posts a small msgpack map here and the
+    // bridge fans out an APNs push. Plain-packet and link-established
+    // callbacks both feed `dispatch_wake`.
+    let mut relay_dest = Destination::new_inbound(
         Some(identity.clone()),
         DestinationType::Single,
-        NOTIFY_APP.to_string(),
-        vec![NOTIFY_ASPECT.to_string()],
+        RELAY_APP.to_string(),
+        vec![RELAY_ASPECT.to_string()],
     )
-    .map_err(|e| format!("cannot create rfed.notify destination: {e}"))?;
-    info!("rfed.notify hash: {}", hex_dest(&notify_dest));
+    .map_err(|e| format!("cannot create apns.relay destination: {e}"))?;
+    info!("apns.relay      hash: {}", hex_dest(&relay_dest));
 
-    // Plain-packet callback (fire-and-forget wake packet, no Link)
     {
         let state2 = Arc::clone(&state);
-        notify_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-            debug!("[rfed.notify] inbound packet from transport, size={}", data.len());
+        relay_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+            debug!("[apns.relay] inbound packet from transport, size={}", data.len());
             let raw = data.to_vec();
             let s = Arc::clone(&state2);
             thread::spawn(move || dispatch_wake(raw, &s));
         })));
     }
 
-    // Link-established callback — rfed nodes may also open a Link first
     {
         let state2 = Arc::clone(&state);
-        notify_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
-            debug!("[rfed.notify] link established");
+        relay_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
+            debug!("[apns.relay] link established");
             let s = Arc::clone(&state2);
             link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-                debug!("[rfed.notify] inbound packet from link, size={}", data.len());
+                debug!("[apns.relay] inbound packet from link, size={}", data.len());
                 let raw = data.to_vec();
                 let s2 = Arc::clone(&s);
                 thread::spawn(move || dispatch_wake(raw, &s2));
@@ -94,29 +108,64 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
         })));
     }
 
-    Transport::register_destination(notify_dest.clone());
+    Transport::register_destination(relay_dest.clone());
 
-    // ── rfed.apns registration destination ───────────────────────────────────
-    let mut apns_dest = Destination::new_inbound(
+    // ── apns.register destination ─────────────────────────────────────────────
+    // Token registration / refresh. Payload is a msgpack map with
+    // `subscriber_hash` (bin16) and `apns_token` (64-char hex str), plus
+    // optional `env` ("sandbox" | "production").
+    let mut register_dest = Destination::new_inbound(
         Some(identity.clone()),
         DestinationType::Single,
-        APNS_APP.to_string(),
-        vec![APNS_ASPECT.to_string()],
+        REGISTER_APP.to_string(),
+        vec![REGISTER_ASPECT.to_string()],
     )
-    .map_err(|e| format!("cannot create rfed.apns destination: {e}"))?;
-    info!("rfed.apns  hash: {}", hex_dest(&apns_dest));
+    .map_err(|e| format!("cannot create apns.register destination: {e}"))?;
+    info!("apns.register   hash: {}", hex_dest(&register_dest));
 
     {
         let state2 = Arc::clone(&state);
-        apns_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+        register_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
             handle_register(data, &state2);
         })));
     }
 
     {
         let state2 = Arc::clone(&state);
-        apns_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
-            debug!("[rfed.apns] link established");
+        register_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
+            debug!("[apns.register] link established");
+            let s = Arc::clone(&state2);
+            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+                debug!("[apns.register] inbound packet from link, size={}", data.len());
+                handle_register(data, &s);
+            })));
+        })));
+    }
+
+    Transport::register_destination(register_dest.clone());
+
+    // ── rfed.apns legacy registration alias ─────────────────────────────────
+    // One-release compatibility alias while clients migrate to apns.register.
+    let mut legacy_register_dest = Destination::new_inbound(
+        Some(identity.clone()),
+        DestinationType::Single,
+        LEGACY_REGISTER_APP.to_string(),
+        vec![LEGACY_REGISTER_ASPECT.to_string()],
+    )
+    .map_err(|e| format!("cannot create legacy rfed.apns destination: {e}"))?;
+    info!("rfed.apns (legacy) hash: {}", hex_dest(&legacy_register_dest));
+
+    {
+        let state2 = Arc::clone(&state);
+        legacy_register_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+            handle_register(data, &state2);
+        })));
+    }
+
+    {
+        let state2 = Arc::clone(&state);
+        legacy_register_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
+            debug!("[rfed.apns] link established (legacy alias)");
             let s = Arc::clone(&state2);
             link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
                 debug!("[rfed.apns] inbound packet from link, size={}", data.len());
@@ -125,21 +174,61 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
         })));
     }
 
-    Transport::register_destination(apns_dest.clone());
+    Transport::register_destination(legacy_register_dest.clone());
+
+    // ── apns.unregister destination ───────────────────────────────────────────
+    // Explicit token removal. Payload is a msgpack map with just
+    // `subscriber_hash` (bin16); any `apns_token` field is ignored.
+    let mut unregister_dest = Destination::new_inbound(
+        Some(identity.clone()),
+        DestinationType::Single,
+        UNREGISTER_APP.to_string(),
+        vec![UNREGISTER_ASPECT.to_string()],
+    )
+    .map_err(|e| format!("cannot create apns.unregister destination: {e}"))?;
+    info!("apns.unregister hash: {}", hex_dest(&unregister_dest));
+
+    {
+        let state2 = Arc::clone(&state);
+        unregister_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+            handle_unregister(data, &state2);
+        })));
+    }
+
+    {
+        let state2 = Arc::clone(&state);
+        unregister_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
+            debug!("[apns.unregister] link established");
+            let s = Arc::clone(&state2);
+            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
+                debug!("[apns.unregister] inbound packet from link, size={}", data.len());
+                handle_unregister(data, &s);
+            })));
+        })));
+    }
+
+    Transport::register_destination(unregister_dest.clone());
 
     // ── Initial announces ─────────────────────────────────────────────────────
-    notify_dest.announce(None, false, None, None, true)
+    relay_dest.announce(None, false, None, None, true)
         .map_err(|e| format!("announce failed: {e}"))?;
-    apns_dest.announce(None, false, None, None, true)
+    register_dest.announce(None, false, None, None, true)
+        .map_err(|e| format!("announce failed: {e}"))?;
+    legacy_register_dest.announce(None, false, None, None, true)
+        .map_err(|e| format!("announce failed: {e}"))?;
+    unregister_dest.announce(None, false, None, None, true)
         .map_err(|e| format!("announce failed: {e}"))?;
 
     let reg_count = state.db.lock().unwrap().count().unwrap_or(0);
     info!("Bridge running — {} tokens registered", reg_count);
 
-    // ── Main loop (periodic re-announce) ──────────────────────────────────────
-    loop {        thread::sleep(ANNOUNCE_INTERVAL);
-        let _ = notify_dest.announce(None, false, None, None, true);
-        let _ = apns_dest.announce(None, false, None, None, true);
+    // ── Main loop (periodic re-announce) ──────────────────────
+    loop {
+        thread::sleep(ANNOUNCE_INTERVAL);
+        let _ = relay_dest.announce(None, false, None, None, true);
+        let _ = register_dest.announce(None, false, None, None, true);
+        let _ = legacy_register_dest.announce(None, false, None, None, true);
+        let _ = unregister_dest.announce(None, false, None, None, true);
         debug!("Periodic announces sent");
     }
 }
@@ -361,8 +450,32 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
 fn handle_register(data: &[u8], state: &BridgeState) {
     let result = try_handle_register(data, state);
     if let Err(e) = result {
-        warn!("Registration packet: rejected — {e}");
+        warn!("apns.register: rejected — {e}");
     }
+}
+
+/// Dedicated handler for the `apns.unregister` destination. Ignores any
+/// `apns_token` field and unconditionally removes the subscriber.
+fn handle_unregister(data: &[u8], state: &BridgeState) {
+    if let Err(e) = try_handle_unregister(data, state) {
+        warn!("apns.unregister: rejected — {e}");
+    }
+}
+
+fn try_handle_unregister(data: &[u8], state: &BridgeState) -> Result<(), String> {
+    let map = parse_msgpack_map(data).ok_or("cannot parse msgpack map")?;
+    let sub_bytes = map_get_bin(&map, "subscriber_hash")
+        .ok_or("subscriber_hash must be 16 bytes")?;
+    if sub_bytes.len() != 16 {
+        return Err("subscriber_hash must be 16 bytes".to_string());
+    }
+    let sub_hex = hex::encode(&sub_bytes);
+    let removed = state.db.lock().unwrap()
+        .unregister(&sub_hex)
+        .map_err(|e| format!("db unregister error: {e}"))?;
+    info!("apns.unregister: {} for {sub_hex}",
+          if removed { "removed" } else { "not found" });
+    Ok(())
 }
 
 fn try_handle_register(data: &[u8], state: &BridgeState) -> Result<(), String> {
@@ -394,14 +507,15 @@ fn try_handle_register(data: &[u8], state: &BridgeState) -> Result<(), String> {
             state.db.lock().unwrap()
                 .register(&sub_hex, &token_lower, env)
                 .map_err(|e| format!("db register error: {e}"))?;
-            info!("Register: token stored for {sub_hex} env={}", env.as_db_str());
+            info!("apns.register: token stored for {sub_hex} env={}", env.as_db_str());
         }
         None => {
-            // Unregister
+            // Backwards-compatible unregister via apns.register with no token.
             let removed = state.db.lock().unwrap()
                 .unregister(&sub_hex)
                 .map_err(|e| format!("db unregister error: {e}"))?;
-            info!("Unregister: {} for {sub_hex}", if removed { "removed" } else { "not found" });
+            info!("apns.register: {} for {sub_hex} (unregister via missing token)",
+                  if removed { "removed" } else { "not found" });
         }
     }
     Ok(())
@@ -441,7 +555,32 @@ mod tests {
     use rmpv::encode::write_value;
     use rmpv::Value;
 
-    use super::{map_get_bin, parse_msgpack_map};
+    use reticulum_rust::destination::Destination;
+
+    use super::{
+        map_get_bin, parse_msgpack_map,
+        LEGACY_REGISTER_APP, LEGACY_REGISTER_ASPECT,
+        RELAY_APP, RELAY_ASPECT,
+        REGISTER_APP, REGISTER_ASPECT,
+        UNREGISTER_APP, UNREGISTER_ASPECT,
+    };
+
+    /// Identity hash used by the canonical aspect pin tests across the
+    /// workspace (matches `rfed::destinations::tests::TEST_IDENTITY_HASH`).
+    /// Keeping the same constant here lets a single audit script compare
+    /// rfed and apns-bridge aspect hashes head-to-head.
+    const TEST_IDENTITY_HASH: [u8; 16] = [
+        0xc2, 0x87, 0xb8, 0x44, 0xb2, 0xb6, 0xf8, 0xd6,
+        0x01, 0x3b, 0x0a, 0x96, 0x2e, 0xb2, 0x10, 0x7b,
+    ];
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    fn dest_hash(app: &str, aspect: &str) -> Vec<u8> {
+        Destination::hash(Some(&TEST_IDENTITY_HASH), app, &[aspect])
+    }
 
     fn encode_map(entries: Vec<(Value, Value)>) -> Vec<u8> {
         let mut payload = Vec::new();
@@ -494,5 +633,75 @@ mod tests {
 
         let map = parse_msgpack_map(&payload).expect("parse registration map");
         assert_eq!(map_get_bin(&map, "subscriber_hash"), Some(subscriber));
+    }
+
+    // ── Aspect / destination-hash pins ───────────────────────────────────
+    //
+    // The wire form is `<app>.<aspect>`. If any of these tests fail an
+    // aspect constant was renamed and every client (iOS PushBridgeConfig
+    // plist, Android reconnect list, diagnostic scripts) must be updated
+    // in lock-step.
+
+    #[test]
+    fn aspect_strings_are_pinned() {
+        assert_eq!(RELAY_APP,        "apns");
+        assert_eq!(RELAY_ASPECT,     "relay");
+        assert_eq!(REGISTER_APP,     "apns");
+        assert_eq!(REGISTER_ASPECT,  "register");
+        assert_eq!(LEGACY_REGISTER_APP, "rfed");
+        assert_eq!(LEGACY_REGISTER_ASPECT, "apns");
+        assert_eq!(UNREGISTER_APP,   "apns");
+        assert_eq!(UNREGISTER_ASPECT, "unregister");
+    }
+
+    #[test]
+    fn apns_relay_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash(RELAY_APP, RELAY_ASPECT)),
+            "1a735b3321820869d4797a4063ec032c",
+        );
+    }
+
+    #[test]
+    fn apns_register_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash(REGISTER_APP, REGISTER_ASPECT)),
+            "a78f50ddd57e773745b8f0a128618d59",
+        );
+    }
+
+    #[test]
+    fn legacy_rfed_apns_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash(LEGACY_REGISTER_APP, LEGACY_REGISTER_ASPECT)),
+            "3f2634ca4ad67d8a88ff2a45e74bac9e",
+        );
+    }
+
+    #[test]
+    fn apns_unregister_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash(UNREGISTER_APP, UNREGISTER_ASPECT)),
+            "74a46665426e139c466192ff1402828d",
+        );
+    }
+
+    #[test]
+    fn apns_aspect_hashes_are_pairwise_distinct() {
+        let triples = [
+            (RELAY_APP,      RELAY_ASPECT),
+            (REGISTER_APP,   REGISTER_ASPECT),
+            (UNREGISTER_APP, UNREGISTER_ASPECT),
+        ];
+        for i in 0..triples.len() {
+            for j in (i + 1)..triples.len() {
+                assert_ne!(
+                    dest_hash(triples[i].0, triples[i].1),
+                    dest_hash(triples[j].0, triples[j].1),
+                    "{}.{} and {}.{} must hash to distinct destinations",
+                    triples[i].0, triples[i].1, triples[j].0, triples[j].1,
+                );
+            }
+        }
     }
 }
