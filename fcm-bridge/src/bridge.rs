@@ -16,13 +16,13 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
+use app_links::AppLinks;
 use log::{debug, error, info, warn};
 use rmpv::decode::read_value;
 use rmpv::Value;
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::link::LinkHandle;
 use reticulum_rust::reticulum::Reticulum;
 use reticulum_rust::transport::Transport;
 
@@ -45,6 +45,32 @@ struct BridgeState {
     notify_count: AtomicU64,
     push_count: AtomicU64,
     push_fail: AtomicU64,
+}
+
+type BridgePacketHandler = Arc<dyn Fn(Vec<u8>, &BridgeState) + Send + Sync + 'static>;
+
+// Use the shared AppLinks inbound wiring so direct destination DATA and
+// peer-established EphemeralLink DATA take the exact same host path.
+fn wire_bridge_destination(
+    destination: &mut Destination,
+    label: &'static str,
+    state: Arc<BridgeState>,
+    handler: BridgePacketHandler,
+) {
+    let packet_state = Arc::clone(&state);
+    let packet_handler = Arc::clone(&handler);
+    AppLinks::wire_inbound_destination(
+        destination,
+        Arc::new(move |data: Vec<u8>, source| {
+            debug!("[{label}] inbound packet via {:?}, size={}", source, data.len());
+            let state = Arc::clone(&packet_state);
+            let handler = Arc::clone(&packet_handler);
+            thread::spawn(move || handler(data, &state));
+        }),
+        Some(Arc::new(move || {
+            debug!("[{label}] link established");
+        })),
+    );
 }
 
 pub fn run(cfg: &BridgeConfig, db: TokenDB, fcm: FcmSender) -> Result<(), String> {
@@ -71,30 +97,12 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, fcm: FcmSender) -> Result<(), String
     )
     .map_err(|e| format!("cannot create rfed.notify destination: {e}"))?;
     info!("rfed.notify     hash: {}", hex_dest(&relay_dest));
-
-    {
-        let state2 = Arc::clone(&state);
-        relay_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-            debug!("[rfed.notify] inbound packet from transport, size={}", data.len());
-            let raw = data.to_vec();
-            let s = Arc::clone(&state2);
-            thread::spawn(move || dispatch_wake(raw, &s));
-        })));
-    }
-
-    {
-        let state2 = Arc::clone(&state);
-        relay_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
-            debug!("[rfed.notify] link established");
-            let s = Arc::clone(&state2);
-            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-                debug!("[rfed.notify] inbound packet from link, size={}", data.len());
-                let raw = data.to_vec();
-                let s2 = Arc::clone(&s);
-                thread::spawn(move || dispatch_wake(raw, &s2));
-            })));
-        })));
-    }
+    wire_bridge_destination(
+        &mut relay_dest,
+        "rfed.notify",
+        Arc::clone(&state),
+        Arc::new(dispatch_wake),
+    );
 
     Transport::register_destination(relay_dest.clone());
 
@@ -106,25 +114,12 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, fcm: FcmSender) -> Result<(), String
     )
     .map_err(|e| format!("cannot create fcm.register destination: {e}"))?;
     info!("fcm.register    hash: {}", hex_dest(&register_dest));
-
-    {
-        let state2 = Arc::clone(&state);
-        register_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-            handle_register(data, &state2);
-        })));
-    }
-
-    {
-        let state2 = Arc::clone(&state);
-        register_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
-            debug!("[fcm.register] link established");
-            let s = Arc::clone(&state2);
-            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-                debug!("[fcm.register] inbound packet from link, size={}", data.len());
-                handle_register(data, &s);
-            })));
-        })));
-    }
+    wire_bridge_destination(
+        &mut register_dest,
+        "fcm.register",
+        Arc::clone(&state),
+        Arc::new(|data: Vec<u8>, state: &BridgeState| handle_register(&data, state)),
+    );
 
     Transport::register_destination(register_dest.clone());
 
@@ -136,25 +131,12 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, fcm: FcmSender) -> Result<(), String
     )
     .map_err(|e| format!("cannot create fcm.unregister destination: {e}"))?;
     info!("fcm.unregister  hash: {}", hex_dest(&unregister_dest));
-
-    {
-        let state2 = Arc::clone(&state);
-        unregister_dest.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-            handle_unregister(data, &state2);
-        })));
-    }
-
-    {
-        let state2 = Arc::clone(&state);
-        unregister_dest.set_link_established_callback(Some(Arc::new(move |link: LinkHandle| {
-            debug!("[fcm.unregister] link established");
-            let s = Arc::clone(&state2);
-            link.set_packet_callback(Some(Arc::new(move |data: &[u8], _pkt| {
-                debug!("[fcm.unregister] inbound packet from link, size={}", data.len());
-                handle_unregister(data, &s);
-            })));
-        })));
-    }
+    wire_bridge_destination(
+        &mut unregister_dest,
+        "fcm.unregister",
+        Arc::clone(&state),
+        Arc::new(|data: Vec<u8>, state: &BridgeState| handle_unregister(&data, state)),
+    );
 
     Transport::register_destination(unregister_dest.clone());
 
@@ -602,5 +584,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn bridge_uses_shared_app_links_inbound_wiring() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/bridge.rs"))
+            .expect("read bridge.rs");
+        assert!(source.contains("wire_bridge_destination(\n        &mut relay_dest"));
+        assert!(source.contains("wire_bridge_destination(\n        &mut register_dest"));
+        assert!(source.contains("wire_bridge_destination(\n        &mut unregister_dest"));
+        assert!(source.contains("AppLinks::wire_inbound_destination("));
     }
 }
