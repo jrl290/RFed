@@ -31,5 +31,6 @@ utilities/apns_bridge.conf
 utilities/*.p8
 __pycache__/
 apns-bridge/apns_bridge
+fcm-bridge/fcm_bridge
 rfed/rfed
 rfed-nas.status
