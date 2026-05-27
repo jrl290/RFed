@@ -178,9 +178,58 @@ impl DeferredQueue {
         removed
     }
 
+    /// Drain at most `max` pending blobs for `subscriber_hash` that belong to
+    /// `channel_hash`.
+    ///
+    /// Non-matching blobs remain queued in their original relative order.
+    pub fn drain_channel_batch(
+        &mut self,
+        subscriber_hash: &[u8],
+        channel_hash: &[u8],
+        max: usize,
+    ) -> Vec<PendingBlob> {
+        let mut removed = Vec::new();
+
+        let drop_bucket = {
+            let bucket = match self.queue.get_mut(subscriber_hash) {
+                Some(b) => b,
+                None => return Vec::new(),
+            };
+
+            let mut kept = VecDeque::with_capacity(bucket.len());
+            while let Some(entry) = bucket.pop_front() {
+                if removed.len() < max && entry.channel_hash == channel_hash {
+                    removed.push(entry);
+                } else {
+                    kept.push_back(entry);
+                }
+            }
+
+            *bucket = kept;
+            bucket.is_empty()
+        };
+
+        if drop_bucket {
+            self.queue.remove(subscriber_hash);
+        }
+        if !removed.is_empty() {
+            let _ = self.save();
+        }
+        removed
+    }
+
     /// Whether there are any pending entries for `subscriber_hash`.
     pub fn has_pending(&self, subscriber_hash: &[u8]) -> bool {
         self.queue.get(subscriber_hash).map(|v| !v.is_empty()).unwrap_or(false)
+    }
+
+    /// Whether there are any pending entries for `subscriber_hash` on the
+    /// requested `channel_hash`.
+    pub fn has_pending_channel(&self, subscriber_hash: &[u8], channel_hash: &[u8]) -> bool {
+        self.queue
+            .get(subscriber_hash)
+            .map(|bucket| bucket.iter().any(|entry| entry.channel_hash == channel_hash))
+            .unwrap_or(false)
     }
 
     /// Flush expired entries older than `max_age_secs`.  Call periodically
@@ -355,6 +404,58 @@ mod tests {
         assert!(!q.has_pending(&sub_a));
         assert!(q.has_pending(&sub_b));
         assert_eq!(q.total_len(), 7);
+    }
+
+    #[test]
+    fn drain_channel_batch_returns_only_requested_channel_in_fifo_order() {
+        let mut q = fresh_queue();
+        let sub = vec![0x44u8; 16];
+        let chan_a = vec![0xAAu8; 16];
+        let chan_b = vec![0xBBu8; 16];
+
+        q.enqueue(sub.clone(), chan_a.clone(), vec![0], 1024);
+        q.enqueue(sub.clone(), chan_b.clone(), vec![1], 1024);
+        q.enqueue(sub.clone(), chan_a.clone(), vec![2], 1024);
+        q.enqueue(sub.clone(), chan_b.clone(), vec![3], 1024);
+
+        let page = q.drain_channel_batch(&sub, &chan_a, 10);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].channel_hash, chan_a);
+        assert_eq!(page[0].blob, vec![0]);
+        assert_eq!(page[1].channel_hash, chan_a);
+        assert_eq!(page[1].blob, vec![2]);
+
+        assert!(!q.has_pending_channel(&sub, &chan_a));
+        assert!(q.has_pending_channel(&sub, &chan_b));
+
+        let remaining = q.drain_batch(&sub, 10);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].channel_hash, chan_b);
+        assert_eq!(remaining[0].blob, vec![1]);
+        assert_eq!(remaining[1].channel_hash, chan_b);
+        assert_eq!(remaining[1].blob, vec![3]);
+    }
+
+    #[test]
+    fn drain_channel_batch_respects_max_and_channel_scoped_pending_flag() {
+        let mut q = fresh_queue();
+        let sub = vec![0x55u8; 16];
+        let chan_a = vec![0x0Au8; 16];
+        let chan_b = vec![0x0Bu8; 16];
+
+        enqueue_n(&mut q, &sub, &chan_a, 3);
+        enqueue_n(&mut q, &sub, &chan_b, 2);
+
+        let first_page = q.drain_channel_batch(&sub, &chan_a, 2);
+        assert_eq!(first_page.len(), 2);
+        assert!(q.has_pending_channel(&sub, &chan_a));
+        assert!(q.has_pending_channel(&sub, &chan_b));
+
+        let second_page = q.drain_channel_batch(&sub, &chan_a, 10);
+        assert_eq!(second_page.len(), 1);
+        assert!(!q.has_pending_channel(&sub, &chan_a));
+        assert!(q.has_pending_channel(&sub, &chan_b));
+        assert!(q.has_pending(&sub));
     }
 
     #[test]

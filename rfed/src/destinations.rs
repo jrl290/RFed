@@ -164,6 +164,40 @@ fn decode_channel_stream_filters(value_bytes: &[u8]) -> Result<Vec<Vec<u8>>, Str
     Ok(filters)
 }
 
+fn decode_channel_pull_request(data: &[u8]) -> Result<Vec<u8>, String> {
+    if data.len() == 16 {
+        return Ok(data.to_vec());
+    }
+
+    let channel_hash = decode_msgpack_bin(data);
+    if channel_hash.len() != 16 {
+        return Err(format!(
+            "channel pull request must carry bin(16) channel hash, got {} bytes",
+            channel_hash.len()
+        ));
+    }
+    Ok(channel_hash)
+}
+
+fn encode_pull_response(pending: Vec<PendingBlob>, more_pending: bool) -> Vec<u8> {
+    let pairs_val: Vec<rmpv::Value> = pending
+        .into_iter()
+        .map(|pb| {
+            rmpv::Value::Array(vec![
+                rmpv::Value::Binary(pb.channel_hash),
+                rmpv::Value::Binary(pb.blob),
+            ])
+        })
+        .collect();
+    let envelope = rmpv::Value::Array(vec![
+        rmpv::Value::Array(pairs_val),
+        rmpv::Value::Boolean(more_pending),
+    ]);
+    let mut buf = Vec::new();
+    let _ = rmpv::encode::write_value(&mut buf, &envelope);
+    buf
+}
+
 fn lxmf_delivery_hash_from_pubkey(pubkey: &[u8]) -> Result<Vec<u8>, String> {
     let identity = Identity::from_public_key(pubkey)
         .map_err(|e| format!("from_public_key: {e}"))?;
@@ -367,7 +401,7 @@ fn handle_notify_command(
 }
 
 use crate::config::NodeConfig;
-use crate::deferred_queue::DeferredQueue;
+use crate::deferred_queue::{DeferredQueue, PendingBlob};
 use crate::fanout;
 use crate::lxmf_propagation::LxmfPropagationNode;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
@@ -2016,6 +2050,36 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         rmp_serde::to_vec(&true).unwrap_or_default()
     });
 
+    let pull_node = Arc::clone(node);
+    let channel_pull_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                         caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        let channel_hash = match decode_channel_pull_request(data) {
+            Ok(hash) => hash,
+            Err(e) => {
+                log(format!("[rfed] channel.pull: {e}"), LOG_WARNING, false, false);
+                return encode_pull_response(Vec::new(), false);
+            }
+        };
+
+        if let Ok(guard) = pull_node.lock() {
+            let page_size = guard
+                .config
+                .policy_for(&subscriber_hash)
+                .deferred_pull_batch_limit
+                .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
+            if let Ok(mut deferred) = guard.deferred_queue.lock() {
+                let pending = deferred.drain_channel_batch(&subscriber_hash, &channel_hash, page_size);
+                let more_pending = deferred.has_pending_channel(&subscriber_hash, &channel_hash);
+                return encode_pull_response(pending, more_pending);
+            }
+        }
+        Vec::new()
+    });
+
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.channel_dest.set_packet_callback(Some(packet_cb.clone()));
     guard.channel_dest.register_request_handler(
@@ -2037,9 +2101,9 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     guard.channel_unsubscribe_dest.register_request_handler(
         UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb), ALLOW_ALL, None, false,
     )?;
-    // channel_pull_dest: handler not yet wired — channel-history pull is a
-    // future feature distinct from rfed.delivery's inbox PULL. Registered
-    // now so clients can request a path and we reserve the hash slot.
+    guard.channel_pull_dest.register_request_handler(
+        PULL_PATH.to_string(), Some(channel_pull_cb), ALLOW_ALL, None, false,
+    )?;
     Transport::register_destination(guard.channel_subscribe_dest.clone());
     Transport::register_destination(guard.channel_unsubscribe_dest.clone());
     Transport::register_destination(guard.channel_publish_dest.clone());
@@ -2050,7 +2114,8 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 // ── rfed.delivery ────────────────────────────────────────────────────────────
 
 fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
-    // PULL — client proves key ownership via the request's authenticated caller.
+    // PULL — legacy compatibility path. Client proves key ownership via the
+    // request's authenticated caller.
     //
     // **User-initiated paging** (mirrors the chat-history "Load earlier
     // messages" UX): each PULL drains at most one page of pending inner blobs
@@ -2083,20 +2148,7 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
                 let pending = deferred.drain_batch(&subscriber_hash, page_size);
                 let more_pending = deferred.has_pending(&subscriber_hash);
-                let pairs_val: Vec<rmpv::Value> = pending
-                    .into_iter()
-                    .map(|pb| rmpv::Value::Array(vec![
-                        rmpv::Value::Binary(pb.channel_hash),
-                        rmpv::Value::Binary(pb.blob),
-                    ]))
-                    .collect();
-                let envelope = rmpv::Value::Array(vec![
-                    rmpv::Value::Array(pairs_val),
-                    rmpv::Value::Boolean(more_pending),
-                ]);
-                let mut buf = Vec::new();
-                let _ = rmpv::encode::write_value(&mut buf, &envelope);
-                return buf;
+                return encode_pull_response(pending, more_pending);
             }
         }
         Vec::new()
@@ -2693,6 +2745,13 @@ mod stream_config_tests {
     }
 
     #[test]
+    fn channel_stream_filters_accept_empty_config_array() {
+        let payload = encode_filter_list(&[]);
+        let decoded = decode_channel_stream_filters(&payload).expect("decode empty config array");
+        assert!(decoded.is_empty(), "empty config array must produce no live filters");
+    }
+
+    #[test]
     fn channel_stream_filters_reject_non_16_byte_entries() {
         let bad = vec![0x33; 15];
         let payload = encode_filter_list(&[&bad]);
@@ -2744,6 +2803,48 @@ mod app_links_tests {
                 "AppLinks::status(&backup_hash) != rns_app_links::APP_LINK_ACTIVE"
             ),
             "backup pushes must wait for the EphemeralLink readiness signal before opening a one-shot backup link"
+        );
+    }
+}
+
+#[cfg(test)]
+mod destination_wiring_tests {
+    #[test]
+    fn channel_pull_and_legacy_delivery_pull_remain_wired() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs");
+
+        let wire_channel_start = source
+            .find("fn wire_channel_destination(")
+            .expect("wire_channel_destination present");
+        let wire_delivery_start = source
+            .find("fn wire_delivery_destination(")
+            .expect("wire_delivery_destination present");
+        let wire_notify_start = source
+            .find("fn wire_notify_destination(")
+            .expect("wire_notify_destination present");
+
+        let channel_fragment = &source[wire_channel_start..wire_delivery_start];
+        let delivery_fragment = &source[wire_delivery_start..wire_notify_start];
+
+        assert!(
+            channel_fragment.contains("guard.channel_pull_dest.register_request_handler("),
+            "rfed.channel.pull must keep a request handler wired"
+        );
+        assert!(
+            channel_fragment.contains("PULL_PATH.to_string(), Some(channel_pull_cb)"),
+            "rfed.channel.pull must serve /rfed/pull via the new handler"
+        );
+        assert!(
+            delivery_fragment.contains("guard.delivery_dest.register_request_handler("),
+            "legacy rfed.delivery pull must remain wired for compatibility"
+        );
+        assert!(
+            delivery_fragment.contains("PULL_PATH.to_string(), Some(pull_cb)"),
+            "legacy rfed.delivery must continue serving /rfed/pull"
         );
     }
 }
