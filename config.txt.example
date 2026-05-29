@@ -11,6 +11,7 @@
   share_instance = No
   enable_transport = No
   panic_on_interface_error = No
+  discover_interfaces = Yes
 
 
 # ── Reticulum interfaces ─────────────────────────────────────────────────────
@@ -28,6 +29,12 @@
     enabled = Yes
     target_host = rmap.world
     target_port = 4242
+
+  # [[Backbone Client]]
+  #   type = BackboneClientInterface
+  #   enabled = Yes
+  #   target_host = rns.example.org
+  #   target_port = 4242
 
 
 # ── rfed settings ────────────────────────────────────────────────────────────
