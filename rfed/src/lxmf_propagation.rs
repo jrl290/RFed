@@ -179,6 +179,8 @@ pub struct PropPeer {
     /// Session-scoped mirror of the active AppLinks-owned link while a sync
     /// exchange is in flight.
     pub link: Option<LinkHandle>,
+    /// Link id of the currently identified AppLinks-owned sync link.
+    pub identified_link_id: Option<Vec<u8>>,
     /// Current sync state machine position (see `IDLE`, `LINK_ESTABLISHING`, etc.).
     pub state: u8,
 }
@@ -212,6 +214,7 @@ impl PropPeer {
             transferring: None,
             last_offer: Vec::new(),
             link: None,
+            identified_link_id: None,
             state: Self::IDLE,
         }
     }
@@ -1647,6 +1650,33 @@ impl LxmfPropagationNode {
         peer.last_heard = now();
         peer.sync_backoff = 0.0;
 
+        let current_link_id = link.link_id();
+        let already_identified = peer
+            .identified_link_id
+            .as_ref()
+            .map(|id| id == &current_link_id)
+            .unwrap_or(false);
+
+        if !already_identified {
+            if let Err(e) = link.identify(&self.identity) {
+                log(
+                    format!("[lxmf.prop] identify before offer failed: {e}"),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
+                link.teardown();
+                peer.state = PropPeer::IDLE;
+                peer.link = None;
+                peer.identified_link_id = None;
+                return;
+            }
+
+            peer.identified_link_id = Some(current_link_id);
+            peer.state = PropPeer::IDLE;
+            return;
+        }
+
         let (peering_key, _) = match &peer.peering_key {
             Some(pk) => pk.clone(),
             None => return,
@@ -1694,6 +1724,7 @@ impl LxmfPropagationNode {
                         if let Some(peer) = node.peers.get_mut(&ph) {
                             peer.state = PropPeer::IDLE;
                             peer.link = None;
+                            peer.identified_link_id = None;
                         }
                     }
                 }
@@ -1747,6 +1778,7 @@ impl LxmfPropagationNode {
             match code {
                 0xF0 => {
                     log("[lxmf.prop] remote: no identity, retrying...", LOG_WARNING, false, false);
+                    peer.identified_link_id = None;
                     peer.state = PropPeer::IDLE;
                     return;
                 }
@@ -1759,6 +1791,7 @@ impl LxmfPropagationNode {
                 0xF3 => {
                     log("[lxmf.prop] remote: invalid peering key, regenerating", LOG_WARNING, false, false);
                     peer.peering_key = None;
+                    peer.identified_link_id = None;
                     peer.state = PropPeer::IDLE;
                     return;
                 }
@@ -2141,6 +2174,56 @@ mod tests {
         assert!(
             !fragment.contains("Link::new_outbound"),
             "RFed propagation peer sync must not construct raw outbound links directly"
+        );
+    }
+
+    #[test]
+    fn send_offer_identifies_link_before_request() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/lxmf_propagation.rs"
+        ))
+        .expect("read lxmf_propagation.rs");
+
+        let start = source
+            .find("fn send_offer_on_link(&mut self, link: &LinkHandle, peer_hash: &[u8], offer_ids: &[Vec<u8>])")
+            .expect("send_offer_on_link present");
+        let end = source[start..]
+            .find("fn handle_offer_response")
+            .map(|offset| start + offset)
+            .expect("handle_offer_response present");
+        let fragment = &source[start..end];
+
+        assert!(
+            fragment.contains("link.identify(&self.identity)"),
+            "RFed propagation peer sync must identify the AppLinks-owned link before sending OFFER"
+        );
+    }
+
+    #[test]
+    fn send_offer_defers_request_until_link_identified() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/lxmf_propagation.rs"
+        ))
+        .expect("read lxmf_propagation.rs");
+
+        let start = source
+            .find("fn send_offer_on_link(&mut self, link: &LinkHandle, peer_hash: &[u8], offer_ids: &[Vec<u8>])")
+            .expect("send_offer_on_link present");
+        let end = source[start..]
+            .find("fn handle_offer_response")
+            .map(|offset| start + offset)
+            .expect("handle_offer_response present");
+        let fragment = &source[start..end];
+
+        assert!(
+            fragment.contains("identified_link_id") && fragment.contains("already_identified"),
+            "RFed propagation peer sync must track whether the current AppLinks link has been identified"
+        );
+        assert!(
+            fragment.contains("peer.state = PropPeer::IDLE;") && fragment.contains("return;"),
+            "RFed propagation peer sync must defer OFFER until after link identification has been sent"
         );
     }
 }
