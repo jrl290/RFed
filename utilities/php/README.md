@@ -128,7 +128,7 @@ in rfed.
 
 ### 4. Register the relay with rfed
 
-In rfed.toml, set `allow_push_registration = true` (already default).  Then
+In rfed's config file (`<config_dir>/config`), set `allow_notify_registration = yes` (already default). Then
 from the iOS app (or a test script), send an `/rfed/notify/register` packet
 to the rfed node containing the relay's 32-char hex destination hash.
 

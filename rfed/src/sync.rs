@@ -519,7 +519,7 @@ impl FedSync {
             cursor += blob_len;
 
             if !store.index.contains_key(message_id.as_slice()) {
-                match store.store(&channel_hash, &blob) {
+                match store.store_with_id(&channel_hash, &message_id, &blob) {
                     Ok(_) => ingested.push((channel_hash, blob)),
                     Err(e) => {
                         log(
@@ -534,5 +534,59 @@ impl FedSync {
             }
         }
         ingested
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(label: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rfed_sync_{label}_{unique}"))
+    }
+
+    #[test]
+    fn ingest_message_get_response_preserves_upstream_message_ids() {
+        let base = temp_path("preserve_ids");
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let blob_store = Arc::new(Mutex::new(BlobStore::open(
+            base.join("blobs"),
+            1024 * 1024,
+        )));
+        let subscription_table = Arc::new(Mutex::new(SubscriptionTable::load(
+            base.join("subscriptions.rmp"),
+        )));
+        let mut sync = FedSync::new(Arc::clone(&blob_store), subscription_table);
+
+        let channel_hash = vec![0x11; 16];
+        let message_id = vec![0x22; 16];
+        let blob = b"hello sync".to_vec();
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&channel_hash);
+        wire.extend_from_slice(&message_id);
+        wire.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        wire.extend_from_slice(&blob);
+        let payload = rmp_serde::to_vec(&wire).expect("encode response payload");
+
+        let ingested = sync.ingest_message_get_response(&[0x33; 16], &payload);
+        assert_eq!(ingested, vec![(channel_hash.clone(), blob.clone())]);
+
+        {
+            let guard = blob_store.lock().expect("lock blob store");
+            assert!(guard.index.contains_key(message_id.as_slice()));
+            assert_eq!(guard.get(message_id.as_slice()).as_deref(), Some(blob.as_slice()));
+        }
+
+        let ingested_again = sync.ingest_message_get_response(&[0x33; 16], &payload);
+        assert!(ingested_again.is_empty(), "re-ingesting the same MESSAGE_GET payload must be a no-op");
+        assert_eq!(blob_store.lock().expect("lock blob store").index.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

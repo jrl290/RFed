@@ -23,18 +23,11 @@ jobs:
       - name: Checkout RFed-rust (this repo)
         uses: actions/checkout@v4
 
-      - name: Clone sibling dependencies (outside workspace)
+      - name: Bootstrap sibling dependencies (outside workspace)
         run: |
-          git clone --depth 1 https://github.com/jrl290/Rusticulum.git \
-            "${{ github.workspace }}/../Reticulum-rust"
-          git clone --depth 1 https://github.com/jrl290/LXMF-rust.git \
-            "${{ github.workspace }}/../LXMF-rust"
-          git clone --depth 1 https://github.com/jrl290/app-links.git \
-            "${{ github.workspace }}/../app-links"
-          # lxmf_rust depends on reticulum_rust with default features, which pulls
-          # in btleplug -> libdbus-sys.  Patch it to disable before building.
-          sed -i 's|reticulum_rust = { path = "../Reticulum-rust" }|reticulum_rust = { path = "../Reticulum-rust", default-features = false }|' \
-            "${{ github.workspace }}/../LXMF-rust/Cargo.toml"
+          ./scripts/bootstrap-sibling-deps.sh \
+            --deps-root "${{ github.workspace }}/.." \
+            --disable-lxmf-reticulum-default-features
 
       - name: Install system dependencies
         run: |

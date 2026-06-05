@@ -182,7 +182,7 @@ A "hello" message of ~7 bytes UTF-8 produces `inner_blob ≈ 256`,
 7. [Deferred Delivery](#7-deferred-delivery)
 8. [Fanout & Double Envelope](#8-fanout--double-envelope)
 9. [Notify System](#9-notify-system)
-10. [LXMF Propagation](#10-lxmf-propagation)
+10. [LXMF Propagation Relationship](#10-lxmf-propagation-relationship)
 11. [Backup Failover](#11-backup-failover)
 12. [Announce Format](#12-announce-format)
 13. [Configuration](#13-configuration)
@@ -283,15 +283,29 @@ the full channel name out-of-band to intended members only.
 
 ## 2. RNS Destinations & Request Paths
 
-rfed registers four inbound Reticulum destinations under the `rfed` app
-namespace:
+rfed exposes four logical Reticulum service groups under the `rfed` app
+namespace. Modern clients should discover and use the split announced
+destinations `rfed.channel.subscribe`, `rfed.channel.unsubscribe`,
+`rfed.channel.publish`, `rfed.channel.pull`, `rfed.notify.register`, and
+`rfed.notify.unregister`. The legacy combined `rfed.channel`, `rfed.delivery`,
+and `rfed.notify` surfaces remain wired for compatibility while clients
+migrate.
+
+In official Reticulum terminology, these are two separate notations:
+
+- **Destinations** are named by app and aspects, commonly rendered in dot
+  notation such as `rfed.channel.subscribe`.
+- **Request handlers** on an established link use a separate request-path
+  string. RFed follows the slash-prefixed convention used in upstream
+  Reticulum examples and built-in handlers, such as `/random/text`, `/status`,
+  `/list`, and therefore `/rfed/subscribe`.
 
 | Destination | Aspects | Purpose |
 |-------------|---------|---------|
 | `rfed.node` | `["node"]` | Peer sync, announces, backup push |
-| `rfed.channel` | `["channel"]` | Channel SEND, subscribe/unsubscribe |
-| `rfed.delivery` | `["delivery"]` | Client pull & deferred flush |
-| `rfed.notify` | `["notify"]` | Notify relay registration |
+| `rfed.channel` | `["channel"]` | Channel publish / subscribe / pull service family |
+| `rfed.delivery` | `["delivery"]` | Live subscriber delivery plus legacy aggregate pull |
+| `rfed.notify` | `["notify"]` | Notify relay registration service family |
 
 All destinations use `DestinationType::Single` (asymmetric encryption,
 multi-hop routed).
@@ -306,14 +320,15 @@ multi-hop routed).
 | `/rfed/backup/push` | Owner node | `msgpack [(sub_hash, ch_hash), ...]` | `msgpack bool` |
 | `/rfed/capabilities` | Any | *(ignored)* | `msgpack Map` (see §17) |
 
-**rfed.channel** (publisher → node):
-| Path | Caller | Payload | Response |
-|------|--------|---------|----------|
-| `/rfed/subscribe` | Subscriber | `msgpack bin(16)` channel_hash | `msgpack bool` |
-| `/rfed/unsubscribe` | Subscriber | `msgpack bin(16)` channel_hash | `msgpack bool` |
-| *(fire-and-forget SEND)* | Publisher | `channel_hash(16) \| inner_blob \| stamp` | *(none)* |
+**rfed.channel.*** (modern split service destinations):
+| Destination | Path | Caller | Payload | Response |
+|-------------|------|--------|---------|----------|
+| `rfed.channel.subscribe` | `/rfed/subscribe` | Subscriber | `msgpack [bin(16) channel_hash, bin(64) subscriber_pubkey, bin(64) sig(channel_hash)]` | `msgpack [bool ok, uint stamp_cost \| nil]` |
+| `rfed.channel.unsubscribe` | `/rfed/unsubscribe` | Subscriber | `msgpack [bin(16) channel_hash, bin(64) subscriber_pubkey, bin(64) sig(channel_hash)]` | `msgpack bool` |
+| `rfed.channel.publish` | *(fire-and-forget SEND)* | Publisher | `channel_hash(16) \| inner_blob \| stamp` | *(none)* |
+| `rfed.channel.pull` | `/rfed/pull` | Subscriber | `bin(16) channel_hash` or `msgpack bin(16)` | `msgpack [ [[bin(16) channel_hash, bin blob], …], bool more_pending ]` |
 
-**rfed.delivery** (subscriber → node):
+**rfed.delivery** (live fanout destination + legacy aggregate pull):
 | Path | Caller | Payload | Response |
 |------|--------|---------|----------|
 | `/rfed/pull` | Subscriber | *(empty — caller authenticated by link identity)* | `msgpack [ [[bin(16) channel_hash, bin blob], …], bool more_pending ]` |
@@ -719,7 +734,7 @@ in future versions.
 
 #### Example: Channel Fanout Wake
 
-When a blob arrives on `rfed.channel` for a subscribed channel:
+When a blob arrives on `rfed.channel.publish` for a subscribed channel:
 
 ```
 msgpack Map {
@@ -803,25 +818,58 @@ manages all platform integrations independently.
 
 ---
 
-## 10. LXMF Propagation Notification
+## 10. LXMF Propagation Relationship
 
-When `lxmf_propagation_notification = true`, rfed announces an
-`lxmf.propagation` destination and accepts inbound LXMF messages **solely
-for triggering notify wake-ups**.  This is NOT full LXMF propagation —
-messages are never stored, forwarded, or made available for download.
-This allows mobile clients (e.g. Sideband) to send LXMF messages that
-trigger notify wake-ups.
+RFed is intentionally LXMF-adjacent, but the relationship has three separate
+layers that are easy to conflate if they are not spelled out explicitly:
+
+1. **Channel payload format**: the recommended RFed inner blob is an LXMF
+   `PROPAGATED` message, with the required source-identity prelude, encrypted
+   to the channel identity.
+2. **Federation mechanics**: RFed reuses LXMF-style OFFER/GET manifest sync and
+   LXMF stamp-validation machinery.
+3. **Optional full propagation service**: rfed can also announce a standard
+  `lxmf.propagation` destination and act as a full LXMF propagation node.
+
+### What RFed reuses from LXMF propagation
+
+- propagated LXMF blob semantics for sender authentication inside the encrypted
+  inner payload
+- manifest-based OFFER / GET sync between store-and-forward peers
+- proof-of-work stamp validation rules and announce metadata conventions
+- the core idea that a node can store opaque ciphertext keyed by a hash without
+  being able to decrypt the content it forwards
+
+### What RFed changes
+
+- the stored key is a **channel hash**, not a recipient delivery hash
+- delivery is **fanout to subscribers**, not one mailbox per recipient
+- peer sync is filtered to channels with local subscriber interest
+- subscribers prove channel membership by signing subscribe requests rather
+  than by owning a delivery mailbox on the propagation node
+
+### Optional full `lxmf.propagation` service
+
+When `[node].lxmf_propagation = yes`, rfed announces an `lxmf.propagation`
+destination and runs the standard LXMF propagation service in parallel with
+its channel federation surfaces. This is full propagation support, not a
+notify-only shim.
 
 ### Behaviour
 
-1. Mobile client sends an LXMF message to rfed's propagation destination.
-2. rfed validates the propagation node (PN) stamp against `stamp_cost`.
-3. rfed extracts the recipient hash (bytes 0–15) and optional sender hash
-   (bytes 16–31) from the LXMF payload.
-4. If the recipient has notify relays registered, rfed dispatches wake
-   packets with `receiver` and `sender` hashes.
-5. rfed **never stores** LXMF content. The message is discarded immediately
-   after notify dispatch.
+1. Client sends an LXMF propagated message to rfed's propagation destination.
+2. rfed validates the propagation-node stamp against the configured
+  cost/flexibility.
+3. rfed stores the LXMF message on disk, indexes it, and queues it for
+  eligible propagation peers.
+4. Recipients retrieve stored messages with the standard LXMF `GET` path, and
+  peers exchange OFFER / GET sync with LXMF-rust `lxmd` instances and other
+  rfed nodes.
+5. If the recipient has notify relays registered, rfed also dispatches wake
+  packets with `receiver` and optional `sender` hashes.
+
+`lxmf_propagation_autopeer` controls announce-based discovery, while
+`[peering].propagation_peers` pins static propagation peers.
 
 ### Announce Metadata
 
@@ -867,10 +915,10 @@ rfed implements chain-of-custody backup delivery for subscriber resilience.
 
 ### Configuration
 
-```toml
+```ini
 [peering]
-primary_node     = "aabbccdd..."    # first-choice backup target
-secondary_nodes  = ["11223344..."]  # ordered fallback list
+primary_node       = aabbccdd...    # first-choice backup target
+secondary_nodes    = 11223344...    # ordered fallback list
 owner_offline_secs = 90             # silence before failover activates
 ```
 
@@ -911,62 +959,70 @@ Encoded as a msgpack array in the announce `app_data`:
 ]
 ```
 
-All four destinations (`rfed.node`, `rfed.channel`, `rfed.delivery`,
-`rfed.notify`) are announced. Only `rfed.node` carries non-empty app_data.
+RFed's channel-federation destinations are described in §2. `rfed.node`
+carries RFed app_data, and when propagation is enabled `lxmf.propagation`
+carries the standard LXMF app_data shown above.
 
 ---
 
 ## 13. Configuration
 
-### TOML File
+### Reticulum Native Config File
 
-Located at `<config_dir>/rfed.toml`. All settings are optional; a commented
-sample is written on first run.
+Located at `<config_dir>/config`. The file uses Reticulum's native config
+format, not TOML. All settings are optional; a commented sample is written on
+first run, and `config.txt.example` is a ready-to-edit starting point.
 
-```toml
+```ini
 [node]
-name                      = "rfed"           # human-readable node name
-announce_interval_minutes = 360              # re-announce period
-announce_at_start         = true             # announce immediately on startup
-lxmf_propagation_notification = false         # accept LXMF solely for notify wake-ups
+name                         = rfed
+announce_interval_minutes    = 360
+announce_at_start            = yes
+lxmf_propagation             = no
+lxmf_propagation_autopeer    = no
 
 [storage]
-limit_mb          = 2000                     # max blob storage (MB)
-transfer_limit_mb = 500                      # max bytes per sync session
-sync_limit_mb     = 1000                     # max bytes per hour (all peers)
+limit_mb          = 2000
+transfer_limit_mb = 500
+sync_limit_mb     = 1000
 
 [peering]
-static_peers         = ["aabbccdd..."]       # known peer hashes
-from_static_only     = false                 # reject unknown peers
-peering_cost         = 18                    # PoW cost for peering
-trusted_backup_peers = ["aabbccdd..."]       # trusted backup nodes
-primary_node         = "aabbccdd..."         # first-choice backup target
-secondary_nodes      = ["11223344..."]       # fallback backup list
-owner_offline_secs   = 90.0                  # silence before failover
+static_peers         = aabbccdd...
+from_static_only     = no
+peering_cost         = 18
+trusted_backup_peers = aabbccdd...
+primary_node         = aabbccdd...
+secondary_nodes      = 11223344...
+owner_offline_secs   = 90
+propagation_peers    = aabbccdd...
 
 [policy.default]
-stamp_cost              = 16                 # PoW bits required
-stamp_flexibility       = 3                  # accept (cost - flexibility)
-deferred_queue_limit    = 256                # offline queue depth
-allow_notify_registration = true
-allow_subscription      = true
-trusted_backup_only     = false
+stamp_cost                = 16
+stamp_flexibility         = 3
+deferred_queue_limit      = 256
+allow_notify_registration = yes
+allow_subscription        = yes
+trusted_backup_only       = no
 
 [policy.vip]
-stamp_cost              = 4
-stamp_flexibility       = 2
-deferred_queue_limit    = 2048
-allow_notify_registration = true
-allow_subscription      = true
-trusted_backup_only     = false
+stamp_cost                = 4
+stamp_flexibility         = 2
+deferred_queue_limit      = 2048
+allow_notify_registration = yes
+allow_subscription        = yes
+trusted_backup_only       = no
 
 [vip]
-subscribers = ["aabbccdd...", "11223344..."]  # VIP subscriber hashes
+subscribers = aabbccdd..., 11223344...
 ```
+
+The `[reticulum]` and `[interfaces]` sections live in the same file and use
+standard Reticulum syntax. List values are comma-separated hashes, and
+booleans use Reticulum-style `yes` / `no`.
 
 ### Merge Order
 
-CLI flags → TOML values → compiled defaults.
+CLI flags → config values → compiled defaults.
 
 ### Data Files
 
@@ -980,6 +1036,9 @@ All persisted to `<config_dir>/`:
 | `deferred_delivery.rmp` | msgpack | Offline blob queue |
 | `peers.rmp` | msgpack | Peer sync state & backoff timers |
 | `blobs/<ch_hex>/<id_hex>` | raw bytes | Stored inner blobs |
+| `lxmf_propagation/messagestore/<message_id_hex>` | raw bytes | Stored LXMF propagated messages (when enabled) |
+| `lxmf_propagation/peers` | msgpack | Propagation peer state and sync backoff |
+| `lxmf_propagation/node_stats` | msgpack map | Propagation message counters |
 
 ---
 
@@ -1044,7 +1103,7 @@ and the `channel_hash.py` utility module for deterministic hash computation.
 | `lxmf_rust` | local | LXMF message handling & PN stamps |
 | `rmp` / `rmpv` / `rmp-serde` | 0.8 / 1.0 / 1.1 | MessagePack serialisation |
 | `serde` | 1.0 | Derive serialisation traits |
-| `toml` | 0.8 | TOML config parsing |
+| `configparser` | 3 | Reticulum-native config parsing |
 | `sha2` | 0.10 | SHA-256 hashing |
 | `x25519-dalek` | 1.1.1 | X25519 key derivation |
 | `ed25519-dalek` | 1.0.1 | Ed25519 key derivation |
@@ -1067,7 +1126,9 @@ this node.  Any caller may issue the request; the payload is ignored.
 | `display_name` | String | Human-readable node name from config. |
 | `subscription` | Boolean | Whether the default policy allows subscription. |
 | `notify` | Boolean | Whether the default policy allows notify registration. |
-| `lxmf_propagation_notification` | Boolean | Whether the node accepts LXMF solely for notify wake-ups (not full propagation). |
+| `lxmf_propagation` | Boolean | Whether the full `lxmf.propagation` service is enabled. |
+| `channel_stream` | Boolean | Whether live per-channel streaming is available. |
+| `propagation_stream` | Boolean | Whether propagation streaming support is available (currently mirrors `lxmf_propagation`). |
 | `backup` | Boolean | Whether backup failover is configured (primary or secondary nodes set). |
 | `stamp_cost` | Integer / Nil | Required PoW leading-zero bits, or Nil if stamping is disabled. |
 
@@ -1083,7 +1144,9 @@ or feature-specific sub-maps.
   "display_name": "my-rfed-node",
   "subscription": true,
   "notify": true,
-  "lxmf_propagation_notification": false,
+  "lxmf_propagation": false,
+  "channel_stream": true,
+  "propagation_stream": false,
   "backup": true,
   "stamp_cost": 16
 }

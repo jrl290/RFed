@@ -998,20 +998,36 @@ impl FedNode {
         // Re-push adopted entries so the chain extends.
         if !adopted.is_empty() {
             if let Some(ref hash) = backup_hash {
-                log(
-                    format!(
-                        "[backup] re-pushing {} adopted entry(ies) to backup {}",
-                        adopted.len(),
-                        hexrep(hash, false),
-                    ),
-                    LOG_NOTICE, false, false,
-                );
-                push_subscriptions_to_backup(
-                    hash.clone(),
-                    adopted,
-                    self.self_handle.clone(),
-                    self.identity.clone(),
-                );
+                let adopted_count = adopted.len();
+                let repush = adopted_pairs_for_chain_extension(adopted, hash.as_slice());
+                let skipped = adopted_count.saturating_sub(repush.len());
+
+                if skipped > 0 {
+                    log(
+                        format!(
+                            "[backup] skipping {skipped} adopted entry(ies) that would bounce back to owner {}",
+                            hexrep(hash, false),
+                        ),
+                        LOG_NOTICE, false, false,
+                    );
+                }
+
+                if !repush.is_empty() {
+                    log(
+                        format!(
+                            "[backup] re-pushing {} adopted entry(ies) to backup {}",
+                            repush.len(),
+                            hexrep(hash, false),
+                        ),
+                        LOG_NOTICE, false, false,
+                    );
+                    push_subscriptions_to_backup(
+                        hash.clone(),
+                        repush,
+                        self.self_handle.clone(),
+                        self.identity.clone(),
+                    );
+                }
             }
         }
     }
@@ -1252,9 +1268,25 @@ fn teardown_sync(
 /// The pattern is:
 ///   1. Verify path/identity to backup node; re-enqueue pairs if missing.
 ///   2. Open encrypted Link; in link_established callback:
-///      a. Identify ourselves (so backup knows the owner).
-///      b. Send BACKUP_PUSH request with the subscription pairs.
-///      c. Tear down the link on response (success or failure).
+///      a. Send a signed BACKUP_PUSH request carrying the subscription pairs.
+///      b. Tear down the link on response (success or failure).
+fn requeue_backup_pairs(
+    node_weak: &Option<Weak<Mutex<FedNode>>>,
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    if pairs.is_empty() {
+        return;
+    }
+
+    if let Some(arc) = node_weak.as_ref().and_then(|w| w.upgrade()) {
+        if let Ok(node) = arc.lock() {
+            if let Ok(mut q) = node.pending_backup_pushes.lock() {
+                q.extend(pairs);
+            }
+        }
+    }
+}
+
 fn push_subscriptions_to_backup(
     backup_hash: Vec<u8>,
     pairs: Vec<(Vec<u8>, Vec<u8>)>,
@@ -1265,13 +1297,7 @@ fn push_subscriptions_to_backup(
     if AppLinks::status(&backup_hash) != rns_app_links::APP_LINK_ACTIVE {
         log("[backup] no path to backup node — will retry on next tick",
             LOG_DEBUG, false, false);
-        if let Some(arc) = node_weak.as_ref().and_then(|w| w.upgrade()) {
-            if let Ok(node) = arc.lock() {
-                if let Ok(mut q) = node.pending_backup_pushes.lock() {
-                    q.extend(pairs);
-                }
-            }
-        }
+        requeue_backup_pairs(&node_weak, pairs);
         return;
     }
 
@@ -1281,13 +1307,7 @@ fn push_subscriptions_to_backup(
         },
         None => {
             Transport::request_path(&backup_hash, None, None, None, None);
-            if let Some(arc) = node_weak.as_ref().and_then(|w| w.upgrade()) {
-                if let Ok(node) = arc.lock() {
-                    if let Ok(mut q) = node.pending_backup_pushes.lock() {
-                        q.extend(pairs);
-                    }
-                }
-            }
+            requeue_backup_pairs(&node_weak, pairs);
             return;
         }
     };
@@ -1304,6 +1324,7 @@ fn push_subscriptions_to_backup(
         Err(e) => {
             log(format!("[backup] dest error for backup node: {e}"),
                 LOG_WARNING, false, false);
+            requeue_backup_pairs(&node_weak, pairs);
             return;
         }
     };
@@ -1315,33 +1336,75 @@ fn push_subscriptions_to_backup(
         Err(e) => {
             log(format!("[backup] link error to backup node: {e}"),
                 LOG_WARNING, false, false);
+            requeue_backup_pairs(&node_weak, pairs);
             return;
         }
     };
 
     let handle = LinkHandle::spawn(link);
-    let payload = rmp_serde::to_vec(&pairs).unwrap_or_default();
+    let pairs_payload = rmp_serde::to_vec(&pairs).unwrap_or_default();
+    let owner_pubkey = match our_identity.get_public_key() {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            log(format!("[backup] could not encode backup owner pubkey: {e}"),
+                LOG_WARNING, false, false);
+            requeue_backup_pairs(&node_weak, pairs);
+            return;
+        }
+    };
+    let owner_sig = our_identity.sign(&pairs_payload);
+    let signed_payload = {
+        let mut encoded = Vec::new();
+        let value = rmpv::Value::Array(vec![
+            rmpv::Value::Binary(pairs_payload),
+            rmpv::Value::Binary(owner_pubkey),
+            rmpv::Value::Binary(owner_sig),
+        ]);
+        let _ = rmpv::encode::write_value(&mut encoded, &value);
+        encoded
+    };
 
     // The callback body uses the live LinkHandle `h` passed by the actor,
     // avoiding the old Arc<Mutex<Link>> pattern entirely.
-    let payload_for_est = payload.clone();
+    let payload_for_est = signed_payload.clone();
+    let pairs_for_retry = pairs.clone();
+    let node_weak_for_retry = node_weak.clone();
     handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
-        // Identify first so the remote side knows our identity.
-        let _ = h.identify(&our_identity);
         let pay = payload_for_est.clone();
-        let h_ok  = h.clone();
+        let h_ok = h.clone();
         let h_err = h.clone();
-        let ok_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |_| {
-            log("[backup] backup push accepted by peer", LOG_NOTICE, false, false);
+        let retry_pairs_ok = pairs_for_retry.clone();
+        let retry_node_ok = node_weak_for_retry.clone();
+        let retry_pairs_err = pairs_for_retry.clone();
+        let retry_node_err = node_weak_for_retry.clone();
+        let ok_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |receipt| {
+            let accepted = receipt
+                .response
+                .as_ref()
+                .and_then(|raw| rmp_serde::from_slice::<bool>(raw).ok())
+                .unwrap_or(false);
+
+            if accepted {
+                log("[backup] backup push accepted by peer", LOG_NOTICE, false, false);
+            } else {
+                log("[backup] backup push rejected by peer", LOG_WARNING, false, false);
+                requeue_backup_pairs(&retry_node_ok, retry_pairs_ok.clone());
+            }
             h_ok.teardown();
         });
         let err_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |_| {
             log("[backup] backup push rejected by peer", LOG_WARNING, false, false);
+            requeue_backup_pairs(&retry_node_err, retry_pairs_err.clone());
             h_err.teardown();
         });
-        let _result = h.request(
+        let result = h.request(
             BACKUP_PUSH_PATH.to_string(), pay, Some(ok_cb), Some(err_cb), None,
         );
+        if result.is_err() {
+            log("[backup] backup push request failed to send", LOG_WARNING, false, false);
+            requeue_backup_pairs(&node_weak_for_retry, pairs_for_retry.clone());
+            h.teardown();
+        }
     })));
     let _ = handle.initiate();
     // Link actor registers itself in LinkMsg::Initiate; no external
@@ -1354,9 +1417,30 @@ fn push_subscriptions_to_backup(
 /// subscribers' channel blobs into the deferred delivery queue so they flush
 /// when the subscriber next comes online or PULLs.
 ///
-/// Returns the list of `(subscriber_hash, channel_hash)` pairs that were
-/// actually delivered ("adopted").  The caller re-pushes these to its own
-/// backup node so the chain of custody extends further.
+/// Returns the list of `(subscriber_hash, channel_hash, owner_hash)` triples
+/// that were actually delivered ("adopted"). The caller may re-push these to
+/// its own backup node so the chain of custody extends further, unless doing
+/// so would send them straight back to the current owner.
+fn adopted_pairs_for_chain_extension(
+    adopted: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>,
+    backup_hash: &[u8],
+) -> Vec<(Vec<u8>, Vec<u8>)> {
+    adopted
+        .into_iter()
+        .filter_map(|(subscriber_hash, channel_hash, owner_hash)| {
+            if owner_hash.as_slice() == backup_hash {
+                None
+            } else {
+                Some((subscriber_hash, channel_hash))
+            }
+        })
+        .collect()
+}
+
+/// Returns the list of `(subscriber_hash, channel_hash, owner_hash)` triples
+/// that were actually delivered ("adopted"). The caller may re-push these to
+/// its own backup node so the chain of custody extends further, unless doing
+/// so would send them straight back to the current owner.
 fn backup_delivery_tick(
     subscription_table: Arc<Mutex<crate::subscription::SubscriptionTable>>,
     blob_store: Arc<Mutex<crate::blob_store::BlobStore>>,
@@ -1365,7 +1449,7 @@ fn backup_delivery_tick(
     config: &crate::config::NodeConfig,
     sync: Arc<Mutex<crate::sync::FedSync>>,
     owner_offline_secs: f64,
-) -> Vec<(Vec<u8>, Vec<u8>)> {
+) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
     let entries = subscription_table
         .lock()
         .ok()
@@ -1383,7 +1467,7 @@ fn backup_delivery_tick(
         by_owner.entry(owner_hash).or_default().push((sub_hash, ch_hash));
     }
 
-    let mut adopted: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut adopted: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
 
     for (owner_hash, subs) in &by_owner {
         // Suppress delivery if the owner node was heard recently via sync peer state.
@@ -1410,7 +1494,7 @@ fn backup_delivery_tick(
                 .map(|q| q.has_pending(sub_hash.as_slice()))
                 .unwrap_or(false);
             if has_pending {
-                adopted.push((sub_hash.clone(), ch_hash.clone()));
+                adopted.push((sub_hash.clone(), ch_hash.clone(), owner_hash.clone()));
                 continue;
             }
 
@@ -1447,7 +1531,7 @@ fn backup_delivery_tick(
                     ),
                     LOG_NOTICE, false, false,
                 );
-                adopted.push((sub_hash.clone(), ch_hash.clone()));
+                adopted.push((sub_hash.clone(), ch_hash.clone(), owner_hash.clone()));
                 if let Ok(notify) = notify_registry.lock() {
                     for reg in notify.get_for_channel(sub_hash.as_slice(), Some(ch_hash.as_slice())) {
                         dispatch_notify(reg, None, Some(ch_hash.as_slice()));
@@ -1457,6 +1541,29 @@ fn backup_delivery_tick(
         }
     }
     adopted
+}
+
+#[cfg(test)]
+mod backup_chain_tests {
+    use super::adopted_pairs_for_chain_extension;
+
+    #[test]
+    fn adopted_pairs_skip_bounce_back_to_owner() {
+        let owner_hash = vec![0x11; 16];
+        let next_backup_hash = vec![0x22; 16];
+        let adopted = vec![
+            (vec![0x31; 16], vec![0x41; 16], owner_hash.clone()),
+            (vec![0x32; 16], vec![0x42; 16], next_backup_hash),
+        ];
+
+        let filtered = adopted_pairs_for_chain_extension(adopted, owner_hash.as_slice());
+
+        assert_eq!(
+            filtered,
+            vec![(vec![0x32; 16], vec![0x42; 16])],
+            "adopted entries must not be re-pushed back to the current owner"
+        );
+    }
 }
 
 // ── enable() ────────────────────────────────────────────────────────────────
@@ -1716,27 +1823,59 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     };
 
     // BACKUP_PUSH — owner node registers backup subscriptions on this node.
-    // The caller's identity is used to derive their rfed.node destination hash
-    // (unforgeable — computed from their actual public key material).
-    // This prevents spoofed owner_hash values; only the real key holder can
-    // produce the matching link authentication.
+    // The owner authenticates by signing the request payload with its node
+    // identity key material, avoiding any dependency on link-identify ordering.
     let backup_push_node = Arc::clone(node);
     let backup_push_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                        caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
-        let owner_hash = match caller {
-            Some(id) => match Destination::new_outbound(
-                Some(id.clone()),
-                DestinationType::Single,
-                APP_NAME.to_string(),
-                vec!["node".to_string()],
-            ) {
-                Ok(d) => d.hash,
-                Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
-            },
-            None => return rmp_serde::to_vec(&false).unwrap_or_default(),
+                                        _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        let (pairs_bytes, _owner_identity_hash, pubkey) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(
+                    format!("[backup] invalid BACKUP_PUSH payload: {e}"),
+                    LOG_WARNING, false, false,
+                );
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
         };
 
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> = rmp_serde::from_slice(data).unwrap_or_default();
+        let owner_identity = match Identity::from_public_key(&pubkey) {
+            Ok(identity) => identity,
+            Err(e) => {
+                log(
+                    format!("[backup] BACKUP_PUSH owner key decode error: {e}"),
+                    LOG_WARNING, false, false,
+                );
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
+        };
+
+        let owner_hash = match Destination::new_outbound(
+            Some(owner_identity),
+            DestinationType::Single,
+            APP_NAME.to_string(),
+            vec!["node".to_string()],
+        ) {
+            Ok(dest) => dest.hash,
+            Err(e) => {
+                log(
+                    format!("[backup] BACKUP_PUSH owner hash derivation error: {e}"),
+                    LOG_WARNING, false, false,
+                );
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
+        };
+
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = match rmp_serde::from_slice(&pairs_bytes) {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                log(
+                    format!("[backup] BACKUP_PUSH pairs decode error: {e}"),
+                    LOG_WARNING, false, false,
+                );
+                return rmp_serde::to_vec(&false).unwrap_or_default();
+            }
+        };
 
         let guard = match backup_push_node.lock() {
             Ok(g) => g,

@@ -18,9 +18,20 @@ RFed's core transport is modelled directly on the [LXMF](https://github.com/mark
 | **Peering cost** | Propagation nodes advertise a PoW cost for incoming peers | Parsed from peer announces; used in sync backoff scheduling |
 | **Destination hash routing** | First 16 bytes of wire format = recipient hash (plaintext, for routing) | Channel hash occupies the same position in the SEND packet |
 | **Exponential backoff** | Sync retry with increasing delay on failure, reset on success | Same pattern: 10 s min → 1 hour max, reset on announce heard |
-| **Announce metadata** | Msgpack array with node state, limits, stamp params, metadata map | Simplified 3-field announce; LXMF-format announce on optional `lxmf.propagation` destination (**notify trigger only — rfed is not an LXMF propagation node**) |
+| **Announce metadata** | Msgpack array with node state, limits, stamp params, metadata map | Simplified RFed node announce plus standard LXMF propagation metadata on the optional full `lxmf.propagation` service |
 
 RFed extends beyond LXMF with **named channels**, **explicit subscriptions**, **double-envelope encryption**, **notify relays**, **deferred per-subscriber queuing**, and **backup failover with chain-of-custody** — none of which exist in LXMF.
+
+## RFed and LXMF Propagation
+
+RFed now exposes two distinct LXMF-related surfaces:
+
+| Service | Stored unit | Retrieval model | Sync model | End goal |
+|---------|-------------|-----------------|------------|----------|
+| RFed channel federation (`rfed.channel.*`) | Channel-addressed opaque blobs | Subscribers receive live fanout or pull deferred pages from rfed | OFFER / GET between rfed peers, filtered to channels with local subscribers | Named-channel messaging |
+| Optional `lxmf.propagation` service | Recipient-addressed LXMF messages | Standard LXMF clients pull with GET | Standard LXMF OFFER / GET between propagation peers | Full LXMF mailbox / propagation compatibility |
+
+RFed's channel federation is still a separate service from LXMF mailbox storage, but the binary can host both. When `lxmf_propagation = yes`, rfed announces `lxmf.propagation`, stores inbound LXMF messages, serves client GETs, peers with LXMF-rust `lxmd` instances and other rfed nodes, and fires notify wake-ups for registered destinations.
 
 ## Features
 
@@ -30,49 +41,123 @@ RFed extends beyond LXMF with **named channels**, **explicit subscriptions**, **
 - **Deferred delivery** — offline subscribers receive queued blobs on reconnect or explicit pull
 - **Notify relays** — lightweight wake packets to registered relays; can be used for mobile push notifications (APNs, FCM, UnifiedPush) without exposing message content
 - **Backup failover** — chain-of-custody handoff when a primary node goes silent
-- **LXMF notify trigger** — when enabled, rfed announces an `lxmf.propagation` destination and accepts inbound LXMF messages **only** to trigger notify wake-ups; messages are never stored, forwarded, or made available for download.
+- **LXMF propagation node** — when enabled, rfed announces `lxmf.propagation`, stores inbound LXMF messages, serves client GETs, peers with other propagation nodes, and also fires notify wake-ups for registered destinations
 - **Proof-of-work stamps** — configurable PoW difficulty per subscriber tier (default / VIP)
 - **Double-envelope encryption** — node never sees inner blob content; encrypted end-to-end
 
-## Quick Start
+## Install and Run
 
-### Prerequisites
+RFed can be installed from prebuilt release binaries. Manual source builds are still supported and are documented further down in this section.
 
-- Rust 1.70+ toolchain
-- [reticulum_rust](https://github.com/your-org/reticulum-rust), [lxmf_rust](https://github.com/your-org/lxmf-rust), and [app_links](https://github.com/jrl290/app-links) cloned alongside this repo (see [Dependencies](#dependencies))
+### 1. Download a release binary
 
-### Build
+Download the matching archive from the project's GitHub releases page:
+
+- `rfed-vX.Y.Z-linux-x86_64.tar.gz` for Linux x86_64
+- `rfed-vX.Y.Z-linux-arm64.tar.gz` for Linux ARM64
+- `rfed-vX.Y.Z-darwin-arm64.tar.gz` for macOS Apple Silicon
+
+Each release archive contains the `rfed` binary, `config.txt.example`, and a copy of this README. A matching `.sha256` file is published alongside each archive.
+
+Example for Linux x86_64:
 
 ```bash
-cargo build --release
+VERSION=v0.1.0
+PACKAGE_DIR="rfed-${VERSION}-linux-x86_64"
+curl -L -o rfed.tar.gz \
+    "https://github.com/jrl290/RFed-rust/releases/download/${VERSION}/rfed-${VERSION}-linux-x86_64.tar.gz"
+tar -xzf rfed.tar.gz
+sudo install -m 755 "${PACKAGE_DIR}/rfed" /usr/local/bin/rfed
 ```
 
-The binary is at `target/release/rfed`.
+On macOS, extract `rfed-${VERSION}-darwin-arm64.tar.gz` and move `rfed` into a directory on your `PATH`.
 
-### Run
+If you do not see a matching binary for your platform yet, use the manual build path in step 4.
+
+### 2. Create a config directory
+
+`rfed --config` expects a directory that contains a file named `config`, not a direct path to the file itself. The file uses Reticulum's native config format rather than TOML.
 
 ```bash
-# Minimal — uses defaults, stores data in ~/.rfed/
+mkdir -p ~/.rfed
+cp "${PACKAGE_DIR}/config.txt.example" ~/.rfed/config
+```
+
+If you downloaded manually instead of using the Linux snippet above, replace `${PACKAGE_DIR}` with the extracted release directory. If you are installing from a macOS archive, copy `config.txt.example` out of that extracted directory instead.
+
+On first run, rfed will also write a commented sample config to `<config_dir>/config` if none exists yet.
+
+### 3. Start the node
+
+```bash
+# Minimal — defaults, stores data in ~/.rfed/
 rfed
 
-# With a config file
-rfed --config /path/to/config/dir
+# Explicit config directory
+rfed --config ~/.rfed
 
-# Override settings via CLI
-rfed --name "my-node" --stamp-cost 12 --storage-limit 5000
+# Override selected settings for one run
+rfed --config ~/.rfed --name "my-node"
 ```
 
-On first run, rfed writes a commented sample config to `<config_dir>/rfed.toml` if none exists.
+### 4. Build from source (manual)
 
-### Configuration
+If you prefer to build locally, or need a platform without a published release binary, use the source-build path below.
 
-Copy `rfed.toml.example` to your config directory and edit:
+From the `RFed-rust/` checkout:
 
 ```bash
-cp rfed.toml.example ~/.rfed/rfed.toml
+./scripts/bootstrap-sibling-deps.sh
 ```
 
-See the [Specification](SPEC.md#13-configuration) for all options.
+That script fetches the required sibling crates into the parent directory of `RFed-rust`, which is the layout Cargo expects today.
+
+You still need:
+
+- Rust 1.70+ toolchain
+
+If you are actively developing across all four repositories, the manual sibling layout remains supported:
+
+```text
+parent/
+├── Reticulum-rust/
+├── LXMF-rust/
+├── app-links/
+└── RFed-rust/
+```
+
+#### Build the node binary
+
+From the `RFed-rust/` workspace root:
+
+```bash
+cargo build --release -p rfed
+```
+
+The node binary will be written to `target/release/rfed`.
+
+#### Start the manually built node
+
+```bash
+# Development run from Cargo
+cargo run --release -p rfed -- --config ~/.rfed
+
+# Or run the built binary directly
+./target/release/rfed --config ~/.rfed
+```
+
+### 5. Operator checklist
+
+Before treating the node as production-ready, make sure you have explicitly reviewed:
+
+- `[node].name` so peers and operators can identify the node in announces
+- `[storage]` limits so sync and blob retention stay bounded
+- `[peering].static_peers` if you want deterministic bootstrap peers
+- `[policy.default]` and `[policy.vip]` so send cost, deferred limits, and backup policy match your threat model
+- `[node].lxmf_propagation` if you want rfed to run the full `lxmf.propagation` service alongside channel federation
+- `[node].lxmf_propagation_autopeer` and `[peering].propagation_peers` so propagation peering matches your discovery model
+
+For the full configuration reference, see [SPEC.md](SPEC.md#13-configuration) and the annotated [config.txt.example](config.txt.example).
 
 ## Channels Are Reticulum Destinations
 
@@ -102,7 +187,7 @@ RFed nodes only ever see the 16-byte `channel_hash`. They store and route opaque
 
 Although a channel hash is derived using the same cryptographic primitives as a Reticulum identity (X25519 + Ed25519 → destination hash), **channels are never announced or routed on the Reticulum network**. No Reticulum destination is registered for a channel, and no packets are addressed *to* the channel hash as a transport destination.
 
-Instead, a channel only comes into existence when a sender publishes a blob to the rfed node's `rfed.channel` destination with the channel hash embedded in the payload. The node treats the hash as an opaque storage key — it has no awareness that the hash corresponds to a keypair, only that blobs should be filed under it and fanned out to matching subscribers.
+Instead, a channel only comes into existence when a sender publishes a blob to the rfed node's `rfed.channel.publish` destination with the channel hash embedded in the payload. The node treats the hash as an opaque storage key — it has no awareness that the hash corresponds to a keypair, only that blobs should be filed under it and fanned out to matching subscribers.
 
 This is directly analogous to how LXMF propagation works: an LXMF propagation node stores messages keyed by the recipient's destination hash without that recipient being registered or announced on the node itself. The node is a mailbox, not a router. RFed applies the same principle to channels.
 
@@ -136,6 +221,60 @@ For **private** channels, use a cryptographically random hex string (e.g. 32+ ch
 
 See [SPEC.md §1](SPEC.md#1-channel-hash-derivation) for the full derivation algorithm.
 
+## Writing Applications Around RFed
+
+Application code talks to an rfed node, not to a channel as an announced network destination. The channel name stays local to the application and is used to derive the channel identity, encrypt/decrypt the inner blob, and prove that the user is a member of the channel.
+
+### Modern client surface
+
+New clients should use the split service destinations announced by rfed:
+
+Reticulum destination names are rendered in dot notation, like
+`rfed.channel.subscribe`. Request handlers on an established link use a
+separate request-path string. Following the convention used in the official
+Reticulum examples and built-in services, RFed writes those request paths with
+a leading slash, like `/rfed/subscribe` or `/rfed/pull`.
+
+| Purpose | Destination | Operation |
+|---------|-------------|-----------|
+| Publish channel data | `rfed.channel.publish` | Fire-and-forget SEND payload `[channel_hash | inner_blob | stamp]` |
+| Subscribe to a channel | `rfed.channel.subscribe` | Request path `/rfed/subscribe` |
+| Unsubscribe from a channel | `rfed.channel.unsubscribe` | Request path `/rfed/unsubscribe` |
+| Pull deferred data for one channel | `rfed.channel.pull` | Request path `/rfed/pull` with `bin(16)` channel hash |
+| Receive live fanout | `rfed.delivery` | Inbound Reticulum Single packets addressed to the subscriber |
+| Register or remove wake relays | `rfed.notify.register` / `rfed.notify.unregister` | Notify relay management |
+
+The older combined `rfed.channel`, `rfed.delivery`, and `rfed.notify` surfaces still exist for transition compatibility, but new client code should target the split destinations above.
+
+### Publisher flow
+
+1. Discover or configure the destination hash of the rfed node you want to publish through.
+2. Derive the channel identity and 16-byte `channel_hash` from the channel name.
+3. Build the inner blob locally. The interoperable choice is to pack an LXMF `PROPAGATED` message, prepend the required source-identity prelude, and encrypt that payload to the channel identity.
+4. Learn the node's current SEND stamp policy. The authoritative application-facing contract today is the `/rfed/subscribe` response shape `[ok_bool, stamp_cost_or_nil]`.
+5. Append the RFed stamp over `channel_hash || inner_blob` when stamping is enabled, then send `[channel_hash | inner_blob | stamp]` to `rfed.channel.publish`.
+
+### Subscriber flow
+
+1. Create or load the subscriber's Reticulum identity.
+2. Open a link to `rfed.channel.subscribe` and send a **signed** subscribe request carrying `[channel_hash, subscriber_pubkey, signature(channel_hash)]`.
+3. Store the returned `stamp_cost` if the node requires SEND proof of work.
+4. Announce or otherwise make your `rfed.delivery` destination reachable for live fanout.
+5. Optionally register notify relays so offline wakeups can be triggered without exposing message content.
+6. When data arrives, use the channel name to re-derive the channel identity and decrypt the inner blob locally.
+
+### What your application owns
+
+RFed handles blob storage, deferred queues, peer sync, and per-subscriber fanout. Your application still owns:
+
+- channel naming and distribution
+- subscriber identity lifecycle
+- message plaintext schema
+- decryption and sender verification on the client side
+- any UX around retries, paging, or showing `more_pending`
+
+If you already have an LXMF-capable application stack, the cleanest integration is usually to keep using LXMF for the inner authenticated message format and let RFed provide the outer channel fanout and deferred-delivery layer.
+
 ## Architecture: Message Journey
 
 ### Step-by-Step: Sender to Subscriber
@@ -156,14 +295,15 @@ See [SPEC.md §1](SPEC.md#1-channel-hash-derivation) for the full derivation alg
 
 The sender derives the channel's X25519 public key from the channel name and encrypts the message content to it (ephemeral ECDH + HKDF + AES-CBC-HMAC — the same scheme Reticulum uses for `Identity.encrypt()`). This produces an **inner blob** — opaque to anyone who doesn't know the channel name.
 
-> **Note:** The current channel wire format does not include sender authentication.
-> Any party that knows the channel name can publish. Sender identity verification
-> is provided by carrying every channel message as an LXMF-rust
-> `LXMessage::pack(PROPAGATED)` block as the inner_blob: Ed25519 signature,
-> source identity hash, timestamp, and structured fields — identical to how
-> LXMF propagation nodes authenticate senders without seeing message content.
+> **Note:** RFed itself does not add a separate server-side sender-auth layer,
+> but the interoperable channel payload format does carry sender identity and
+> authenticity inside the encrypted inner blob. The recommended format is an
+> LXMF-rust `LXMessage::pack(PROPAGATED)` block plus the required source-identity
+> prelude, which gives subscribers the same signature-verification semantics used
+> by LXMF propagation without exposing plaintext to the rfed node.
 
-The sender transmits to the node's `rfed.channel` destination:
+The sender transmits to the node's `rfed.channel.publish` destination
+(`rfed.channel` remains as a legacy compatibility alias during transition):
 
 ```
 [ channel_hash (16 bytes) | inner_blob | PoW stamp ]
@@ -231,7 +371,7 @@ The node wraps each inner blob in a second Reticulum envelope addressed to the s
 │  ┌─── Inner Blob (sender → channel) ─────────────────────┐  │
 │  │  Encrypted to channel's X25519 pubkey                  │  │
 │  │  Content: opaque to rfed node                          │  │
-│  │  (sender auth planned via LXMF inner format)           │  │
+│  │  (sender auth carried by LXMF inner format)            │  │
 │  └────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -258,12 +398,14 @@ The rfed node is a **courier, not a reader**. It repackages and propagates chann
 
 ## Documentation
 
+- **[README.md](README.md)** — Installation, operator onboarding, application integration, and architecture overview
 - **[SPEC.md](SPEC.md)** — Full protocol and operational specification
-- **[rfed.toml.example](rfed.toml.example)** — Annotated configuration template
+- **[config.txt.example](config.txt.example)** — Example Reticulum-native configuration copied to `<config_dir>/config`
+- **[rfed/TESTS.md](rfed/TESTS.md)** — Automated and manual test entry points
 
 ## Dependencies
 
-RFed depends on two direct local crates, and `lxmf_rust` now has a sibling path dependency on `app_links`, so all three repos must be cloned side-by-side:
+RFed currently builds against three sibling local crates: `reticulum_rust`, `lxmf_rust`, and `app_links`. For normal installs, `./scripts/bootstrap-sibling-deps.sh` clones them into the correct parent-directory layout automatically. If you are working across the repos directly, the manual layout is:
 
 ```
 parent/
@@ -276,7 +418,7 @@ parent/
     │   ├── Cargo.toml
     │   └── src/
     ├── SPEC.md
-    └── rfed.toml.example
+    └── config.txt.example
 ```
 
 | Crate | Purpose |

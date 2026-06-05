@@ -65,13 +65,39 @@ impl BlobStore {
         store
     }
 
-    /// Persist an inner blob.  Returns the new message_id (16 random bytes).
+    /// Persist an inner blob. Returns the new random message_id (16 bytes).
     /// Returns an error if the storage limit would be exceeded.
     pub fn store(
         &mut self,
         destination_hash: &[u8],
         blob: &[u8],
     ) -> Result<Vec<u8>, String> {
+        let mut message_id = vec![0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut message_id);
+        self.store_with_id(destination_hash, &message_id, blob)
+    }
+
+    /// Persist an inner blob under a caller-supplied message ID.
+    ///
+    /// Sync uses this to preserve upstream message IDs across federation hops
+    /// so manifests converge instead of cloning the same blob forever under
+    /// fresh random IDs.
+    pub fn store_with_id(
+        &mut self,
+        destination_hash: &[u8],
+        message_id: &[u8],
+        blob: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if let Some(existing) = self.index.get(message_id) {
+            if existing.destination_hash == destination_hash {
+                return Ok(message_id.to_vec());
+            }
+            return Err(format!(
+                "message id collision for {}",
+                hex(message_id),
+            ));
+        }
+
         let blob_size = blob.len() as u64;
 
         // Periodic TTL eviction — runs at most once per EVICT_CHECK_INTERVAL_SECS.
@@ -93,28 +119,24 @@ impl BlobStore {
             ));
         }
 
-        // 16-byte random message ID
-        let mut message_id = vec![0u8; 16];
-        rand::rngs::OsRng.fill_bytes(&mut message_id);
-
         let dest_dir = self.storage_dir.join(hex(destination_hash));
         std::fs::create_dir_all(&dest_dir)
             .map_err(|e| format!("create_dir_all({:?}): {e}", dest_dir))?;
 
-        let blob_path = dest_dir.join(hex(&message_id));
+        let blob_path = dest_dir.join(hex(message_id));
         std::fs::write(&blob_path, blob)
             .map_err(|e| format!("write blob {:?}: {e}", blob_path))?;
 
         let meta = BlobMeta {
-            message_id: message_id.clone(),
+            message_id: message_id.to_vec(),
             destination_hash: destination_hash.to_vec(),
             received: now(),
             size: blob.len(),
         };
-        self.index.insert(message_id.clone(), meta);
+        self.index.insert(message_id.to_vec(), meta);
         self.used_bytes += blob_size;
 
-        Ok(message_id)
+        Ok(message_id.to_vec())
     }
 
     /// Read a blob from disk by its message_id.  Returns `None` if unknown.

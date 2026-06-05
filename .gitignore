@@ -34,3 +34,11 @@ apns-bridge/apns_bridge
 fcm-bridge/fcm_bridge
 rfed/rfed
 rfed-nas.status
+
+# Local release packaging output
+/dist/
+/dist-release-set/
+/dist-test/
+
+# Local sample config written by rfed when using the repo root as config dir
+/config
