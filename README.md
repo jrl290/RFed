@@ -65,7 +65,7 @@ Example for Linux x86_64:
 VERSION=v0.1.0
 PACKAGE_DIR="rfed-${VERSION}-linux-x86_64"
 curl -L -o rfed.tar.gz \
-    "https://github.com/jrl290/RFed-rust/releases/download/${VERSION}/rfed-${VERSION}-linux-x86_64.tar.gz"
+    "https://github.com/jrl290/RFed/releases/download/${VERSION}/rfed-${VERSION}-linux-x86_64.tar.gz"
 tar -xzf rfed.tar.gz
 sudo install -m 755 "${PACKAGE_DIR}/rfed" /usr/local/bin/rfed
 ```
