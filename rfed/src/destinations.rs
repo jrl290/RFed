@@ -42,7 +42,7 @@
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use app_links::{self as rns_app_links, AppLinks};
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
@@ -758,6 +758,7 @@ impl FedNode {
     /// Link to their rfed.node destination.  The link_established callback then
     /// runs `run_sync_session()` which handles the OFFER → MESSAGE_GET flow.
     pub fn tick_sync(&mut self) {
+        let tick_start = Instant::now();
         // Prune links that have closed since the last tick.
         // Retaining only live links prevents stale entries from blocking
         // new connection attempts.
@@ -864,6 +865,10 @@ impl FedNode {
             }
             self.sync_links.insert(peer_hash, handle);
         }
+        let held = tick_start.elapsed();
+        if held > Duration::from_secs(1) {
+            log(format!("[rfed] LOCK-WARN tick_sync: held FedNode lock for {:.2}s", held.as_secs_f64()), LOG_WARNING, false, false);
+        }
     }
 
     /// Three backup-related tasks run every 30 seconds:
@@ -876,6 +881,7 @@ impl FedNode {
     /// 3. **Prune**: remove stale backup entries whose upstream custodian
     ///    stopped refreshing them (owner recovered → chain unravels).
     pub fn tick_backup_delivery(&mut self) {
+        let tick_start = Instant::now();
         // ── Helper: resolve a backup node from config or auto-select ───
         let resolve_backup = |selected: &mut Vec<Vec<u8>>,
                               sync: &Arc<Mutex<FedSync>>,
@@ -1029,6 +1035,10 @@ impl FedNode {
                     );
                 }
             }
+        }
+        let held = tick_start.elapsed();
+        if held > Duration::from_secs(1) {
+            log(format!("[rfed] LOCK-WARN tick_backup_delivery: held FedNode lock for {:.2}s", held.as_secs_f64()), LOG_WARNING, false, false);
         }
     }
 }
@@ -2130,7 +2140,12 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             log(format!("[rfed] subscribe_cb: bad channel_hash len={}", channel_hash.len()), LOG_WARNING, false, false);
             return rmp_serde::to_vec(&false).unwrap_or_default();
         }
+        let lock_start = Instant::now();
         if let Ok(guard) = sub_node.lock() {
+            let lock_held = lock_start.elapsed();
+            if lock_held > Duration::from_secs(1) {
+                log(format!("[rfed] LOCK-WARN subscribe_cb: FedNode lock acquired after {:.2}s", lock_held.as_secs_f64()), LOG_WARNING, false, false);
+            }
             if !guard.config.policy_for(&subscriber_hash).allow_subscription {
                 log(
                     format!(
@@ -2181,7 +2196,12 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             Ok(v) => v,
             Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
         };
+        let lock_start = Instant::now();
         if let Ok(guard) = unsub_node.lock() {
+            let lock_held = lock_start.elapsed();
+            if lock_held > Duration::from_secs(1) {
+                log(format!("[rfed] LOCK-WARN unsubscribe_cb: FedNode lock acquired after {:.2}s", lock_held.as_secs_f64()), LOG_WARNING, false, false);
+            }
             if let Ok(mut subs) = guard.subscription_table.lock() {
                 subs.unsubscribe(&subscriber_hash, &channel_hash);
             }
@@ -2204,7 +2224,12 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             }
         };
 
+        let lock_start = Instant::now();
         if let Ok(guard) = pull_node.lock() {
+            let lock_held = lock_start.elapsed();
+            if lock_held > Duration::from_secs(1) {
+                log(format!("[rfed] LOCK-WARN channel.pull: FedNode lock acquired after {:.2}s", lock_held.as_secs_f64()), LOG_WARNING, false, false);
+            }
             let page_size = guard
                 .config
                 .policy_for(&subscriber_hash)
