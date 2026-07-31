@@ -53,6 +53,7 @@ mod subscription;
 mod channel;
 mod blob_store;
 mod deferred_queue;
+mod distro;
 mod fanout;
 mod sync;
 mod toml_config;
@@ -195,6 +196,9 @@ fn write_status_file(
                 "    \"rfed.propagation.stream\": \"{}\",\n",
                 "    \"rfed.notify.register\": \"{}\",\n",
                 "    \"rfed.notify.unregister\": \"{}\",\n",
+                "    \"rfed.distro.register\": \"{}\",\n",
+                "    \"rfed.distro.unregister\": \"{}\",\n",
+                "    \"rfed.distro.list\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
                 "  \"interfaces\": [],\n",
@@ -219,6 +223,9 @@ fn write_status_file(
             hexrep(&guard.propagation_stream_dest.hash, false),
             hexrep(&guard.notify_register_dest.hash, false),
             hexrep(&guard.notify_unregister_dest.hash, false),
+            hexrep(&guard.distro_register_dest.hash, false),
+            hexrep(&guard.distro_unregister_dest.hash, false),
+            hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
             uptime_secs, sub_count, blob_count, notify_count,
         )
@@ -241,6 +248,9 @@ fn write_status_file(
                 "    \"rfed.propagation.stream\": \"{}\",\n",
                 "    \"rfed.notify.register\": \"{}\",\n",
                 "    \"rfed.notify.unregister\": \"{}\",\n",
+                "    \"rfed.distro.register\": \"{}\",\n",
+                "    \"rfed.distro.unregister\": \"{}\",\n",
+                "    \"rfed.distro.list\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
                 "  \"interfaces\": [\n",
@@ -267,6 +277,9 @@ fn write_status_file(
             hexrep(&guard.propagation_stream_dest.hash, false),
             hexrep(&guard.notify_register_dest.hash, false),
             hexrep(&guard.notify_unregister_dest.hash, false),
+            hexrep(&guard.distro_register_dest.hash, false),
+            hexrep(&guard.distro_unregister_dest.hash, false),
+            hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
             interfaces_json,
             uptime_secs, sub_count, blob_count, notify_count,
@@ -656,11 +669,19 @@ fn main() -> Result<(), String> {
         let propagation_streams = node.lock().map_err(|_| "lock")?.propagation_streams.clone();
         let node_config = node.lock().map_err(|_| "lock")?.config.clone();
         let prop_identity = node.lock().map_err(|_| "lock")?.identity.clone();
+        let distro_table = node.lock().map_err(|_| "lock")?.distro_table.clone();
+        let blob_store = node.lock().map_err(|_| "lock")?.blob_store.clone();
+        let hook_registry = node.lock().map_err(|_| "lock")?.hook_registry.clone();
+        let deferred_queue = node.lock().map_err(|_| "lock")?.deferred_queue.clone();
         let prop = lxmf_propagation::LxmfPropagationNode::new(
             prop_identity,
             &node_config,
             notify_reg,
             propagation_streams,
+            Some(distro_table),
+            Some(blob_store),
+            Some(hook_registry),
+            Some(deferred_queue),
         )?;
         lxmf_propagation::LxmfPropagationNode::enable(&prop)?;
 

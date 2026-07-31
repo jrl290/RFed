@@ -216,6 +216,9 @@ impl NodeConfig {
     pub fn deferred_queue_file(&self) -> PathBuf {
         self.config_dir.join("deferred_delivery.rmp")
     }
+    pub fn distro_file(&self) -> PathBuf {
+        self.config_dir.join("distro.rmp")
+    }
     pub fn peer_state_file(&self) -> PathBuf {
         self.config_dir.join("peers.rmp")
     }

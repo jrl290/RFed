@@ -59,6 +59,7 @@ use rmpv::encode::write_value;
 use rmpv::Value;
 
 use crate::config::NodeConfig;
+use crate::distro::DistroTable;
 use crate::notify::NotifyRegistry;
 use crate::stream_registry::{PropagationStreamRegistry, StreamDispatchResult};
 
@@ -86,6 +87,7 @@ pub const MESSAGE_EXPIRY_SECS: f64 = 30.0 * 24.0 * 3600.0;
 pub const PEER_SYNC_INTERVAL_SECS: f64 = 6.0;
 /// Peer sync backoff step.
 pub const SYNC_BACKOFF_STEP_SECS: f64 = 12.0 * 60.0;
+const DISTRO_DEFERRED_QUEUE_LIMIT: usize = 256;
 /// Max time a peer is unreachable before removal (14 days).
 pub const MAX_UNREACHABLE_SECS: f64 = 14.0 * 24.0 * 3600.0;
 /// Peer OFFER request path.
@@ -320,6 +322,17 @@ pub struct LxmfPropagationNode {
     pub identity: Identity,
     /// Shared notify registry — checked for every inbound LXMF message.
     registry: Arc<Mutex<NotifyRegistry>>,
+    /// Distro device registry — checked for intercept after message storage.
+    /// When set, messages for distro identities are stored in BlobStore
+    /// (not messagestore) and fanned out to registered devices.
+    distro_table: Option<Arc<Mutex<DistroTable>>>,
+    /// BlobStore for distro message persistence (shared with FedSync).
+    /// Only used when `distro_table` is Some.
+    distro_blob_store: Option<Arc<Mutex<crate::blob_store::BlobStore>>>,
+    /// Shared hook registry for delivery events.
+    distro_hook_registry: Option<Arc<Mutex<crate::notify::HookRegistry>>>,
+    /// Deferred delivery queue for distro messages (shared with FedNode).
+    deferred_queue: Option<Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
     /// Active rfed.propagation.stream sessions keyed by link.
     stream_registry: Arc<Mutex<PropagationStreamRegistry>>,
 
@@ -374,6 +387,10 @@ impl LxmfPropagationNode {
         config: &NodeConfig,
         registry: Arc<Mutex<NotifyRegistry>>,
         stream_registry: Arc<Mutex<PropagationStreamRegistry>>,
+        distro_table: Option<Arc<Mutex<DistroTable>>>,
+        distro_blob_store: Option<Arc<Mutex<crate::blob_store::BlobStore>>>,
+        distro_hook_registry: Option<Arc<Mutex<crate::notify::HookRegistry>>>,
+        deferred_queue: Option<Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
     ) -> Result<Arc<Mutex<Self>>, String> {
         let destination = Destination::new_inbound(
             Some(identity.clone()),
@@ -404,6 +421,10 @@ impl LxmfPropagationNode {
             destination,
             identity,
             registry,
+            distro_table,
+            distro_blob_store,
+            distro_hook_registry,
+            deferred_queue,
             stream_registry,
             stamp_cost,
             stamp_flexibility,
@@ -1074,15 +1095,92 @@ impl LxmfPropagationNode {
         let mut notified = 0usize;
 
         for (_transient_id, lxmf_data, stamp_value, stamp_raw) in &validated {
-            // Store the message
-            if self.store_message(lxmf_data, *stamp_value, Some(stamp_raw), None).is_some() {
-                stored += 1;
-            }
+            // ── Distro intercept ──────────────────────────────────────
+            // If the destination is a registered distro identity, store the
+            // LXMF blob in BlobStore (for rfed→rfed sync) instead of the
+            // propagation messagestore, and fan out to registered devices.
+            // This prevents distro messages from polluting the lxmd mesh.
+            let dest_hash = if lxmf_data.len() >= DESTINATION_LENGTH {
+                &lxmf_data[..DESTINATION_LENGTH]
+            } else {
+                &[]
+            };
 
-            match self.dispatch_live_or_notify(lxmf_data, "") {
-                LiveDispatchOutcome::Streamed => streamed += 1,
-                LiveDispatchOutcome::Notified => notified += 1,
-                LiveDispatchOutcome::None => {}
+            let is_distro = self.distro_table.as_ref().and_then(|dt| {
+                dt.lock().ok().map(|t| t.is_distro(dest_hash))
+            }).unwrap_or(false);
+
+            if is_distro {
+                log(
+                    format!("[distro] intercepted propagated message for {}", hexrep(dest_hash, false)),
+                    LOG_NOTICE, false, false,
+                );
+                // Store in BlobStore for FedSync distribution
+                if let Some(ref blob_store) = self.distro_blob_store {
+                    if let Ok(mut store) = blob_store.lock() {
+                        let msg_id = reticulum_rust::identity::full_hash(lxmf_data);
+                        if !store.index.contains_key(&msg_id) {
+                            if let Err(e) = store.store_with_id(dest_hash, &msg_id, lxmf_data) {
+                                log(
+                                    format!("[distro] BlobStore store error: {e}"),
+                                    LOG_WARNING, false, false,
+                                );
+                            } else {
+                                stored += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Fan out to registered devices immediately
+                if let Some(ref dt) = self.distro_table {
+                    if let Ok(table) = dt.lock() {
+                        let hook_guard = self.distro_hook_registry.as_ref()
+                            .and_then(|h| h.lock().ok());
+                        let default_hooks = crate::notify::HookRegistry::new();
+                        let hooks: &crate::notify::HookRegistry = match &hook_guard {
+                            Some(g) => &**g,
+                            None => &default_hooks,
+                        };
+                        let missed = crate::distro::distro_fanout(
+                            dest_hash,
+                            lxmf_data,
+                            &*table,
+                            hooks,
+                            Some(&self.stream_registry),
+                        );
+                        if !missed.is_empty() {
+                            log(
+                                format!(
+                                    "[distro] {} device(s) unreachable for distro {} — enqueuing in deferred queue",
+                                    missed.len(),
+                                    hexrep(dest_hash, false),
+                                ),
+                                LOG_NOTICE,
+                                false,
+                                false,
+                            );
+                            enqueue_distro_misses(
+                                self.deferred_queue.as_ref(),
+                                missed,
+                                dest_hash,
+                                lxmf_data,
+                            );
+                        }
+                    }
+                }
+            } else {
+                // ── Normal propagation path ───────────────────────────
+                // Store the message
+                if self.store_message(lxmf_data, *stamp_value, Some(stamp_raw), None).is_some() {
+                    stored += 1;
+                }
+
+                match self.dispatch_live_or_notify(lxmf_data, "") {
+                    LiveDispatchOutcome::Streamed => streamed += 1,
+                    LiveDispatchOutcome::Notified => notified += 1,
+                    LiveDispatchOutcome::None => {}
+                }
             }
         }
 
@@ -2078,13 +2176,65 @@ impl LxmfPropagationNode {
         let mut streamed = 0;
         let mut notified = 0;
         for (_tid, lxmf_data, stamp_value, stamp_raw) in &validated {
-            if self.store_message(lxmf_data, *stamp_value, Some(stamp_raw), from_peer).is_some() {
-                stored += 1;
+            // ── Distro intercept (peer sync path) ────────────────────
+            let dest_hash = if lxmf_data.len() >= DESTINATION_LENGTH {
+                &lxmf_data[..DESTINATION_LENGTH]
+            } else {
+                &[]
+            };
 
-                match self.dispatch_live_or_notify(lxmf_data, " (peer sync)") {
-                    LiveDispatchOutcome::Streamed => streamed += 1,
-                    LiveDispatchOutcome::Notified => notified += 1,
-                    LiveDispatchOutcome::None => {}
+            let is_distro = self.distro_table.as_ref().and_then(|dt| {
+                dt.lock().ok().map(|t| t.is_distro(dest_hash))
+            }).unwrap_or(false);
+
+            if is_distro {
+                // Store in BlobStore for FedSync distribution
+                if let Some(ref blob_store) = self.distro_blob_store {
+                    if let Ok(mut store) = blob_store.lock() {
+                        let msg_id = reticulum_rust::identity::full_hash(lxmf_data);
+                        if !store.index.contains_key(&msg_id) {
+                            if store.store_with_id(dest_hash, &msg_id, lxmf_data).is_ok() {
+                                stored += 1;
+                            }
+                        }
+                    }
+                }
+
+                // Fan out to registered devices
+                if let Some(ref dt) = self.distro_table {
+                    if let Ok(table) = dt.lock() {
+                        let hook_guard = self.distro_hook_registry.as_ref()
+                            .and_then(|h| h.lock().ok());
+                        let default_hooks = crate::notify::HookRegistry::new();
+                        let hooks: &crate::notify::HookRegistry = match &hook_guard {
+                            Some(g) => &**g,
+                            None => &default_hooks,
+                        };
+                        let missed = crate::distro::distro_fanout(
+                            dest_hash,
+                            lxmf_data,
+                            &*table,
+                            hooks,
+                            Some(&self.stream_registry),
+                        );
+                        enqueue_distro_misses(
+                            self.deferred_queue.as_ref(),
+                            missed,
+                            dest_hash,
+                            lxmf_data,
+                        );
+                    }
+                }
+            } else {
+                // ── Normal propagation path ───────────────────────────
+                if self.store_message(lxmf_data, *stamp_value, Some(stamp_raw), from_peer).is_some() {
+                    stored += 1;
+
+                    match self.dispatch_live_or_notify(lxmf_data, " (peer sync)") {
+                        LiveDispatchOutcome::Streamed => streamed += 1,
+                        LiveDispatchOutcome::Notified => notified += 1,
+                        LiveDispatchOutcome::None => {}
+                    }
                 }
             }
         }
@@ -2144,8 +2294,58 @@ fn encode_error(code: u8) -> Vec<u8> {
     encode_value(Value::Integer((code as i64).into()))
 }
 
+fn enqueue_distro_misses(
+    deferred_queue: Option<&Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
+    missed: Vec<Vec<u8>>,
+    distro_hash: &[u8],
+    lxmf_data: &[u8],
+) {
+    let Some(deferred_queue) = deferred_queue else {
+        return;
+    };
+    let Ok(mut queue) = deferred_queue.lock() else {
+        return;
+    };
+    for device_hash in missed {
+        queue.enqueue(
+            device_hash,
+            distro_hash.to_vec(),
+            lxmf_data.to_vec(),
+            DISTRO_DEFERRED_QUEUE_LIMIT,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn distro_misses_are_queued_for_pull() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("rfed_distro_deferred_{unique}.rmp"));
+        let queue = Arc::new(Mutex::new(crate::deferred_queue::DeferredQueue::load(path.clone())));
+        let device_hash = vec![0x11; 16];
+        let distro_hash = vec![0x22; 16];
+        let lxmf_data = vec![0x33; 64];
+
+        super::enqueue_distro_misses(
+            Some(&queue),
+            vec![device_hash.clone()],
+            &distro_hash,
+            &lxmf_data,
+        );
+
+        let pending = queue.lock().expect("queue lock").drain(&device_hash);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].channel_hash, distro_hash);
+        assert_eq!(pending[0].blob, lxmf_data);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn initiate_sync_uses_persistent_app_links() {
         let source = std::fs::read_to_string(concat!(

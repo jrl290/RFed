@@ -189,6 +189,7 @@ A "hello" message of ~7 bytes UTF-8 produces `inner_blob ≈ 256`,
 14. [CLI Reference](#14-cli-reference)
 15. [Test Suite](#15-test-suite)
 16. [Dependencies](#16-dependencies)
+17. [Distro](#17-distro)
 
 ---
 
@@ -1129,6 +1130,7 @@ this node.  Any caller may issue the request; the payload is ignored.
 | `lxmf_propagation` | Boolean | Whether the full `lxmf.propagation` service is enabled. |
 | `channel_stream` | Boolean | Whether live per-channel streaming is available. |
 | `propagation_stream` | Boolean | Whether propagation streaming support is available (currently mirrors `lxmf_propagation`). |
+| `distro` | Boolean | Whether distro (multi-device fanout) is available. Always `true` on current rfed. |
 | `backup` | Boolean | Whether backup failover is configured (primary or secondary nodes set). |
 | `stamp_cost` | Integer / Nil | Required PoW leading-zero bits, or Nil if stamping is disabled. |
 
@@ -1147,10 +1149,128 @@ or feature-specific sub-maps.
   "lxmf_propagation": false,
   "channel_stream": true,
   "propagation_stream": false,
+  "distro": true,
   "backup": true,
   "stamp_cost": 16
 }
 ```
+
+---
+
+## 17. Distro
+
+Distro (Distribution List) provides personal multi-device message fanout for a
+shared LXMF identity.  A user with multiple devices (phone, laptop, LoRa
+messenger) registers each device's `lxmf.delivery` address under a single
+"distro identity."  Any LXMF message sent to the distro identity is
+automatically fanned out to all registered devices.
+
+### 17.1 Architecture
+
+Distro is a **double-wrap, server-blind** relay (same trust model as channels):
+
+```
+Sender → LXMF message encrypted to distro identity
+       → lxmf.propagation PUT (standard LXMF path)
+       → RFed intercepts, stores in BlobStore (NOT messagestore)
+       → RFed fans out to each registered device via rfed.delivery
+       → Device receives on rfed.delivery, decrypts with shared distro key
+```
+
+**Key differences from channels:**
+
+| | Channel | Distro |
+|---|---|---|
+| Identity model | Derived from channel name | Standard LXMF identity, shared out-of-band |
+| Registration | Self-service (know name → join) | Owner-managed (distro key proves ownership) |
+| Sender experience | Must know channel name, derive keys | Sends normal LXMF to a normal address |
+| Reply identity | Each sender signs with own identity | All devices reply as the distro identity |
+| Ingress | `rfed.channel.publish` (DATA) | `lxmf.propagation` (intercepted) |
+
+### 17.2 Cross-Node Distribution
+
+Distro messages are stored in **BlobStore** (not the LXMF propagation
+messagestore) and synced between RFed nodes via **FedSync** (the same
+`rfed.node` OFFER/MESSAGE_GET engine channels use).  This avoids polluting
+the vanilla `lxmd` propagation mesh with messages those nodes can never
+deliver.
+
+Each RFed node maintains its own **DistroTable** — a per-node registry of
+which devices have registered locally.  A node pulls distro blobs from
+peers when it has at least one local device registered for that distro hash.
+
+### 17.3 Delivery Format
+
+Distro messages are delivered via `rfed.delivery` (same destination as
+channel blobs), using the same payload layout:
+
+```
+[ distro_lxmf_hash(16) | lxmf_blob(*) ]
+```
+
+The device's `rfed.delivery` handler distinguishes distro messages from
+channel messages by the routing hash prefix.  The `lxmf_blob` is a standard
+LXMF propagation message (encrypted to the distro identity's X25519 key).
+RFed never decrypts it.
+
+Offline devices are handled via the **DeferredQueue** (same as channels).
+When the device announces `rfed.delivery`, pending distro blobs are flushed.
+
+### 17.4 RNS Destinations & Request Paths
+
+| Destination | Aspects | Request Path | Purpose |
+|---|---|---|---|
+| `rfed.distro.register` | `["distro", "register"]` | `/rfed/distro/register` | Register a device |
+| `rfed.distro.unregister` | `["distro", "unregister"]` | `/rfed/distro/unregister` | Remove a device |
+| `rfed.distro.list` | `["distro", "list"]` | `/rfed/distro/list` | List registered devices |
+
+All three use `DestinationType::Single`.
+
+### 17.5 Registration Protocol
+
+The distro owner proves possession of the distro private key by signing the
+registration payload.  The protocol mirrors the channel subscription format:
+
+**Register / Unregister:**
+```
+Payload: msgpack [ bin(64) device_pubkey, bin(64) distro_pubkey, bin(64) sig(device_pubkey) ]
+```
+
+`verify_signed_payload` extracts `(device_pubkey, distro_identity_hash, distro_pubkey)`
+and validates `sig(device_pubkey)` against `distro_pubkey`.  The server derives:
+- `distro_lxmf_hash` = `Destination::hash(app="lxmf", aspects=["delivery"], identity_hash=distro_identity_hash)`
+- `device_lxmf_hash` = same derivation from `device_pubkey`
+
+**List:**
+```
+Payload: msgpack [ bin(16) distro_identity_hash, bin(64) distro_pubkey, bin(64) sig(distro_identity_hash) ]
+Response: msgpack [ bin(16) device_lxmf_hash, ... ]
+```
+
+### 17.6 DistroTable Schema
+
+Per-node table persisted to `distro.rmp`:
+
+| Field | Type | Description |
+|---|---|---|
+| `distro_lxmf_hash` | `[u8; 16]` | Distro identity's `lxmf.delivery` hash (routing key) |
+| `device_lxmf_hash` | `[u8; 16]` | Device's `lxmf.delivery` hash |
+| `device_pubkey` | `[u8; 64]` | Device identity public key (for outbound delivery) |
+| `added` | `f64` | Unix timestamp of registration |
+| `owner_node_hash` | `Option<[u8; 16]>` | Reserved for backup failover (future) |
+| `last_refreshed` | `f64` | Backup TTL tracking (future) |
+
+### 17.7 Sync Engine Integration
+
+The FedSync engine treats channel and distro blobs uniformly:
+
+- **Manifest building** (`local_manifest`): includes blobs for channels with
+  local subscribers AND distros with local devices.
+- **Gap filtering** (`gap_from_peer`): pulls blobs for subscribed channels
+  OR registered distros that the node doesn't already hold.
+- **Post-ingest dispatch**: calls `fanout_blob()` for channel hashes and
+  `distro_fanout()` for distro hashes, then enqueues missed subscribers/devices
+  in the DeferredQueue.
 
 ---
 

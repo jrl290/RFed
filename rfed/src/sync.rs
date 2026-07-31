@@ -26,7 +26,7 @@
 //! That case would require an explicit "relay" role (a node that stores blobs
 //! for channels it has no local subscribers for) and is not currently in scope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,6 +39,7 @@ use reticulum_rust::{log, hexrep, LOG_NOTICE, LOG_WARNING};
 pub use reticulum_rust::transport::Transport;
 
 use crate::blob_store::BlobStore;
+use crate::distro::DistroTable;
 use crate::subscription::SubscriptionTable;
 
 fn now() -> f64 {
@@ -134,6 +135,9 @@ pub struct FedSync {
     pub peers: HashMap<Vec<u8>, FedPeer>,
     pub blob_store: Arc<Mutex<BlobStore>>,
     pub subscription_table: Arc<Mutex<SubscriptionTable>>,
+    /// Distro device registry — per-node, never synced.
+    /// Checked during manifest filtering and post-ingest fanout dispatch.
+    pub distro_table: Arc<Mutex<DistroTable>>,
     pub max_peering_cost: u32,
     pub transfer_limit_bytes: Option<f64>,
     pub sync_limit_bytes: Option<f64>,
@@ -153,11 +157,13 @@ impl FedSync {
     pub fn new(
         blob_store: Arc<Mutex<BlobStore>>,
         subscription_table: Arc<Mutex<SubscriptionTable>>,
+        distro_table: Arc<Mutex<DistroTable>>,
     ) -> Self {
         FedSync {
             peers: HashMap::new(),
             blob_store,
             subscription_table,
+            distro_table,
             max_peering_cost: 26,
             transfer_limit_bytes: None,
             sync_limit_bytes: None,
@@ -317,24 +323,31 @@ impl FedSync {
     // ── Inbound request handlers (called from rfed.node request handlers) ────
 
     /// Returns `(channel_hash, message_id)` pairs for all blobs this node
-    /// holds for channels that have at least one local subscriber.
+    /// holds for channels that have at least one local subscriber, AND blobs
+    /// for distro hashes that have at least one registered device.
     ///
-    /// Including the channel hash lets the *requesting* peer filter out entries
-    /// for channels it doesn't subscribe to, so it never pulls blobs it has no
-    /// use for.
+    /// Including the routing hash lets the *requesting* peer filter out entries
+    /// it doesn't care about (no local subs for that channel, no devices for
+    /// that distro).
     pub fn local_manifest(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
         let store = self.blob_store.lock().unwrap();
         let subs  = self.subscription_table.lock().unwrap();
-        let local_channels: std::collections::HashSet<Vec<u8>> =
+        let distro = self.distro_table.lock().unwrap();
+        let local_channels: HashSet<Vec<u8>> =
             subs.subscribed_channel_hashes().into_iter().collect();
-        if local_channels.is_empty() {
-            // No local subscribers yet — don't advertise anything.
+        let local_distros: HashSet<Vec<u8>> =
+            distro.registered_distro_hashes();
+        if local_channels.is_empty() && local_distros.is_empty() {
+            // No local subscribers or distro devices yet — don't advertise anything.
             return Vec::new();
         }
         store
             .index
             .values()
-            .filter(|m| local_channels.contains(&m.destination_hash))
+            .filter(|m| {
+                local_channels.contains(&m.destination_hash)
+                    || local_distros.contains(&m.destination_hash)
+            })
             .map(|m| (m.destination_hash.clone(), m.message_id.clone()))
             .collect()
     }
@@ -360,20 +373,24 @@ impl FedSync {
 
     /// Compute the message IDs we should pull from a peer.
     ///
-    /// Given the peer's manifest as `(channel_hash, message_id)` pairs, returns
-    /// the IDs to request: blobs for channels we subscribe to that we don't
-    /// already hold.  Acquires `blob_store` and `subscription_table` exactly
-    /// once each — avoids the double-lock that a separate `local_manifest()` +
-    /// `subscription_table.lock()` call would incur.
+    /// Given the peer's manifest as `(routing_hash, message_id)` pairs, returns
+    /// the IDs to request: blobs for channels we subscribe to OR distros we have
+    /// devices for, that we don't already hold.
     pub fn gap_from_peer(&self, peer_pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<Vec<u8>> {
         let store = self.blob_store.lock().unwrap();
         let subs  = self.subscription_table.lock().unwrap();
-        let our_ids: std::collections::HashSet<Vec<u8>> =
+        let distro = self.distro_table.lock().unwrap();
+        let our_ids: HashSet<Vec<u8>> =
             store.index.keys().cloned().collect();
-        let subscribed: std::collections::HashSet<Vec<u8>> =
+        let subscribed: HashSet<Vec<u8>> =
             subs.subscribed_channel_hashes().into_iter().collect();
+        let distro_hashes: HashSet<Vec<u8>> =
+            distro.registered_distro_hashes();
         peer_pairs.into_iter()
-            .filter(|(ch, id)| subscribed.contains(ch) && !our_ids.contains(id))
+            .filter(|(routing_hash, id)| {
+                (subscribed.contains(routing_hash) || distro_hashes.contains(routing_hash))
+                    && !our_ids.contains(id)
+            })
             .map(|(_, id)| id)
             .collect()
     }
@@ -561,7 +578,10 @@ mod tests {
         let subscription_table = Arc::new(Mutex::new(SubscriptionTable::load(
             base.join("subscriptions.rmp"),
         )));
-        let mut sync = FedSync::new(Arc::clone(&blob_store), subscription_table);
+        let distro_table = Arc::new(Mutex::new(DistroTable::load(
+            base.join("distro.rmp"),
+        )));
+        let mut sync = FedSync::new(Arc::clone(&blob_store), subscription_table, distro_table);
 
         let channel_hash = vec![0x11; 16];
         let message_id = vec![0x22; 16];
@@ -586,6 +606,81 @@ mod tests {
         let ingested_again = sync.ingest_message_get_response(&[0x33; 16], &payload);
         assert!(ingested_again.is_empty(), "re-ingesting the same MESSAGE_GET payload must be a no-op");
         assert_eq!(blob_store.lock().expect("lock blob store").index.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gap_from_peer_includes_distro_hashes() {
+        let base = temp_path("distro_gap");
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let blob_store = Arc::new(Mutex::new(BlobStore::open(
+            base.join("blobs"), 1024 * 1024,
+        )));
+        let subscription_table = Arc::new(Mutex::new(SubscriptionTable::load(
+            base.join("subscriptions.rmp"),
+        )));
+        let distro_table = Arc::new(Mutex::new(DistroTable::load(
+            base.join("distro.rmp"),
+        )));
+        let sync = FedSync::new(
+            Arc::clone(&blob_store),
+            subscription_table,
+            distro_table.clone(),
+        );
+
+        let distro_hash = vec![0xDD; 16];
+        let message_id = vec![0xEE; 16];
+
+        // Register a device for this distro so gap_from_peer should want it.
+        distro_table.lock().unwrap().register(
+            distro_hash.clone(),
+            vec![0x01; 16],
+            vec![0x01; 64],
+        );
+
+        // Offer a peer manifest containing a blob for the distro hash.
+        let peer_manifest = vec![(distro_hash.clone(), message_id.clone())];
+        let wanted = sync.gap_from_peer(peer_manifest);
+
+        // We don't have this blob yet, and we have a distro device → should want it.
+        assert_eq!(wanted, vec![message_id.clone()],
+            "gap_from_peer should include blobs for distro hashes with registered devices");
+
+        // Now store the blob locally → gap should be empty.
+        blob_store.lock().unwrap().store_with_id(&distro_hash, &message_id, b"test").unwrap();
+        let wanted2 = sync.gap_from_peer(vec![(distro_hash, message_id.clone())]);
+        assert!(wanted2.is_empty(),
+            "gap_from_peer should not request blobs we already have");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gap_from_peer_ignores_distro_without_devices() {
+        let base = temp_path("distro_nogap");
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let blob_store = Arc::new(Mutex::new(BlobStore::open(
+            base.join("blobs"), 1024 * 1024,
+        )));
+        let subscription_table = Arc::new(Mutex::new(SubscriptionTable::load(
+            base.join("subscriptions.rmp"),
+        )));
+        let distro_table = Arc::new(Mutex::new(DistroTable::load(
+            base.join("distro.rmp"),
+        )));
+        let sync = FedSync::new(Arc::clone(&blob_store), subscription_table, distro_table);
+
+        // Don't register any devices — the distro hash should be ignored.
+        let distro_hash = vec![0xDD; 16];
+        let message_id = vec![0xEE; 16];
+        let peer_manifest = vec![(distro_hash, message_id.clone())];
+        let wanted = sync.gap_from_peer(peer_manifest);
+
+        assert!(wanted.is_empty(),
+            "gap_from_peer should ignore distro hashes that have no registered devices");
 
         let _ = std::fs::remove_dir_all(&base);
     }

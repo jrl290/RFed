@@ -402,6 +402,7 @@ fn handle_notify_command(
 
 use crate::config::NodeConfig;
 use crate::deferred_queue::{DeferredQueue, PendingBlob};
+use crate::distro::DistroTable;
 use crate::fanout;
 use crate::lxmf_propagation::LxmfPropagationNode;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
@@ -465,6 +466,7 @@ pub struct FedNode {
 
     pub blob_store: Arc<Mutex<BlobStore>>,
     pub subscription_table: Arc<Mutex<SubscriptionTable>>,
+    pub distro_table: Arc<Mutex<DistroTable>>,
     pub hook_registry: Arc<Mutex<HookRegistry>>,
     pub notify_registry: Arc<Mutex<NotifyRegistry>>,
     pub sync: Arc<Mutex<FedSync>>,
@@ -495,6 +497,11 @@ pub struct FedNode {
     pub notify_unregister_dest: Destination,
     pub channel_stream_dest: Destination,
     pub propagation_stream_dest: Destination,
+
+    // ── Distro (multi-device fanout) ─────────────────────────────────
+    pub distro_register_dest: Destination,
+    pub distro_unregister_dest: Destination,
+    pub distro_list_dest: Destination,
 
     pub channel_streams: Arc<Mutex<ChannelStreamRegistry>>,
     pub propagation_streams: Arc<Mutex<PropagationStreamRegistry>>,
@@ -540,6 +547,10 @@ impl FedNode {
             config.subscription_file(),
         )));
 
+        let distro_table = Arc::new(Mutex::new(DistroTable::load(
+            config.distro_file(),
+        )));
+
         let hook_registry = Arc::new(Mutex::new(HookRegistry::new()));
         let notify_registry = Arc::new(Mutex::new(NotifyRegistry::load(
             config.notify_registry_file(),
@@ -553,6 +564,7 @@ impl FedNode {
         let mut fed_sync = FedSync::new(
             Arc::clone(&blob_store),
             Arc::clone(&subscription_table),
+            Arc::clone(&distro_table),
         );
         fed_sync.from_static_only = config.from_static_only;
         fed_sync.static_peers = config.static_peers.clone();
@@ -615,6 +627,11 @@ impl FedNode {
         let notify_register_dest     = mk_inbound(vec!["notify".into(), "register".into()])?;
         let notify_unregister_dest   = mk_inbound(vec!["notify".into(), "unregister".into()])?;
 
+        // ── Distro destinations ──────────────────────────────────────
+        let distro_register_dest   = mk_inbound(vec!["distro".into(), "register".into()])?;
+        let distro_unregister_dest = mk_inbound(vec!["distro".into(), "unregister".into()])?;
+        let distro_list_dest       = mk_inbound(vec!["distro".into(), "list".into()])?;
+
         if let Ok(mut s) = sync.lock() {
             s.set_local_node_hash(node_dest.hash.clone());
         }
@@ -624,6 +641,7 @@ impl FedNode {
             config,
             blob_store,
             subscription_table,
+            distro_table,
             hook_registry,
             notify_registry,
             sync,
@@ -643,6 +661,9 @@ impl FedNode {
             propagation_stream_dest,
             notify_register_dest,
             notify_unregister_dest,
+            distro_register_dest,
+            distro_unregister_dest,
+            distro_list_dest,
             sync_links: HashMap::new(),
             pending_backup_pushes: Arc::new(Mutex::new(Vec::new())),
             selected_backups: Vec::new(),
@@ -690,6 +711,9 @@ impl FedNode {
         let _ = self.propagation_stream_dest.announce(None, false, None, None, true);
         let _ = self.notify_register_dest.announce(None, false, None, None, true);
         let _ = self.notify_unregister_dest.announce(None, false, None, None, true);
+        let _ = self.distro_register_dest.announce(None, false, None, None, true);
+        let _ = self.distro_unregister_dest.announce(None, false, None, None, true);
+        let _ = self.distro_list_dest.announce(None, false, None, None, true);
     }
 
     /// Opt all four locally-registered destinations into Transport's
@@ -731,6 +755,9 @@ impl FedNode {
         Transport::publish_destination(self.propagation_stream_dest.hash.clone(),  svc, None);
         Transport::publish_destination(self.notify_register_dest.hash.clone(),     svc, None);
         Transport::publish_destination(self.notify_unregister_dest.hash.clone(),   svc, None);
+        Transport::publish_destination(self.distro_register_dest.hash.clone(),     svc, None);
+        Transport::publish_destination(self.distro_unregister_dest.hash.clone(),   svc, None);
+        Transport::publish_destination(self.distro_list_dest.hash.clone(),         svc, None);
     }
 
     /// Explicitly persist all in-memory state to disk.
@@ -748,6 +775,9 @@ impl FedNode {
         }
         if let Ok(q) = self.deferred_queue.lock() {
             let _ = q.save();
+        }
+        if let Ok(d) = self.distro_table.lock() {
+            let _ = d.save();
         }
         log("[rfed] all state persisted to disk", LOG_NOTICE, false, false);
     }
@@ -1170,16 +1200,56 @@ fn run_sync_session(
                         if let Some(arc) = nw2.as_ref().and_then(|w| w.upgrade()) {
                             if let Ok(guard) = arc.lock() {
                                 let subs  = guard.subscription_table.lock().ok();
+                                let distro = guard.distro_table.lock().ok();
                                 let hooks = guard.hook_registry.lock().ok();
                                 if let (Some(subs), Some(hooks)) = (subs, hooks) {
-                                    for (channel_hash, blob) in &ingested {
+                                    for (routing_hash, blob) in &ingested {
+                                        // ── Channel fanout ────────────
                                         let missed = fanout::fanout_blob(
                                             blob,
-                                            channel_hash,
+                                            routing_hash,
                                             &subs,
                                             &hooks,
                                             Some(&guard.channel_streams),
                                         );
+
+                                        // ── Distro fanout ────────────
+                                        if let Some(ref dtable) = distro {
+                                            if dtable.is_distro(routing_hash) {
+                                                let dmissed = crate::distro::distro_fanout(
+                                                    routing_hash,
+                                                    blob,
+                                                    &dtable,
+                                                    &hooks,
+                                                    Some(&guard.propagation_streams),
+                                                );
+                                                // Enqueue missed distro devices in deferred queue
+                                                if !dmissed.is_empty() {
+                                                    if let Ok(mut deferred) = guard.deferred_queue.lock() {
+                                                        for dev_hash in &dmissed {
+                                                            let limit = guard.config
+                                                                .policy_for(dev_hash)
+                                                                .deferred_queue_limit;
+                                                            deferred.enqueue(
+                                                                dev_hash.clone(),
+                                                                routing_hash.clone(),
+                                                                blob.clone(),
+                                                                limit,
+                                                            );
+                                                        }
+                                                    }
+                                                    // Fire notify wake-ups for deferred devices
+                                                    if let Ok(notify) = guard.notify_registry.lock() {
+                                                        for dev_hash in &dmissed {
+                                                            for reg in notify.get_for_channel(dev_hash, None) {
+                                                                dispatch_notify(reg, None, Some(routing_hash));
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
                                         if !missed.is_empty() {
                                             if let Ok(mut deferred) = guard.deferred_queue.lock() {
                                                 for sub_hash in &missed {
@@ -1188,7 +1258,7 @@ fn run_sync_session(
                                                         .deferred_queue_limit;
                                                     deferred.enqueue(
                                                         sub_hash.clone(),
-                                                        channel_hash.clone(),
+                                                        routing_hash.clone(),
                                                         blob.clone(),
                                                         limit,
                                                     );
@@ -1197,8 +1267,8 @@ fn run_sync_session(
                                             // Fire notify wake-ups for deferred subscribers.
                                             if let Ok(notify) = guard.notify_registry.lock() {
                                                 for sub_hash in &missed {
-                                                    for reg in notify.get_for_channel(sub_hash, Some(channel_hash)) {
-                                                        dispatch_notify(reg, None, Some(channel_hash));
+                                                    for reg in notify.get_for_channel(sub_hash, Some(routing_hash)) {
+                                                        dispatch_notify(reg, None, Some(routing_hash));
                                                     }
                                                 }
                                             }
@@ -1603,6 +1673,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     wire_delivery_destination(&node)?;
     wire_notify_destination(&node)?;
     wire_stream_destinations(&node)?;
+    wire_distro_destination(&node)?;
 
     // Load persisted peer state and seed static peers, then request paths
     // for all known/static peers so Reticulum starts routing to them.
@@ -1637,6 +1708,9 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             ("propagation.stream",  &guard.propagation_stream_dest),
             ("notify.register",     &guard.notify_register_dest),
             ("notify.unregister",   &guard.notify_unregister_dest),
+            ("distro.register",     &guard.distro_register_dest),
+            ("distro.unregister",   &guard.distro_unregister_dest),
+            ("distro.list",         &guard.distro_list_dest),
         ] {
             log(
                 format!("[rfed] rfed.{} dest hash: {}", label, hexrep(&dest.hash, false)),
@@ -1963,6 +2037,10 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         caps.push((
             rmpv::Value::String("propagation_stream".into()),
             rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
+        ));
+        caps.push((
+            rmpv::Value::String("distro".into()),
+            rmpv::Value::Boolean(true),
         ));
         caps.push((
             rmpv::Value::String("backup".into()),
@@ -2641,6 +2719,186 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     Ok(())
 }
 
+// ── rfed.distro ──────────────────────────────────────────────────────────────
+
+fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
+    /// Unified distro registration handler (register or unregister).
+    ///
+    /// Payload (mirrors channel subscribe format):
+    ///   msgpack [ bin(64) device_pubkey, bin(64) distro_pubkey, bin(64) sig(device_pubkey) ]
+    ///
+    /// verify_signed_payload extracts (device_pubkey, distro_identity_hash, distro_pubkey)
+    /// and validates sig(device_pubkey) with distro_pubkey, proving the caller holds
+    /// the distro private key.
+    fn handle_distro_registration(
+        node: &Arc<Mutex<FedNode>>,
+        data: &[u8],
+        register: bool,
+    ) -> Result<bool, String> {
+        let (device_pubkey, _distro_identity_hash, distro_pubkey) = verify_signed_payload(data)
+            .map_err(|e| format!("bad signature: {e}"))?;
+
+        if device_pubkey.len() != 64 {
+            return Err(format!("device_pubkey len {} != 64", device_pubkey.len()));
+        }
+        if distro_pubkey.len() != 64 {
+            return Err(format!("distro_pubkey len {} != 64", distro_pubkey.len()));
+        }
+
+        // Derive distro identity to compute its lxmf.delivery hash.
+        let distro_identity = Identity::from_public_key(&distro_pubkey)
+            .map_err(|e| format!("distro pubkey invalid: {e}"))?;
+
+        // Derive distro's lxmf.delivery hash (the routing key for fanout).
+        let distro_lxmf_hash = Destination::new_outbound(
+            Some(distro_identity),
+            DestinationType::Single,
+            "lxmf".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .map(|d| d.hash)
+        .map_err(|e| format!("distro lxmf.delivery hash: {e}"))?;
+
+        // Derive device's identity and lxmf.delivery hash.
+        let device_identity = Identity::from_public_key(&device_pubkey)
+            .map_err(|e| format!("device pubkey invalid: {e}"))?;
+        let device_lxmf_hash = Destination::new_outbound(
+            Some(device_identity),
+            DestinationType::Single,
+            "lxmf".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .map(|d| d.hash)
+        .map_err(|e| format!("device lxmf.delivery hash: {e}"))?;
+
+        let guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
+        if let Ok(mut table) = guard.distro_table.lock() {
+            if register {
+                table.register(distro_lxmf_hash.clone(), device_lxmf_hash.clone(), device_pubkey);
+                log(
+                    format!(
+                        "[distro] registered device {} for distro {}",
+                        hexrep(&device_lxmf_hash, false),
+                        hexrep(&distro_lxmf_hash, false),
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+            } else {
+                table.unregister(&distro_lxmf_hash, &device_lxmf_hash);
+                log(
+                    format!(
+                        "[distro] unregistered device {} from distro {}",
+                        hexrep(&device_lxmf_hash, false),
+                        hexrep(&distro_lxmf_hash, false),
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+            }
+        }
+
+        Ok(true)
+    }
+
+    // ── REGISTER ──────────────────────────────────────────────────────
+    let reg_node = Arc::clone(node);
+    let register_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                      _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        match handle_distro_registration(&reg_node, data, true) {
+            Ok(ok) => rmp_serde::to_vec(&ok).unwrap_or_default(),
+            Err(e) => {
+                log(format!("[rfed] distro/register: {e}"), LOG_WARNING, false, false);
+                rmp_serde::to_vec(&false).unwrap_or_default()
+            }
+        }
+    });
+
+    // ── UNREGISTER ────────────────────────────────────────────────────
+    let unreg_node = Arc::clone(node);
+    let unregister_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                        _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        match handle_distro_registration(&unreg_node, data, false) {
+            Ok(ok) => rmp_serde::to_vec(&ok).unwrap_or_default(),
+            Err(e) => {
+                log(format!("[rfed] distro/unregister: {e}"), LOG_WARNING, false, false);
+                rmp_serde::to_vec(&false).unwrap_or_default()
+            }
+        }
+    });
+
+    // ── LIST ──────────────────────────────────────────────────────────
+    // Payload: msgpack [ bin(16) distro_identity_hash, bin(64) distro_pubkey,
+    //                      bin(64) sig(distro_identity_hash) ]
+    let list_node = Arc::clone(node);
+    let list_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                  _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        let (value_bytes, _distro_identity_hash, distro_pubkey) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] distro/list: {e}"), LOG_WARNING, false, false);
+                return rmp_serde::to_vec(&Vec::<Vec<u8>>::new()).unwrap_or_default();
+            }
+        };
+
+        // value_bytes should be the distro_identity_hash (16 bytes)
+        let _ = value_bytes;
+
+        let distro_identity = match Identity::from_public_key(&distro_pubkey) {
+            Ok(id) => id,
+            Err(_) => return rmp_serde::to_vec(&Vec::<Vec<u8>>::new()).unwrap_or_default(),
+        };
+
+        let distro_lxmf_hash = match Destination::new_outbound(
+            Some(distro_identity),
+            DestinationType::Single,
+            "lxmf".to_string(),
+            vec!["delivery".to_string()],
+        ) {
+            Ok(d) => d.hash,
+            Err(_) => return rmp_serde::to_vec(&Vec::<Vec<u8>>::new()).unwrap_or_default(),
+        };
+
+        let guard = match list_node.lock() {
+            Ok(g) => g,
+            Err(_) => return rmp_serde::to_vec(&Vec::<Vec<u8>>::new()).unwrap_or_default(),
+        };
+
+        let devices: Vec<Vec<u8>> = match guard.distro_table.lock() {
+            Ok(table) => table
+                .get_devices(&distro_lxmf_hash)
+                .iter()
+                .map(|e| e.device_lxmf_hash.clone())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        rmp_serde::to_vec(&devices).unwrap_or_default()
+    });
+
+    // ── Request paths ─────────────────────────────────────────────────
+    const DISTRO_REGISTER_PATH: &str = "/rfed/distro/register";
+    const DISTRO_UNREGISTER_PATH: &str = "/rfed/distro/unregister";
+    const DISTRO_LIST_PATH: &str = "/rfed/distro/list";
+
+    let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
+    guard.distro_register_dest.register_request_handler(
+        DISTRO_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.distro_unregister_dest.register_request_handler(
+        DISTRO_UNREGISTER_PATH.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.distro_list_dest.register_request_handler(
+        DISTRO_LIST_PATH.to_string(), Some(list_cb), ALLOW_ALL, None, false,
+    )?;
+    Transport::register_destination(guard.distro_register_dest.clone());
+    Transport::register_destination(guard.distro_unregister_dest.clone());
+    Transport::register_destination(guard.distro_list_dest.clone());
+    Ok(())
+}
+
 #[cfg(test)]
 mod hash_tests {
     //! Pin the on-the-wire destination hashes for RFed's stable destination aspects.
@@ -2809,6 +3067,32 @@ mod hash_tests {
         );
     }
 
+    // ── Distro aspects ───────────────────────────────────────────────
+
+    #[test]
+    fn rfed_distro_register_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["distro", "register"])),
+            "6ed6295b6cf0fa6d8762643fdae065f3",
+        );
+    }
+
+    #[test]
+    fn rfed_distro_unregister_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["distro", "unregister"])),
+            "cae11f874f5f5527fdd4a3938d6ea5f0",
+        );
+    }
+
+    #[test]
+    fn rfed_distro_list_hash_is_pinned() {
+        assert_eq!(
+            hex(&dest_hash_multi(&["distro", "list"])),
+            "fedb1d56c01ef1be44e3c4dd5ccbee18",
+        );
+    }
+
     #[test]
     fn rfed_split_aspects_distinct_from_legacy() {
         // Each new two-aspect destination must hash differently from the
@@ -2820,6 +3104,9 @@ mod hash_tests {
         assert_ne!(dest_hash_multi(&["channel", "stream"]),      dest_hash("channel"));
         assert_ne!(dest_hash_multi(&["notify",  "register"]),    dest_hash("notify"));
         assert_ne!(dest_hash_multi(&["notify",  "unregister"]),  dest_hash("notify"));
+        assert_ne!(dest_hash_multi(&["distro",  "register"]),    dest_hash("notify"));
+        assert_ne!(dest_hash_multi(&["distro",  "unregister"]),  dest_hash("notify"));
+        assert_ne!(dest_hash_multi(&["distro",  "list"]),        dest_hash("notify"));
         for legacy in ["node", "delivery", "channel", "notify"] {
             assert_ne!(
                 dest_hash_multi(&["propagation", "stream"]),
@@ -2840,6 +3127,9 @@ mod hash_tests {
             &["propagation", "stream"],
             &["notify",  "register"],
             &["notify",  "unregister"],
+            &["distro",  "register"],
+            &["distro",  "unregister"],
+            &["distro",  "list"],
         ];
         for i in 0..split.len() {
             for j in (i + 1)..split.len() {
@@ -2864,6 +3154,9 @@ mod hash_tests {
             &["propagation", "stream"],
             &["notify",  "register"],
             &["notify",  "unregister"],
+            &["distro",  "register"],
+            &["distro",  "unregister"],
+            &["distro",  "list"],
         ];
         for aspects in split {
             assert_ne!(
