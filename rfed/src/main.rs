@@ -153,6 +153,9 @@ fn write_status_file(
     let uptime_secs = startup.elapsed().as_secs();
     let name = &guard.config.display_name;
 
+    // MARKER: Prove deployment includes distro code (persists in status.json)
+    let distro_marker = "DISTRO_ENABLED_v1";
+
     // Build interfaces JSON array
     let snap = get_state_snapshot();
     let mut interfaces_json = String::new();
@@ -201,6 +204,7 @@ fn write_status_file(
                 "    \"rfed.distro.list\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
+                "  \"distro_marker\": \"{}\",\n",
                 "  \"interfaces\": [],\n",
                 "  \"stats\": {{\n",
                 "    \"uptime_secs\": {},\n",
@@ -227,6 +231,7 @@ fn write_status_file(
             hexrep(&guard.distro_unregister_dest.hash, false),
             hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
+            distro_marker,
             uptime_secs, sub_count, blob_count, notify_count,
         )
     } else {
@@ -253,6 +258,7 @@ fn write_status_file(
                 "    \"rfed.distro.list\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
+                "  \"distro_marker\": \"{}\",\n",
                 "  \"interfaces\": [\n",
                 "{}\n",
                 "  ],\n",
@@ -281,6 +287,7 @@ fn write_status_file(
             hexrep(&guard.distro_unregister_dest.hash, false),
             hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
+            distro_marker,
             interfaces_json,
             uptime_secs, sub_count, blob_count, notify_count,
         )

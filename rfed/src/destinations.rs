@@ -1678,6 +1678,14 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     wire_stream_destinations(&node)?;
     wire_distro_destination(&node)?;
 
+    // MARKER: Distro destinations wired (proves deployment includes distro code)
+    log(
+        "[rfed] DISTRO MARKER: distro destinations wired successfully".to_string(),
+        LOG_NOTICE,
+        false,
+        false,
+    );
+
     // Load persisted peer state and seed static peers, then request paths
     // for all known/static peers so Reticulum starts routing to them.
     let startup_peer_hashes: Vec<Vec<u8>> = {
