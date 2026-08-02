@@ -81,8 +81,8 @@ pub const MAX_PEERING_COST: u32 = 26;
 pub const DEFAULT_TRANSFER_LIMIT_KB: f64 = 256.0;
 /// Default per-sync limit in KB.
 pub const DEFAULT_SYNC_LIMIT_KB: f64 = 10240.0;
-/// Message expiry: 30 days.
-pub const MESSAGE_EXPIRY_SECS: f64 = 30.0 * 24.0 * 3600.0;
+/// Message expiry: 7 days.  Matches BlobStore TTL.
+pub const MESSAGE_EXPIRY_SECS: f64 = 7.0 * 24.0 * 3600.0;
 /// Peer sync interval in seconds.
 pub const PEER_SYNC_INTERVAL_SECS: f64 = 6.0;
 /// Peer sync backoff step.
@@ -964,24 +964,23 @@ impl LxmfPropagationNode {
         }
     }
 
-    /// Enforce storage limit by removing oldest/heaviest messages.
+    /// Enforce storage limit by removing oldest messages.
+    /// Uses age-only sorting (O(n log n) but no weight calculation per entry).
+    /// Hard cap: stops once we're under the limit.
     pub fn enforce_storage_limit(&mut self) {
         let total_size: u64 = self.entries.values().map(|e| e.size as u64).sum();
         if total_size <= self.storage_limit_bytes {
             return;
         }
 
-        // Sort by weight: age * size (oldest and biggest first)
-        let mut by_weight: Vec<(Vec<u8>, f64)> = self.entries.iter()
-            .map(|(id, e)| {
-                let age = ((now() - e.received) / 86400.0 / 4.0).max(1.0);
-                (id.clone(), age * e.size as f64)
-            })
+        // Sort by age only (oldest first) — no weight calculation
+        let mut by_age: Vec<(Vec<u8>, f64)> = self.entries.iter()
+            .map(|(id, e)| (id.clone(), e.received))
             .collect();
-        by_weight.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let mut current_size = total_size;
-        for (transient_id, _weight) in by_weight {
+        for (transient_id, _received) in by_age {
             if current_size <= self.storage_limit_bytes {
                 break;
             }
