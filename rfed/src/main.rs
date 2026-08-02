@@ -689,7 +689,6 @@ fn main() -> Result<(), String> {
         let ah = lxmf_propagation::LxmfPropagationNode::announce_handler(&prop);
         reticulum_rust::transport::Transport::register_announce_handler(ah);
 
-        lxmf_propagation::LxmfPropagationNode::announce(&prop);
         node.lock().map_err(|_| "lock")?.lxmf_propagation = Some(Arc::clone(&prop));
         if let Ok(guard) = prop.lock() {
             log(

@@ -686,6 +686,10 @@ impl FedNode {
             &self.config.display_name,
             announce_stamp_cost,
         );
+        // Distro registration is the bootstrap route for all Distro clients.
+        // Announce it first so backbone announce pacing cannot strand it behind
+        // the rest of the service-destination burst.
+        let _ = self.distro_register_dest.announce(None, false, None, None, true);
         self.node_dest.set_default_app_data(Some(app_data.clone()));
         let _ = self.node_dest.announce(Some(&app_data), false, None, None, true);
         log(
@@ -711,7 +715,6 @@ impl FedNode {
         let _ = self.propagation_stream_dest.announce(None, false, None, None, true);
         let _ = self.notify_register_dest.announce(None, false, None, None, true);
         let _ = self.notify_unregister_dest.announce(None, false, None, None, true);
-        let _ = self.distro_register_dest.announce(None, false, None, None, true);
         let _ = self.distro_unregister_dest.announce(None, false, None, None, true);
         let _ = self.distro_list_dest.announce(None, false, None, None, true);
     }
@@ -2878,6 +2881,31 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         rmp_serde::to_vec(&devices).unwrap_or_default()
     });
 
+    // ── PULL (also on distro.register for link reuse) ──────────────
+    // Clients that already have a link to distro.register can PULL
+    // deferred blobs without establishing a separate link to rfed.delivery.
+    // This avoids rmap.world dropping rapid successive link requests.
+    let pull_distro_node = Arc::clone(node);
+    let pull_distro_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
+                                        caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
+            Some(h) => h,
+            None => return Vec::new(),
+        };
+        if let Ok(guard) = pull_distro_node.lock() {
+            let page_size = guard.config
+                .policy_for(&subscriber_hash)
+                .deferred_pull_batch_limit
+                .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
+            if let Ok(mut deferred) = guard.deferred_queue.lock() {
+                let pending = deferred.drain_batch(&subscriber_hash, page_size);
+                let more_pending = deferred.has_pending(&subscriber_hash);
+                return encode_pull_response(pending, more_pending);
+            }
+        }
+        Vec::new()
+    });
+
     // ── Request paths ─────────────────────────────────────────────────
     const DISTRO_REGISTER_PATH: &str = "/rfed/distro/register";
     const DISTRO_UNREGISTER_PATH: &str = "/rfed/distro/unregister";
@@ -2886,6 +2914,9 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.distro_register_dest.register_request_handler(
         DISTRO_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.distro_register_dest.register_request_handler(
+        PULL_PATH.to_string(), Some(pull_distro_cb), ALLOW_ALL, None, false,
     )?;
     guard.distro_unregister_dest.register_request_handler(
         DISTRO_UNREGISTER_PATH.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
