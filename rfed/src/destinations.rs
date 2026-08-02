@@ -797,6 +797,8 @@ impl FedNode {
         // new connection attempts.
         self.sync_links.retain(|_, link| link.is_alive());
 
+        // Collect due peers quickly, then release the sync lock before
+        // iterating.  This prevents a slow peer from blocking client links.
         let due: Vec<Vec<u8>> = if let Ok(mut s) = self.sync.lock() {
             s.tick()
         } else {

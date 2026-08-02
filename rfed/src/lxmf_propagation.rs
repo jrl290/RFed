@@ -1527,8 +1527,12 @@ impl LxmfPropagationNode {
                 return;
             }
 
-            // Initiate sync
-            guard.initiate_sync(&peer_hash);
+            // Initiate sync — drop the guard before the expensive offer building
+            // to avoid blocking client links.  initiate_sync re-acquires the lock
+            // internally for each peer access.
+            drop(guard);
+            Self::initiate_sync_locked(arc, &peer_hash);
+            return;
         }
 
         // Also check for peers that need peering keys generated — spawn background
@@ -1632,6 +1636,123 @@ impl LxmfPropagationNode {
                 }
             }
         });
+    }
+
+    /// Initiate an outbound sync session with a peer (lock-free wrapper).
+    ///
+    /// Re-acquires the lock for each peer access to avoid blocking client
+    /// links during the expensive offer building.
+    fn initiate_sync_locked(arc: &Arc<Mutex<Self>>, peer_hash: &[u8]) {
+        log(
+            format!("[lxmf.prop] initiate_sync starting for {}", hexrep(peer_hash, false)),
+            LOG_DEBUG, false, false,
+        );
+
+        // Phase 1: Collect peer data we need (short lock)
+        let (unhandled_ids, peering_key_ready) = {
+            let guard = match arc.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let peer = match guard.peers.get(peer_hash) {
+                Some(p) => p,
+                None => { log("[lxmf.prop] sync: peer not found", LOG_DEBUG, false, false); return; }
+            };
+            if peer.state != PropPeer::IDLE {
+                log(format!("[lxmf.prop] sync: peer state={} not IDLE", peer.state), LOG_DEBUG, false, false);
+                return;
+            }
+            (peer.unhandled_ids.clone(), peer.peering_key.is_some())
+        };
+
+        if !peering_key_ready {
+            return;
+        }
+
+        // Phase 2: Build offer WITHOUT holding the lock (expensive operation)
+        let mut entries_with_weight: Vec<(Vec<u8>, f64, u64)> = Vec::new();
+        {
+            let guard = match arc.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            for tid in &unhandled_ids {
+                if let Some(entry) = guard.entries.get(tid) {
+                    let age = ((now() - entry.received) / 86400.0 / 4.0).max(1.0);
+                    let weight = age * entry.size as f64;
+                    entries_with_weight.push((tid.clone(), weight, entry.size as u64));
+                }
+            }
+        }
+
+        entries_with_weight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let per_message_overhead = 16.0;
+        let mut cumulative_size = 24.0;
+        let mut offer_ids = Vec::new();
+
+        {
+            let mut guard = match arc.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            let peer = match guard.peers.get_mut(peer_hash) {
+                Some(p) => p,
+                None => return,
+            };
+
+            for (tid, _, size) in &entries_with_weight {
+                if offer_ids.len() >= MAX_OFFER_IDS {
+                    break;
+                }
+                let msg_size = *size as f64 + per_message_overhead;
+                let next_size = cumulative_size + msg_size;
+
+                if let Some(limit) = peer.propagation_transfer_limit {
+                    if msg_size > limit * 1000.0 {
+                        peer.mark_handled(tid);
+                        continue;
+                    }
+                }
+
+                if let Some(sync_limit) = peer.propagation_sync_limit {
+                    if next_size >= sync_limit * 1000.0 {
+                        continue;
+                    }
+                }
+
+                cumulative_size += msg_size;
+                offer_ids.push(tid.clone());
+            }
+        }
+
+        if offer_ids.is_empty() {
+            return;
+        }
+
+        // Phase 3: Send offer (short lock)
+        let mut guard = match arc.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        if let Some(handle) = AppLinks::get_handle(peer_hash)
+            .filter(|link| link.status() == reticulum_rust::link::STATE_ACTIVE)
+        {
+            log(
+                format!(
+                    "[lxmf.prop] reusing AppLinks persistent link for {}",
+                    hexrep(peer_hash, false),
+                ),
+                LOG_DEBUG,
+                false,
+                false,
+            );
+            guard.send_offer_on_link(&handle, peer_hash, &offer_ids);
+            return;
+        }
+
+        AppLinks::open_persistent(peer_hash, LXMF_APP, &[PROP_ASPECT]);
     }
 
     /// Initiate an outbound sync session with a peer.
