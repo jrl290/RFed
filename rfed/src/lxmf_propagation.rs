@@ -88,6 +88,10 @@ pub const PEER_SYNC_INTERVAL_SECS: f64 = 6.0;
 /// Peer sync backoff step.
 pub const SYNC_BACKOFF_STEP_SECS: f64 = 12.0 * 60.0;
 const DISTRO_DEFERRED_QUEUE_LIMIT: usize = 256;
+/// Max messages to offer in a single OFFER request. Prevents the offer
+/// building from exceeding the 5-second send budget when the messagestore
+/// is large (197k+ messages).
+pub const MAX_OFFER_IDS: usize = 500;
 /// Max time a peer is unreachable before removal (14 days).
 pub const MAX_UNREACHABLE_SECS: f64 = 14.0 * 24.0 * 3600.0;
 /// Peer OFFER request path.
@@ -1678,6 +1682,11 @@ impl LxmfPropagationNode {
         let mut offer_ids = Vec::new();
 
         for (tid, _, size) in &entries_with_weight {
+            // Cap the number of offered IDs to stay within the 5-second send
+            // budget.  With 197k+ messages the sort+filter alone takes >5s.
+            if offer_ids.len() >= MAX_OFFER_IDS {
+                break;
+            }
             let msg_size = *size as f64 + per_message_overhead;
             let next_size = cumulative_size + msg_size;
 
