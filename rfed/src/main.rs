@@ -156,6 +156,10 @@ fn write_status_file(
     // MARKER: Prove deployment includes distro code (persists in status.json)
     let distro_marker = "DISTRO_ENABLED_v1";
 
+    // Commit hash from build environment (set by GitHub Action)
+    let commit_hash = option_env!("GITHUB_SHA").unwrap_or("unknown");
+    let commit_short = if commit_hash.len() >= 7 { &commit_hash[..7] } else { commit_hash };
+
     // Build interfaces JSON array
     let snap = get_state_snapshot();
     let mut interfaces_json = String::new();
@@ -205,6 +209,7 @@ fn write_status_file(
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
                 "  \"distro_marker\": \"{}\",\n",
+                "  \"commit_hash\": \"{}\",\n",
                 "  \"interfaces\": [],\n",
                 "  \"stats\": {{\n",
                 "    \"uptime_secs\": {},\n",
@@ -232,6 +237,7 @@ fn write_status_file(
             hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
             distro_marker,
+            commit_short,
             uptime_secs, sub_count, blob_count, notify_count,
         )
     } else {
@@ -259,6 +265,7 @@ fn write_status_file(
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
                 "  \"distro_marker\": \"{}\",\n",
+                "  \"commit_hash\": \"{}\",\n",
                 "  \"interfaces\": [\n",
                 "{}\n",
                 "  ],\n",
@@ -288,6 +295,7 @@ fn write_status_file(
             hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
             distro_marker,
+            commit_short,
             interfaces_json,
             uptime_secs, sub_count, blob_count, notify_count,
         )
