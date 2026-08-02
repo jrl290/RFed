@@ -307,6 +307,9 @@ In official Reticulum terminology, these are two separate notations:
 | `rfed.channel` | `["channel"]` | Channel publish / subscribe / pull service family |
 | `rfed.delivery` | `["delivery"]` | Live subscriber delivery plus legacy aggregate pull |
 | `rfed.notify` | `["notify"]` | Notify relay registration service family |
+| `rfed.distro.register` | `["distro", "register"]` | Distro device registration |
+| `rfed.distro.unregister` | `["distro", "unregister"]` | Distro device removal |
+| `rfed.distro.list` | `["distro", "list"]` | Distro device listing |
 
 All destinations use `DestinationType::Single` (asymmetric encryption,
 multi-hop routed).
@@ -328,6 +331,14 @@ multi-hop routed).
 | `rfed.channel.unsubscribe` | `/rfed/unsubscribe` | Subscriber | `msgpack [bin(16) channel_hash, bin(64) subscriber_pubkey, bin(64) sig(channel_hash)]` | `msgpack bool` |
 | `rfed.channel.publish` | *(fire-and-forget SEND)* | Publisher | `channel_hash(16) \| inner_blob \| stamp` | *(none)* |
 | `rfed.channel.pull` | `/rfed/pull` | Subscriber | `bin(16) channel_hash` or `msgpack bin(16)` | `msgpack [ [[bin(16) channel_hash, bin blob], …], bool more_pending ]` |
+
+**rfed.distro.*** (distro service destinations):
+| Destination | Path | Caller | Payload | Response |
+|-------------|------|--------|---------|----------|
+| `rfed.distro.register` | `/rfed/distro/register` | Device | `msgpack [bin(64) device_pubkey, bin(64) distro_pubkey, bin(64) sig(device_pubkey)]` | `msgpack bool` |
+| `rfed.distro.register` | `/rfed/pull` | Device | *(empty — caller authenticated by link identity)* | `msgpack [ [[bin(16) distro_hash, bin blob], …], bool more_pending ]` |
+| `rfed.distro.unregister` | `/rfed/distro/unregister` | Device | `msgpack [bin(64) device_pubkey, bin(64) distro_pubkey, bin(64) sig(device_pubkey)]` | `msgpack bool` |
+| `rfed.distro.list` | `/rfed/distro/list` | Device | `msgpack [bin(16) distro_identity_hash, bin(64) distro_pubkey, bin(64) sig(distro_identity_hash)]` | `msgpack [bin(16) device_lxmf_hash, ...]` |
 
 **rfed.delivery** (live fanout destination + legacy aggregate pull):
 | Path | Caller | Payload | Response |
@@ -1071,8 +1082,7 @@ rfed [OPTIONS]
 
 ## 15. Test Suite
 
-The integration test suite lives in `cli-tests/rfed_tests/` and covers six
-scenarios:
+The integration test suite lives in `cli-tests/rfed_tests/` and covers:
 
 | # | Scenario | Description |
 |---|----------|-------------|
@@ -1082,6 +1092,9 @@ scenarios:
 | 4 | `notify` | Register relay → publish offline → verify wake packet |
 | 5 | `sync` | Two-node: publish on A, subscribe on B, verify sync |
 | 6 | `backup_failover` | Primary dies → backup activates → subscriber receives |
+| 7 | `prop_notify` | Register via rfed.notify → send LXMF propagation → relay woken |
+| 9 | `nse_timing` | Full propagation store-forward with tight NSE-like sync budget |
+| — | `distro_e2e` | Distro register → propagate → PULL via rmap.world |
 
 ```bash
 # Run all tests
@@ -1089,6 +1102,17 @@ scenarios:
 
 # Run a specific scenario
 ./run_tests.sh 3
+
+# Run distro E2E test (requires seeded identity, see seed_test_identity.sh)
+RFED_TEST_HOST=rmap.world \
+RFED_TEST_CONFIG_DIR=/tmp/rfed-local-rmap-client \
+RFED_TEST_RUN_DIR=/tmp/rfed-actual-local-harness \
+RFED_UPLINK_PORT=4242 \
+RFED_LOCAL_CONFIG=/tmp/rfed-actual-local-rmap-only \
+RFED_LOCAL_IDENTITY=... \
+RFED_IDENTITY_HASH=... \
+RFED_PUBLIC_KEY=... \
+PYTHONPATH=... python distro_e2e_test.py
 ```
 
 Test clients are Python scripts that use the reference Reticulum library
@@ -1271,6 +1295,64 @@ The FedSync engine treats channel and distro blobs uniformly:
 - **Post-ingest dispatch**: calls `fanout_blob()` for channel hashes and
   `distro_fanout()` for distro hashes, then enqueues missed subscribers/devices
   in the DeferredQueue.
+
+### 17.8 Deferred PULL on distro.register
+
+In addition to `rfed.delivery`, the `/rfed/pull` request path is also
+registered on `rfed.distro.register`. This allows a client to reuse an
+existing distro.register link for PULL without establishing a separate
+link to `rfed.delivery`.
+
+This is important for relay nodes (e.g., rmap.world) that may drop rapid
+successive link requests from the same client. By reusing the register
+link, the client avoids a third LINKREQUEST that the relay might drop.
+
+| Destination | Path | Caller | Payload | Response |
+|-------------|------|--------|---------|----------|
+| `rfed.distro.register` | `/rfed/pull` | Subscriber | *(empty — caller authenticated by link identity)* | `msgpack [ [[bin(16) distro_hash, bin blob], …], bool more_pending ]` |
+
+The response format is identical to the `rfed.delivery` PULL response.
+The `distro_hash` field contains the distro's `lxmf.delivery` hash
+(the routing key), and `blob` is the raw LXMF propagation message.
+
+### 17.9 Distro Identity Transfer
+
+The distro identity (64-byte private key) is shared between devices
+using a URI format or encrypted LXMF transfer.
+
+**URI format:**
+
+```
+rfed-distro-id://<128_hex_chars>
+```
+
+The 128 hex characters encode the 64-byte private key
+(X25519_priv(32) || Ed25519_priv(32)). The public key is derived from
+the private key on import.
+
+**LXMF transfer:**
+
+The sender encrypts the private key bytes to the recipient's
+`lxmf.delivery` address using standard RNS identity encryption.
+The recipient decrypts with their own identity key and imports the
+distro identity.
+
+**User flow:**
+
+1. Device A generates a new distro identity (button press in Retichat).
+2. Device A shares via LXMF to Device B (or shows QR code with URI).
+3. Device B receives the encrypted private key, prompts user to import.
+4. Device B imports identity and registers with RFed.
+
+**Security model:**
+
+- The private key is never displayed to the user.
+- The URI is only shown ephemerally (QR code) or sent encrypted (LXMF).
+- The identity is stored in the platform's secure enclave
+  (iOS Keychain / Android Keystore).
+- Possession of the private key = full access to all distro traffic.
+  There is no revocation mechanism — a compromised key requires
+  generating a new distro identity and re-registering all devices.
 
 ---
 
