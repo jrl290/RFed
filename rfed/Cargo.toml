@@ -21,7 +21,11 @@ sha2       = "0.10"
 rand       = "0.8"
 once_cell  = "1.19"
 base64     = "0.22"
-ctrlc      = "3.4"
+# "termination" makes the existing SIGINT handler ALSO fire on SIGTERM/SIGHUP,
+# so `docker stop` (SIGTERM) triggers the graceful shutdown path instead of
+# escalating to a forced SIGKILL teardown. Without this feature the handler is
+# SIGINT-only and RFed ignores SIGTERM entirely.
+ctrlc      = { version = "3.4", features = ["termination"] }
 
 # Must be pinned to match reticulum_rust's transitive deps exactly.
 x25519-dalek = "=1.1.1"
