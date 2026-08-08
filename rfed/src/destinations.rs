@@ -1846,6 +1846,8 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             };
 
             let hooks = guard.hook_registry.lock().ok();
+            let limit = guard.config.policy_for(&sub_id_hash).deferred_queue_limit;
+            let mut failed: Vec<&crate::deferred_queue::PendingBlob> = Vec::new();
             for pb in &pending {
                 // Delivery packet payload: channel_hash(16) | inner_blob
                 // Matches the format expected by the subscriber's onRfedBlob handler.
@@ -1863,17 +1865,49 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     false,
                     reticulum_rust::packet::FLAG_UNSET,
                 );
-                if let Err(e) = packet.send() {
-                    log(
-                        format!("[deferred] send to {} failed: {e}",
-                            hexrep(&sub_id_hash, false)),
-                        LOG_WARNING,
-                        false,
-                        false,
-                    );
+                match packet.send() {
+                    // Ok(Some) = transmitted (receipt); keep it drained.
+                    Ok(Some(_)) => {
+                        if let Some(ref hooks) = hooks {
+                            hooks.on_deliver(&sub_id_hash, &pb.blob);
+                        }
+                    }
+                    // Ok(None) = Transport::outbound returned sent=false (no
+                    // usable interface/path right now).  Do NOT mark delivered
+                    // and do NOT drop it — re-enqueue so the next announce /
+                    // path-ready edge retries.  Previously Ok(None) fell through
+                    // to on_deliver and the blob was silently lost, which is why
+                    // fanned-out distro messages never reached devices.
+                    Ok(None) => {
+                        log(
+                            format!("[deferred] send to {} not transmitted (no usable interface) — re-enqueueing",
+                                hexrep(&sub_id_hash, false)),
+                            LOG_NOTICE,
+                            false,
+                            false,
+                        );
+                        failed.push(pb);
+                    }
+                    // Err = hard send error — re-enqueue so a later announce retries.
+                    Err(e) => {
+                        log(
+                            format!("[deferred] send to {} failed: {e} — re-enqueueing",
+                                hexrep(&sub_id_hash, false)),
+                            LOG_WARNING,
+                            false,
+                            false,
+                        );
+                        failed.push(pb);
+                    }
                 }
-                if let Some(ref hooks) = hooks {
-                    hooks.on_deliver(&sub_id_hash, &pb.blob);
+            }
+            // Re-enqueue the blobs that did not transmit so they survive for the
+            // next announce / path-ready trigger instead of being dropped.
+            if !failed.is_empty() {
+                if let Ok(mut q) = guard.deferred_queue.lock() {
+                    for pb in failed {
+                        q.enqueue(sub_id_hash.clone(), pb.channel_hash.clone(), pb.blob.clone(), limit);
+                    }
                 }
             }
         }),

@@ -368,6 +368,9 @@ pub fn distro_fanout(
         }
 
         // ── Send ──────────────────────────────────────────────────────
+        // Capture the destination hash before `dest` is moved into the packet,
+        // so the no-transmission branch can request a fresh path for it.
+        let dest_hash_for_request = dest.hash.clone();
         let mut packet = Packet::new(
             Some(dest),
             payload,
@@ -394,15 +397,22 @@ pub fn distro_fanout(
                 missed.push(device_id_hash.clone());
             }
             Ok(None) => {
+                // Ok(None) = Transport::outbound returned sent=false: the path
+                // to the device exists but has no usable (online) interface
+                // right now.  Request a fresh path so the NEXT fanout / the
+                // deferred flush finds a warm route, then defer.  Previously
+                // this just deferred without re-resolving, so the blob sat in
+                // the deferred queue while the path stayed cold.
                 log(
                     format!(
-                        "[distro] no interface for device {} — will defer",
+                        "[distro] no interface for device {} — requesting path + will defer",
                         hexrep(&entry.device_lxmf_hash, false)
                     ),
                     LOG_WARNING,
                     false,
                     false,
                 );
+                Transport::request_path(&dest_hash_for_request, None, None, None, None);
                 missed.push(device_id_hash.clone());
             }
             Ok(Some(_)) => {
@@ -417,10 +427,12 @@ pub fn distro_fanout(
                     false,
                     false,
                 );
+                // Only report delivery on an actual transmission.  Previously
+                // on_deliver fired unconditionally (even on defer/Ok(None)),
+                // marking blobs delivered that never left the node.
+                hook_registry.on_deliver(&device_id_hash, lxmf_blob);
             }
         }
-
-        hook_registry.on_deliver(&device_id_hash, lxmf_blob);
     }
 
     missed
