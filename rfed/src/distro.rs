@@ -59,7 +59,7 @@ use serde::{Deserialize, Serialize};
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::packet::{Packet, DATA, NONE, HEADER_1, FLAG_UNSET};
+use reticulum_rust::packet::{Packet, ANNOUNCE, DATA, NONE, HEADER_1, FLAG_SET, FLAG_UNSET};
 use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
@@ -218,6 +218,225 @@ impl DistroTable {
             .map_err(|e| format!("DistroTable write: {e}"))?;
         Ok(())
     }
+}
+
+// ── Pre-signed announces ─────────────────────────────────────────────────────
+
+/// Length of the X25519 ratchet public key carried in a ratchet-bearing announce.
+const RATCHET_LEN: usize = 32;
+/// `public_key(64) + name_hash(10) + random_hash(10) + signature(64)`.
+const ANNOUNCE_FIXED_LEN: usize = 64 + 10 + 10 + 64;
+
+/// A pre-signed announce for a distro identity, minted by a device that holds
+/// the distro private key and replayed verbatim by this node.
+///
+/// RFed only ever receives the distro *public* key (see `handle_distro_registration`),
+/// so it cannot mint an announce itself. Replaying a device-signed one is the
+/// same operation a transport node performs when it answers a path request from
+/// its announce cache: the packet is self-contained and signed by the identity
+/// it describes, so relaying it neither requires nor grants key access.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DistroAnnounce {
+    /// 16-byte `lxmf.delivery` destination hash the announce describes.
+    pub distro_lxmf_hash: Vec<u8>,
+    /// Wire announce payload: `pubkey | name_hash | random_hash | [ratchet] | sig | app_data`.
+    pub announce_data: Vec<u8>,
+    /// Whether `announce_data` carries a ratchet — becomes the packet context flag.
+    pub ratchet: bool,
+    /// Unix timestamp of the last submission that replaced this announce.
+    pub updated: f64,
+}
+
+/// Per-node store of pre-signed distro announces.
+///
+/// Kept in its own file rather than folded into `DistroTable` so the existing
+/// on-disk `Vec<DistroEntry>` shape needs no migration.
+pub struct DistroAnnounceStore {
+    entries: Vec<DistroAnnounce>,
+    file_path: PathBuf,
+}
+
+impl DistroAnnounceStore {
+    /// Load from disk, or start empty if the file doesn't exist.
+    pub fn load(file_path: PathBuf) -> Self {
+        let entries = if file_path.exists() {
+            std::fs::read(&file_path)
+                .ok()
+                .and_then(|bytes| rmp_serde::from_slice::<Vec<DistroAnnounce>>(&bytes).ok())
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        DistroAnnounceStore { entries, file_path }
+    }
+
+    /// Store or replace the announce for a distro identity.
+    ///
+    /// A fresh submission always wins: the device re-signs with a new emission
+    /// time (and possibly a new ratchet), and a stale announce would be ignored
+    /// by receivers as an out-of-date duplicate.
+    pub fn put(&mut self, distro_lxmf_hash: Vec<u8>, announce_data: Vec<u8>, ratchet: bool) {
+        self.entries
+            .retain(|e| e.distro_lxmf_hash != distro_lxmf_hash);
+        self.entries.push(DistroAnnounce {
+            distro_lxmf_hash,
+            announce_data,
+            ratchet,
+            updated: now(),
+        });
+        let _ = self.save();
+    }
+
+    /// Drop the announce for a distro identity.  No-op if absent.
+    pub fn remove(&mut self, distro_lxmf_hash: &[u8]) {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| e.distro_lxmf_hash.as_slice() != distro_lxmf_hash);
+        if self.entries.len() != before {
+            let _ = self.save();
+        }
+    }
+
+    /// The announce for one distro identity, if held.
+    pub fn get(&self, distro_lxmf_hash: &[u8]) -> Option<&DistroAnnounce> {
+        self.entries
+            .iter()
+            .find(|e| e.distro_lxmf_hash.as_slice() == distro_lxmf_hash)
+    }
+
+    /// Owned copy of every held announce, for replay without holding the lock.
+    pub fn snapshot(&self) -> Vec<DistroAnnounce> {
+        self.entries.clone()
+    }
+
+    /// Number of stored announces.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Persist to disk.
+    pub fn save(&self) -> Result<(), String> {
+        let bytes = rmp_serde::to_vec(&self.entries)
+            .map_err(|e| format!("DistroAnnounceStore serialize: {e}"))?;
+        std::fs::write(&self.file_path, &bytes)
+            .map_err(|e| format!("DistroAnnounceStore write: {e}"))?;
+        Ok(())
+    }
+}
+
+/// Split a `/rfed/distro/announce` payload value into its ratchet flag and
+/// announce bytes.
+///
+/// Wire format: `flags(1) | announce_data`, flags bit 0 = ratchet present.
+/// The flag cannot be derived from the length because app_data is variable, and
+/// it decides where the signature starts — so it travels explicitly.
+pub fn parse_distro_announce_payload(value: &[u8]) -> Result<(bool, Vec<u8>), String> {
+    if value.is_empty() {
+        return Err("empty announce payload".into());
+    }
+    Ok((value[0] & 0x01 != 0, value[1..].to_vec()))
+}
+
+/// Verify a pre-signed announce and return the `lxmf.delivery` hash it describes.
+///
+/// NEVER WEAKEN THIS. The node rebroadcasts whatever this accepts, so an
+/// unchecked path here would turn RFed into an open announce injector able to
+/// bind any destination hash to attacker-chosen keys. Every field is pinned:
+/// the embedded key must be the distro key the caller proved ownership of, the
+/// aspect must be `lxmf.delivery`, and the signature must cover the whole thing.
+pub fn verify_distro_announce(
+    announce_data: &[u8],
+    ratchet: bool,
+    expected_distro_pubkey: &[u8],
+) -> Result<Vec<u8>, String> {
+    let ratchet_len = if ratchet { RATCHET_LEN } else { 0 };
+    if announce_data.len() < ANNOUNCE_FIXED_LEN + ratchet_len {
+        return Err(format!(
+            "announce_data len {} < minimum {}",
+            announce_data.len(),
+            ANNOUNCE_FIXED_LEN + ratchet_len
+        ));
+    }
+
+    let public_key = &announce_data[0..64];
+    if public_key != expected_distro_pubkey {
+        return Err("announce public key does not match the registering distro key".into());
+    }
+
+    let name_hash = &announce_data[64..74];
+    let random_hash = &announce_data[74..84];
+    let ratchet_bytes = &announce_data[84..84 + ratchet_len];
+    let sig_start = 84 + ratchet_len;
+    let signature = &announce_data[sig_start..sig_start + 64];
+    let app_data = &announce_data[sig_start + 64..];
+
+    // Reconstructing the destination pins both the hash and the aspect: a
+    // submission for any aspect other than lxmf.delivery fails the name_hash
+    // comparison, so this endpoint cannot be used to announce, say, a
+    // propagation node under someone else's key.
+    let identity = Identity::from_public_key(public_key)
+        .map_err(|e| format!("distro pubkey invalid: {e}"))?;
+    let destination = Destination::new_outbound(
+        Some(identity.clone()),
+        DestinationType::Single,
+        "lxmf".to_string(),
+        vec!["delivery".to_string()],
+    )
+    .map_err(|e| format!("lxmf.delivery destination: {e}"))?;
+
+    if destination.name_hash != name_hash {
+        return Err("announce name_hash is not lxmf.delivery".into());
+    }
+
+    let mut signed_data = Vec::with_capacity(16 + announce_data.len());
+    signed_data.extend_from_slice(&destination.hash);
+    signed_data.extend_from_slice(public_key);
+    signed_data.extend_from_slice(name_hash);
+    signed_data.extend_from_slice(random_hash);
+    signed_data.extend_from_slice(ratchet_bytes);
+    signed_data.extend_from_slice(app_data);
+
+    if !identity.validate(signature, &signed_data) {
+        return Err("announce signature verification failed".into());
+    }
+
+    Ok(destination.hash)
+}
+
+/// Rebroadcast a stored pre-signed announce onto the network.
+///
+/// Emitted as a HEADER_1 broadcast announce sourced from this node, so
+/// neighbours install a path toward RFed for the distro address. Only
+/// propagated LXMF delivery can be served over that path — RFed has no distro
+/// private key and so cannot terminate a direct link for it.
+pub fn replay_distro_announce(announce: &DistroAnnounce) -> Result<(), String> {
+    if announce.announce_data.len() < 64 {
+        return Err("stored announce too short".into());
+    }
+    let identity = Identity::from_public_key(&announce.announce_data[0..64])
+        .map_err(|e| format!("stored announce pubkey invalid: {e}"))?;
+    let destination = Destination::new_outbound(
+        Some(identity),
+        DestinationType::Single,
+        "lxmf".to_string(),
+        vec!["delivery".to_string()],
+    )
+    .map_err(|e| format!("lxmf.delivery destination: {e}"))?;
+
+    let context_flag = if announce.ratchet { FLAG_SET } else { FLAG_UNSET };
+    let mut packet = Packet::new(
+        Some(destination),
+        announce.announce_data.clone(),
+        ANNOUNCE,
+        NONE,
+        reticulum_rust::transport::BROADCAST,
+        HEADER_1,
+        None,
+        None,
+        false,
+        context_flag,
+    );
+    packet.send().map(|_| ()).map_err(|e| format!("announce send: {e}"))
 }
 
 // ── Distro fanout ────────────────────────────────────────────────────────────
@@ -507,6 +726,267 @@ mod tests {
 
     fn dummy_pubkey(byte: u8) -> Vec<u8> {
         vec![byte; 64]
+    }
+
+    // ── Pre-signed announce helpers ──────────────────────────────────────
+
+    /// Build a genuine, correctly signed `lxmf.delivery` announce for `identity`,
+    /// mirroring `Destination::generate_announce_data` in reticulum_rust.
+    fn build_announce(identity: &Identity, app_data: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let destination = Destination::new_outbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            "lxmf".to_string(),
+            vec!["delivery".to_string()],
+        )
+        .expect("destination");
+
+        let public_key = identity.get_public_key().expect("public key");
+        let random_hash = vec![0x5Au8; 10];
+
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&destination.hash);
+        signed_data.extend_from_slice(&public_key);
+        signed_data.extend_from_slice(&destination.name_hash);
+        signed_data.extend_from_slice(&random_hash);
+        signed_data.extend_from_slice(app_data);
+        let signature = identity.sign(&signed_data);
+
+        let mut announce_data = Vec::new();
+        announce_data.extend_from_slice(&public_key);
+        announce_data.extend_from_slice(&destination.name_hash);
+        announce_data.extend_from_slice(&random_hash);
+        announce_data.extend_from_slice(&signature);
+        announce_data.extend_from_slice(app_data);
+
+        (announce_data, destination.hash)
+    }
+
+    #[test]
+    fn verify_accepts_a_genuine_announce_and_returns_the_delivery_hash() {
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let (announce_data, expected_hash) = build_announce(&identity, b"");
+
+        let hash = verify_distro_announce(&announce_data, false, &pubkey)
+            .expect("a correctly signed announce must verify");
+
+        assert_eq!(hash, expected_hash, "must return the lxmf.delivery hash");
+    }
+
+    #[test]
+    fn verify_accepts_an_announce_carrying_app_data() {
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let (announce_data, expected_hash) = build_announce(&identity, b"display name bytes");
+
+        let hash = verify_distro_announce(&announce_data, false, &pubkey)
+            .expect("app data is signed too, so it must still verify");
+
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn verify_rejects_an_announce_for_a_different_key() {
+        // The attack this blocks: prove ownership of distro key A during
+        // registration, then submit an announce binding key B's destination.
+        let attacker = Identity::new(true);
+        let victim = Identity::new(true);
+        let victim_pubkey = victim.get_public_key().expect("public key");
+        let (announce_data, _) = build_announce(&attacker, b"");
+
+        let err = verify_distro_announce(&announce_data, false, &victim_pubkey)
+            .expect_err("an announce for another identity must be rejected");
+
+        assert!(
+            err.contains("does not match"),
+            "expected a key-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_tampered_signature() {
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let (mut announce_data, _) = build_announce(&identity, b"");
+        let sig_start = 84;
+        announce_data[sig_start] ^= 0xFF;
+
+        let err = verify_distro_announce(&announce_data, false, &pubkey)
+            .expect_err("a corrupted signature must be rejected");
+
+        assert!(
+            err.contains("signature"),
+            "expected a signature error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_tampered_app_data() {
+        // app_data is inside the signed region, so flipping it must invalidate
+        // the announce rather than sneak through as unsigned trailing bytes.
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let (mut announce_data, _) = build_announce(&identity, b"display name bytes");
+        let last = announce_data.len() - 1;
+        announce_data[last] ^= 0xFF;
+
+        let err = verify_distro_announce(&announce_data, false, &pubkey)
+            .expect_err("modified app data must invalidate the signature");
+
+        assert!(
+            err.contains("signature"),
+            "expected a signature error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_an_announce_for_a_non_delivery_aspect() {
+        // Guards against using this endpoint to announce e.g. a propagation
+        // node under the distro key.
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let destination = Destination::new_outbound(
+            Some(identity.clone()),
+            DestinationType::Single,
+            "lxmf".to_string(),
+            vec!["propagation".to_string()],
+        )
+        .expect("destination");
+
+        let public_key = identity.get_public_key().expect("public key");
+        let random_hash = vec![0x5Au8; 10];
+        let mut signed_data = Vec::new();
+        signed_data.extend_from_slice(&destination.hash);
+        signed_data.extend_from_slice(&public_key);
+        signed_data.extend_from_slice(&destination.name_hash);
+        signed_data.extend_from_slice(&random_hash);
+        let signature = identity.sign(&signed_data);
+
+        let mut announce_data = Vec::new();
+        announce_data.extend_from_slice(&public_key);
+        announce_data.extend_from_slice(&destination.name_hash);
+        announce_data.extend_from_slice(&random_hash);
+        announce_data.extend_from_slice(&signature);
+
+        let err = verify_distro_announce(&announce_data, false, &pubkey)
+            .expect_err("only lxmf.delivery announces may be replayed");
+
+        assert!(
+            err.contains("name_hash"),
+            "expected an aspect error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_rejects_a_truncated_announce() {
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let (announce_data, _) = build_announce(&identity, b"");
+
+        let err = verify_distro_announce(&announce_data[..100], false, &pubkey)
+            .expect_err("a short announce must not be indexed out of bounds");
+
+        assert!(err.contains("len"), "expected a length error, got: {err}");
+    }
+
+    #[test]
+    fn verify_rejects_a_ratchet_announce_claiming_no_ratchet() {
+        // The ratchet flag shifts where the signature starts, so a mismatched
+        // flag must fail rather than silently misparse.
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let (announce_data, _) = build_announce(&identity, b"");
+
+        let err = verify_distro_announce(&announce_data, true, &pubkey)
+            .expect_err("claiming a ratchet that is not present must be rejected");
+
+        assert!(
+            err.contains("len") || err.contains("signature"),
+            "expected a parse or signature error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn announce_payload_framing_round_trips_the_client_format() {
+        // Mirrors what app.js sends: flags(1) then the announce bytes.
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("public key");
+        let (announce_data, expected_hash) = build_announce(&identity, b"");
+
+        let mut value = vec![0x00];
+        value.extend_from_slice(&announce_data);
+        let (ratchet, parsed) =
+            parse_distro_announce_payload(&value).expect("framing must parse");
+
+        assert!(!ratchet, "flags bit 0 clear means no ratchet");
+        let hash = verify_distro_announce(&parsed, ratchet, &pubkey)
+            .expect("the unframed announce must still verify");
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn announce_payload_framing_reads_the_ratchet_flag() {
+        let (ratchet, parsed) =
+            parse_distro_announce_payload(&[0x01, 0xAA, 0xBB]).expect("framing must parse");
+
+        assert!(ratchet, "flags bit 0 set means a ratchet is present");
+        assert_eq!(parsed, vec![0xAA, 0xBB], "flags byte must not leak into the announce");
+    }
+
+    #[test]
+    fn announce_payload_framing_rejects_an_empty_value() {
+        assert!(
+            parse_distro_announce_payload(&[]).is_err(),
+            "an empty value must not panic on the flags byte"
+        );
+    }
+
+    #[test]
+    fn announce_store_replaces_on_resubmission() {
+        let path = temp_path("announce_replace");
+        let _ = std::fs::remove_file(&path);
+        let mut store = DistroAnnounceStore::load(path);
+        let hash = dummy_hash(0xAB);
+
+        store.put(hash.clone(), vec![0x01; 200], false);
+        store.put(hash.clone(), vec![0x02; 200], true);
+
+        assert_eq!(store.len(), 1, "a resubmission must replace, not accumulate");
+        let held = store.get(&hash).expect("announce present");
+        assert_eq!(held.announce_data[0], 0x02, "the newest announce must win");
+        assert!(held.ratchet, "the ratchet flag must be updated too");
+    }
+
+    #[test]
+    fn announce_store_round_trips_through_disk() {
+        let path = temp_path("announce_persist");
+        let _ = std::fs::remove_file(&path);
+        let hash = dummy_hash(0xCD);
+        {
+            let mut store = DistroAnnounceStore::load(path.clone());
+            store.put(hash.clone(), vec![0x07; 180], true);
+        }
+
+        let reloaded = DistroAnnounceStore::load(path);
+
+        let held = reloaded.get(&hash).expect("announce must survive a restart");
+        assert_eq!(held.announce_data, vec![0x07; 180]);
+        assert!(held.ratchet);
+    }
+
+    #[test]
+    fn announce_store_remove_drops_the_entry() {
+        let path = temp_path("announce_remove");
+        let _ = std::fs::remove_file(&path);
+        let mut store = DistroAnnounceStore::load(path);
+        let hash = dummy_hash(0xEF);
+        store.put(hash.clone(), vec![0x01; 180], false);
+
+        store.remove(&hash);
+
+        assert!(store.get(&hash).is_none(), "removed announce must be gone");
+        assert_eq!(store.len(), 0);
     }
 
     #[test]

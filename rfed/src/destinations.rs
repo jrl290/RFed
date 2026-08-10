@@ -402,7 +402,7 @@ fn handle_notify_command(
 
 use crate::config::NodeConfig;
 use crate::deferred_queue::{DeferredQueue, PendingBlob};
-use crate::distro::DistroTable;
+use crate::distro::{self, DistroAnnounceStore, DistroTable};
 use crate::fanout;
 use crate::lxmf_propagation::LxmfPropagationNode;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
@@ -467,6 +467,8 @@ pub struct FedNode {
     pub blob_store: Arc<Mutex<BlobStore>>,
     pub subscription_table: Arc<Mutex<SubscriptionTable>>,
     pub distro_table: Arc<Mutex<DistroTable>>,
+    /// Device-signed announces this node replays on behalf of distro identities.
+    pub distro_announces: Arc<Mutex<DistroAnnounceStore>>,
     pub hook_registry: Arc<Mutex<HookRegistry>>,
     pub notify_registry: Arc<Mutex<NotifyRegistry>>,
     pub sync: Arc<Mutex<FedSync>>,
@@ -549,6 +551,10 @@ impl FedNode {
 
         let distro_table = Arc::new(Mutex::new(DistroTable::load(
             config.distro_file(),
+        )));
+
+        let distro_announces = Arc::new(Mutex::new(DistroAnnounceStore::load(
+            config.distro_announce_file(),
         )));
 
         let hook_registry = Arc::new(Mutex::new(HookRegistry::new()));
@@ -642,6 +648,7 @@ impl FedNode {
             blob_store,
             subscription_table,
             distro_table,
+            distro_announces,
             hook_registry,
             notify_registry,
             sync,
@@ -717,6 +724,39 @@ impl FedNode {
         let _ = self.notify_unregister_dest.announce(None, false, None, None, true);
         let _ = self.distro_unregister_dest.announce(None, false, None, None, true);
         let _ = self.distro_list_dest.announce(None, false, None, None, true);
+        self.replay_distro_announces();
+    }
+
+    /// Rebroadcast every stored pre-signed distro announce.
+    ///
+    /// These are not owned destinations, so `Transport`'s announce daemon will
+    /// not refresh them — this node has to replay them itself to keep the
+    /// distro address inside the Reticulum path TTL.
+    pub fn replay_distro_announces(&self) {
+        // Snapshot and release the lock before any network work; replaying
+        // broadcasts on every interface. See the note on `distro_fanout`.
+        let announces = match self.distro_announces.lock() {
+            Ok(store) => store.snapshot(),
+            Err(_) => return,
+        };
+        for announce in &announces {
+            match distro::replay_distro_announce(announce) {
+                Ok(()) => log(
+                    format!(
+                        "[distro] replayed announce for {}",
+                        hexrep(&announce.distro_lxmf_hash, false)
+                    ),
+                    LOG_DEBUG, false, false,
+                ),
+                Err(e) => log(
+                    format!(
+                        "[distro] announce replay failed for {}: {e}",
+                        hexrep(&announce.distro_lxmf_hash, false)
+                    ),
+                    LOG_WARNING, false, false,
+                ),
+            }
+        }
     }
 
     /// Opt all four locally-registered destinations into Transport's
@@ -781,6 +821,9 @@ impl FedNode {
         }
         if let Ok(d) = self.distro_table.lock() {
             let _ = d.save();
+        }
+        if let Ok(a) = self.distro_announces.lock() {
+            let _ = a.save();
         }
         log("[rfed] all state persisted to disk", LOG_NOTICE, false, false);
     }
@@ -2895,6 +2938,13 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 );
             } else {
                 table.unregister(&distro_lxmf_hash, &device_lxmf_hash);
+                // Once the last device is gone there is nothing to fan out to,
+                // so stop advertising a route to this node for the distro.
+                if !table.is_distro(&distro_lxmf_hash) {
+                    if let Ok(mut announces) = guard.distro_announces.lock() {
+                        announces.remove(&distro_lxmf_hash);
+                    }
+                }
                 log(
                     format!(
                         "[distro] unregistered device {} from distro {}",
@@ -3011,14 +3061,111 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         Vec::new()
     });
 
+    // ── ANNOUNCE (pre-signed, replayed on the distro's behalf) ─────────
+    // Payload: msgpack [ bin value, bin(64) distro_pubkey, bin(64) sig(value) ]
+    // where value = flags(1) | announce_data, flags bit 0 = ratchet present.
+    //
+    // RFed only ever holds the distro *public* key, so it cannot mint this
+    // announce itself. The device that holds the private key signs it and this
+    // node rebroadcasts it verbatim — the same thing a transport node does when
+    // it answers a path request out of its announce cache.
+    let announce_node = Arc::clone(node);
+    let announce_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                      _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+        let fail = || rmp_serde::to_vec(&false).unwrap_or_default();
+
+        let (value, _distro_identity_hash, distro_pubkey) = match verify_signed_payload(data) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] distro/announce: {e}"), LOG_WARNING, false, false);
+                return fail();
+            }
+        };
+        let (ratchet, announce_data) = match distro::parse_distro_announce_payload(&value) {
+            Ok(v) => v,
+            Err(e) => {
+                log(format!("[rfed] distro/announce: {e}"), LOG_WARNING, false, false);
+                return fail();
+            }
+        };
+
+        let distro_lxmf_hash =
+            match distro::verify_distro_announce(&announce_data, ratchet, &distro_pubkey) {
+                Ok(h) => h,
+                Err(e) => {
+                    log(format!("[rfed] distro/announce rejected: {e}"), LOG_WARNING, false, false);
+                    return fail();
+                }
+            };
+
+        // Store under the lock, then release it before touching the network —
+        // see the deadlock note on `distro_fanout`.
+        let (distro_table, announce_store) = {
+            let guard = match announce_node.lock() {
+                Ok(g) => g,
+                Err(_) => return fail(),
+            };
+            (
+                Arc::clone(&guard.distro_table),
+                Arc::clone(&guard.distro_announces),
+            )
+        };
+
+        // Only advertise a route we can actually serve: without a registered
+        // device there is nothing to fan out to.
+        let has_device = distro_table
+            .lock()
+            .map(|t| t.is_distro(&distro_lxmf_hash))
+            .unwrap_or(false);
+        if !has_device {
+            log(
+                format!(
+                    "[rfed] distro/announce refused for {} — no device registered",
+                    hexrep(&distro_lxmf_hash, false)
+                ),
+                LOG_WARNING, false, false,
+            );
+            return fail();
+        }
+
+        let stored = match announce_store.lock() {
+            Ok(mut store) => {
+                store.put(distro_lxmf_hash.clone(), announce_data, ratchet);
+                store.get(&distro_lxmf_hash).cloned()
+            }
+            Err(_) => None,
+        };
+
+        if let Some(announce) = stored {
+            log(
+                format!(
+                    "[distro] stored pre-signed announce for {} (ratchet={})",
+                    hexrep(&distro_lxmf_hash, false), ratchet
+                ),
+                LOG_NOTICE, false, false,
+            );
+            if let Err(e) = distro::replay_distro_announce(&announce) {
+                log(format!("[distro] announce replay failed: {e}"), LOG_WARNING, false, false);
+            }
+        }
+
+        rmp_serde::to_vec(&true).unwrap_or_default()
+    });
+
     // ── Request paths ─────────────────────────────────────────────────
     const DISTRO_REGISTER_PATH: &str = "/rfed/distro/register";
     const DISTRO_UNREGISTER_PATH: &str = "/rfed/distro/unregister";
     const DISTRO_LIST_PATH: &str = "/rfed/distro/list";
+    const DISTRO_ANNOUNCE_PATH: &str = "/rfed/distro/announce";
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.distro_register_dest.register_request_handler(
         DISTRO_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+    )?;
+    // Hosted on distro.register so a client that has already established a link
+    // for registration can submit its announce over the same link.
+    guard.distro_register_dest.register_request_handler(
+        DISTRO_ANNOUNCE_PATH.to_string(), Some(announce_cb), ALLOW_ALL, None, false,
     )?;
     guard.distro_register_dest.register_request_handler(
         PULL_PATH.to_string(), Some(pull_distro_cb), ALLOW_ALL, None, false,

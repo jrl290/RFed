@@ -219,6 +219,9 @@ impl NodeConfig {
     pub fn distro_file(&self) -> PathBuf {
         self.config_dir.join("distro.rmp")
     }
+    pub fn distro_announce_file(&self) -> PathBuf {
+        self.config_dir.join("distro_announces.rmp")
+    }
     pub fn peer_state_file(&self) -> PathBuf {
         self.config_dir.join("peers.rmp")
     }

@@ -761,9 +761,15 @@ fn main() -> Result<(), String> {
     let mut last_evict        = Instant::now();
     let mut last_backup_tick  = Instant::now();
     let mut last_heartbeat    = Instant::now();
+    let mut last_distro_announce = Instant::now();
     let heartbeat_interval    = Duration::from_secs(5 * 60);
     let evict_interval        = Duration::from_secs(3600);
     let backup_tick_interval  = Duration::from_secs(BACKUP_TICK_SECS);
+    // Pre-signed distro announces are not owned destinations, so Transport's
+    // announce daemon never refreshes them. Match the service-destination
+    // cadence so the distro address stays inside the Reticulum path TTL.
+    let distro_announce_interval =
+        Duration::from_secs(destinations::SERVICE_REFRESH_INTERVAL_SECS);
     let evict_max_age         = 7.0 * 24.0 * 3600.0_f64;
     let startup = Instant::now();
 
@@ -815,6 +821,15 @@ fn main() -> Result<(), String> {
             }
             write_status_file(&node, &lxmf_prop_arc, &startup);
             last_backup_tick = Instant::now();
+        }
+
+        // Keep replayed distro announces fresh on behalf of the devices that
+        // signed them; they have no other refresh path.
+        if last_distro_announce.elapsed() >= distro_announce_interval {
+            if let Ok(guard) = node.lock() {
+                guard.replay_distro_announces();
+            }
+            last_distro_announce = Instant::now();
         }
 
         // Evict stale deferred-queue entries for gone-forever subscribers.
