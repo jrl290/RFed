@@ -9,7 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 reticulum_rust = { path = "../../Reticulum-rust", default-features = false }
-lxmf_rust      = { path = "../../LXMF-rust" }
+# lxmf_rust's default feature re-enables reticulum_rust/serial, which drags in
+# btleplug -> libdbus-sys and breaks the musl cross-build.
+lxmf_rust      = { path = "../../LXMF-rust", default-features = false }
 app_links      = { path = "../../app-links" }
 
 rmp          = "0.8.14"
