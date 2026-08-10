@@ -2,6 +2,9 @@
 /target/
 rfed/target/
 
+# Runtime dump written by rfed into its working directory
+status.json
+
 # Cargo lock is committed for binary crates
 # (uncomment the next line for library crates)
 # Cargo.lock
