@@ -1205,8 +1205,26 @@ fn run_sync_session(
                         if let Some(arc) = nw2.as_ref().and_then(|w| w.upgrade()) {
                             if let Ok(guard) = arc.lock() {
                                 let subs  = guard.subscription_table.lock().ok();
-                                let distro = guard.distro_table.lock().ok();
                                 let hooks = guard.hook_registry.lock().ok();
+                                // Snapshot the distro device lists for every
+                                // ingested blob and release distro_table BEFORE
+                                // any fanout.
+                                //
+                                // NEVER REMOVE. distro_fanout does unbounded
+                                // network work per device; holding distro_table
+                                // across it wedged /rfed/distro/register in
+                                // production (see distro::distro_fanout).
+                                let distro_devices: std::collections::HashMap<Vec<u8>, Vec<crate::distro::DistroEntry>> =
+                                    match guard.distro_table.lock() {
+                                        Ok(dtable) => ingested
+                                            .iter()
+                                            .filter(|(routing_hash, _)| dtable.is_distro(routing_hash))
+                                            .map(|(routing_hash, _)| {
+                                                (routing_hash.clone(), dtable.devices_snapshot(routing_hash))
+                                            })
+                                            .collect(),
+                                        Err(_) => std::collections::HashMap::new(),
+                                    };
                                 if let (Some(subs), Some(hooks)) = (subs, hooks) {
                                     for (routing_hash, blob) in &ingested {
                                         // ── Channel fanout ────────────
@@ -1219,12 +1237,12 @@ fn run_sync_session(
                                         );
 
                                         // ── Distro fanout ────────────
-                                        if let Some(ref dtable) = distro {
-                                            if dtable.is_distro(routing_hash) {
+                                        if let Some(devices) = distro_devices.get(routing_hash) {
+                                            {
                                                 let dmissed = crate::distro::distro_fanout(
                                                     routing_hash,
                                                     blob,
-                                                    &dtable,
+                                                    devices,
                                                     &hooks,
                                                     Some(&guard.propagation_streams),
                                                 );
@@ -2152,8 +2170,10 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     //
     // When a stamp is required the node validates PoW before accepting the blob.
     // The stamp is stripped before storage so peers receive clean blobs.
+    // Payloads at or under the link MDU (431 B) arrive as a single DATA
+    // packet; anything larger arrives as a Resource. Both land here.
     let send_node = Arc::clone(node);
-    let packet_cb = Arc::new(move |data: &[u8], _packet: &reticulum_rust::packet::Packet| {
+    let ingest_send: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |data: &[u8]| {
         if data.len() < 17 {
             log("[channel] malformed SEND packet (too short)", LOG_WARNING, false, false);
             return;
@@ -2246,6 +2266,45 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             }
         }
     });
+
+    let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> = {
+        let ingest = Arc::clone(&ingest_send);
+        Arc::new(move |data: &[u8], _packet: &Packet| ingest(data))
+    };
+
+    // A link defaults to ACCEPT_NONE, so without this an oversized channel
+    // publish is advertised, silently ignored, and never proved — the sender
+    // sees nothing at all. ACCEPT_APP additionally requires a `resource`
+    // callback to be present (RNS/Link.py:1106).
+    let resource_ingest = Arc::clone(&ingest_send);
+    let channel_link_established: Arc<dyn Fn(LinkHandle) + Send + Sync> =
+        Arc::new(move |link: LinkHandle| {
+            link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
+            let ingest = Arc::clone(&resource_ingest);
+            link.set_resource_callbacks(
+                Some(Arc::new(|_resource| {})),
+                None,
+                Some(Arc::new(move |resource: Arc<Mutex<reticulum_rust::resource::Resource>>| {
+                    let data: Vec<u8> = match resource.lock() {
+                        Ok(r) => {
+                            if r.status != reticulum_rust::resource::ResourceStatus::Complete {
+                                return;
+                            }
+                            match r.data.clone() {
+                                Some(d) => d,
+                                None => return,
+                            }
+                        }
+                        Err(_) => return,
+                    };
+                    log(
+                        format!("[channel] SEND arrived as resource ({} bytes)", data.len()),
+                        LOG_DEBUG, false, false,
+                    );
+                    ingest(&data);
+                })),
+            );
+        });
 
     // SUBSCRIBE — client registers (subscriber_hash, channel_hash).
     let sub_node = Arc::clone(node);
@@ -2371,6 +2430,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.channel_dest.set_packet_callback(Some(packet_cb.clone()));
+    guard.channel_dest.set_link_established_callback(Some(channel_link_established.clone()));
     guard.channel_dest.register_request_handler(
         SUBSCRIBE_PATH.to_string(), Some(subscribe_cb.clone()), ALLOW_ALL, None, false,
     )?;
@@ -2384,6 +2444,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // distinct destination hashes. SUBSCRIBE/UNSUBSCRIBE paths are reused
     // since the path string is informational once routed to the right dest.
     guard.channel_publish_dest.set_packet_callback(Some(packet_cb));
+    guard.channel_publish_dest.set_link_established_callback(Some(channel_link_established));
     guard.channel_subscribe_dest.register_request_handler(
         SUBSCRIBE_PATH.to_string(), Some(subscribe_cb), ALLOW_ALL, None, false,
     )?;
@@ -3377,6 +3438,47 @@ mod destination_wiring_tests {
         assert!(
             delivery_fragment.contains("PULL_PATH.to_string(), Some(pull_cb)"),
             "legacy rfed.delivery must continue serving /rfed/pull"
+        );
+    }
+
+    #[test]
+    fn channel_publish_accepts_oversized_sends_as_resources() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs");
+
+        let wire_channel_start = source
+            .find("fn wire_channel_destination(")
+            .expect("wire_channel_destination present");
+        let wire_delivery_start = source
+            .find("fn wire_delivery_destination(")
+            .expect("wire_delivery_destination present");
+        let channel_fragment = &source[wire_channel_start..wire_delivery_start];
+
+        assert!(
+            channel_fragment
+                .contains("link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP)"),
+            "channel links must accept resources; a link defaults to ACCEPT_NONE, \
+             which silently drops any publish larger than the 431-byte link MDU"
+        );
+        assert!(
+            channel_fragment.contains("link.set_resource_callbacks("),
+            "ACCEPT_APP is inert without a resource callback (RNS/Link.py:1106)"
+        );
+        for dest in ["channel_dest", "channel_publish_dest"] {
+            assert!(
+                channel_fragment.contains(&format!(
+                    "guard.{dest}.set_link_established_callback(Some(channel_link_established"
+                )),
+                "rfed.{dest} must arm resource acceptance on every inbound link"
+            );
+        }
+        assert!(
+            channel_fragment.contains("let ingest = Arc::clone(&resource_ingest);"),
+            "the resource path must reuse the same SEND ingest as the packet path, \
+             so stamp validation and fanout cannot drift between the two"
         );
     }
 }

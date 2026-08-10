@@ -174,6 +174,19 @@ impl DistroTable {
             .collect()
     }
 
+    /// Owned copy of the devices registered for `distro_lxmf_hash`.
+    ///
+    /// NEVER REMOVE. This exists so callers can take the `distro_table` mutex,
+    /// snapshot, and release it BEFORE doing any network work. See the comment
+    /// on `distro_fanout` for the production deadlock this prevents.
+    pub fn devices_snapshot(&self, distro_lxmf_hash: &[u8]) -> Vec<DistroEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.distro_lxmf_hash.as_slice() == distro_lxmf_hash)
+            .cloned()
+            .collect()
+    }
+
     /// Whether any devices are registered for this distro hash.
     pub fn is_distro(&self, distro_lxmf_hash: &[u8]) -> bool {
         self.entries
@@ -221,15 +234,27 @@ impl DistroTable {
 /// This mirrors `fanout::fanout_blob()` but uses `DistroTable` instead of
 /// `SubscriptionTable`, targets `lxmf.delivery`-derived destinations, and
 /// checks `PropagationStreamRegistry` instead of `ChannelStreamRegistry`.
+/// Takes an already-snapshotted device list rather than the `DistroTable`.
+///
+/// NEVER REMOVE the `&[DistroEntry]` parameter in favour of `&DistroTable`.
+/// This function performs unbounded network work per device (stream dispatch,
+/// path lookup, link establishment, packet dispatch). When it took
+/// `&DistroTable`, every caller necessarily held the `distro_table` mutex for
+/// the whole fan-out, so a single stalled device delivery froze the table for
+/// every other user of it. Verified in production 2026-08-09 00:56:54: two
+/// `/rfed/distro/register` callbacks blocked forever on `distro_table.lock()`
+/// and never reached `[REQ] callback completed`, so RFed sent no response and
+/// the browser client hung. Identical registrations on the same build had
+/// completed in well under a second earlier the same day (18:35, 18:38, 18:43),
+/// i.e. the table had been wedged in between. Snapshot under the lock, release,
+/// then fan out.
 pub fn distro_fanout(
     distro_lxmf_hash: &[u8],
     lxmf_blob: &[u8],
-    distro_table: &DistroTable,
+    devices: &[DistroEntry],
     hook_registry: &HookRegistry,
     propagation_streams: Option<&Arc<Mutex<PropagationStreamRegistry>>>,
 ) -> Vec<Vec<u8>> {
-    let devices = distro_table.get_devices(distro_lxmf_hash);
-
     if devices.is_empty() {
         log(
             format!(
@@ -257,7 +282,7 @@ pub fn distro_fanout(
 
     let mut missed: Vec<Vec<u8>> = Vec::new();
 
-    for entry in &devices {
+    for entry in devices {
         // Build delivery payload: [ distro_lxmf_hash(16) | lxmf_blob ]
         // Same format as channel delivery: [ routing_hash(16) | inner_blob ]
         let mut payload = distro_lxmf_hash.to_vec();

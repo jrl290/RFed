@@ -1155,9 +1155,18 @@ impl LxmfPropagationNode {
                     }
                 }
 
-                // Fan out to registered devices immediately
+                // Fan out to registered devices immediately.
+                //
+                // NEVER REMOVE the snapshot-then-drop. The distro_table lock is
+                // released before distro_fanout does any network work — holding
+                // it across the fan-out wedged /rfed/distro/register in
+                // production (see distro::distro_fanout's doc comment).
                 if let Some(ref dt) = self.distro_table {
-                    if let Ok(table) = dt.lock() {
+                    let devices = match dt.lock() {
+                        Ok(table) => table.devices_snapshot(dest_hash),
+                        Err(_) => Vec::new(),
+                    };
+                    if !devices.is_empty() {
                         let hook_guard = self.distro_hook_registry.as_ref()
                             .and_then(|h| h.lock().ok());
                         let default_hooks = crate::notify::HookRegistry::new();
@@ -1168,7 +1177,7 @@ impl LxmfPropagationNode {
                         let missed = crate::distro::distro_fanout(
                             dest_hash,
                             lxmf_data,
-                            &*table,
+                            &devices,
                             hooks,
                             Some(&self.stream_registry),
                         );
@@ -2349,9 +2358,16 @@ impl LxmfPropagationNode {
                     }
                 }
 
-                // Fan out to registered devices
+                // Fan out to registered devices.
+                //
+                // NEVER REMOVE the snapshot-then-drop — see the peer-sync path
+                // above and distro::distro_fanout's doc comment.
                 if let Some(ref dt) = self.distro_table {
-                    if let Ok(table) = dt.lock() {
+                    let devices = match dt.lock() {
+                        Ok(table) => table.devices_snapshot(dest_hash),
+                        Err(_) => Vec::new(),
+                    };
+                    if !devices.is_empty() {
                         let hook_guard = self.distro_hook_registry.as_ref()
                             .and_then(|h| h.lock().ok());
                         let default_hooks = crate::notify::HookRegistry::new();
@@ -2362,7 +2378,7 @@ impl LxmfPropagationNode {
                         let missed = crate::distro::distro_fanout(
                             dest_hash,
                             lxmf_data,
-                            &*table,
+                            &devices,
                             hooks,
                             Some(&self.stream_registry),
                         );

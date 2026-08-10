@@ -2075,6 +2075,7 @@ name = "reticulum_rust"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "base64",
  "block-padding",
  "btleplug",
  "bzip2",
@@ -2090,11 +2091,13 @@ dependencies = [
  "once_cell",
  "parking_lot",
  "rand 0.8.5",
+ "reqwest",
  "rmp",
  "rmp-serde",
  "rmpv",
  "serde",
  "serde_bytes",
+ "serde_json",
  "serialport",
  "sha2 0.10.9",
  "socket2 0.5.10",
