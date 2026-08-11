@@ -32,3 +32,4 @@ ctrlc      = { version = "3.4", features = ["termination"] }
 # Must be pinned to match reticulum_rust's transitive deps exactly.
 x25519-dalek = "=1.1.1"
 ed25519-dalek = "=1.0.1"
+# ci: rebuild for reticulum_rust 7e5c9a8 (log reduction)
