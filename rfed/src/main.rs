@@ -853,11 +853,16 @@ fn main() -> Result<(), String> {
         // a fine-grained timestamp for diagnosing unexpected deaths.
         if last_heartbeat.elapsed() >= heartbeat_interval {
             let snap = reticulum_rust::transport::get_state_snapshot();
-            eprintln!(
-                "[rfed] heartbeat uptime={:.1}h links={} paths={}",
-                startup.elapsed().as_secs_f64() / 3600.0,
-                snap.link_table_len,
-                snap.path_table.len(),
+            log(
+                format!(
+                    "[rfed] heartbeat uptime={:.1}h links={} paths={}",
+                    startup.elapsed().as_secs_f64() / 3600.0,
+                    snap.link_table_len,
+                    snap.path_table.len(),
+                ),
+                LOG_NOTICE,
+                false,
+                false,
             );
             last_heartbeat = Instant::now();
         }
