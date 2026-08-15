@@ -168,7 +168,7 @@ fn send_direct_packet(
                 dest_hex,
                 hexrep(&sub_hash, false),
             ),
-            LOG_NOTICE,
+            LOG_DEBUG,
             false,
             false,
         ),

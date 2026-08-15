@@ -1278,7 +1278,7 @@ impl LxmfPropagationNode {
                         hexrep(dest_hash, false),
                         log_suffix,
                     ),
-                    LOG_NOTICE,
+                    LOG_DEBUG,
                     false,
                     false,
                 );
@@ -1298,7 +1298,7 @@ impl LxmfPropagationNode {
                     hexrep(dest_hash, false),
                     log_suffix,
                 ),
-                LOG_NOTICE,
+                LOG_DEBUG,
                 false,
                 false,
             );
