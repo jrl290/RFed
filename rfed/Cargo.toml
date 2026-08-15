@@ -35,4 +35,4 @@ ed25519-dalek = "=1.0.1"
 # ci: rebuild for reticulum_rust 7e5c9a8 (log reduction)
 # ci: pick up reticulum_rust ef123c9 (write amplification fix)
 
-# ci: pick up reticulum_rust d815e0c transport trace demotions
+# ci: pick up reticulum_rust 3163440 transport trace demotions
