@@ -2243,8 +2243,20 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             // older/different cost announcement are still accepted.
             let min_cost = cost.saturating_sub(stamp_flexibility.unwrap_or(0));
             if !LXStamper::stamp_valid(stamp, min_cost, &workblock) {
-                log("[channel] SEND rejected: stamp does not meet required cost",
-                    LOG_WARNING, false, false);
+                // Name the pre-parity stamper explicitly. Before LXStamper was
+                // brought back in line with LXMF's Python implementation it
+                // built the workblock as a single iterated digest, so an old
+                // client's stamp fails here for a reason that has nothing to do
+                // with its cost — and "does not meet required cost" would send
+                // whoever is debugging it in entirely the wrong direction.
+                if LXStamper::is_legacy_stamp(&transient_id, stamp, min_cost, STAMP_EXPAND_ROUNDS) {
+                    log("[channel] SEND rejected: client is using the pre-parity stamp workblock \
+                         (iterated digest instead of LXMF HKDF expansion) — it needs updating",
+                        LOG_WARNING, false, false);
+                } else {
+                    log("[channel] SEND rejected: stamp does not meet required cost",
+                        LOG_WARNING, false, false);
+                }
                 return;
             }
             log(format!("[channel] stamp accepted (cost>={min_cost})"),
