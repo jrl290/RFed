@@ -514,7 +514,7 @@ fn main() {
             vec![0u8; LXStamper::STAMP_SIZE]
         } else {
             let (s, _) = LXStamper::generate_stamp(&transient_id, cost, 16);
-            s
+            s.expect("stamp generation must succeed")
         };
         eprintln!("[send] appending stamp (cost={cost})");
         payload.extend_from_slice(&stamp);

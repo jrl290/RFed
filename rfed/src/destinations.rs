@@ -3848,6 +3848,7 @@ mod wire_format_tests {
         let transient_id = identity::full_hash(&material);
         let workblock = LXStamper::stamp_workblock(&transient_id, STAMP_EXPAND_ROUNDS);
         let (stamp, _value) = LXStamper::generate_stamp(&transient_id, cost, STAMP_EXPAND_ROUNDS);
+        let stamp = stamp.expect("stamp generation must succeed");
         assert_eq!(stamp.len(), LXStamper::STAMP_SIZE, "stamp MUST be STAMP_SIZE bytes");
         assert!(LXStamper::stamp_valid(&stamp, cost, &workblock));
     }
@@ -3862,7 +3863,8 @@ mod wire_format_tests {
         let material: Vec<u8> = channel_hash.iter().chain(inner_blob.iter()).copied().collect();
         let transient_id = identity::full_hash(&material);
         let workblock = LXStamper::stamp_workblock(&transient_id, STAMP_EXPAND_ROUNDS);
-        let (stamp, _) = LXStamper::generate_stamp(&transient_id, cost, STAMP_EXPAND_ROUNDS);
+        let stamp = LXStamper::generate_stamp(&transient_id, cost, STAMP_EXPAND_ROUNDS).0
+            .expect("stamp generation must succeed");
         let min_cost = cost.saturating_sub(flexibility);
         assert!(
             LXStamper::stamp_valid(&stamp, min_cost, &workblock),
@@ -3881,7 +3883,8 @@ mod wire_format_tests {
         let tid_a = identity::full_hash(&mat_a);
         let tid_b = identity::full_hash(&mat_b);
         let wb_b = LXStamper::stamp_workblock(&tid_b, STAMP_EXPAND_ROUNDS);
-        let (stamp_a, _) = LXStamper::generate_stamp(&tid_a, cost, STAMP_EXPAND_ROUNDS);
+        let stamp_a = LXStamper::generate_stamp(&tid_a, cost, STAMP_EXPAND_ROUNDS).0
+            .expect("stamp generation must succeed");
         assert!(
             !LXStamper::stamp_valid(&stamp_a, cost, &wb_b),
             "stamp from material A MUST NOT validate against workblock B",
