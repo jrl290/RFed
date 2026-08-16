@@ -657,6 +657,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// A distro blob must carry the same message ID on every node.
+    ///
+    /// `handle_message_get` writes the ID as a fixed 16-byte field. Distro
+    /// blobs used to be keyed by a 32-byte full hash, so the ID was truncated
+    /// on the wire: the peer stored the blob under the short ID and advertised
+    /// that, and the origin — holding only the long ID — read the manifest
+    /// entry as a blob it had never seen, pulled it back, and fanned it out to
+    /// every registered device a second time. Every sync round, one duplicate.
+    #[test]
+    fn distro_blob_ids_survive_the_message_get_wire_format() {
+        let base = temp_path("distro_id_roundtrip");
+        std::fs::create_dir_all(&base).expect("create temp dir");
+
+        let distro_hash = vec![0xD1; 16];
+        let blob = b"a distro lxmf message".to_vec();
+        let message_id = crate::distro::distro_message_id(&blob);
+        assert_eq!(
+            message_id.len(), 16,
+            "the MESSAGE_GET wire format has a fixed 16-byte ID field",
+        );
+
+        let make_node = |label: &str| {
+            let dir = base.join(label);
+            let store = Arc::new(Mutex::new(BlobStore::open(dir.join("blobs"), 1024 * 1024)));
+            let distro = Arc::new(Mutex::new(DistroTable::load(dir.join("distro.rmp"))));
+            distro.lock().unwrap().register(
+                distro_hash.clone(), vec![0x01; 16], vec![0x01; 64],
+            );
+            let sync = FedSync::new(
+                Arc::clone(&store),
+                Arc::new(Mutex::new(SubscriptionTable::load(dir.join("subs.rmp")))),
+                distro,
+            );
+            (store, sync)
+        };
+
+        // Origin ingests the blob the way the propagation path does.
+        let (origin_store, mut origin) = make_node("origin");
+        origin_store.lock().unwrap()
+            .store_with_id(&distro_hash, &message_id, &blob)
+            .expect("store distro blob");
+
+        // Peer pulls it across the wire.
+        let (_peer_store, mut peer) = make_node("peer");
+        let wanted = peer.gap_from_peer(origin.local_manifest());
+        assert_eq!(wanted, vec![message_id.clone()], "peer wants the blob");
+        let response = origin.handle_message_get(&wanted);
+        let ingested = peer.ingest_message_get_response(&[0x99; 16], &response);
+        assert_eq!(ingested, vec![(distro_hash.clone(), blob.clone())]);
+
+        // …and offers it straight back. The origin must recognise its own blob,
+        // or it re-ingests and re-fans it.
+        assert!(
+            origin.gap_from_peer(peer.local_manifest()).is_empty(),
+            "the origin already holds this blob — re-pulling it would re-fan it to every device",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn gap_from_peer_ignores_distro_without_devices() {
         let base = temp_path("distro_nogap");

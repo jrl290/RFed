@@ -1138,30 +1138,18 @@ impl LxmfPropagationNode {
                     format!("[distro] intercepted propagated message for {}", hexrep(dest_hash, false)),
                     LOG_NOTICE, false, false,
                 );
-                // Store in BlobStore for FedSync distribution
-                if let Some(ref blob_store) = self.distro_blob_store {
-                    if let Ok(mut store) = blob_store.lock() {
-                        let msg_id = reticulum_rust::identity::full_hash(lxmf_data);
-                        if !store.index.contains_key(&msg_id) {
-                            if let Err(e) = store.store_with_id(dest_hash, &msg_id, lxmf_data) {
-                                log(
-                                    format!("[distro] BlobStore store error: {e}"),
-                                    LOG_WARNING, false, false,
-                                );
-                            } else {
-                                stored += 1;
-                            }
-                        }
-                    }
-                }
+                // Store in BlobStore for FedSync distribution, and decide
+                // whether this is the first time we have seen the message.
+                let first_sight = self.ingest_distro_blob(dest_hash, lxmf_data, &mut stored);
 
-                // Fan out to registered devices immediately.
+                // Fan out to registered devices immediately — but only on
+                // first sight. See `ingest_distro_blob`.
                 //
                 // NEVER REMOVE the snapshot-then-drop. The distro_table lock is
                 // released before distro_fanout does any network work — holding
                 // it across the fan-out wedged /rfed/distro/register in
                 // production (see distro::distro_fanout's doc comment).
-                if let Some(ref dt) = self.distro_table {
+                if let (true, Some(ref dt)) = (first_sight, &self.distro_table) {
                     let devices = match dt.lock() {
                         Ok(table) => table.devices_snapshot(dest_hash),
                         Err(_) => Vec::new(),
@@ -2346,23 +2334,17 @@ impl LxmfPropagationNode {
             }).unwrap_or(false);
 
             if is_distro {
-                // Store in BlobStore for FedSync distribution
-                if let Some(ref blob_store) = self.distro_blob_store {
-                    if let Ok(mut store) = blob_store.lock() {
-                        let msg_id = reticulum_rust::identity::full_hash(lxmf_data);
-                        if !store.index.contains_key(&msg_id) {
-                            if store.store_with_id(dest_hash, &msg_id, lxmf_data).is_ok() {
-                                stored += 1;
-                            }
-                        }
-                    }
-                }
+                // Store in BlobStore for FedSync distribution, and decide
+                // whether this is the first time we have seen the message.
+                let first_sight = self.ingest_distro_blob(dest_hash, lxmf_data, &mut stored);
 
-                // Fan out to registered devices.
+                // Fan out to registered devices, on first sight only. Peers
+                // re-offer the same message on every sync round; without this
+                // gate each round delivered it to the devices again.
                 //
                 // NEVER REMOVE the snapshot-then-drop — see the peer-sync path
                 // above and distro::distro_fanout's doc comment.
-                if let Some(ref dt) = self.distro_table {
+                if let (true, Some(ref dt)) = (first_sight, &self.distro_table) {
                     let devices = match dt.lock() {
                         Ok(table) => table.devices_snapshot(dest_hash),
                         Err(_) => Vec::new(),
@@ -2412,6 +2394,57 @@ impl LxmfPropagationNode {
                 ),
                 LOG_NOTICE, false, false,
             );
+        }
+    }
+
+    // ── Distro ingest ────────────────────────────────────────────────────────
+
+    /// Persist a distro blob and report whether this node had never seen it.
+    ///
+    /// The BlobStore is the idempotency record for distro delivery. The same
+    /// LXMF message arrives here repeatedly — a client that re-PUTs, and once
+    /// per federation peer that offers it on a sync round — and the fan-out
+    /// used to run on every arrival, so a device with two peers upstream
+    /// received the message once per peer, forever. Storage was already
+    /// deduplicated; delivery now follows the same verdict.
+    ///
+    /// Returns `true` when the caller should fan out. A store that is
+    /// unreachable or full answers `true`: dropping a message is worse than
+    /// delivering it twice, and that is exactly the pre-existing behaviour.
+    fn ingest_distro_blob(
+        &self,
+        dest_hash: &[u8],
+        lxmf_data: &[u8],
+        stored: &mut usize,
+    ) -> bool {
+        let Some(ref blob_store) = self.distro_blob_store else { return true };
+        let Ok(mut store) = blob_store.lock() else { return true };
+
+        let msg_id = crate::distro::distro_message_id(lxmf_data);
+        if store.index.contains_key(&msg_id) {
+            log(
+                format!(
+                    "[distro] already hold blob {} for {} — not re-fanning",
+                    hexrep(&msg_id, false),
+                    hexrep(dest_hash, false),
+                ),
+                LOG_DEBUG, false, false,
+            );
+            return false;
+        }
+
+        match store.store_with_id(dest_hash, &msg_id, lxmf_data) {
+            Ok(_) => {
+                *stored += 1;
+                true
+            }
+            Err(e) => {
+                log(
+                    format!("[distro] BlobStore store error: {e}"),
+                    LOG_WARNING, false, false,
+                );
+                true
+            }
         }
     }
 

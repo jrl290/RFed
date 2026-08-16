@@ -684,6 +684,19 @@ pub fn distro_fanout(
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
+/// Content-addressed BlobStore ID for a distro message.
+///
+/// **Must be 16 bytes.** The FedSync MESSAGE_GET wire format
+/// (`sync::handle_message_get`) writes the message ID as a fixed 16-byte
+/// field, so a longer ID is silently truncated on the way out. A peer then
+/// stores the blob under the truncated ID and advertises *that* in its
+/// manifest; this node, which knows only the long ID, sees an ID it has never
+/// held, pulls the blob back, stores it a second time — and fans it out to
+/// every registered device again. Same bytes in, same ID on every node.
+pub fn distro_message_id(lxmf_data: &[u8]) -> Vec<u8> {
+    reticulum_rust::identity::truncated_hash(lxmf_data)
+}
+
 /// Derive the `lxmf.delivery` destination hash from a 64-byte identity public key.
 ///
 /// Used during registration: the device provides its pubkey, we compute the
