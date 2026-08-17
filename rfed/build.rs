@@ -61,9 +61,28 @@ fn component(env_var: &str, dir: &Path) -> String {
             return value.trim().to_string();
         }
     }
-    // Rebuild the stamp when the checkout moves.
+    // Rebuild the stamp when the checkout moves *or* the working tree changes.
+    //
+    // Watching only .git/HEAD and .git/index is not enough, and the failure is
+    // the dangerous direction. Editing a tracked source file leaves both of
+    // those untouched — the index records staged content, not the working tree
+    // — so cargo would not re-run this script and the binary would keep a stamp
+    // claiming a clean checkout while being built from modified sources. That
+    // is precisely the "deployed tree matching no commit" case the stamp exists
+    // to expose, reproduced inside the detector.
+    //
+    // Cargo walks directories given to rerun-if-changed, so watching each
+    // repository's sources costs one directory scan and makes the dirty flag
+    // track reality. Verified 2026-08-17: with only the .git probes, cleaning an
+    // untracked file left the stamp reading "+dirty" indefinitely.
     for probe in ["HEAD", "index"] {
         let path = dir.join(".git").join(probe);
+        if path.exists() {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
+    for probe in ["src", "Cargo.toml", "Cargo.lock"] {
+        let path = dir.join(probe);
         if path.exists() {
             println!("cargo:rerun-if-changed={}", path.display());
         }
