@@ -56,7 +56,7 @@ mod deferred_queue;
 mod distro;
 mod fanout;
 mod sync;
-mod toml_config;
+mod ini_config;
 mod destinations;
 mod lxmf_propagation;
 mod stream_registry;
@@ -64,7 +64,7 @@ pub mod notify;
 
 use config::{NodeConfig, TierPolicy};
 use destinations::FedNode;
-use toml_config::{IniConfig, CONFIG_FILENAME};
+use ini_config::{IniConfig, CONFIG_FILENAME};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -160,12 +160,13 @@ fn write_status_file(
     let uptime_secs = startup.elapsed().as_secs();
     let name = &guard.config.display_name;
 
-    // MARKER: Prove deployment includes distro code (persists in status.json)
-    let distro_marker = "DISTRO_ENABLED_v1";
-
-    // Commit hash from build environment (set by GitHub Action)
-    let commit_hash = option_env!("GITHUB_SHA").unwrap_or("unknown");
-    let commit_short = if commit_hash.len() >= 7 { &commit_hash[..7] } else { commit_hash };
+    // Provenance in status.json is BUILD_STAMP, nothing else. Two ad-hoc
+    // predecessors used to live here and both are the disease this repo is
+    // curing: a hardcoded "DISTRO_ENABLED_v1" marker (proved only that the
+    // string was compiled in, and would have claimed distro was enabled
+    // forever), and option_env!("GITHUB_SHA") (named only this repo's commit —
+    // none of the three path dependencies — and read "unknown" on every local
+    // build). BUILD_STAMP names all four commits and flags dirty trees.
 
     // Build interfaces JSON array
     let snap = get_state_snapshot();
@@ -215,8 +216,7 @@ fn write_status_file(
                 "    \"rfed.distro.list\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
-                "  \"distro_marker\": \"{}\",\n",
-                "  \"commit_hash\": \"{}\",\n",
+                "  \"build\": \"{}\",\n",
                 "  \"interfaces\": [],\n",
                 "  \"stats\": {{\n",
                 "    \"uptime_secs\": {},\n",
@@ -243,8 +243,7 @@ fn write_status_file(
             hexrep(&guard.distro_unregister_dest.hash, false),
             hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
-            distro_marker,
-            commit_short,
+            BUILD_STAMP,
             uptime_secs, sub_count, blob_count, notify_count,
         )
     } else {
@@ -271,8 +270,7 @@ fn write_status_file(
                 "    \"rfed.distro.list\": \"{}\",\n",
                 "    \"lxmf.propagation\": \"{}\"\n",
                 "  }},\n",
-                "  \"distro_marker\": \"{}\",\n",
-                "  \"commit_hash\": \"{}\",\n",
+                "  \"build\": \"{}\",\n",
                 "  \"interfaces\": [\n",
                 "{}\n",
                 "  ],\n",
@@ -301,8 +299,7 @@ fn write_status_file(
             hexrep(&guard.distro_unregister_dest.hash, false),
             hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
-            distro_marker,
-            commit_short,
+            BUILD_STAMP,
             interfaces_json,
             uptime_secs, sub_count, blob_count, notify_count,
         )
@@ -359,7 +356,7 @@ fn main() -> Result<(), String> {
             eprintln!("[rfed] NOTE: config format has changed to Reticulum's native format.");
             eprintln!("[rfed]       Please migrate your settings from rfed.conf to config.");
         }
-        let _ = fs::write(&conf_path, toml_config::SAMPLE_CONFIG);
+        let _ = fs::write(&conf_path, ini_config::SAMPLE_CONFIG);
         eprintln!("[rfed] Wrote sample config to {}", conf_path.display());
     }
     let cfg = IniConfig::load(&conf_path)?;

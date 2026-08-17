@@ -45,3 +45,9 @@ rfed-nas.status
 
 # Local sample config written by rfed when using the repo root as config dir
 /config
+
+# Runtime status snapshots (per-node output, not source — rfed.status was
+# tracked by accident and froze a May snapshot into the repo)
+rfed.status
+*.status
+run_output.json

@@ -480,14 +480,28 @@ pub struct FedNode {
     // Inbound RNS destinations
     pub node_dest: Destination,
     pub delivery_dest: Destination,
-    /// DEPRECATED — replaced by the four split aspects
-    /// (rfed.channel.{subscribe,unsubscribe,publish,pull}).
-    /// Kept registered for one transition release so in-the-wild Retichat
-    /// builds keep working. Remove after Retichat clients migrate.
-    /// See REFACTOR.md (2026-05-17).
+    /// DEPRECATED in favour of the split aspects
+    /// (rfed.channel.{subscribe,unsubscribe,publish,pull}) — but NOT removable,
+    /// and "one transition release" (REFACTOR.md, 2026-05-17) turned out to be
+    /// wrong. Verified 2026-08-17 by grepping the actual clients:
+    ///
+    ///   - Retichat-js `_subscribeChannel` / `_unsubscribeChannel` send
+    ///     `/rfed/subscribe` over `_rfedRequest(["channel"], ...)` — the legacy
+    ///     aspect — and `sendChannelMessage` publishes over
+    ///     `_ensureRfedLink(["channel"])`.
+    ///   - Retichat-android `RfedChannelClient` builds its primary link with
+    ///     `rfedDestHash(..., listOf("channel"))`.
+    ///
+    /// Removal condition: every client's subscribe/publish paths use the split
+    /// aspects, those releases are actually deployed (web: verify-deploy.sh;
+    /// mobile: shipped builds), and the greps above return nothing. Until all
+    /// three hold, deleting this silently strands deployed clients — the exact
+    /// "fix regressed" experience this repo is trying to stamp out.
     pub channel_dest: Destination,
-    /// DEPRECATED — replaced by rfed.notify.{register,unregister}.
-    /// See REFACTOR.md (2026-05-17).
+    /// DEPRECATED in favour of rfed.notify.{register,unregister} — same story
+    /// as `channel_dest` above: Retichat-android's push wake-up registration
+    /// still targets legacy `rfed.notify` (UserPreferences.kt, verified
+    /// 2026-08-17), so this stays until that client migrates and ships.
     pub notify_dest: Destination,
 
     // ── New split aspects (REFACTOR.md 2026-05-17) ──────────────────
