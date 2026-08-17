@@ -51,7 +51,7 @@ use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC};
 use reticulum_rust::lxstamper::LXStamper;
 use reticulum_rust::packet::Packet;
 use reticulum_rust::transport::{AnnounceHandler, Transport};
-use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
+use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_WARNING};
 
 use crate::announce;
 use crate::blob_store::BlobStore;
@@ -451,6 +451,24 @@ const STAMP_EXPAND_ROUNDS: u32 = 16;
 /// pending blobs plus a `more_pending` flag so the client knows whether to
 /// offer another page.
 const DEFAULT_PULL_PAGE_SIZE: usize = 25;
+
+/// Error codes for `/rfed/pull`, taken verbatim from the reference
+/// implementation (LXMF/LXMPeer.py:24).
+///
+/// PULL is the one rfed request family that authenticates by the caller's
+/// link identity instead of a signed payload (SPEC.md), which makes it
+/// vulnerable to the identify race that commit 325a3c6 removed from every
+/// other endpoint: LINKIDENTIFY is fire-and-forget, so a request can reach
+/// the handler before the identify has. The reference design's answer
+/// (LXMF/LXMRouter.py:1445) is to *reply* with ERROR_NO_IDENTITY so the
+/// client can tear the link down and re-identify on a fresh one
+/// (LXMF/LXMRouter.py:1525). Until 2026-08-17 these handlers returned zero
+/// bytes instead, which the request layer turns into "send no response
+/// packet at all" — the client could not distinguish an unidentified link
+/// from a dead node and burned its full timeout budget in silence.
+const ERROR_NO_IDENTITY: u8 = 0xF0;
+/// Malformed request payload — reference code 0xF4 (LXMF/LXMPeer.py:27).
+const ERROR_INVALID_DATA: u8 = 0xF4;
 
 // ── FedNode ──────────────────────────────────────────────────────────────────
 
@@ -2500,13 +2518,17 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                                          caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
-            None => return Vec::new(),
+            // Reference behaviour, never silence — see ERROR_NO_IDENTITY.
+            None => {
+                log("[rfed] channel.pull from unidentified link — answering ERROR_NO_IDENTITY".to_string(), LOG_WARNING, false, false);
+                return crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY);
+            }
         };
         let channel_hash = match decode_channel_pull_request(data) {
             Ok(hash) => hash,
             Err(e) => {
-                log(format!("[rfed] channel.pull: {e}"), LOG_WARNING, false, false);
-                return encode_pull_response(Vec::new(), false);
+                log(format!("[rfed] channel.pull: {e} — answering ERROR_INVALID_DATA"), LOG_WARNING, false, false);
+                return crate::lxmf_propagation::encode_error(ERROR_INVALID_DATA);
             }
         };
 
@@ -2527,6 +2549,11 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return encode_pull_response(pending, more_pending);
             }
         }
+        // Poisoned lock: process state is broken. Log it — silence here cost
+        // days of diagnosis when it was the *normal* path — but send nothing:
+        // the reference defines no code for internal failure, and a client
+        // timeout is honest about a node in this condition.
+        log("[rfed] pull: node lock poisoned — no response sent".to_string(), LOG_ERROR, false, false);
         Vec::new()
     });
 
@@ -2590,7 +2617,11 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                                   caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
-            None => return Vec::new(),
+            // Reference behaviour, never silence — see ERROR_NO_IDENTITY.
+            None => {
+                log("[rfed] delivery pull from unidentified link — answering ERROR_NO_IDENTITY".to_string(), LOG_WARNING, false, false);
+                return crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY);
+            }
         };
         if let Ok(guard) = pull_node.lock() {
             let page_size = guard.config
@@ -2603,6 +2634,11 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return encode_pull_response(pending, more_pending);
             }
         }
+        // Poisoned lock: process state is broken. Log it — silence here cost
+        // days of diagnosis when it was the *normal* path — but send nothing:
+        // the reference defines no code for internal failure, and a client
+        // timeout is honest about a node in this condition.
+        log("[rfed] pull: node lock poisoned — no response sent".to_string(), LOG_ERROR, false, false);
         Vec::new()
     });
 
@@ -3104,7 +3140,11 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                                         caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
-            None => return Vec::new(),
+            // Reference behaviour, never silence — see ERROR_NO_IDENTITY.
+            None => {
+                log("[rfed] distro pull from unidentified link — answering ERROR_NO_IDENTITY".to_string(), LOG_WARNING, false, false);
+                return crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY);
+            }
         };
         if let Ok(guard) = pull_distro_node.lock() {
             let page_size = guard.config
@@ -3117,6 +3157,11 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return encode_pull_response(pending, more_pending);
             }
         }
+        // Poisoned lock: process state is broken. Log it — silence here cost
+        // days of diagnosis when it was the *normal* path — but send nothing:
+        // the reference defines no code for internal failure, and a client
+        // timeout is honest about a node in this condition.
+        log("[rfed] pull: node lock poisoned — no response sent".to_string(), LOG_ERROR, false, false);
         Vec::new()
     });
 
@@ -3746,6 +3791,54 @@ mod app_links_tests {
 
 #[cfg(test)]
 mod destination_wiring_tests {
+    /// Every /rfed/pull handler must answer an unidentified caller with
+    /// ERROR_NO_IDENTITY, per the reference (LXMF/LXMRouter.py:1445).
+    ///
+    /// Until 2026-08-17 all three returned zero bytes, which the request layer
+    /// turns into "send no response packet" — the browser client burned its
+    /// full 43s timeout on every distro pull and the failure was silent on
+    /// both ends. The propagation module got this right from the start
+    /// (lxmf_propagation.rs /get answers 0xF0); pull was the missed sibling —
+    /// a fix applied to one instance and not the class.
+    #[test]
+    fn pull_handlers_answer_unidentified_callers() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs");
+
+        for cb in ["channel_pull_cb", "pull_cb", "pull_distro_cb"] {
+            let start = source
+                .find(&format!("let {cb} = Arc::new"))
+                .unwrap_or_else(|| panic!("{cb} present"));
+            // The caller-check must resolve within the first part of the
+            // closure; a window keeps the assertion local to this handler.
+            let window = &source[start..(start + 1200).min(source.len())];
+            assert!(
+                window.contains("encode_error(ERROR_NO_IDENTITY)"),
+                "{cb} must answer ERROR_NO_IDENTITY for an unidentified \
+                 caller, never return empty bytes (which sends no packet \
+                 at all — LXMF/LXMRouter.py:1445 is the reference)"
+            );
+            assert!(
+                !window.contains("None => return Vec::new()"),
+                "{cb} has regressed to silently dropping unidentified callers"
+            );
+        }
+    }
+
+    /// The error encoding must be a bare msgpack integer — that is what the
+    /// reference emits and what the JS client's numeric-response check parses.
+    #[test]
+    fn pull_error_is_bare_msgpack_integer() {
+        let encoded = crate::lxmf_propagation::encode_error(super::ERROR_NO_IDENTITY);
+        // msgpack uint8 0xF0 encodes as [0xcc, 0xf0]
+        assert_eq!(encoded, vec![0xcc, 0xf0]);
+        let decoded: u64 = rmp_serde::from_slice(&encoded).expect("valid msgpack");
+        assert_eq!(decoded, 0xF0);
+    }
+
     #[test]
     fn channel_pull_and_legacy_delivery_pull_remain_wired() {
         let source = std::fs::read_to_string(concat!(

@@ -354,6 +354,28 @@ Drain is destructive on the server side — once a page has been returned
 those blobs are gone from this node and will only re-arrive via fanout
 from another session or sync from the origin.
 
+**PULL error responses.** PULL is the one rfed request family authenticated
+by the caller's **link identity** rather than a signed payload, which exposes
+it to the LINKIDENTIFY race: identify is fire-and-forget, so a request can
+reach the node before the identify has (the race that moved every other
+endpoint to signed payloads in the first place). Error handling therefore
+follows the reference LXMF Propagation protocol exactly:
+
+- Unidentified caller → response is a bare msgpack integer `0xF0`
+  (`ERROR_NO_IDENTITY`, LXMF/LXMPeer.py) — **never silence**. A node must
+  not answer an unidentified PULL by sending nothing: the client cannot
+  distinguish that from a dead node and burns its full timeout budget.
+  (rfed did exactly this until 2026-08-17.)
+- Malformed payload (channel-scoped PULL only) → `0xF4` (`ERROR_INVALID_DATA`).
+- Client reaction, per LXMF/LXMRouter.py `message_list_response`: on `0xF0`
+  or `0xF1`, **tear the link down** and re-identify on a fresh link at the
+  next attempt. No in-place retry.
+
+Success responses remain the `[[pairs...], more_pending]` array, so a client
+distinguishes refusal from success by type: integer = error code, array =
+page. This matches how the propagation `/get` path already behaves on both
+node and client.
+
 **rfed.notify** (subscriber → node):
 | Path | Caller | Payload | Response |
 |------|--------|---------|----------|

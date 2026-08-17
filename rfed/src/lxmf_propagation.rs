@@ -2386,7 +2386,13 @@ fn encode_value(value: Value) -> Vec<u8> {
 }
 
 /// Encode an error code (0xF0–0xFF) as a msgpack Integer.
-fn encode_error(code: u8) -> Vec<u8> {
+///
+/// Shared with the `/rfed/pull` handlers in destinations.rs: pull is the one
+/// rfed request family that authenticates by link identity (SPEC.md §"PULL
+/// paging"), and the reference implementation answers an unidentified caller
+/// with an error code — LXMF/LXMRouter.py:1445 `return ERROR_NO_IDENTITY` —
+/// rather than staying silent.
+pub(crate) fn encode_error(code: u8) -> Vec<u8> {
     encode_value(Value::Integer((code as i64).into()))
 }
 
