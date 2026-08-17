@@ -2,6 +2,13 @@ name: Build rfed (Linux)
 
 on:
   workflow_dispatch:
+  # A sibling repo's CI can ask for a rebuild directly:
+  #   gh api repos/<owner>/RFed-rust/dispatches \
+  #     -f event_type=sibling-updated
+  # This is the mechanism that replaces remembering. Until the sibling repos
+  # send it, the drift is at least detectable — see below.
+  repository_dispatch:
+    types: [sibling-updated]
   push:
     branches: [main, master]
     paths:
@@ -9,10 +16,22 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/build-rfed.yml'
-  # NOTE: rfed depends on sibling repos (Rusticulum, LXMF-rust) via path deps
-  # cloned at build time. Pushes to those repos do NOT trigger this workflow.
-  # To force a rebuild after a sibling-repo fix, run workflow_dispatch from
-  # the Actions tab, or push an empty commit to a path listed above.
+  # NOTE: rfed depends on sibling repos (Rusticulum, LXMF-rust, app-links) via
+  # path deps cloned at build time. Pushes to those repos do NOT trigger this
+  # workflow, and the siblings are cloned at their main-branch HEAD, so a build
+  # triggered for an unrelated rfed change also sweeps in whatever landed there
+  # since the last build. The deployed binary is therefore a function of when CI
+  # last ran, not of any ref.
+  #
+  # That used to be invisible. Every build now compiles the four commit shas
+  # into the binary (rfed/build.rs); `rfed --build` prints them, the startup
+  # banner logs them, the CAPABILITIES response returns them, and
+  # `scripts/check-sibling-drift.sh` turns them into "N commits behind" against
+  # local HEADs. Run that before concluding a fix did not work.
+  #
+  # The trail of "Trigger:" comments below is what this replaced — each one a
+  # rebuild that had to be remembered, with no way to count the ones that were
+  # not.
   # Trigger: pick up Reticulum-rust d54bb61 (TCP shutdown-on-write-error reconnect fix).
 
 permissions:
@@ -34,6 +53,31 @@ jobs:
           ./scripts/bootstrap-sibling-deps.sh \
             --deps-root "${{ github.workspace }}/.." \
             --disable-lxmf-reticulum-default-features
+
+      # Record exactly which sibling commits this build resolved to. Without
+      # this, the image is unattributable: the siblings are cloned at their
+      # main-branch HEAD, so nothing downstream can say what went into it.
+      # build.rs prefers these over its own git lookups.
+      - name: Resolve the sibling commits going into this build
+        id: stamp
+        run: |
+          set -euo pipefail
+          deps="${{ github.workspace }}/.."
+          sha_of() {
+            if [ -d "$1/.git" ]; then
+              git -C "$1" rev-parse --short=12 HEAD
+            else
+              echo unknown
+            fi
+          }
+          {
+            echo "RFED_BUILD_SHA=$(git rev-parse --short=12 HEAD)"
+            echo "RETICULUM_RUST_SHA=$(sha_of "$deps/Reticulum-rust")"
+            echo "LXMF_RUST_SHA=$(sha_of "$deps/LXMF-rust")"
+            echo "APP_LINKS_SHA=$(sha_of "$deps/app-links")"
+          } | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
+          echo "--- build stamp ---"
+          cat "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -70,6 +114,29 @@ jobs:
           file target/x86_64-unknown-linux-musl/release/rfed
           ldd  target/x86_64-unknown-linux-musl/release/rfed || true
 
+      # Prove the binary can say what it is. A stamp that silently degraded to
+      # "unknown" would leave us back where we started, unable to tell what is
+      # running on a node, so fail the build instead of shipping it.
+      - name: Verify the build stamp
+        run: |
+          set -euo pipefail
+          stamp="$(./target/x86_64-unknown-linux-musl/release/rfed --build | tail -1)"
+          echo "$stamp"
+          for component in rfed reticulum lxmf app_links; do
+            case "$stamp" in
+              *"${component}=unknown"*)
+                echo "::error::${component} did not resolve to a commit — the image would be unattributable"
+                exit 1 ;;
+              *"${component}=+dirty"*|*"${component}=unknown+dirty"*)
+                echo "::error::${component} is dirty in CI, which should be impossible"
+                exit 1 ;;
+              *"${component}="*) ;;
+              *)
+                echo "::error::${component} missing from the build stamp"
+                exit 1 ;;
+            esac
+          done
+
       - name: Upload binary as artifact
         uses: actions/upload-artifact@v4
         with:
@@ -96,6 +163,24 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/rfed:latest
             ghcr.io/${{ github.repository_owner }}/rfed:${{ github.sha }}
+          # `:latest` alone cannot tell you what a node is running, and the
+          # `:${{ github.sha }}` tag only identifies *this* repo — not the three
+          # path dependencies compiled into the binary. Label all four so the
+          # registry can answer it without pulling the image.
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            com.retichat.rfed.sha=${{ steps.stamp.outputs.RFED_BUILD_SHA }}
+            com.retichat.reticulum_rust.sha=${{ steps.stamp.outputs.RETICULUM_RUST_SHA }}
+            com.retichat.lxmf_rust.sha=${{ steps.stamp.outputs.LXMF_RUST_SHA }}
+            com.retichat.app_links.sha=${{ steps.stamp.outputs.APP_LINKS_SHA }}
 
       - name: Show image digest
-        run: echo "Pushed ghcr.io/${{ github.repository_owner }}/rfed:latest"
+        run: |
+          echo "Pushed ghcr.io/${{ github.repository_owner }}/rfed:latest"
+          echo "  rfed          ${{ steps.stamp.outputs.RFED_BUILD_SHA }}"
+          echo "  reticulum_rust ${{ steps.stamp.outputs.RETICULUM_RUST_SHA }}"
+          echo "  lxmf_rust     ${{ steps.stamp.outputs.LXMF_RUST_SHA }}"
+          echo "  app_links     ${{ steps.stamp.outputs.APP_LINKS_SHA }}"
+          echo
+          echo "On the node:   docker run --rm ghcr.io/${{ github.repository_owner }}/rfed:latest --build"
+          echo "Locally:       ./scripts/check-sibling-drift.sh --stamp \"\$(that output)\""

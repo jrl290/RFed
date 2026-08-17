@@ -2170,6 +2170,16 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             rmpv::Value::String(cfg.display_name.clone().into()),
         ));
 
+        // Which commits this binary was built from — rfed plus its three path
+        // dependencies. CI builds ghcr rfed:latest from sibling repos cloned at
+        // build time and does not rebuild when they change, so a node's actual
+        // contents were previously unknowable from the outside. Now you can ask
+        // it. See rfed/build.rs and scripts/check-sibling-drift.sh.
+        caps.push((
+            rmpv::Value::String("build".into()),
+            rmpv::Value::String(crate::BUILD_STAMP.into()),
+        ));
+
         // Feature flags — reflects what this node has enabled.
         caps.push((
             rmpv::Value::String("subscription".into()),

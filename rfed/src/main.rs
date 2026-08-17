@@ -68,6 +68,12 @@ use toml_config::{IniConfig, CONFIG_FILENAME};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Which commits of rfed and its three path dependencies this binary was built
+/// from — see `build.rs`. Logged at startup and returned in the CAPABILITIES
+/// response, so "which rfed is actually running on that node?" has an answer
+/// that does not depend on remembering when CI last ran.
+pub const BUILD_STAMP: &str = env!("RFED_BUILD_STAMP");
+
 // ── CLI helpers ──────────────────────────────────────────────────────────────
 
 fn print_help() {
@@ -80,6 +86,7 @@ using Reticulum's native config format.
 Usage: rfed [OPTIONS]
 
 Options:
+  --build                   Print the commits this binary was built from, and exit
   --config <DIR>            rfed config/storage directory (default: ~/.rfed)
   --identity <FILE>         Path to identity file (default: <config>/identity)
   --name <NAME>             Node display name
@@ -325,6 +332,16 @@ fn main() -> Result<(), String> {
         return Ok(());
     }
 
+    // Print what this binary was built from and exit, without touching a config
+    // directory or the network. This is what makes the deployed build
+    // checkable: `docker run --rm <image> --build` answers "what is on that
+    // node?" and scripts/check-sibling-drift.sh compares it to local HEADs.
+    if has_flag(&args, "--build") {
+        println!("rfed v{VERSION}");
+        println!("{BUILD_STAMP}");
+        return Ok(());
+    }
+
     // ── Config directory ─────────────────────────────────────────────
     let config_dir: PathBuf = arg_value(&args, "--config")
         .map(PathBuf::from)
@@ -531,6 +548,9 @@ fn main() -> Result<(), String> {
         default_stamp_cost.map(|c| c.to_string()).as_deref().unwrap_or("disabled"));
     eprintln!("│  lxmf.propagation: {:<33}│", if lxmf_propagation_enabled { "yes" } else { "no" });
     eprintln!("└──────────────────────────────────────────────────────┘");
+    // Not inside the box: the stamp is longer than 54 columns and truncating the
+    // one line that identifies the build would defeat the point of having it.
+    eprintln!("  build: {BUILD_STAMP}");
 
     // ── Ensure directories exist ─────────────────────────────────────
     for dir in [&config_dir] {
