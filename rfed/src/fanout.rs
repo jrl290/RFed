@@ -19,6 +19,7 @@
 //!   4. Fire registered delivery hooks (notify adapters).
 
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use reticulum_rust::destination::{Destination, DestinationType};
@@ -27,28 +28,124 @@ use reticulum_rust::packet::{Packet, DATA, NONE, HEADER_1, FLAG_UNSET};
 use reticulum_rust::transport::Transport;
 use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
-use crate::notify::HookRegistry;
+use crate::deferred_queue::DeferredQueue;
+use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry};
 use crate::stream_registry::ChannelStreamRegistry;
-use crate::subscription::SubscriptionTable;
 
 /// rfed app name used to compute destination hashes.
 pub const APP_NAME: &str = "rfed";
 
-/// Fanout an inner blob to all subscribers of `channel_dest_hash`.
+/// A channel fan-out that has been fully detached from the `FedNode` mutex.
+///
+/// # Why this type exists
+///
+/// A fan-out performs unbounded network work per subscriber: stream dispatch,
+/// `Identity::recall`, path lookup, and packet dispatch. On this transport a
+/// single subscriber's link establishment measures 7–16 seconds. Any lock held
+/// across the loop is therefore held for minutes, and every request callback
+/// that needs the same lock stalls behind it.
+///
+/// That is not hypothetical. The distro side of it was diagnosed in production
+/// on 2026-08-09 (see `distro::distro_fanout`): `/rfed/distro/register`
+/// callbacks blocked forever on `distro_table.lock()`, never logged
+/// `[REQ] callback completed`, and the browser client hung. The fix there
+/// snapshotted one table. The channel side kept the original shape — the
+/// callers held the **`FedNode` mutex itself**, plus `subscription_table` and
+/// `hook_registry`, across `fanout_blob` — so the same wedge reappeared on
+/// 2026-08-17 from the other direction: `/rfed/subscribe` returned no response
+/// within 26s and the `rfed.distro.register` link never proved, because
+/// `subscribe_cb` and every other handler were waiting on `sub_node.lock()`.
+///
+/// So the contract is enforced by the type instead of by a comment. A
+/// `FanoutPlan` owns its subscriber snapshot and holds `Arc`s rather than
+/// borrows, which means it stays valid after the guard is dropped — and
+/// `FanoutPlan::run` needs no guard at all.
+///
+/// NEVER REMOVE the owned snapshot in favour of borrowing from the `FedNode`
+/// guard. Build the plan under the lock, let the guard drop, then `run`.
+pub struct FanoutPlan {
+    /// `(subscriber_hash, owner_node_hash)` snapshot taken under
+    /// `subscription_table`, which is released before any delivery.
+    pub subscribers: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    /// Per-subscriber deferred-queue limit, resolved from `NodeConfig` under
+    /// the guard so the config need not be reachable during the fan-out.
+    pub deferred_limits: HashMap<Vec<u8>, usize>,
+    pub hook_registry: Arc<Mutex<HookRegistry>>,
+    pub notify_registry: Arc<Mutex<NotifyRegistry>>,
+    pub deferred_queue: Arc<Mutex<DeferredQueue>>,
+    pub channel_streams: Arc<Mutex<ChannelStreamRegistry>>,
+}
+
+impl FanoutPlan {
+    /// Deliver `inner_blob` to every subscriber in the plan, then defer and
+    /// wake whoever could not be reached.
+    ///
+    /// Callers must not hold the `FedNode` mutex here — see the type's docs.
+    pub fn run(&self, channel_dest_hash: &[u8], inner_blob: &[u8]) {
+        let missed = {
+            let hooks = match self.hook_registry.lock() {
+                Ok(h) => h,
+                Err(_) => {
+                    log("[fanout] hook registry poisoned — skipping fanout",
+                        LOG_WARNING, false, false);
+                    return;
+                }
+            };
+            fanout_blob(
+                inner_blob,
+                channel_dest_hash,
+                &self.subscribers,
+                &hooks,
+                Some(&self.channel_streams),
+            )
+        };
+
+        if missed.is_empty() {
+            return;
+        }
+
+        if let Ok(mut deferred) = self.deferred_queue.lock() {
+            for sub_hash in &missed {
+                let limit = self.deferred_limits.get(sub_hash).copied().unwrap_or(0);
+                deferred.enqueue(
+                    sub_hash.clone(),
+                    channel_dest_hash.to_vec(),
+                    inner_blob.to_vec(),
+                    limit,
+                );
+            }
+        }
+
+        // Fire notify wake-ups for deferred subscribers.
+        if let Ok(notify) = self.notify_registry.lock() {
+            for sub_hash in &missed {
+                for reg in notify.get_for_channel(sub_hash, Some(channel_dest_hash)) {
+                    dispatch_notify(reg, None, Some(channel_dest_hash));
+                }
+            }
+        }
+    }
+}
+
+/// Fanout an inner blob to the given subscribers of `channel_dest_hash`.
 ///
 /// Returns the dest hashes of subscribers whose identity was not yet known
 /// to the local Reticulum node (i.e. `Identity::recall` returned `None`).
 /// The caller is responsible for enqueuing those in the deferred delivery
-/// queue and firing notify hooks for them.
+/// queue and firing notify hooks for them — `FanoutPlan::run` does both.
+///
+/// NEVER REMOVE the `subscribers` snapshot parameter in favour of a
+/// `&SubscriptionTable`. Taking the table forced every caller to hold
+/// `subscription_table` — and in practice the whole `FedNode` mutex — across
+/// the delivery loop, which wedged `/rfed/subscribe` in production on
+/// 2026-08-17. See `FanoutPlan`.
 pub fn fanout_blob(
     inner_blob: &[u8],
     channel_dest_hash: &[u8],
-    subscription_table: &SubscriptionTable,
+    subscribers: &[(Vec<u8>, Option<Vec<u8>>)],
     hook_registry: &HookRegistry,
     channel_streams: Option<&Arc<Mutex<ChannelStreamRegistry>>>,
 ) -> Vec<Vec<u8>> {
-    let subscribers = subscription_table.get_subscribers_with_owner(channel_dest_hash);
-
     if subscribers.is_empty() {
         log(
             format!(
@@ -76,7 +173,7 @@ pub fn fanout_blob(
 
     let mut missed: Vec<Vec<u8>> = Vec::new();
 
-    for (sub_hash, owner_hash) in &subscribers {
+    for (sub_hash, owner_hash) in subscribers {
         // Backup subscriptions: suppress delivery while the owner node is reachable.
         // If the owner's path has decayed, fall through and deliver normally.
         if let Some(owner) = owner_hash {

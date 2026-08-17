@@ -526,7 +526,67 @@ pub struct FedNode {
     pub(crate) self_handle: Option<Weak<Mutex<FedNode>>>,
 }
 
+/// Collaborators a distro fan-out needs once the `FedNode` guard is gone.
+///
+/// `distro_fanout` already takes a device snapshot, but its `hooks`,
+/// `propagation_streams`, deferred queue and config were still borrowed out of
+/// the guard, which kept the `FedNode` mutex alive for the whole fan-out. These
+/// are `Arc`s and an owned config, so the guard can be dropped first.
+pub(crate) struct DistroFanoutCtx {
+    pub hook_registry: Arc<Mutex<HookRegistry>>,
+    pub propagation_streams: Arc<Mutex<PropagationStreamRegistry>>,
+    pub deferred_queue: Arc<Mutex<DeferredQueue>>,
+    pub notify_registry: Arc<Mutex<NotifyRegistry>>,
+    pub config: NodeConfig,
+}
+
 impl FedNode {
+    /// The `Arc`s and config a distro fan-out needs after the guard is
+    /// released. See `DistroFanoutCtx`.
+    pub(crate) fn distro_fanout_ctx(&self) -> DistroFanoutCtx {
+        DistroFanoutCtx {
+            hook_registry: Arc::clone(&self.hook_registry),
+            propagation_streams: Arc::clone(&self.propagation_streams),
+            deferred_queue: Arc::clone(&self.deferred_queue),
+            notify_registry: Arc::clone(&self.notify_registry),
+            config: self.config.clone(),
+        }
+    }
+
+    /// Snapshot everything a channel fan-out needs, so the caller can release
+    /// the `FedNode` mutex before any delivery happens.
+    ///
+    /// NEVER REMOVE this in favour of fanning out with the guard still held.
+    /// Delivery does unbounded network work per subscriber (7–16s per link on
+    /// the polled HTTP transport); holding this mutex across it stalls every
+    /// request callback — `subscribe_cb` logs `LOCK-WARN` and the browser
+    /// client times out with `/rfed/subscribe did not respond`. See
+    /// `fanout::FanoutPlan`.
+    pub fn plan_channel_fanout(&self, channel_dest_hash: &[u8]) -> fanout::FanoutPlan {
+        let subscribers = self
+            .subscription_table
+            .lock()
+            .map(|t| t.get_subscribers_with_owner(channel_dest_hash))
+            .unwrap_or_default();
+
+        let deferred_limits = subscribers
+            .iter()
+            .map(|(sub_hash, _)| {
+                let limit = self.config.policy_for(sub_hash).deferred_queue_limit;
+                (sub_hash.clone(), limit)
+            })
+            .collect();
+
+        fanout::FanoutPlan {
+            subscribers,
+            deferred_limits,
+            hook_registry: Arc::clone(&self.hook_registry),
+            notify_registry: Arc::clone(&self.notify_registry),
+            deferred_queue: Arc::clone(&self.deferred_queue),
+            channel_streams: Arc::clone(&self.channel_streams),
+        }
+    }
+
     pub fn new(identity: Identity, config: NodeConfig) -> Result<Self, String> {
         // ── Ensure directories exist ─────────────────────────────────
         for dir in [config.blob_store_dir()] {
@@ -1246,94 +1306,72 @@ fn run_sync_session(
                     // Fanout each newly ingested blob to local subscribers.
                     if !ingested.is_empty() {
                         if let Some(arc) = nw2.as_ref().and_then(|w| w.upgrade()) {
-                            if let Ok(guard) = arc.lock() {
-                                let subs  = guard.subscription_table.lock().ok();
-                                let hooks = guard.hook_registry.lock().ok();
-                                // Snapshot the distro device lists for every
-                                // ingested blob and release distro_table BEFORE
-                                // any fanout.
-                                //
-                                // NEVER REMOVE. distro_fanout does unbounded
-                                // network work per device; holding distro_table
-                                // across it wedged /rfed/distro/register in
-                                // production (see distro::distro_fanout).
-                                let distro_devices: std::collections::HashMap<Vec<u8>, Vec<crate::distro::DistroEntry>> =
-                                    match guard.distro_table.lock() {
-                                        Ok(dtable) => ingested
-                                            .iter()
-                                            .filter(|(routing_hash, _)| dtable.is_distro(routing_hash))
-                                            .map(|(routing_hash, _)| {
-                                                (routing_hash.clone(), dtable.devices_snapshot(routing_hash))
-                                            })
-                                            .collect(),
-                                        Err(_) => std::collections::HashMap::new(),
-                                    };
-                                if let (Some(subs), Some(hooks)) = (subs, hooks) {
-                                    for (routing_hash, blob) in &ingested {
-                                        // ── Channel fanout ────────────
-                                        let missed = fanout::fanout_blob(
-                                            blob,
-                                            routing_hash,
-                                            &subs,
-                                            &hooks,
-                                            Some(&guard.channel_streams),
-                                        );
+                            // Everything the fan-out needs is snapshotted here,
+                            // under the FedNode mutex, and the guard is dropped
+                            // at the end of this statement. NEVER move delivery
+                            // back inside the lock scope: it does unbounded
+                            // network work per subscriber and per device, and
+                            // holding the mutex across it wedges every request
+                            // callback (/rfed/subscribe on 2026-08-17,
+                            // /rfed/distro/register on 2026-08-09).
+                            let planned = match arc.lock() {
+                                Ok(guard) => {
+                                    let distro_devices: std::collections::HashMap<Vec<u8>, Vec<crate::distro::DistroEntry>> =
+                                        match guard.distro_table.lock() {
+                                            Ok(dtable) => ingested
+                                                .iter()
+                                                .filter(|(routing_hash, _)| dtable.is_distro(routing_hash))
+                                                .map(|(routing_hash, _)| {
+                                                    (routing_hash.clone(), dtable.devices_snapshot(routing_hash))
+                                                })
+                                                .collect(),
+                                            Err(_) => std::collections::HashMap::new(),
+                                        };
+                                    let plans: Vec<fanout::FanoutPlan> = ingested
+                                        .iter()
+                                        .map(|(routing_hash, _)| guard.plan_channel_fanout(routing_hash))
+                                        .collect();
+                                    Some((plans, distro_devices, guard.distro_fanout_ctx()))
+                                }
+                                Err(_) => None,
+                            };
 
-                                        // ── Distro fanout ────────────
-                                        if let Some(devices) = distro_devices.get(routing_hash) {
-                                            {
-                                                let dmissed = crate::distro::distro_fanout(
-                                                    routing_hash,
-                                                    blob,
-                                                    devices,
-                                                    &hooks,
-                                                    Some(&guard.propagation_streams),
-                                                );
-                                                // Enqueue missed distro devices in deferred queue
-                                                if !dmissed.is_empty() {
-                                                    if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                                                        for dev_hash in &dmissed {
-                                                            let limit = guard.config
-                                                                .policy_for(dev_hash)
-                                                                .deferred_queue_limit;
-                                                            deferred.enqueue(
-                                                                dev_hash.clone(),
-                                                                routing_hash.clone(),
-                                                                blob.clone(),
-                                                                limit,
-                                                            );
-                                                        }
-                                                    }
-                                                    // Fire notify wake-ups for deferred devices
-                                                    if let Ok(notify) = guard.notify_registry.lock() {
-                                                        for dev_hash in &dmissed {
-                                                            for reg in notify.get_for_channel(dev_hash, None) {
-                                                                dispatch_notify(reg, None, Some(routing_hash));
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                            if let Some((plans, distro_devices, ctx)) = planned {
+                                for ((routing_hash, blob), plan) in ingested.iter().zip(plans.iter()) {
+                                    // ── Channel fanout ────────────
+                                    plan.run(routing_hash, blob);
 
-                                        if !missed.is_empty() {
-                                            if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                                                for sub_hash in &missed {
-                                                    let limit = guard.config
-                                                        .policy_for(sub_hash)
+                                    // ── Distro fanout ────────────
+                                    if let Some(devices) = distro_devices.get(routing_hash) {
+                                        let dmissed = match ctx.hook_registry.lock() {
+                                            Ok(hooks) => crate::distro::distro_fanout(
+                                                routing_hash,
+                                                blob,
+                                                devices,
+                                                &hooks,
+                                                Some(&ctx.propagation_streams),
+                                            ),
+                                            Err(_) => Vec::new(),
+                                        };
+                                        // Enqueue missed distro devices in deferred queue
+                                        if !dmissed.is_empty() {
+                                            if let Ok(mut deferred) = ctx.deferred_queue.lock() {
+                                                for dev_hash in &dmissed {
+                                                    let limit = ctx.config
+                                                        .policy_for(dev_hash)
                                                         .deferred_queue_limit;
                                                     deferred.enqueue(
-                                                        sub_hash.clone(),
+                                                        dev_hash.clone(),
                                                         routing_hash.clone(),
                                                         blob.clone(),
                                                         limit,
                                                     );
                                                 }
                                             }
-                                            // Fire notify wake-ups for deferred subscribers.
-                                            if let Ok(notify) = guard.notify_registry.lock() {
-                                                for sub_hash in &missed {
-                                                    for reg in notify.get_for_channel(sub_hash, Some(routing_hash)) {
+                                            // Fire notify wake-ups for deferred devices
+                                            if let Ok(notify) = ctx.notify_registry.lock() {
+                                                for dev_hash in &dmissed {
+                                                    for reg in notify.get_for_channel(dev_hash, None) {
                                                         dispatch_notify(reg, None, Some(routing_hash));
                                                     }
                                                 }
@@ -1838,14 +1876,24 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 Some(a) => a,
                 None => return,
             };
-            let guard = match arc.lock() {
-                Ok(g) => g,
+            // Take the collaborators this handler needs and release the FedNode
+            // mutex immediately. The flush below sends one packet per blob —
+            // network work — and this handler runs on the announce path, so
+            // holding the mutex here stalls every request callback exactly the
+            // way the channel fan-out did (see FedNode::plan_channel_fanout).
+            //
+            // NEVER REMOVE the early drop.
+            let (deferred_queue, hook_registry, limit) = match arc.lock() {
+                Ok(guard) => (
+                    Arc::clone(&guard.deferred_queue),
+                    Arc::clone(&guard.hook_registry),
+                    guard.config.policy_for(&sub_id_hash).deferred_queue_limit,
+                ),
                 Err(_) => return,
             };
 
             // Fast-path: skip the lock chain if nothing is queued.
-            let has_pending = guard
-                .deferred_queue
+            let has_pending = deferred_queue
                 .lock()
                 .ok()
                 .map(|q| q.has_pending(&sub_id_hash))
@@ -1855,8 +1903,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             }
 
             // Drain the queue for this subscriber (keyed by identity hash).
-            let pending = guard
-                .deferred_queue
+            let pending = deferred_queue
                 .lock()
                 .ok()
                 .map(|mut q| q.drain(&sub_id_hash))
@@ -1896,8 +1943,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                         false,
                     );
                     // Re-enqueue everything — we'll try again on next announce.
-                    if let Ok(mut q) = guard.deferred_queue.lock() {
-                        let limit = guard.config.policy_for(&sub_id_hash).deferred_queue_limit;
+                    if let Ok(mut q) = deferred_queue.lock() {
                         for pb in pending {
                             q.enqueue(sub_id_hash.clone(), pb.channel_hash, pb.blob, limit);
                         }
@@ -1906,8 +1952,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 }
             };
 
-            let hooks = guard.hook_registry.lock().ok();
-            let limit = guard.config.policy_for(&sub_id_hash).deferred_queue_limit;
+            let hooks = hook_registry.lock().ok();
             let mut failed: Vec<&crate::deferred_queue::PendingBlob> = Vec::new();
             for pb in &pending {
                 // Delivery packet payload: channel_hash(16) | inner_blob
@@ -1965,7 +2010,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             // Re-enqueue the blobs that did not transmit so they survive for the
             // next announce / path-ready trigger instead of being dropped.
             if !failed.is_empty() {
-                if let Ok(mut q) = guard.deferred_queue.lock() {
+                if let Ok(mut q) = deferred_queue.lock() {
                     for pb in failed {
                         q.enqueue(sub_id_hash.clone(), pb.channel_hash.clone(), pb.blob.clone(), limit);
                     }
@@ -2276,48 +2321,26 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
         if let Some(_msg_id) = msg_id_opt {
             // Fanout to subscribers.
-            if let Ok(guard) = send_node.lock() {
-                let subs  = guard.subscription_table.lock().ok();
-                let hooks = guard.hook_registry.lock().ok();
-                if let (Some(subs), Some(hooks)) = (subs, hooks) {
-                    log(
-                        format!("[CHANNEL-RX] channel={} blob_bytes={} → fanning out to {} subscriber(s)",
-                            hexrep(channel_hash, false),
-                            inner_blob.len(),
-                            subs.get_subscribers_with_owner(channel_hash).len(),
-                        ),
-                        LOG_NOTICE, false, false,
-                    );
-                    let missed = fanout::fanout_blob(
-                        inner_blob,
-                        channel_hash,
-                        &subs,
-                        &hooks,
-                        Some(&guard.channel_streams),
-                    );
-                    if !missed.is_empty() {
-                        if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                            for sub_hash in &missed {
-                                let limit = guard.config.policy_for(sub_hash)
-                                    .deferred_queue_limit;
-                                deferred.enqueue(
-                                    sub_hash.clone(),
-                                    channel_hash.to_vec(),
-                                    inner_blob.to_vec(),
-                                    limit,
-                                );
-                            }
-                        }
-                        // Fire notify wake-ups for deferred subscribers.
-                        if let Ok(notify) = guard.notify_registry.lock() {
-                            for sub_hash in &missed {
-                                for reg in notify.get_for_channel(sub_hash, Some(channel_hash)) {
-                                    dispatch_notify(reg, None, Some(channel_hash));
-                                }
-                            }
-                        }
-                    }
-                }
+            //
+            // The plan is built under the FedNode mutex and the guard is
+            // dropped at the end of this statement; `plan.run` then does the
+            // network work with no FedNode lock held. NEVER inline the run
+            // into the lock scope — that wedged /rfed/subscribe on 2026-08-17
+            // (see FedNode::plan_channel_fanout).
+            let plan = match send_node.lock() {
+                Ok(guard) => Some(guard.plan_channel_fanout(channel_hash)),
+                Err(_) => None,
+            };
+            if let Some(plan) = plan {
+                log(
+                    format!("[CHANNEL-RX] channel={} blob_bytes={} → fanning out to {} subscriber(s)",
+                        hexrep(channel_hash, false),
+                        inner_blob.len(),
+                        plan.subscribers.len(),
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                plan.run(channel_hash, inner_blob);
             }
         }
     });
@@ -3509,6 +3532,144 @@ mod stream_config_tests {
         let payload = encode_filter_list(&[&bad]);
         let err = decode_channel_stream_filters(&payload).expect_err("reject short entry");
         assert!(err.contains("!= 16"), "unexpected error: {err}");
+    }
+}
+
+/// The lock-scope invariant for fan-out, enforced rather than documented.
+///
+/// This is the check that was missing twice. On 2026-08-09 `/rfed/distro/register`
+/// callbacks blocked forever because `distro_table` was held across a distro
+/// fan-out; the fix snapshotted that one table and wrote `NEVER REMOVE` above it.
+/// On 2026-08-17 the identical wedge came back from the channel side — the
+/// publish path held the whole `FedNode` mutex plus `subscription_table` and
+/// `hook_registry` across `fanout_blob`, so `/rfed/subscribe` returned nothing
+/// for 26 seconds and the `rfed.distro.register` link never proved. Two
+/// instances of one class, and nothing in the repo could tell the difference
+/// between "fixed" and "fixed here only".
+#[cfg(test)]
+mod fanout_lock_scope_tests {
+    fn destinations_source() -> String {
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs")
+    }
+
+    fn fanout_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fanout.rs"))
+            .expect("read fanout.rs")
+    }
+
+    /// `FanoutPlan` must own its data. A lifetime parameter here would mean it
+    /// borrows out of the `MutexGuard` again, which is precisely the bug.
+    #[test]
+    fn fanout_plan_owns_its_data() {
+        fn assert_detached<T: Send + 'static>() {}
+        assert_detached::<crate::fanout::FanoutPlan>();
+    }
+
+    /// `fanout_blob` must take a subscriber snapshot. Taking `&SubscriptionTable`
+    /// forces every caller to hold the table across the delivery loop.
+    #[test]
+    fn fanout_blob_takes_a_snapshot_not_the_table() {
+        let source = fanout_source();
+        let sig_start = source
+            .find("pub fn fanout_blob(")
+            .expect("fanout_blob present");
+        let sig_end = sig_start
+            + source[sig_start..]
+                .find("\n) -> ")
+                .expect("fanout_blob signature closes");
+        let signature = &source[sig_start..sig_end];
+        assert!(
+            signature.contains("subscribers: &[(Vec<u8>, Option<Vec<u8>>)]"),
+            "fanout_blob must take a snapshot of subscribers; taking the \
+             SubscriptionTable makes callers hold it across unbounded network work"
+        );
+        assert!(
+            !signature.contains("SubscriptionTable"),
+            "fanout_blob must not take the SubscriptionTable — see FanoutPlan"
+        );
+    }
+
+    /// Delivery must go through `FanoutPlan::run`, which needs no `FedNode`
+    /// guard, and never through `fanout_blob` directly from a lock scope.
+    #[test]
+    fn destinations_deliver_only_through_the_plan() {
+        let source = destinations_source();
+        // This module names the call in its own assertions, so only look at the
+        // code above it.
+        let tests_start = source
+            .find("mod fanout_lock_scope_tests")
+            .expect("this module is in this file");
+        assert!(
+            !source[..tests_start].contains("fanout::fanout_blob("),
+            "destinations.rs must not call fanout_blob directly — build a \
+             FanoutPlan under the lock, drop the guard, then plan.run()"
+        );
+    }
+
+    /// The publish path's guard must not outlive the statement that builds the
+    /// plan. Asserting the exact shape is deliberate: if someone restructures
+    /// this to hold the guard across `plan.run`, the shape disappears and this
+    /// test says why.
+    #[test]
+    fn publish_path_drops_the_guard_before_delivering() {
+        let source = destinations_source();
+        let start = source
+            .find("let ingest_send:")
+            .expect("channel SEND ingest closure present");
+        let end = start
+            + source[start..]
+                .find("let packet_cb:")
+                .expect("packet_cb follows the ingest closure");
+        let fragment = &source[start..end];
+
+        assert!(
+            fragment.contains("Ok(guard) => Some(guard.plan_channel_fanout(channel_hash)),"),
+            "the channel SEND path must snapshot the fan-out inside a `let` \
+             statement so the FedNode guard is dropped at its end"
+        );
+        assert!(
+            fragment.contains("plan.run(channel_hash, inner_blob);"),
+            "the channel SEND path must deliver via FanoutPlan::run"
+        );
+        // Anything reached through `guard.` after the plan exists is work done
+        // while the mutex is still held.
+        let plan_built = fragment
+            .find("guard.plan_channel_fanout(channel_hash)")
+            .expect("plan is built");
+        assert!(
+            !fragment[plan_built + 1..].contains("guard."),
+            "nothing may touch the FedNode guard after the fan-out plan is \
+             built — that is the wedge from 2026-08-17"
+        );
+    }
+
+    /// The deferred-flush announce handler sends one packet per queued blob.
+    /// It must take its collaborators and let the guard go first.
+    #[test]
+    fn deferred_flush_drops_the_guard_before_sending() {
+        let source = destinations_source();
+        let start = source
+            .find("aspect_filter: Some(format!(\"{APP_NAME}.delivery\")),")
+            .expect("rfed.delivery announce handler present");
+        let end = start
+            + source[start..]
+                .find("fn wire_node_destination(")
+                .expect("wire_node_destination follows the delivery handler");
+        let fragment = &source[start..end];
+
+        assert!(
+            fragment.contains("let (deferred_queue, hook_registry, limit) = match arc.lock()"),
+            "the deferred flush must snapshot its collaborators and release the \
+             FedNode mutex before sending"
+        );
+        assert!(
+            !fragment.contains("guard.deferred_queue.lock()"),
+            "the deferred flush must not reach through a live FedNode guard"
+        );
     }
 }
 
