@@ -336,14 +336,14 @@ multi-hop routed).
 | Destination | Path | Caller | Payload | Response |
 |-------------|------|--------|---------|----------|
 | `rfed.distro.register` | `/rfed/distro/register` | Device | `msgpack [bin(64) device_pubkey, bin(64) distro_pubkey, bin(64) sig(device_pubkey)]` | `msgpack bool` |
-| `rfed.distro.register` | `/rfed/pull` | Device | *(empty — caller authenticated by link identity)* | `msgpack [ [[bin(16) distro_hash, bin blob], …], bool more_pending ]` |
+| `rfed.distro.register` | `/rfed/pull` | Device | `msgpack nil` (packed `None`, `0xc0` — a request with no data is still one msgpack value; zero bytes is malformed and unparseable). Caller authenticated by link identity | `msgpack [ [[bin(16) distro_hash, bin blob], …], bool more_pending ]` |
 | `rfed.distro.unregister` | `/rfed/distro/unregister` | Device | `msgpack [bin(64) device_pubkey, bin(64) distro_pubkey, bin(64) sig(device_pubkey)]` | `msgpack bool` |
 | `rfed.distro.list` | `/rfed/distro/list` | Device | `msgpack [bin(16) distro_identity_hash, bin(64) distro_pubkey, bin(64) sig(distro_identity_hash)]` | `msgpack [bin(16) device_lxmf_hash, ...]` |
 
 **rfed.delivery** (live fanout destination + legacy aggregate pull):
 | Path | Caller | Payload | Response |
 |------|--------|---------|----------|
-| `/rfed/pull` | Subscriber | *(empty — caller authenticated by link identity)* | `msgpack [ [[bin(16) channel_hash, bin blob], …], bool more_pending ]` |
+| `/rfed/pull` | Subscriber | `msgpack nil` (packed `None`, `0xc0` — a request with no data is still one msgpack value; zero bytes is malformed and unparseable). Caller authenticated by link identity | `msgpack [ [[bin(16) channel_hash, bin blob], …], bool more_pending ]` |
 
 **PULL paging** (user-initiated; mirrors chat-history "Load earlier
 messages"): each call drains at most one page (`deferred_pull_batch_limit`
@@ -1331,7 +1331,7 @@ link, the client avoids a third LINKREQUEST that the relay might drop.
 
 | Destination | Path | Caller | Payload | Response |
 |-------------|------|--------|---------|----------|
-| `rfed.distro.register` | `/rfed/pull` | Subscriber | *(empty — caller authenticated by link identity)* | `msgpack [ [[bin(16) distro_hash, bin blob], …], bool more_pending ]` |
+| `rfed.distro.register` | `/rfed/pull` | Subscriber | `msgpack nil` (packed `None`, `0xc0` — a request with no data is still one msgpack value; zero bytes is malformed and unparseable). Caller authenticated by link identity | `msgpack [ [[bin(16) distro_hash, bin blob], …], bool more_pending ]` |
 
 The response format is identical to the `rfed.delivery` PULL response.
 The `distro_hash` field contains the distro's `lxmf.delivery` hash
