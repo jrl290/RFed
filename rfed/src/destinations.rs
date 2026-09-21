@@ -4160,12 +4160,31 @@ mod wire_format_tests {
         let mat_b: Vec<u8> = std::iter::repeat(0xBB).take(32).collect();
         let tid_a = identity::full_hash(&mat_a);
         let tid_b = identity::full_hash(&mat_b);
+        let wb_a = LXStamper::stamp_workblock(&tid_a, STAMP_EXPAND_ROUNDS);
         let wb_b = LXStamper::stamp_workblock(&tid_b, STAMP_EXPAND_ROUNDS);
-        let stamp_a = LXStamper::generate_stamp(&tid_a, cost, STAMP_EXPAND_ROUNDS).0
-            .expect("stamp generation must succeed");
+
+        // A single stamp cannot carry this assertion. At cost=4 a stamp made
+        // for A also clears 4 leading zero bits against an UNRELATED workblock
+        // one time in 16, by chance, with nothing wrong — which is how often
+        // the one-stamp form of this test failed. Eight independent stamps all
+        // doing so is 16^-8 (~1 in 4 billion) for a correct implementation,
+        // and certain for one that ignores the workblock.
+        const TRIALS: usize = 8;
+        let mut valid_against_b = 0;
+        for _ in 0..TRIALS {
+            let stamp_a = LXStamper::generate_stamp(&tid_a, cost, STAMP_EXPAND_ROUNDS).0
+                .expect("stamp generation must succeed");
+            assert!(
+                LXStamper::stamp_valid(&stamp_a, cost, &wb_a),
+                "a stamp MUST validate against the workblock it was made for",
+            );
+            if LXStamper::stamp_valid(&stamp_a, cost, &wb_b) {
+                valid_against_b += 1;
+            }
+        }
         assert!(
-            !LXStamper::stamp_valid(&stamp_a, cost, &wb_b),
-            "stamp from material A MUST NOT validate against workblock B",
+            valid_against_b < TRIALS,
+            "every stamp made for material A validated against workblock B — the workblock is not being checked",
         );
     }
 
