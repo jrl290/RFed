@@ -13,10 +13,16 @@
 //!
 //! The node's only job is:
 //!   1. Look up subscribers for the destination channel.
-//!   2. Prefer any active `rfed.channel.stream` links for that subscriber.
-//!   3. Fall back to the legacy `rfed.delivery` packet path when no stream
-//!      session is active (compatibility during migration).
-//!   4. Fire registered delivery hooks (notify adapters).
+//!   2. Prefer any bound `rfed.link` session for that subscriber
+//!      (RFed-spec/Link.md) — a `/delivery` request back down the link the
+//!      client already has open.
+//!   3. Then any active `rfed.channel.stream` link for that subscriber.
+//!   4. Fall back to the legacy `rfed.delivery` packet path when no session
+//!      is active (compatibility during migration).
+//!   5. Fire registered delivery hooks (notify adapters).
+//!
+//! Tiers 2 and 3 are mutually exclusive per subscriber: a client that has
+//! migrated to `rfed.link` must not also receive the legacy copy.
 
 
 use std::collections::HashMap;
@@ -29,6 +35,7 @@ use reticulum_rust::transport::Transport;
 use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::deferred_queue::DeferredQueue;
+use crate::link_session::LinkSessionRegistry;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry};
 use crate::stream_registry::ChannelStreamRegistry;
 
@@ -74,6 +81,8 @@ pub struct FanoutPlan {
     pub notify_registry: Arc<Mutex<NotifyRegistry>>,
     pub deferred_queue: Arc<Mutex<DeferredQueue>>,
     pub channel_streams: Arc<Mutex<ChannelStreamRegistry>>,
+    /// `rfed.link` sessions — tier 1, ahead of `channel_streams`.
+    pub link_sessions: Arc<Mutex<LinkSessionRegistry>>,
 }
 
 impl FanoutPlan {
@@ -97,6 +106,11 @@ impl FanoutPlan {
                 &self.subscribers,
                 &hooks,
                 Some(&self.channel_streams),
+                Some(&PushContext {
+                    link_sessions: Arc::clone(&self.link_sessions),
+                    deferred_queue: Arc::clone(&self.deferred_queue),
+                    deferred_limits: self.deferred_limits.clone(),
+                }),
             )
         };
 
@@ -139,12 +153,25 @@ impl FanoutPlan {
 /// `subscription_table` — and in practice the whole `FedNode` mutex — across
 /// the delivery loop, which wedged `/rfed/subscribe` in production on
 /// 2026-08-17. See `FanoutPlan`.
+/// What an `rfed.link` push needs beyond the blob itself: the sessions to push
+/// over, and somewhere to put the blob when a push is dispatched but never
+/// acknowledged.
+///
+/// Owned `Arc`s and an owned limit map, for the same reason `FanoutPlan` is —
+/// nothing here may borrow from the `FedNode` guard.
+pub struct PushContext {
+    pub link_sessions: Arc<Mutex<LinkSessionRegistry>>,
+    pub deferred_queue: Arc<Mutex<DeferredQueue>>,
+    pub deferred_limits: HashMap<Vec<u8>, usize>,
+}
+
 pub fn fanout_blob(
     inner_blob: &[u8],
     channel_dest_hash: &[u8],
     subscribers: &[(Vec<u8>, Option<Vec<u8>>)],
     hook_registry: &HookRegistry,
     channel_streams: Option<&Arc<Mutex<ChannelStreamRegistry>>>,
+    push: Option<&PushContext>,
 ) -> Vec<Vec<u8>> {
     if subscribers.is_empty() {
         log(
@@ -202,6 +229,61 @@ pub fn fanout_blob(
 
         let mut payload = channel_dest_hash.to_vec();
         payload.extend_from_slice(inner_blob);
+
+        // ── Tier 1: rfed.link session (RFed-spec/Link.md) ────────────
+        let link_result = push.and_then(|ctx| {
+            let mut registry = ctx.link_sessions.lock().ok()?;
+            if !registry.has_channel_session(sub_hash, channel_dest_hash) {
+                // No session — fall through to the next tier without copying
+                // the blob into a failure hook that could never fire.
+                return None;
+            }
+
+            // The client answers this push. If it never does, `on_failed` puts
+            // the blob in the deferred queue and `/channel/pull` becomes the
+            // delivery route — a tier change, not a retry
+            // (DESIGN_PRINCIPLES §3).
+            let limit = ctx.deferred_limits.get(sub_hash).copied().unwrap_or(0);
+            let queue = Arc::clone(&ctx.deferred_queue);
+            let sub = sub_hash.clone();
+            let channel = channel_dest_hash.to_vec();
+            let blob = inner_blob.to_vec();
+            let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                if let Ok(mut deferred) = queue.lock() {
+                    deferred.enqueue(sub.clone(), channel.clone(), blob.clone(), limit);
+                }
+            });
+
+            Some(registry.dispatch_channel(sub_hash, channel_dest_hash, &payload, Some(on_failed)))
+        });
+
+        if let Some(result) = link_result {
+            if result.delivered() {
+                log(
+                    format!(
+                        "[fanout] rfed.link pushed channel {} to subscriber {} on {} link(s)",
+                        hexrep(channel_dest_hash, false),
+                        hexrep(sub_hash, false),
+                        result.sent,
+                    ),
+                    LOG_DEBUG,
+                    false,
+                    false,
+                );
+                hook_registry.on_deliver(sub_hash, inner_blob);
+                continue;
+            }
+            log(
+                format!(
+                    "[fanout] rfed.link push failed for subscriber {} on channel {} — falling through",
+                    hexrep(sub_hash, false),
+                    hexrep(channel_dest_hash, false),
+                ),
+                LOG_WARNING,
+                false,
+                false,
+            );
+        }
 
         if let Some(streams) = channel_streams {
             if let Ok(mut registry) = streams.lock() {

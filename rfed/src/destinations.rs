@@ -108,7 +108,10 @@ fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Str
     Ok((value, subscriber_hash, pubkey))
 }
 
-fn encode_stream_open_response(ok: bool, reason: Option<&str>) -> Vec<u8> {
+/// msgpack `[bool, str|nil]` — the shared "accepted, or here is why not"
+/// envelope. Used by both stream-open responses and `/channel/publish` on
+/// rfed.link (RFed-spec/Link.md).
+fn encode_ok_reason(ok: bool, reason: Option<&str>) -> Vec<u8> {
     let response = rmpv::Value::Array(vec![
         rmpv::Value::Boolean(ok),
         match reason {
@@ -404,6 +407,7 @@ use crate::config::NodeConfig;
 use crate::deferred_queue::{DeferredQueue, PendingBlob};
 use crate::distro::{self, DistroAnnounceStore, DistroTable};
 use crate::fanout;
+use crate::link_session::{paths as link_paths, LinkSessionRegistry};
 use crate::lxmf_propagation::LxmfPropagationNode;
 use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
 use crate::stream_registry::{ChannelStreamRegistry, PropagationStreamRegistry};
@@ -537,8 +541,20 @@ pub struct FedNode {
     pub distro_unregister_dest: Destination,
     pub distro_list_dest: Destination,
 
+    /// The single bidirectional endpoint (RFed-spec/Link.md). Every operation
+    /// above is also reachable here under its `/`-delineated path, and node →
+    /// client pushes travel back over the same link.
+    ///
+    /// Additive: none of the destinations above stop working because this one
+    /// exists, and no deployed client has to move.
+    pub link_dest: Destination,
+
     pub channel_streams: Arc<Mutex<ChannelStreamRegistry>>,
     pub propagation_streams: Arc<Mutex<PropagationStreamRegistry>>,
+    /// `rfed.link` links a client has bound for push. Consulted before the two
+    /// stream registries above — a migrated client must not also receive the
+    /// legacy copy.
+    pub link_sessions: Arc<Mutex<LinkSessionRegistry>>,
 
     /// Active outbound sync links keyed by peer destination hash.
     /// Pruned each tick_sync — dead links are removed so a new link can be
@@ -567,6 +583,7 @@ pub struct FedNode {
 pub(crate) struct DistroFanoutCtx {
     pub hook_registry: Arc<Mutex<HookRegistry>>,
     pub propagation_streams: Arc<Mutex<PropagationStreamRegistry>>,
+    pub link_sessions: Arc<Mutex<LinkSessionRegistry>>,
     pub deferred_queue: Arc<Mutex<DeferredQueue>>,
     pub notify_registry: Arc<Mutex<NotifyRegistry>>,
     pub config: NodeConfig,
@@ -579,6 +596,7 @@ impl FedNode {
         DistroFanoutCtx {
             hook_registry: Arc::clone(&self.hook_registry),
             propagation_streams: Arc::clone(&self.propagation_streams),
+            link_sessions: Arc::clone(&self.link_sessions),
             deferred_queue: Arc::clone(&self.deferred_queue),
             notify_registry: Arc::clone(&self.notify_registry),
             config: self.config.clone(),
@@ -616,6 +634,7 @@ impl FedNode {
             notify_registry: Arc::clone(&self.notify_registry),
             deferred_queue: Arc::clone(&self.deferred_queue),
             channel_streams: Arc::clone(&self.channel_streams),
+            link_sessions: Arc::clone(&self.link_sessions),
         }
     }
 
@@ -658,6 +677,7 @@ impl FedNode {
         )));
         let channel_streams = Arc::new(Mutex::new(ChannelStreamRegistry::default()));
         let propagation_streams = Arc::new(Mutex::new(PropagationStreamRegistry::default()));
+        let link_sessions = Arc::new(Mutex::new(LinkSessionRegistry::default()));
 
         let mut fed_sync = FedSync::new(
             Arc::clone(&blob_store),
@@ -730,6 +750,11 @@ impl FedNode {
         let distro_unregister_dest = mk_inbound(vec!["distro".into(), "unregister".into()])?;
         let distro_list_dest       = mk_inbound(vec!["distro".into(), "list".into()])?;
 
+        // ── rfed.link (RFed-spec/Link.md) ────────────────────────────
+        // One destination, one link, every operation — the aspect chain each
+        // destination above encodes on the wire becomes a request path here.
+        let link_dest = mk_inbound(vec!["link".into()])?;
+
         if let Ok(mut s) = sync.lock() {
             s.set_local_node_hash(node_dest.hash.clone());
         }
@@ -747,6 +772,7 @@ impl FedNode {
             deferred_queue,
             channel_streams,
             propagation_streams,
+            link_sessions,
             lxmf_propagation: None,
             node_dest,
             delivery_dest,
@@ -763,6 +789,7 @@ impl FedNode {
             distro_register_dest,
             distro_unregister_dest,
             distro_list_dest,
+            link_dest,
             sync_links: HashMap::new(),
             pending_backup_pushes: Arc::new(Mutex::new(Vec::new())),
             selected_backups: Vec::new(),
@@ -816,6 +843,12 @@ impl FedNode {
         let _ = self.notify_unregister_dest.announce(None, false, None, None, true);
         let _ = self.distro_unregister_dest.announce(None, false, None, None, true);
         let _ = self.distro_list_dest.announce(None, false, None, None, true);
+        // rfed.link carries the node app_data because it carries
+        // `/channel/publish`: a client that has learned only this destination
+        // must still be able to read the stamp policy before its first send,
+        // exactly as one that learned rfed.channel.publish can.
+        self.link_dest.set_default_app_data(Some(app_data.clone()));
+        let _ = self.link_dest.announce(Some(&app_data), false, None, None, true);
         self.replay_distro_announces();
     }
 
@@ -884,7 +917,10 @@ impl FedNode {
         // the publish destination since that's where SEND lands.
         Transport::publish_destination(self.channel_subscribe_dest.hash.clone(),   svc, None);
         Transport::publish_destination(self.channel_unsubscribe_dest.hash.clone(), svc, None);
-        Transport::publish_destination(self.channel_publish_dest.hash.clone(),     svc, Some(app_data));
+        Transport::publish_destination(self.channel_publish_dest.hash.clone(),     svc, Some(app_data.clone()));
+        // Same refresh cadence as every other service destination: a client
+        // that only knows rfed.link must never have to wait out a stale path.
+        Transport::publish_destination(self.link_dest.hash.clone(),                svc, Some(app_data));
         Transport::publish_destination(self.channel_pull_dest.hash.clone(),        svc, None);
         Transport::publish_destination(self.channel_stream_dest.hash.clone(),      svc, None);
         Transport::publish_destination(self.propagation_stream_dest.hash.clone(),  svc, None);
@@ -1382,6 +1418,7 @@ fn run_sync_session(
                                                 devices,
                                                 &hooks,
                                                 Some(&ctx.propagation_streams),
+                                                Some(&ctx.link_sessions),
                                             ),
                                             Err(_) => Vec::new(),
                                         };
@@ -1810,6 +1847,31 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     wire_notify_destination(&node)?;
     wire_stream_destinations(&node)?;
     wire_distro_destination(&node)?;
+
+    // rfed.link collects handlers from every wire_* function above, so it is
+    // registered exactly once, here, after the last of them has run.
+    //
+    // NEVER move this into a wire_* function. `Transport::register_destination`
+    // stores a **clone** and ignores a second call for a hash it already holds
+    // (Transport::register_destination, Reticulum-rust/src/transport.rs) — an
+    // early registration would publish a destination carrying only the handlers
+    // wired so far, and every later path would answer nothing at all. That is
+    // the silent-drop shape this repo keeps paying for; `link_dest_registered_last`
+    // asserts the ordering.
+    {
+        let guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
+        Transport::register_destination(guard.link_dest.clone());
+        log(
+            format!(
+                "[rfed] rfed.link {} wired — {} request path(s)",
+                hexrep(&guard.link_dest.hash, false),
+                guard.link_dest.request_handlers.len(),
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+    }
 
     // MARKER: Distro destinations wired (proves deployment includes distro code)
     log(
@@ -2261,18 +2323,38 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.node_dest.register_request_handler(
-        OFFER_PATH.to_string(), Some(sync_offer), ALLOW_ALL, None, false,
+        OFFER_PATH.to_string(), Some(sync_offer.clone()), ALLOW_ALL, None, false,
     )?;
     guard.node_dest.register_request_handler(
-        MESSAGE_GET_PATH.to_string(), Some(sync_get), ALLOW_ALL, None, false,
+        MESSAGE_GET_PATH.to_string(), Some(sync_get.clone()), ALLOW_ALL, None, false,
     )?;
     guard.node_dest.register_request_handler(
-        BACKUP_PUSH_PATH.to_string(), Some(backup_push_cb), ALLOW_ALL, None, false,
+        BACKUP_PUSH_PATH.to_string(), Some(backup_push_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.node_dest.register_request_handler(
-        CAPABILITIES_PATH.to_string(), Some(capabilities_cb), ALLOW_ALL, None, false,
+        CAPABILITIES_PATH.to_string(), Some(capabilities_cb.clone()), ALLOW_ALL, None, false,
     )?;
     Transport::register_destination(guard.node_dest.clone());
+
+    // ── Same handlers on rfed.link (RFed-spec/Link.md) ──────────────
+    // Identical callbacks, identical payloads — only the routing differs.
+    // rfed.link is NOT registered with Transport here: every wire_* function
+    // adds handlers to the same destination and `Transport::register_destination`
+    // stores a *clone*, so registering it before the last handler is attached
+    // would publish a destination that answers only the paths wired so far.
+    // enable() makes that one call, last. NEVER move it into a wire_* function.
+    guard.link_dest.register_request_handler(
+        link_paths::NODE_OFFER.to_string(), Some(sync_offer), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::NODE_GET.to_string(), Some(sync_get), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::NODE_BACKUP_PUSH.to_string(), Some(backup_push_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::NODE_CAPABILITIES.to_string(), Some(capabilities_cb), ALLOW_ALL, None, false,
+    )?;
     Ok(())
 }
 
@@ -2302,11 +2384,16 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // The stamp is stripped before storage so peers receive clean blobs.
     // Payloads at or under the link MDU (431 B) arrive as a single DATA
     // packet; anything larger arrives as a Resource. Both land here.
+    // Returns the rejection reason instead of only logging it, so
+    // `/channel/publish` on rfed.link can answer the sender. The packet path
+    // has nowhere to put an answer and keeps dropping silently — that
+    // asymmetry is the whole reason the request form exists
+    // (RFed-spec/Link.md, "/channel/publish — the one behavior change").
     let send_node = Arc::clone(node);
-    let ingest_send: Arc<dyn Fn(&[u8]) + Send + Sync> = Arc::new(move |data: &[u8]| {
+    let ingest_send: Arc<dyn Fn(&[u8]) -> Result<(), &'static str> + Send + Sync> = Arc::new(move |data: &[u8]| {
         if data.len() < 17 {
             log("[channel] malformed SEND packet (too short)", LOG_WARNING, false, false);
-            return;
+            return Err("too_short");
         }
 
         // ── Stamp validation (when configured) ───────────────────────
@@ -2316,7 +2403,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             if data.len() < min_len {
                 log("[channel] SEND rejected: too short to contain stamp",
                     LOG_WARNING, false, false);
-                return;
+                return Err("stamp_too_short");
             }
             let stamp_start = data.len() - LXStamper::STAMP_SIZE;
             let stamp    = &data[stamp_start..];
@@ -2340,11 +2427,11 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                     log("[channel] SEND rejected: client is using the pre-parity stamp workblock \
                          (iterated digest instead of LXMF HKDF expansion) — it needs updating",
                         LOG_WARNING, false, false);
-                } else {
-                    log("[channel] SEND rejected: stamp does not meet required cost",
-                        LOG_WARNING, false, false);
+                    return Err("stamp_legacy");
                 }
-                return;
+                log("[channel] SEND rejected: stamp does not meet required cost",
+                    LOG_WARNING, false, false);
+                return Err("stamp_invalid");
             }
             log(format!("[channel] stamp accepted (cost>={min_cost})"),
                 LOG_DEBUG, false, false);
@@ -2361,36 +2448,55 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             })
         });
 
-        if let Some(_msg_id) = msg_id_opt {
-            // Fanout to subscribers.
-            //
-            // The plan is built under the FedNode mutex and the guard is
-            // dropped at the end of this statement; `plan.run` then does the
-            // network work with no FedNode lock held. NEVER inline the run
-            // into the lock scope — that wedged /rfed/subscribe on 2026-08-17
-            // (see FedNode::plan_channel_fanout).
-            let plan = match send_node.lock() {
-                Ok(guard) => Some(guard.plan_channel_fanout(channel_hash)),
-                Err(_) => None,
-            };
-            if let Some(plan) = plan {
-                log(
-                    format!("[CHANNEL-RX] channel={} blob_bytes={} → fanning out to {} subscriber(s)",
-                        hexrep(channel_hash, false),
-                        inner_blob.len(),
-                        plan.subscribers.len(),
-                    ),
-                    LOG_NOTICE, false, false,
-                );
-                plan.run(channel_hash, inner_blob);
-            }
+        if msg_id_opt.is_none() {
+            log("[channel] SEND rejected: blob store refused the blob",
+                LOG_WARNING, false, false);
+            return Err("store_failed");
         }
+
+        // Fanout to subscribers.
+        //
+        // The plan is built under the FedNode mutex and the guard is
+        // dropped at the end of this statement; `plan.run` then does the
+        // network work with no FedNode lock held. NEVER inline the run
+        // into the lock scope — that wedged /rfed/subscribe on 2026-08-17
+        // (see FedNode::plan_channel_fanout).
+        let plan = match send_node.lock() {
+            Ok(guard) => Some(guard.plan_channel_fanout(channel_hash)),
+            Err(_) => None,
+        };
+        if let Some(plan) = plan {
+            log(
+                format!("[CHANNEL-RX] channel={} blob_bytes={} → fanning out to {} subscriber(s)",
+                    hexrep(channel_hash, false),
+                    inner_blob.len(),
+                    plan.subscribers.len(),
+                ),
+                LOG_NOTICE, false, false,
+            );
+            plan.run(channel_hash, inner_blob);
+        }
+        Ok(())
     });
 
     let packet_cb: Arc<dyn Fn(&[u8], &Packet) + Send + Sync> = {
         let ingest = Arc::clone(&ingest_send);
-        Arc::new(move |data: &[u8], _packet: &Packet| ingest(data))
+        // The packet form has no response channel: the reason is logged inside
+        // `ingest_send` and there is nowhere else for it to go.
+        Arc::new(move |data: &[u8], _packet: &Packet| { let _ = ingest(data); })
     };
+
+    // PUBLISH — the request form of the same ingest, for rfed.link.
+    // Response: msgpack [bool, str|nil] (RFed-spec/Link.md).
+    let publish_ingest = Arc::clone(&ingest_send);
+    let publish_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                    _caller: Option<&Identity>, _link: Option<&LinkHandle>,
+                                    _timeout: f64| -> Vec<u8> {
+        match publish_ingest(data) {
+            Ok(()) => encode_ok_reason(true, None),
+            Err(reason) => encode_ok_reason(false, Some(reason)),
+        }
+    });
 
     // A link defaults to ACCEPT_NONE, so without this an oversized channel
     // publish is advertised, silently ignored, and never proved — the sender
@@ -2421,7 +2527,9 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                         format!("[channel] SEND arrived as resource ({} bytes)", data.len()),
                         LOG_DEBUG, false, false,
                     );
-                    ingest(&data);
+                    // Resource form, like the packet form, has no response
+                    // channel — the reason is logged inside `ingest_send`.
+                    let _ = ingest(&data);
                 })),
             );
         });
@@ -2572,17 +2680,38 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // Each new destination carries the intent on the wire. Same callbacks,
     // distinct destination hashes. SUBSCRIBE/UNSUBSCRIBE paths are reused
     // since the path string is informational once routed to the right dest.
-    guard.channel_publish_dest.set_packet_callback(Some(packet_cb));
-    guard.channel_publish_dest.set_link_established_callback(Some(channel_link_established));
+    guard.channel_publish_dest.set_packet_callback(Some(packet_cb.clone()));
+    guard.channel_publish_dest.set_link_established_callback(Some(channel_link_established.clone()));
     guard.channel_subscribe_dest.register_request_handler(
-        SUBSCRIBE_PATH.to_string(), Some(subscribe_cb), ALLOW_ALL, None, false,
+        SUBSCRIBE_PATH.to_string(), Some(subscribe_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.channel_unsubscribe_dest.register_request_handler(
-        UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb), ALLOW_ALL, None, false,
+        UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.channel_pull_dest.register_request_handler(
-        PULL_PATH.to_string(), Some(channel_pull_cb), ALLOW_ALL, None, false,
+        PULL_PATH.to_string(), Some(channel_pull_cb.clone()), ALLOW_ALL, None, false,
     )?;
+
+    // ── Same handlers on rfed.link (RFed-spec/Link.md) ──────────────
+    // The link also has to accept publishes as link DATA and as Resources,
+    // because a request is a single packet in this stack and a channel message
+    // routinely exceeds the link MDU. Without the established callback an
+    // oversized publish is advertised, never accepted, and never proved.
+    guard.link_dest.set_packet_callback(Some(packet_cb));
+    guard.link_dest.set_link_established_callback(Some(channel_link_established));
+    guard.link_dest.register_request_handler(
+        link_paths::CHANNEL_SUBSCRIBE.to_string(), Some(subscribe_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::CHANNEL_UNSUBSCRIBE.to_string(), Some(unsubscribe_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::CHANNEL_PULL.to_string(), Some(channel_pull_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::CHANNEL_PUBLISH.to_string(), Some(publish_cb), ALLOW_ALL, None, false,
+    )?;
+
     Transport::register_destination(guard.channel_subscribe_dest.clone());
     Transport::register_destination(guard.channel_unsubscribe_dest.clone());
     Transport::register_destination(guard.channel_publish_dest.clone());
@@ -2758,7 +2887,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         NOTIFY_UNREGISTER_PATH.to_string(), Some(unregister_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.notify_dest.register_request_handler(
-        NOTIFY_CLEAR_PATH.to_string(), Some(clear_cb), ALLOW_ALL, None, false,
+        NOTIFY_CLEAR_PATH.to_string(), Some(clear_cb.clone()), ALLOW_ALL, None, false,
     )?;
     Transport::register_destination(guard.notify_dest.clone());
 
@@ -2772,7 +2901,7 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         link.set_packet_callback(Some(packet_cb_for_reg_link.clone()));
     })));
     guard.notify_register_dest.register_request_handler(
-        NOTIFY_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+        NOTIFY_REGISTER_PATH.to_string(), Some(register_cb.clone()), ALLOW_ALL, None, false,
     )?;
 
     guard.notify_unregister_dest.set_packet_callback(Some(packet_cb.clone()));
@@ -2781,7 +2910,21 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         link.set_packet_callback(Some(packet_cb_for_unreg_link.clone()));
     })));
     guard.notify_unregister_dest.register_request_handler(
-        NOTIFY_UNREGISTER_PATH.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
+        NOTIFY_UNREGISTER_PATH.to_string(), Some(unregister_cb.clone()), ALLOW_ALL, None, false,
+    )?;
+
+    // ── Same handlers on rfed.link (RFed-spec/Link.md) ──────────────
+    // rfed.link carries `/notify/clear` as well: it is a maintenance op with
+    // no split aspect of its own, and stranding it on the legacy destination
+    // would mean a migrated client still has to keep that link alive.
+    guard.link_dest.register_request_handler(
+        link_paths::NOTIFY_REGISTER.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::NOTIFY_UNREGISTER.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::NOTIFY_CLEAR.to_string(), Some(clear_cb), ALLOW_ALL, None, false,
     )?;
 
     Transport::register_destination(guard.notify_register_dest.clone());
@@ -2790,20 +2933,25 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 }
 
 fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
+    // `path` is what tells the two callers apart. On the legacy destination the
+    // request arrives as `/rfed/channel/stream/open`; on rfed.link it arrives
+    // as `/channel/stream/open` and the session belongs to the rfed.link
+    // registry, which fanout consults first. Same payload, same signature
+    // check, different session book.
     let channel_stream_node = Arc::clone(node);
-    let channel_stream_open = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+    let channel_stream_open = Arc::new(move |path: &str, data: &[u8], _req_id: &[u8],
                                              _caller: Option<&Identity>, link: Option<&LinkHandle>,
                                              _timeout: f64| -> Vec<u8> {
         let link = match link {
             Some(link) => link.clone(),
-            None => return encode_stream_open_response(false, Some("no_link")),
+            None => return encode_ok_reason(false, Some("no_link")),
         };
 
         let (value_bytes, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(e) => {
                 log(format!("[rfed] channel.stream/open: {e}"), LOG_WARNING, false, false);
-                return encode_stream_open_response(false, Some("bad_signature"));
+                return encode_ok_reason(false, Some("bad_signature"));
             }
         };
 
@@ -2816,16 +2964,19 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                     false,
                     false,
                 );
-                return encode_stream_open_response(false, Some("bad_channel_config"));
+                return encode_ok_reason(false, Some("bad_channel_config"));
             }
         };
 
-        let (subscriptions, stream_registry) = match channel_stream_node.lock() {
+        let on_rfed_link = path == link_paths::CHANNEL_STREAM_OPEN;
+
+        let (subscriptions, stream_registry, link_registry) = match channel_stream_node.lock() {
             Ok(guard) => (
                 Arc::clone(&guard.subscription_table),
                 Arc::clone(&guard.channel_streams),
+                Arc::clone(&guard.link_sessions),
             ),
-            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+            Err(_) => return encode_ok_reason(false, Some("internal_error")),
         };
 
         let subscribed = subscriptions
@@ -2838,26 +2989,43 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             })
             .unwrap_or(false);
         if !subscribed {
-            return encode_stream_open_response(false, Some("not_subscribed"));
+            return encode_ok_reason(false, Some("not_subscribed"));
         }
 
-        match stream_registry.lock() {
-            Ok(mut registry) => {
-                registry.configure(link.clone(), subscriber_hash.clone(), channel_hashes.clone());
+        if on_rfed_link {
+            match link_registry.lock() {
+                Ok(mut registry) => registry.configure_channels(
+                    link.clone(),
+                    subscriber_hash.clone(),
+                    channel_hashes.clone(),
+                ),
+                Err(_) => return encode_ok_reason(false, Some("internal_error")),
             }
-            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+            let cleanup_registry = Arc::clone(&link_registry);
+            link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
+                if let Ok(mut registry) = cleanup_registry.lock() {
+                    registry.remove(closed_link.link_id().as_slice());
+                }
+            })));
+        } else {
+            match stream_registry.lock() {
+                Ok(mut registry) => {
+                    registry.configure(link.clone(), subscriber_hash.clone(), channel_hashes.clone());
+                }
+                Err(_) => return encode_ok_reason(false, Some("internal_error")),
+            }
+            let cleanup_registry = Arc::clone(&stream_registry);
+            link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
+                if let Ok(mut registry) = cleanup_registry.lock() {
+                    registry.remove(closed_link.link_id().as_slice());
+                }
+            })));
         }
-
-        let cleanup_registry = Arc::clone(&stream_registry);
-        link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
-            if let Ok(mut registry) = cleanup_registry.lock() {
-                registry.remove(closed_link.link_id().as_slice());
-            }
-        })));
 
         log(
             format!(
-                "[rfed] channel.stream/open configured subscriber={} channels={} link={}",
+                "[rfed] {} configured subscriber={} channels={} link={}",
+                path,
                 hexrep(&subscriber_hash, false),
                 channel_hashes.len(),
                 hexrep(&link.link_id(), false),
@@ -2867,73 +3035,92 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             false,
         );
 
-        encode_stream_open_response(true, None)
+        encode_ok_reason(true, None)
     });
 
     let propagation_stream_node = Arc::clone(node);
-    let propagation_stream_open = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+    let propagation_stream_open = Arc::new(move |path: &str, data: &[u8], _req_id: &[u8],
                                                  _caller: Option<&Identity>, link: Option<&LinkHandle>,
                                                  _timeout: f64| -> Vec<u8> {
         let link = match link {
             Some(link) => link.clone(),
-            None => return encode_stream_open_response(false, Some("no_link")),
+            None => return encode_ok_reason(false, Some("no_link")),
         };
 
         let (delivery_hash, _subscriber_hash, pubkey) = match verify_signed_payload(data) {
             Ok(v) => v,
             Err(e) => {
                 log(format!("[rfed] propagation.stream/open: {e}"), LOG_WARNING, false, false);
-                return encode_stream_open_response(false, Some("bad_signature"));
+                return encode_ok_reason(false, Some("bad_signature"));
             }
         };
 
         if delivery_hash.len() != 16 {
-            return encode_stream_open_response(false, Some("bad_delivery_hash"));
+            return encode_ok_reason(false, Some("bad_delivery_hash"));
         }
 
         let expected_delivery_hash = match lxmf_delivery_hash_from_pubkey(&pubkey) {
             Ok(hash) => hash,
             Err(e) => {
                 log(format!("[rfed] propagation.stream/open: {e}"), LOG_WARNING, false, false);
-                return encode_stream_open_response(false, Some("bad_pubkey"));
+                return encode_ok_reason(false, Some("bad_pubkey"));
             }
         };
 
         if expected_delivery_hash != delivery_hash {
-            return encode_stream_open_response(false, Some("delivery_mismatch"));
+            return encode_ok_reason(false, Some("delivery_mismatch"));
         }
 
-        let (propagation_enabled, stream_registry) = match propagation_stream_node.lock() {
+        let on_rfed_link = path == link_paths::PROPAGATION_STREAM_OPEN;
+
+        let (propagation_enabled, stream_registry, link_registry) = match propagation_stream_node.lock() {
             Ok(guard) => (
                 guard.config.lxmf_propagation_enabled,
                 Arc::clone(&guard.propagation_streams),
+                Arc::clone(&guard.link_sessions),
             ),
-            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+            Err(_) => return encode_ok_reason(false, Some("internal_error")),
         };
 
         if !propagation_enabled {
-            return encode_stream_open_response(false, Some("feature_disabled"));
+            return encode_ok_reason(false, Some("feature_disabled"));
         }
 
-        match stream_registry.lock() {
-            Ok(mut registry) => {
-                if let Err(code) = registry.register(link.clone(), delivery_hash.clone()) {
-                    return encode_stream_open_response(false, Some(code));
+        if on_rfed_link {
+            // No `already_open` refusal here, unlike the legacy registry: on
+            // rfed.link the same link also carries the channel binding, so a
+            // second open is reconfiguration of one session, not a duplicate.
+            match link_registry.lock() {
+                Ok(mut registry) => registry.configure_delivery(link.clone(), delivery_hash.clone()),
+                Err(_) => return encode_ok_reason(false, Some("internal_error")),
+            }
+            let cleanup_registry = Arc::clone(&link_registry);
+            link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
+                if let Ok(mut registry) = cleanup_registry.lock() {
+                    registry.remove(closed_link.link_id().as_slice());
                 }
+            })));
+        } else {
+            match stream_registry.lock() {
+                Ok(mut registry) => {
+                    if let Err(code) = registry.register(link.clone(), delivery_hash.clone()) {
+                        return encode_ok_reason(false, Some(code));
+                    }
+                }
+                Err(_) => return encode_ok_reason(false, Some("internal_error")),
             }
-            Err(_) => return encode_stream_open_response(false, Some("internal_error")),
+            let cleanup_registry = Arc::clone(&stream_registry);
+            link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
+                if let Ok(mut registry) = cleanup_registry.lock() {
+                    registry.remove(closed_link.link_id().as_slice());
+                }
+            })));
         }
-
-        let cleanup_registry = Arc::clone(&stream_registry);
-        link.set_link_closed_callback(Some(Arc::new(move |closed_link: LinkHandle| {
-            if let Ok(mut registry) = cleanup_registry.lock() {
-                registry.remove(closed_link.link_id().as_slice());
-            }
-        })));
 
         log(
             format!(
-                "[rfed] propagation.stream/open linked delivery={} link={}",
+                "[rfed] {} linked delivery={} link={}",
+                path,
                 hexrep(&delivery_hash, false),
                 hexrep(&link.link_id(), false),
             ),
@@ -2942,24 +3129,43 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             false,
         );
 
-        encode_stream_open_response(true, None)
+        encode_ok_reason(true, None)
     });
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.channel_stream_dest.register_request_handler(
         CHANNEL_STREAM_OPEN_PATH.to_string(),
-        Some(channel_stream_open),
+        Some(channel_stream_open.clone()),
         ALLOW_ALL,
         None,
         false,
     )?;
     guard.propagation_stream_dest.register_request_handler(
         PROPAGATION_STREAM_OPEN_PATH.to_string(),
+        Some(propagation_stream_open.clone()),
+        ALLOW_ALL,
+        None,
+        false,
+    )?;
+
+    // ── Same handlers on rfed.link (RFed-spec/Link.md) ──────────────
+    // These two are what bind a link for push: after either one, the node has
+    // somewhere to send. Both may be opened on the same link.
+    guard.link_dest.register_request_handler(
+        link_paths::CHANNEL_STREAM_OPEN.to_string(),
+        Some(channel_stream_open),
+        ALLOW_ALL,
+        None,
+        false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::PROPAGATION_STREAM_OPEN.to_string(),
         Some(propagation_stream_open),
         ALLOW_ALL,
         None,
         false,
     )?;
+
     Transport::register_destination(guard.channel_stream_dest.clone());
     Transport::register_destination(guard.propagation_stream_dest.clone());
     Ok(())
@@ -3264,22 +3470,42 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
     guard.distro_register_dest.register_request_handler(
-        DISTRO_REGISTER_PATH.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+        DISTRO_REGISTER_PATH.to_string(), Some(register_cb.clone()), ALLOW_ALL, None, false,
     )?;
     // Hosted on distro.register so a client that has already established a link
     // for registration can submit its announce over the same link.
     guard.distro_register_dest.register_request_handler(
-        DISTRO_ANNOUNCE_PATH.to_string(), Some(announce_cb), ALLOW_ALL, None, false,
+        DISTRO_ANNOUNCE_PATH.to_string(), Some(announce_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.distro_register_dest.register_request_handler(
-        PULL_PATH.to_string(), Some(pull_distro_cb), ALLOW_ALL, None, false,
+        PULL_PATH.to_string(), Some(pull_distro_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.distro_unregister_dest.register_request_handler(
-        DISTRO_UNREGISTER_PATH.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
+        DISTRO_UNREGISTER_PATH.to_string(), Some(unregister_cb.clone()), ALLOW_ALL, None, false,
     )?;
     guard.distro_list_dest.register_request_handler(
-        DISTRO_LIST_PATH.to_string(), Some(list_cb), ALLOW_ALL, None, false,
+        DISTRO_LIST_PATH.to_string(), Some(list_cb.clone()), ALLOW_ALL, None, false,
     )?;
+
+    // ── Same handlers on rfed.link (RFed-spec/Link.md) ──────────────
+    // The distro pull moves to `/distro/pull`: on rfed.link the destination no
+    // longer says which pull this is, so the path has to.
+    guard.link_dest.register_request_handler(
+        link_paths::DISTRO_REGISTER.to_string(), Some(register_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::DISTRO_ANNOUNCE.to_string(), Some(announce_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::DISTRO_PULL.to_string(), Some(pull_distro_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::DISTRO_UNREGISTER.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_request_handler(
+        link_paths::DISTRO_LIST.to_string(), Some(list_cb), ALLOW_ALL, None, false,
+    )?;
+
     Transport::register_destination(guard.distro_register_dest.clone());
     Transport::register_destination(guard.distro_unregister_dest.clone());
     Transport::register_destination(guard.distro_list_dest.clone());
@@ -3554,6 +3780,49 @@ mod hash_tests {
             );
         }
     }
+
+    // ── rfed.link (RFed-spec/Link.md) ─────────────────────────────────────
+    //
+    // One destination replaces every one above as a *routing* target, so its
+    // hash is the single address a migrated client resolves. It is pinned for
+    // exactly the same reason as the others: a client computes it from the
+    // node identity, and a change in the aspect string strands every client
+    // that already knows the old value.
+
+    #[test]
+    fn rfed_link_hash_is_pinned() {
+        assert_eq!(hex(&dest_hash("link")), "6924703824241635d3ffefba668d34f0");
+    }
+
+    #[test]
+    fn rfed_link_is_distinct_from_every_other_destination() {
+        let link = dest_hash("link");
+        for legacy in ["node", "delivery", "channel", "notify"] {
+            assert_ne!(link, dest_hash(legacy), "rfed.link must not collide with rfed.{legacy}");
+        }
+        let split: &[&[&str]] = &[
+            &["channel", "subscribe"],
+            &["channel", "unsubscribe"],
+            &["channel", "publish"],
+            &["channel", "pull"],
+            &["channel", "stream"],
+            &["propagation", "stream"],
+            &["notify",  "register"],
+            &["notify",  "unregister"],
+            &["distro",  "register"],
+            &["distro",  "unregister"],
+            &["distro",  "list"],
+        ];
+        for aspects in split {
+            assert_ne!(
+                link,
+                dest_hash_multi(aspects),
+                "rfed.link must not collide with rfed.{}",
+                aspects.join("."),
+            );
+        }
+        assert_ne!(hex(&link), RNS_PATH_REQUEST_HASH_HEX);
+    }
 }
 
 #[cfg(test)]
@@ -3601,6 +3870,134 @@ mod stream_config_tests {
         let payload = encode_filter_list(&[&bad]);
         let err = decode_channel_stream_filters(&payload).expect_err("reject short entry");
         assert!(err.contains("!= 16"), "unexpected error: {err}");
+    }
+}
+
+/// `rfed.link` is assembled by every `wire_*` function and registered once.
+///
+/// `Transport::register_destination` stores a **clone** of the destination and
+/// silently ignores a second call for a hash it already holds. Registering
+/// `rfed.link` from inside a `wire_*` function would therefore publish whatever
+/// subset of handlers existed at that moment, and every path wired afterwards
+/// would answer nothing — no error, no log, just a client that waits out its
+/// timeout. These tests hold the ordering in place.
+#[cfg(test)]
+mod link_destination_tests {
+    use crate::link_session::paths;
+
+    fn destinations_source() -> String {
+        std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs")
+    }
+
+    /// The registration happens exactly once, and inside `enable()` — which
+    /// runs after the last `wire_*` call.
+    #[test]
+    fn link_dest_registered_once_and_only_from_enable() {
+        let source = destinations_source();
+        // Assembled rather than written out, so this test's own source line
+        // does not count as one of the occurrences it is counting.
+        let needle = format!("Transport::register_destination(guard.{}.clone())", "link_dest");
+        let needle = needle.as_str();
+        assert_eq!(
+            source.matches(needle).count(),
+            1,
+            "rfed.link must be registered with Transport exactly once — a second \
+             call is ignored, so the first one decides which paths answer"
+        );
+
+        let enable_start = source.find("pub fn enable(").expect("enable present");
+        // Every wire_* function is defined after enable() in this file, so the
+        // first one marks the end of enable()'s body for this check.
+        let enable_end = source
+            .find("fn wire_node_destination(")
+            .expect("wire_node_destination present");
+        assert!(enable_start < enable_end, "enable() must precede the wire_* functions");
+        assert!(
+            source[enable_start..enable_end].contains(needle),
+            "rfed.link must be registered from enable(), after every wire_* \
+             function has added its handlers — never from inside one of them"
+        );
+    }
+
+    /// Every client → node path in the spec is actually wired. A path that is
+    /// defined but never registered is a request that vanishes.
+    #[test]
+    fn every_request_path_is_wired() {
+        let source = destinations_source();
+        let request_paths: &[(&str, &str)] = &[
+            ("NODE_OFFER", paths::NODE_OFFER),
+            ("NODE_GET", paths::NODE_GET),
+            ("NODE_BACKUP_PUSH", paths::NODE_BACKUP_PUSH),
+            ("NODE_CAPABILITIES", paths::NODE_CAPABILITIES),
+            ("CHANNEL_SUBSCRIBE", paths::CHANNEL_SUBSCRIBE),
+            ("CHANNEL_UNSUBSCRIBE", paths::CHANNEL_UNSUBSCRIBE),
+            ("CHANNEL_PUBLISH", paths::CHANNEL_PUBLISH),
+            ("CHANNEL_PULL", paths::CHANNEL_PULL),
+            ("CHANNEL_STREAM_OPEN", paths::CHANNEL_STREAM_OPEN),
+            ("PROPAGATION_STREAM_OPEN", paths::PROPAGATION_STREAM_OPEN),
+            ("NOTIFY_REGISTER", paths::NOTIFY_REGISTER),
+            ("NOTIFY_UNREGISTER", paths::NOTIFY_UNREGISTER),
+            ("NOTIFY_CLEAR", paths::NOTIFY_CLEAR),
+            ("DISTRO_REGISTER", paths::DISTRO_REGISTER),
+            ("DISTRO_ANNOUNCE", paths::DISTRO_ANNOUNCE),
+            ("DISTRO_PULL", paths::DISTRO_PULL),
+            ("DISTRO_UNREGISTER", paths::DISTRO_UNREGISTER),
+            ("DISTRO_LIST", paths::DISTRO_LIST),
+        ];
+        for (name, path) in request_paths {
+            assert!(
+                source.contains(&format!("link_paths::{name}.to_string()")),
+                "rfed.link path {path} ({name}) is defined but never registered on link_dest"
+            );
+        }
+    }
+
+    /// The push paths are node → client. Registering one as an inbound handler
+    /// would mean the node answers its own push path, which is never right.
+    #[test]
+    fn push_paths_are_not_wired_as_inbound_handlers() {
+        let source = destinations_source();
+        for name in ["DELIVERY", "LXMF_DELIVERY", "NOTIFY"] {
+            assert!(
+                !source.contains(&format!("link_paths::{name}.to_string()")),
+                "link_paths::{name} is a node → client push path and must not be \
+                 registered as an inbound request handler"
+            );
+        }
+    }
+
+    /// Every legacy destination stays registered. `rfed.link` is additive:
+    /// deleting a legacy registration here strands whichever deployed client
+    /// still uses it, which is the regression this repo keeps re-living.
+    #[test]
+    fn legacy_destinations_remain_registered() {
+        let source = destinations_source();
+        for dest in [
+            "node_dest",
+            "delivery_dest",
+            "channel_dest",
+            "notify_dest",
+            "channel_subscribe_dest",
+            "channel_unsubscribe_dest",
+            "channel_publish_dest",
+            "channel_pull_dest",
+            "channel_stream_dest",
+            "propagation_stream_dest",
+            "notify_register_dest",
+            "notify_unregister_dest",
+            "distro_register_dest",
+            "distro_unregister_dest",
+            "distro_list_dest",
+        ] {
+            assert!(
+                source.contains(&format!("Transport::register_destination(guard.{dest}.clone())")),
+                "{dest} must stay registered — rfed.link is additive, not a cutover"
+            );
+        }
     }
 }
 
@@ -3864,8 +4261,12 @@ mod destination_wiring_tests {
             channel_fragment.contains("guard.channel_pull_dest.register_request_handler("),
             "rfed.channel.pull must keep a request handler wired"
         );
+        // Matches `Some(channel_pull_cb)` and `Some(channel_pull_cb.clone())` —
+        // the same callback is now also registered on rfed.link, which needs
+        // its own clone. What matters is that the channel-scoped handler is
+        // still the one wired here.
         assert!(
-            channel_fragment.contains("PULL_PATH.to_string(), Some(channel_pull_cb)"),
+            channel_fragment.contains("PULL_PATH.to_string(), Some(channel_pull_cb"),
             "rfed.channel.pull must serve /rfed/pull via the new handler"
         );
         assert!(

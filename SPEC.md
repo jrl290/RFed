@@ -310,6 +310,7 @@ In official Reticulum terminology, these are two separate notations:
 | `rfed.distro.register` | `["distro", "register"]` | Distro device registration |
 | `rfed.distro.unregister` | `["distro", "unregister"]` | Distro device removal |
 | `rfed.distro.list` | `["distro", "list"]` | Distro device listing |
+| `rfed.link` | `["link"]` | Every operation above, both directions, over one link |
 
 All destinations use `DestinationType::Single` (asymmetric encryption,
 multi-hop routed).
@@ -382,6 +383,37 @@ node and client.
 | `/rfed/notify/register` | Subscriber | `msgpack string` (32-char hex relay hash) | `msgpack bool` |
 | `/rfed/notify/unregister` | Subscriber | `msgpack string` (32-char hex relay hash) | `msgpack bool` |
 | `/rfed/notify/clear` | Subscriber | *(empty)* | `msgpack bool` |
+
+### `rfed.link` — one destination for all of it
+
+Normative spec: **[RFed-spec/Link.md](../RFed-spec/Link.md)**. Path table in
+code: `rfed/src/link_session.rs::paths`.
+
+Every destination above is also reachable on the single `rfed.link`
+destination, addressed by request path instead of by destination hash. The
+path is the destination's aspect chain with `.` replaced by `/`, plus the
+operation verb when the aspect chain does not already name it —
+`rfed.channel.pull` `/rfed/pull` becomes `/channel/pull`. Payloads and
+responses are byte-identical to the tables above; only the routing differs.
+
+Two things are genuinely new rather than relocated:
+
+- **`/channel/publish` answers.** The legacy publish is a fire-and-forget
+  packet, so a rejected stamp is indistinguishable from a lost one. As a
+  request it responds `msgpack [bool, str|nil]` with `too_short`,
+  `stamp_too_short`, `stamp_invalid`, `stamp_legacy`, or `store_failed`.
+  A publish over the link MDU is still a request — RNS carries it as a request
+  Resource — and is answered the same way. A bare Resource on the link is also
+  ingested, but gets no answer.
+- **Node → client requests.** After `/channel/stream/open` or
+  `/propagation/stream/open` binds the link, the node pushes back over it:
+  `/delivery` (`channel_hash(16) | inner_blob`), `/lxmf/delivery` (packed
+  LXMF), `/notify` (wake map). The client's `msgpack bool` response is the
+  delivery proof; an unanswered push moves the blob to the deferred queue and
+  the client collects it with `/channel/pull`.
+
+`rfed.link` is additive. Every destination above stays registered, announced,
+and answering, and no deployed client has to move.
 
 ---
 

@@ -64,6 +64,7 @@ use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::notify::HookRegistry;
+use crate::link_session::LinkSessionRegistry;
 use crate::stream_registry::PropagationStreamRegistry;
 
 fn now() -> f64 {
@@ -473,6 +474,7 @@ pub fn distro_fanout(
     devices: &[DistroEntry],
     hook_registry: &HookRegistry,
     propagation_streams: Option<&Arc<Mutex<PropagationStreamRegistry>>>,
+    link_sessions: Option<&Arc<Mutex<LinkSessionRegistry>>>,
 ) -> Vec<Vec<u8>> {
     if devices.is_empty() {
         log(
@@ -506,6 +508,30 @@ pub fn distro_fanout(
         // Same format as channel delivery: [ routing_hash(16) | inner_blob ]
         let mut payload = distro_lxmf_hash.to_vec();
         payload.extend_from_slice(lxmf_blob);
+
+        // ── Try the device's rfed.link session (RFed-spec/Link.md) ───
+        // Same `/lxmf/delivery` push a directly-addressed LXMF message takes;
+        // a device does not need a second link because its messages arrive by
+        // way of a distro identity.
+        if let Some(sessions) = link_sessions {
+            if let Ok(mut registry) = sessions.lock() {
+                let result = registry.dispatch_lxmf(&entry.device_lxmf_hash, lxmf_blob, None);
+                if result.delivered() {
+                    log(
+                        format!(
+                            "[distro] rfed.link pushed to device {} on {} link(s)",
+                            hexrep(&entry.device_lxmf_hash, false),
+                            result.sent,
+                        ),
+                        LOG_DEBUG,
+                        false,
+                        false,
+                    );
+                    hook_registry.on_deliver(&entry.device_lxmf_hash, lxmf_blob);
+                    continue;
+                }
+            }
+        }
 
         // ── Try propagation.stream live delivery ─────────────────────
         if let Some(streams) = propagation_streams {

@@ -61,6 +61,7 @@ use rmpv::Value;
 use crate::config::NodeConfig;
 use crate::distro::DistroTable;
 use crate::notify::NotifyRegistry;
+use crate::link_session::LinkSessionRegistry;
 use crate::stream_registry::{PropagationStreamRegistry, StreamDispatchResult};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -339,6 +340,10 @@ pub struct LxmfPropagationNode {
     deferred_queue: Option<Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
     /// Active rfed.propagation.stream sessions keyed by link.
     stream_registry: Arc<Mutex<PropagationStreamRegistry>>,
+    /// `rfed.link` sessions (RFed-spec/Link.md). Tried before
+    /// `stream_registry`: a client that has migrated must not also receive the
+    /// legacy stream copy.
+    link_sessions: Arc<Mutex<LinkSessionRegistry>>,
 
     // ── Configuration ─────────────────────────────────────────────────
     pub stamp_cost: u32,
@@ -391,6 +396,7 @@ impl LxmfPropagationNode {
         config: &NodeConfig,
         registry: Arc<Mutex<NotifyRegistry>>,
         stream_registry: Arc<Mutex<PropagationStreamRegistry>>,
+        link_sessions: Arc<Mutex<LinkSessionRegistry>>,
         distro_table: Option<Arc<Mutex<DistroTable>>>,
         distro_blob_store: Option<Arc<Mutex<crate::blob_store::BlobStore>>>,
         distro_hook_registry: Option<Arc<Mutex<crate::notify::HookRegistry>>>,
@@ -430,6 +436,7 @@ impl LxmfPropagationNode {
             distro_hook_registry,
             deferred_queue,
             stream_registry,
+            link_sessions,
             stamp_cost,
             stamp_flexibility,
             peering_cost: config.peering_cost.unwrap_or(DEFAULT_PEERING_COST),
@@ -1168,6 +1175,7 @@ impl LxmfPropagationNode {
                             &devices,
                             hooks,
                             Some(&self.stream_registry),
+                            Some(&self.link_sessions),
                         );
                         if !missed.is_empty() {
                             log(
@@ -1221,6 +1229,46 @@ impl LxmfPropagationNode {
         }
 
         let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
+
+        // ── rfed.link session first (RFed-spec/Link.md) ──────────────
+        // `/lxmf/delivery` on the link the client already has open. No
+        // `on_failed` hook: an unanswered push here still leaves the message in
+        // the messagestore, where the client's next propagation sync finds it.
+        let link_result = self
+            .link_sessions
+            .lock()
+            .ok()
+            .map(|mut registry| registry.dispatch_lxmf(dest_hash, lxmf_data, None))
+            .unwrap_or_else(StreamDispatchResult::default);
+
+        if link_result.delivered() {
+            log(
+                format!(
+                    "[lxmf.prop] rfed.link pushed recipient {} on {} link(s){}",
+                    hexrep(dest_hash, false),
+                    link_result.sent,
+                    log_suffix,
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+            return LiveDispatchOutcome::Streamed;
+        }
+
+        if link_result.had_sessions() {
+            log(
+                format!(
+                    "[lxmf.prop] rfed.link push failed for recipient {} — falling through{}",
+                    hexrep(dest_hash, false),
+                    log_suffix,
+                ),
+                LOG_WARNING,
+                false,
+                false,
+            );
+        }
+
         let stream_result = self
             .stream_registry
             .lock()

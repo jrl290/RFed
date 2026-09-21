@@ -12,6 +12,8 @@
 //!   rfed.channel.stream      — Live per-channel fanout stream over a persistent Link
 //!   rfed.propagation.stream  — Live LXMF propagation stream over a persistent Link
 //!   rfed.notify    — Notify registration
+//!   rfed.link      — All of the above over one bidirectional link, addressed
+//!                    by `/`-delineated request path (RFed-spec/Link.md)
 //!
 //! Usage:
 //!     rfed [OPTIONS]
@@ -58,6 +60,7 @@ mod fanout;
 mod sync;
 mod ini_config;
 mod destinations;
+mod link_session;
 mod lxmf_propagation;
 mod stream_registry;
 pub mod notify;
@@ -699,6 +702,7 @@ fn main() -> Result<(), String> {
     if lxmf_propagation_enabled {
         let notify_reg = node.lock().map_err(|_| "lock")?.notify_registry.clone();
         let propagation_streams = node.lock().map_err(|_| "lock")?.propagation_streams.clone();
+        let link_sessions = node.lock().map_err(|_| "lock")?.link_sessions.clone();
         let node_config = node.lock().map_err(|_| "lock")?.config.clone();
         let prop_identity = node.lock().map_err(|_| "lock")?.identity.clone();
         let distro_table = node.lock().map_err(|_| "lock")?.distro_table.clone();
@@ -710,6 +714,7 @@ fn main() -> Result<(), String> {
             &node_config,
             notify_reg,
             propagation_streams,
+            link_sessions,
             Some(distro_table),
             Some(blob_store),
             Some(hook_registry),
