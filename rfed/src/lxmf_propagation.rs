@@ -39,7 +39,7 @@
 //! outbound links to send OFFER requests.  The remote responds with which
 //! transient_ids it wants, and we transfer those messages via resource.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -51,7 +51,6 @@ use lxmf_rust::lx_stamper;
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::link::{Link, LinkHandle, MODE_AES256_CBC, RequestReceipt};
-use reticulum_rust::packet::Packet;
 use reticulum_rust::transport::{AnnounceHandler, AnnounceCallback, Transport};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING, LOG_ERROR};
 use rmpv::decode::read_value;
@@ -175,9 +174,9 @@ pub struct PropPeer {
     pub sync_transfer_rate: f64,
 
     /// Transient IDs this peer has already received (or declined).
-    pub handled_ids: Vec<Vec<u8>>,
+    pub handled_ids: IdQueue,
     /// Transient IDs this peer has NOT yet received — drives the OFFER payload.
-    pub unhandled_ids: Vec<Vec<u8>>,
+    pub unhandled_ids: IdQueue,
 
     /// Messages currently being transferred (in-flight guard).
     pub transferring: Option<Vec<Vec<u8>>>,
@@ -216,8 +215,8 @@ impl PropPeer {
             next_sync_attempt: 0.0,
             last_sync_attempt: 0.0,
             sync_transfer_rate: 0.0,
-            handled_ids: Vec::new(),
-            unhandled_ids: Vec::new(),
+            handled_ids: IdQueue::default(),
+            unhandled_ids: IdQueue::default(),
             transferring: None,
             last_offer: Vec::new(),
             link: None,
@@ -300,18 +299,61 @@ impl PropPeer {
     /// Queue a transient_id for delivery to this peer.  Deduplicates against
     /// both the unhandled and handled sets.
     pub fn add_unhandled(&mut self, transient_id: Vec<u8>) {
-        if !self.unhandled_ids.contains(&transient_id) && !self.handled_ids.contains(&transient_id) {
-            self.unhandled_ids.push(transient_id);
+        if !self.handled_ids.contains(&transient_id) {
+            self.unhandled_ids.push_unique(transient_id);
         }
     }
 
     /// Move a transient_id from unhandled → handled (peer accepted or declined it).
     pub fn mark_handled(&mut self, transient_id: &[u8]) {
-        self.unhandled_ids.retain(|id| id.as_slice() != transient_id);
-        if !self.handled_ids.contains(&transient_id.to_vec()) {
-            self.handled_ids.push(transient_id.to_vec());
+        self.unhandled_ids.remove(transient_id);
+        self.handled_ids.push_unique(transient_id.to_vec());
+    }
+}
+
+/// An insertion-ordered set of transient ids with O(log n) insert, remove and
+/// membership.
+///
+/// These were `Vec<Vec<u8>>`, deduplicated with `contains` and pruned with
+/// `retain` — both linear. Every stored message is queued for every peer, so
+/// one store cost `peers x ids` comparisons: measured at 3.6 ms per message
+/// with 20 peers and the production store's ~150,000 messages (release build),
+/// all of it while holding the node lock that `/get` and `/offer` wait on.
+/// Expiry paid the same price per expired message.
+#[derive(Clone, Debug, Default)]
+pub struct IdQueue {
+    order: BTreeMap<u64, Vec<u8>>,
+    index: HashMap<Vec<u8>, u64>,
+    next: u64,
+}
+
+impl IdQueue {
+    /// Append `id` unless it is already present. Returns whether it was added.
+    pub fn push_unique(&mut self, id: Vec<u8>) -> bool {
+        if self.index.contains_key(&id) {
+            return false;
+        }
+        let seq = self.next;
+        self.next += 1;
+        self.index.insert(id.clone(), seq);
+        self.order.insert(seq, id);
+        true
+    }
+
+    pub fn remove(&mut self, id: &[u8]) -> bool {
+        match self.index.remove(id) {
+            Some(seq) => { self.order.remove(&seq); true }
+            None => false,
         }
     }
+
+    pub fn contains(&self, id: &[u8]) -> bool { self.index.contains_key(id) }
+    pub fn len(&self) -> usize { self.index.len() }
+    pub fn is_empty(&self) -> bool { self.index.is_empty() }
+
+    /// Ids in the order they were added.
+    pub fn iter(&self) -> impl Iterator<Item = &Vec<u8>> { self.order.values() }
+    pub fn to_vec(&self) -> Vec<Vec<u8>> { self.iter().cloned().collect() }
 }
 
 // ── LxmfPropagationNode ──────────────────────────────────────────────────────
@@ -499,7 +541,7 @@ impl LxmfPropagationNode {
             OFFER_PATH.to_string(),
             Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
                 if let Some(arc) = weak_offer.upgrade() {
-                    if let Ok(mut node) = arc.lock() {
+                    if let Some(mut node) = lock_node(&arc, "/offer") {
                         return node.handle_offer(path, data, request_id, remote_identity, requested_at);
                     }
                 }
@@ -515,7 +557,7 @@ impl LxmfPropagationNode {
             GET_PATH.to_string(),
             Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
                 if let Some(arc) = weak_get.upgrade() {
-                    if let Ok(mut node) = arc.lock() {
+                    if let Some(mut node) = lock_node(&arc, "/get") {
                         return node.handle_get(path, data, request_id, remote_identity, requested_at);
                     }
                 }
@@ -959,7 +1001,11 @@ impl LxmfPropagationNode {
                 file_data.len(),
                 self.peers.len(),
             ),
-            LOG_NOTICE, false, false,
+            // Per message, so DEBUG: at production ingest rates this one line
+            // filled the 5 MB log every ~11 minutes and rotated the startup
+            // banner and every diagnostic away within twenty. The per-batch
+            // "processed N msgs" summary carries the same counts at NOTICE.
+            LOG_DEBUG, false, false,
         );
 
         Some(transient_id)
@@ -978,8 +1024,8 @@ impl LxmfPropagationNode {
                 let _ = fs::remove_file(&entry.filepath);
             }
             for (_, peer) in self.peers.iter_mut() {
-                peer.handled_ids.retain(|id| id != transient_id);
-                peer.unhandled_ids.retain(|id| id != transient_id);
+                peer.handled_ids.remove(transient_id);
+                peer.unhandled_ids.remove(transient_id);
             }
         }
 
@@ -1016,8 +1062,8 @@ impl LxmfPropagationNode {
                 let _ = fs::remove_file(&entry.filepath);
             }
             for (_, peer) in self.peers.iter_mut() {
-                peer.handled_ids.retain(|id| id != &transient_id);
-                peer.unhandled_ids.retain(|id| id != &transient_id);
+                peer.handled_ids.remove(&transient_id);
+                peer.unhandled_ids.remove(&transient_id);
             }
         }
     }
@@ -1031,10 +1077,10 @@ impl LxmfPropagationNode {
         link.set_packet_callback(Some(Arc::new({
             let weak = weak.clone();
             move |data, packet| {
+                // NOT under the node lock — see `ingest_propagation_batch`.
+                let _ = packet;
                 if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                    if let Ok(mut node) = arc.lock() {
-                        node.on_propagation_packet(data, packet);
-                    }
+                    LxmfPropagationNode::ingest_propagation_batch(&arc, data);
                 }
             }
         })));
@@ -1069,10 +1115,9 @@ impl LxmfPropagationNode {
                     }
                     Err(_) => return,
                 };
+                // NOT under the node lock — see `ingest_propagation_batch`.
                 if let Some(arc) = weak_concluded.as_ref().and_then(|w| w.upgrade()) {
-                    if let Ok(mut node) = arc.lock() {
-                        node.ingest_propagation_bytes(&data);
-                    }
+                    LxmfPropagationNode::ingest_propagation_batch(&arc, &data);
                 }
             })),
         );
@@ -1084,40 +1129,40 @@ impl LxmfPropagationNode {
     //   msgpack Array: [type_marker, [lxmf_payload_1, lxmf_payload_2, ...]]
     // Each lxmf_payload has the destination hash in the first 16 bytes.
 
-    fn on_propagation_packet(&mut self, data: &[u8], _packet: &Packet) {
-        self.ingest_propagation_bytes(data);
-    }
-
-    /// Decode and ingest a propagation payload. Shared between the
-    /// single-packet inbound path (`on_propagation_packet`) and the
-    /// resource-concluded path for multi-segment batch transfers from
-    /// peers/clients. Wire format: msgpack [timebase, [lxmf_data, ...]].
-    fn ingest_propagation_bytes(&mut self, data: &[u8]) {
-        let items = match read_value(&mut Cursor::new(data)) {
-            Ok(Value::Array(a)) => a,
-            _ => {
-                log("[lxmf.prop] malformed packet", LOG_WARNING, false, false);
-                return;
-            }
-        };
-
-        let messages: Vec<Vec<u8>> = match items.get(1) {
-            Some(Value::Array(values)) => values.iter()
-                .filter_map(|v| match v { Value::Binary(b) => Some(b.clone()), _ => None })
-                .collect(),
-            _ => {
-                log("[lxmf.prop] packet missing message array", LOG_DEBUG, false, false);
-                return;
-            }
-        };
-
+    /// Decode and ingest a propagation payload — a client PUT packet or an
+    /// assembled batch Resource from a peer (same wire format for both).
+    ///
+    /// Takes the `Arc`, not `&mut self`, ON PURPOSE. The node mutex is the one
+    /// `/get` and `/offer` wait on, so it is held here only for the one step
+    /// that needs the node — recording a message in the store — and for one
+    /// message at a time. Everything else runs with it released:
+    ///
+    ///   * stamp validation. Each stamp costs a workblock expansion, ~8 ms in a
+    ///     release build, and a peer sync delivers hundreds per batch;
+    ///   * the distro path, which only touches the BlobStore and DistroTable;
+    ///   * live delivery and notify wakes, which are network sends.
+    ///
+    /// NEVER move any of those back under the node lock. This was one
+    /// `&mut self` method called with the lock held for the whole batch. Under
+    /// a sustained ingest of ~30 messages/s in production, `/get` — a client
+    /// asking for its own mail — waited 73 s and then 182 s for a 1-byte
+    /// answer, long after the client had given up, and nothing logged the
+    /// wait. Same class as the FedNode fan-out wedge of 2026-08-17: a lock held
+    /// across work whose duration the holder does not control.
+    /// `ingest_lock_scope_tests` holds this in place.
+    pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8]) {
+        let Some(messages) = decode_propagation_batch(data) else { return };
         if messages.is_empty() {
             return;
         }
 
-        // Validate PN (Propagation Node) stamps on all messages.
-        // Stamps below `min_cost` are rejected; only validated messages proceed.
-        let min_cost = self.stamp_cost.saturating_sub(self.stamp_flexibility);
+        let (min_cost, delivery) = {
+            let Some(node) = lock_node(arc, "ingest (setup)") else { return };
+            (node.stamp_cost.saturating_sub(node.stamp_flexibility), node.delivery_handles())
+        };
+
+        // Validate PN (Propagation Node) stamps on all messages. Stamps below
+        // `min_cost` are rejected; only validated messages proceed.
         let validated = lx_stamper::validate_pn_stamps(&messages, min_cost);
 
         let mut stored = 0usize;
@@ -1125,90 +1170,45 @@ impl LxmfPropagationNode {
         let mut notified = 0usize;
 
         for (_transient_id, lxmf_data, stamp_value, stamp_raw) in &validated {
-            // ── Distro intercept ──────────────────────────────────────
-            // If the destination is a registered distro identity, store the
-            // LXMF blob in BlobStore (for rfed→rfed sync) instead of the
-            // propagation messagestore, and fan out to registered devices.
-            // This prevents distro messages from polluting the lxmd mesh.
             let dest_hash = if lxmf_data.len() >= DESTINATION_LENGTH {
                 &lxmf_data[..DESTINATION_LENGTH]
             } else {
                 &[]
             };
 
-            let is_distro = self.distro_table.as_ref().and_then(|dt| {
-                dt.lock().ok().map(|t| t.is_distro(dest_hash))
-            }).unwrap_or(false);
-
-            if is_distro {
+            // ── Distro intercept ──────────────────────────────────────
+            // If the destination is a registered distro identity, store the
+            // LXMF blob in BlobStore (for rfed→rfed sync) instead of the
+            // propagation messagestore, and fan out to registered devices.
+            // This prevents distro messages from polluting the lxmd mesh.
+            if delivery.is_distro(dest_hash) {
                 log(
                     format!("[distro] intercepted propagated message for {}", hexrep(dest_hash, false)),
                     LOG_NOTICE, false, false,
                 );
-                // Store in BlobStore for FedSync distribution, and decide
-                // whether this is the first time we have seen the message.
-                let first_sight = self.ingest_distro_blob(dest_hash, lxmf_data, &mut stored);
-
                 // Fan out to registered devices immediately — but only on
                 // first sight. See `ingest_distro_blob`.
-                //
-                // NEVER REMOVE the snapshot-then-drop. The distro_table lock is
-                // released before distro_fanout does any network work — holding
-                // it across the fan-out wedged /rfed/distro/register in
-                // production (see distro::distro_fanout's doc comment).
-                if let (true, Some(ref dt)) = (first_sight, &self.distro_table) {
-                    let devices = match dt.lock() {
-                        Ok(table) => table.devices_snapshot(dest_hash),
-                        Err(_) => Vec::new(),
-                    };
-                    if !devices.is_empty() {
-                        let hook_guard = self.distro_hook_registry.as_ref()
-                            .and_then(|h| h.lock().ok());
-                        let default_hooks = crate::notify::HookRegistry::new();
-                        let hooks: &crate::notify::HookRegistry = match &hook_guard {
-                            Some(g) => &**g,
-                            None => &default_hooks,
-                        };
-                        let missed = crate::distro::distro_fanout(
-                            dest_hash,
-                            lxmf_data,
-                            &devices,
-                            hooks,
-                            Some(&self.stream_registry),
-                            Some(&self.link_sessions),
-                        );
-                        if !missed.is_empty() {
-                            log(
-                                format!(
-                                    "[distro] {} device(s) unreachable for distro {} — enqueuing in deferred queue",
-                                    missed.len(),
-                                    hexrep(dest_hash, false),
-                                ),
-                                LOG_NOTICE,
-                                false,
-                                false,
-                            );
-                            enqueue_distro_misses(
-                                self.deferred_queue.as_ref(),
-                                missed,
-                                dest_hash,
-                                lxmf_data,
-                            );
-                        }
-                    }
+                if delivery.ingest_distro_blob(dest_hash, lxmf_data, &mut stored) {
+                    delivery.distro_fanout(dest_hash, lxmf_data);
                 }
-            } else {
-                // ── Normal propagation path ───────────────────────────
-                // Store the message
-                if self.store_message(lxmf_data, *stamp_value, Some(stamp_raw), None).is_some() {
-                    stored += 1;
-                }
+                continue;
+            }
 
-                match self.dispatch_live_or_notify(lxmf_data, "") {
-                    LiveDispatchOutcome::Streamed => streamed += 1,
-                    LiveDispatchOutcome::Notified => notified += 1,
-                    LiveDispatchOutcome::None => {}
-                }
+            // ── Normal propagation path ───────────────────────────────
+            // The only step that needs the node. One message per acquisition,
+            // so a waiting request handler gets in between any two of them.
+            let was_stored = match lock_node(arc, "ingest (store)") {
+                Some(mut node) => node.store_message(lxmf_data, *stamp_value, Some(stamp_raw), None).is_some(),
+                None => return,
+            };
+            if was_stored {
+                stored += 1;
+            }
+
+            match delivery.dispatch_live_or_notify(lxmf_data, "") {
+                LiveDispatchOutcome::Streamed => streamed += 1,
+                LiveDispatchOutcome::Notified => notified += 1,
+                LiveDispatchOutcome::None => {}
             }
         }
 
@@ -1221,6 +1221,132 @@ impl LxmfPropagationNode {
             ),
             LOG_NOTICE, false, false,
         );
+    }
+
+    /// The shared handles delivery works through. Cloning them out is the only
+    /// thing ingest needs the node for besides `store_message`.
+    fn delivery_handles(&self) -> DeliveryHandles {
+        DeliveryHandles {
+            registry: self.registry.clone(),
+            stream_registry: self.stream_registry.clone(),
+            link_sessions: self.link_sessions.clone(),
+            distro_table: self.distro_table.clone(),
+            distro_blob_store: self.distro_blob_store.clone(),
+            distro_hook_registry: self.distro_hook_registry.clone(),
+            deferred_queue: self.deferred_queue.clone(),
+        }
+    }
+}
+
+/// Acquire the propagation node lock, and say so when it was not free.
+///
+/// A request handler that waits here is a client that waits, and until this
+/// existed the wait was invisible: the log showed the request arriving and,
+/// minutes later, the response leaving, with nothing in between. Anything over
+/// a second is reported — enough to stay quiet under ordinary contention and
+/// to speak long before DESIGN_PRINCIPLES §1's five.
+fn lock_node<'a>(
+    arc: &'a Arc<Mutex<LxmfPropagationNode>>,
+    who: &str,
+) -> Option<std::sync::MutexGuard<'a, LxmfPropagationNode>> {
+    let started = std::time::Instant::now();
+    let guard = arc.lock().ok()?;
+    let waited = started.elapsed().as_secs_f64();
+    if waited >= NODE_LOCK_WAIT_WARN_SECS {
+        log(
+            format!("[lxmf.prop] LOCK-WARN {who}: waited {waited:.2}s for the propagation node lock"),
+            LOG_WARNING, false, false,
+        );
+    }
+    Some(guard)
+}
+
+const NODE_LOCK_WAIT_WARN_SECS: f64 = 1.0;
+
+/// `[timebase, [lxmf_payload, ...]]` — the propagation wire format.
+fn decode_propagation_batch(data: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let items = match read_value(&mut Cursor::new(data)) {
+        Ok(Value::Array(a)) => a,
+        _ => {
+            log("[lxmf.prop] malformed packet", LOG_WARNING, false, false);
+            return None;
+        }
+    };
+    match items.get(1) {
+        Some(Value::Array(values)) => Some(
+            values.iter()
+                .filter_map(|v| match v { Value::Binary(b) => Some(b.clone()), _ => None })
+                .collect(),
+        ),
+        _ => {
+            log("[lxmf.prop] packet missing message array", LOG_DEBUG, false, false);
+            None
+        }
+    }
+}
+
+/// Everything message delivery needs that is not the node itself: shared
+/// handles, each with its own lock. Delivery runs on these precisely so that
+/// it never needs — and never holds — the node lock.
+#[derive(Clone)]
+struct DeliveryHandles {
+    registry: Arc<Mutex<NotifyRegistry>>,
+    stream_registry: Arc<Mutex<PropagationStreamRegistry>>,
+    link_sessions: Arc<Mutex<LinkSessionRegistry>>,
+    distro_table: Option<Arc<Mutex<DistroTable>>>,
+    distro_blob_store: Option<Arc<Mutex<crate::blob_store::BlobStore>>>,
+    distro_hook_registry: Option<Arc<Mutex<crate::notify::HookRegistry>>>,
+    deferred_queue: Option<Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
+}
+
+impl DeliveryHandles {
+    fn is_distro(&self, dest_hash: &[u8]) -> bool {
+        self.distro_table
+            .as_ref()
+            .and_then(|dt| dt.lock().ok().map(|t| t.is_distro(dest_hash)))
+            .unwrap_or(false)
+    }
+
+    fn distro_fanout(&self, dest_hash: &[u8], lxmf_data: &[u8]) {
+        // NEVER REMOVE the snapshot-then-drop. The distro_table lock is
+        // released before distro_fanout does any network work — holding
+        // it across the fan-out wedged /rfed/distro/register in
+        // production (see distro::distro_fanout's doc comment).
+        let Some(ref dt) = self.distro_table else { return };
+        let devices = match dt.lock() {
+            Ok(table) => table.devices_snapshot(dest_hash),
+            Err(_) => Vec::new(),
+        };
+        if devices.is_empty() {
+            return;
+        }
+        let hook_guard = self.distro_hook_registry.as_ref().and_then(|h| h.lock().ok());
+        let default_hooks = crate::notify::HookRegistry::new();
+        let hooks: &crate::notify::HookRegistry = match &hook_guard {
+            Some(g) => &**g,
+            None => &default_hooks,
+        };
+        let missed = crate::distro::distro_fanout(
+            dest_hash,
+            lxmf_data,
+            &devices,
+            hooks,
+            Some(&self.stream_registry),
+            Some(&self.link_sessions),
+        );
+        if !missed.is_empty() {
+            log(
+                format!(
+                    "[distro] {} device(s) unreachable for distro {} — enqueuing in deferred queue",
+                    missed.len(),
+                    hexrep(dest_hash, false),
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+            enqueue_distro_misses(self.deferred_queue.as_ref(), missed, dest_hash, lxmf_data);
+        }
     }
 
     fn dispatch_live_or_notify(&self, lxmf_data: &[u8], log_suffix: &str) -> LiveDispatchOutcome {
@@ -1342,6 +1468,58 @@ impl LxmfPropagationNode {
 
         LiveDispatchOutcome::None
     }
+
+    /// Persist a distro blob and report whether this node had never seen it.
+    ///
+    /// The BlobStore is the idempotency record for distro delivery. The same
+    /// LXMF message arrives here repeatedly — a client that re-PUTs, and once
+    /// per federation peer that offers it on a sync round — and the fan-out
+    /// used to run on every arrival, so a device with two peers upstream
+    /// received the message once per peer, forever. Storage was already
+    /// deduplicated; delivery now follows the same verdict.
+    ///
+    /// Returns `true` when the caller should fan out. A store that is
+    /// unreachable or full answers `true`: dropping a message is worse than
+    /// delivering it twice, and that is exactly the pre-existing behaviour.
+    fn ingest_distro_blob(
+        &self,
+        dest_hash: &[u8],
+        lxmf_data: &[u8],
+        stored: &mut usize,
+    ) -> bool {
+        let Some(ref blob_store) = self.distro_blob_store else { return true };
+        let Ok(mut store) = blob_store.lock() else { return true };
+
+        let msg_id = crate::distro::distro_message_id(lxmf_data);
+        if store.index.contains_key(&msg_id) {
+            log(
+                format!(
+                    "[distro] already hold blob {} for {} — not re-fanning",
+                    hexrep(&msg_id, false),
+                    hexrep(dest_hash, false),
+                ),
+                LOG_DEBUG, false, false,
+            );
+            return false;
+        }
+
+        match store.store_with_id(dest_hash, &msg_id, lxmf_data) {
+            Ok(_) => {
+                *stored += 1;
+                true
+            }
+            Err(e) => {
+                log(
+                    format!("[distro] BlobStore store error: {e}"),
+                    LOG_WARNING, false, false,
+                );
+                true
+            }
+        }
+    }
+}
+
+impl LxmfPropagationNode {
 
     // ── OFFER handler ────────────────────────────────────────────────────────
     //
@@ -1727,7 +1905,7 @@ impl LxmfPropagationNode {
                 log(format!("[lxmf.prop] sync: peer state={} not IDLE", peer.state), LOG_DEBUG, false, false);
                 return;
             }
-            (peer.unhandled_ids.clone(), peer.peering_key.is_some())
+            (peer.unhandled_ids.to_vec(), peer.peering_key.is_some())
         };
 
         if !peering_key_ready {
@@ -1853,7 +2031,7 @@ impl LxmfPropagationNode {
         // This ensures small/recent messages are offered first, and oversized
         // messages that exceed the peer's transfer limit are auto-handled.
         let mut entries_with_weight: Vec<(Vec<u8>, f64, u64)> = Vec::new();
-        for tid in &peer.unhandled_ids {
+        for tid in peer.unhandled_ids.iter() {
             if let Some(entry) = self.entries.get(tid) {
                 let age = ((now() - entry.received) / 86400.0 / 4.0).max(1.0);
                 let weight = age * entry.size as f64;
@@ -2239,8 +2417,8 @@ impl LxmfPropagationNode {
                 peering_key: peer.peering_key.clone(),
                 metadata: peer.metadata.clone(),
                 sync_transfer_rate: peer.sync_transfer_rate,
-                handled_ids: peer.handled_ids.clone(),
-                unhandled_ids: peer.unhandled_ids.clone(),
+                handled_ids: peer.handled_ids.to_vec(),
+                unhandled_ids: peer.unhandled_ids.to_vec(),
             };
             if let Ok(bytes) = rmp_serde::to_vec(&peer_data) {
                 serialised.push(bytes);
@@ -2294,12 +2472,12 @@ impl LxmfPropagationNode {
             // Rebuild handled/unhandled based on what's still in the store
             for tid in state.handled_ids {
                 if self.entries.contains_key(&tid) {
-                    peer.handled_ids.push(tid);
+                    peer.handled_ids.push_unique(tid);
                 }
             }
             for tid in state.unhandled_ids {
                 if self.entries.contains_key(&tid) {
-                    peer.unhandled_ids.push(tid);
+                    peer.unhandled_ids.push_unique(tid);
                 }
             }
 
@@ -2344,55 +2522,6 @@ impl LxmfPropagationNode {
     }
 
     // ── Distro ingest ────────────────────────────────────────────────────────
-
-    /// Persist a distro blob and report whether this node had never seen it.
-    ///
-    /// The BlobStore is the idempotency record for distro delivery. The same
-    /// LXMF message arrives here repeatedly — a client that re-PUTs, and once
-    /// per federation peer that offers it on a sync round — and the fan-out
-    /// used to run on every arrival, so a device with two peers upstream
-    /// received the message once per peer, forever. Storage was already
-    /// deduplicated; delivery now follows the same verdict.
-    ///
-    /// Returns `true` when the caller should fan out. A store that is
-    /// unreachable or full answers `true`: dropping a message is worse than
-    /// delivering it twice, and that is exactly the pre-existing behaviour.
-    fn ingest_distro_blob(
-        &self,
-        dest_hash: &[u8],
-        lxmf_data: &[u8],
-        stored: &mut usize,
-    ) -> bool {
-        let Some(ref blob_store) = self.distro_blob_store else { return true };
-        let Ok(mut store) = blob_store.lock() else { return true };
-
-        let msg_id = crate::distro::distro_message_id(lxmf_data);
-        if store.index.contains_key(&msg_id) {
-            log(
-                format!(
-                    "[distro] already hold blob {} for {} — not re-fanning",
-                    hexrep(&msg_id, false),
-                    hexrep(dest_hash, false),
-                ),
-                LOG_DEBUG, false, false,
-            );
-            return false;
-        }
-
-        match store.store_with_id(dest_hash, &msg_id, lxmf_data) {
-            Ok(_) => {
-                *stored += 1;
-                true
-            }
-            Err(e) => {
-                log(
-                    format!("[distro] BlobStore store error: {e}"),
-                    LOG_WARNING, false, false,
-                );
-                true
-            }
-        }
-    }
 
     // ── Get statistics ───────────────────────────────────────────────────────
 
@@ -2469,6 +2598,193 @@ fn enqueue_distro_misses(
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    // ── The propagation node lock: who may hold it, and for how long ──────
+    //
+    // `/get` and `/offer` wait on the node mutex. In production `/get` waited
+    // 73 s and 182 s for it behind message ingest, which held it for a whole
+    // batch: stamp validation, a disk write and a linear scan of every peer's
+    // queue per message, and live delivery. See `ingest_propagation_batch`.
+    mod ingest_lock_scope_tests {
+        use super::super::*;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Instant;
+
+        fn test_node(tag: &str) -> Arc<Mutex<LxmfPropagationNode>> {
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("rfed_prop_{tag}_{unique}"));
+            let config = NodeConfig {
+                config_dir: dir.clone(),
+                rns_config_dir: None,
+                identity_file: dir.join("identity"),
+                display_name: "test".into(),
+                announce_interval_secs: 600,
+                announce_at_start: false,
+                default_policy: crate::config::TierPolicy::default(),
+                vip_policy: crate::config::TierPolicy::vip_default(),
+                vip_subscribers: Vec::new(),
+                peering_cost: None,
+                storage_limit_bytes: 0,
+                transfer_limit_bytes: None,
+                sync_limit_bytes: None,
+                static_peers: Vec::new(),
+                from_static_only: false,
+                trusted_backup_peers: Vec::new(),
+                primary_node: None,
+                secondary_nodes: Vec::new(),
+                owner_offline_secs: 90.0,
+                lxmf_propagation_enabled: true,
+                lxmf_propagation_autopeer: false,
+                lxmf_propagation_peers: Vec::new(),
+            };
+            LxmfPropagationNode::new(
+                Identity::new(true),
+                &config,
+                Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp")))),
+                Arc::new(Mutex::new(PropagationStreamRegistry::default())),
+                Arc::new(Mutex::new(LinkSessionRegistry::default())),
+                None, None, None, None,
+            )
+            .expect("propagation node")
+        }
+
+        /// A peer sync batch in the propagation wire format. The stamps are
+        /// junk — every message will be rejected — which is all this needs:
+        /// the cost of a stamp is validating it, valid or not.
+        fn batch(messages: usize) -> Vec<u8> {
+            let payloads: Vec<Value> = (0..messages)
+                .map(|n| Value::Binary((0..320usize).map(|i| (i * 31 + n * 7) as u8).collect()))
+                .collect();
+            let mut out = Vec::new();
+            write_value(&mut out, &Value::Array(vec![Value::F64(0.0), Value::Array(payloads)])).unwrap();
+            out
+        }
+
+        #[test]
+        fn get_is_served_while_a_batch_is_being_ingested() {
+            let node = test_node("get_during_ingest");
+            let ingesting = Arc::new(AtomicBool::new(true));
+
+            let ingest_node = node.clone();
+            let ingest_flag = ingesting.clone();
+            let ingest = std::thread::spawn(move || {
+                let started = Instant::now();
+                LxmfPropagationNode::ingest_propagation_batch(&ingest_node, &batch(64));
+                ingest_flag.store(false, Ordering::SeqCst);
+                started.elapsed()
+            });
+
+            // Exactly what the registered `/get` callback does, for as long as
+            // the ingest runs. A request is judged by when it was ASKED: one
+            // asked mid-ingest and answered only after the ingest let go of the
+            // lock is precisely the failure, and must not be discarded for
+            // having finished late.
+            let mut served_during_ingest = 0usize;
+            let mut worst_wait = 0.0f64;
+            while ingesting.load(Ordering::SeqCst) {
+                let asked = Instant::now();
+                let response = lock_node(&node, "/get (test)")
+                    .map(|mut n| n.handle_get("", &[], &[], None, 0.0))
+                    .expect("node lock");
+                assert!(!response.is_empty(), "/get answers even an unidentified caller");
+                served_during_ingest += 1;
+                worst_wait = worst_wait.max(asked.elapsed().as_secs_f64());
+                std::thread::yield_now();
+            }
+            let ingest_took = ingest.join().expect("ingest thread").as_secs_f64();
+
+            assert!(
+                ingest_took > 4.0 * NODE_LOCK_WAIT_WARN_SECS,
+                "the ingest only took {ingest_took:.2}s — too short to prove anything; use a bigger batch"
+            );
+            assert!(
+                worst_wait < NODE_LOCK_WAIT_WARN_SECS,
+                "/get waited {worst_wait:.2}s for the node lock during a {ingest_took:.2}s ingest \
+                 ({served_during_ingest} served). Something slow is back under the lock."
+            );
+        }
+
+        /// Source-level guard, in the style of `fanout_lock_scope_tests`: stamp
+        /// validation must never be reachable from a method that holds the
+        /// node (`&self` / `&mut self`), because every caller of such a method
+        /// holds the node lock.
+        #[test]
+        fn stamp_validation_is_never_called_with_the_node_borrowed() {
+            let source = include_str!("lxmf_propagation.rs");
+            let production = &source[..source.find("#[cfg(test)]").expect("test module")];
+            let mut calls = 0;
+            let mut offset = 0;
+            while let Some(found) = production[offset..].find("validate_pn_stamps(") {
+                let at = offset + found;
+                let fn_start = production[..at].rfind("\n    fn ").max(production[..at].rfind("\n    pub(crate) fn "))
+                    .expect("enclosing fn");
+                let signature = &production[fn_start..production[fn_start..].find('{').map(|i| fn_start + i).unwrap()];
+                assert!(
+                    !signature.contains("self"),
+                    "validate_pn_stamps is called from a method that borrows the node:{signature}"
+                );
+                calls += 1;
+                offset = at + 1;
+            }
+            assert!(calls > 0, "validate_pn_stamps is no longer called at all — this guard needs updating");
+        }
+    }
+
+    mod id_queue_tests {
+        use super::super::IdQueue;
+
+        fn id(n: u8) -> Vec<u8> { vec![n; 32] }
+
+        #[test]
+        fn keeps_insertion_order_and_refuses_duplicates() {
+            let mut q = IdQueue::default();
+            assert!(q.push_unique(id(3)));
+            assert!(q.push_unique(id(1)));
+            assert!(!q.push_unique(id(3)), "a duplicate is not added");
+            assert!(q.push_unique(id(2)));
+            assert_eq!(q.to_vec(), vec![id(3), id(1), id(2)]);
+            assert_eq!(q.len(), 3);
+        }
+
+        #[test]
+        fn remove_keeps_the_order_of_the_rest() {
+            let mut q = IdQueue::default();
+            for n in 1..=4 { q.push_unique(id(n)); }
+            assert!(q.remove(&id(2)));
+            assert!(!q.remove(&id(2)), "already gone");
+            assert!(!q.contains(&id(2)));
+            assert_eq!(q.to_vec(), vec![id(1), id(3), id(4)]);
+            // A removed id may come back, and goes to the end.
+            assert!(q.push_unique(id(2)));
+            assert_eq!(q.to_vec(), vec![id(1), id(3), id(4), id(2)]);
+        }
+
+        #[test]
+        fn a_peer_does_not_requeue_what_it_already_handled() {
+            let mut peer = super::super::PropPeer::new(vec![9; 16]);
+            peer.add_unhandled(id(1));
+            peer.mark_handled(&id(1));
+            peer.add_unhandled(id(1));
+            assert!(peer.unhandled_ids.is_empty());
+            assert!(peer.handled_ids.contains(&id(1)));
+        }
+
+        /// The regression this type exists for: queueing one message for every
+        /// peer must not get slower as the queues grow.
+        #[test]
+        fn queueing_stays_cheap_at_production_scale() {
+            let mut peers: Vec<super::super::PropPeer> =
+                (0..20).map(|i| super::super::PropPeer::new(vec![i as u8; 16])).collect();
+            let wide = |n: u32| { let mut v = vec![0u8; 32]; v[..4].copy_from_slice(&n.to_be_bytes()); v };
+            for p in peers.iter_mut() { for n in 0..150_000u32 { p.add_unhandled(wide(n)); } }
+
+            let started = std::time::Instant::now();
+            for n in 0..200u32 { for p in peers.iter_mut() { p.add_unhandled(wide(150_000 + n)); } }
+            let per_message_ms = started.elapsed().as_secs_f64() * 1000.0 / 200.0;
+            // The Vec version measured 38 ms per message here in a debug build.
+            assert!(per_message_ms < 2.0, "queueing for 20 peers took {per_message_ms:.2} ms per message");
+        }
+    }
 
     #[test]
     fn distro_misses_are_queued_for_pull() {
