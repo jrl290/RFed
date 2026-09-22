@@ -635,20 +635,16 @@ impl LxmfPropagationNode {
     }
 
     /// Opt the propagation destination into Transport's announce daemon
-    /// so it is automatically re-announced on every interface up-edge
-    /// and every `SERVICE_REFRESH_INTERVAL_SECS` (15min) thereafter.
+    /// so it is re-announced every `SERVICE_REFRESH_INTERVAL_SECS` (15 min).
     /// See DESIGN_PRINCIPLES.md §3-§4.
     ///
-    /// ORDERING (DESIGN_PRINCIPLES.md §1): interface TCP connects are async,
-    /// so an interface can transition online (firing `announce_all_destinations`
-    /// over the published set) BEFORE this publish lands — the exact race that
-    /// left the propagation destination un-announced to a flapping uplink while
-    /// the rfed service destinations made it. The up-edge re-announce covers
-    /// interfaces that come up AFTER the publish; to cover interfaces that came
-    /// up BEFORE it, we also fire one immediate announce here. `announce` with
-    /// `send=true` routes through `Transport::outbound`, which cleanly skips
-    /// offline interfaces, so this is safe regardless of current link state.
-    /// This is a single targeted announce, not a periodic timer.
+    /// Transport announces nothing on interface state changes (as in the
+    /// reference, since Reticulum-rust B22), so the one immediate announce
+    /// fired here is what reaches interfaces that are already up; the
+    /// refresh covers the rest. `announce` with `send=true` routes through
+    /// `Transport::outbound`, which skips offline interfaces, so this is
+    /// safe regardless of current link state. This is a single targeted
+    /// announce, not a periodic timer.
     pub fn publish_destination(arc: &Arc<Mutex<Self>>) {
         use reticulum_rust::transport::Transport;
         let mut immediate: Option<(Vec<u8>, Destination)> = None;

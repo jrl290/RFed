@@ -823,8 +823,9 @@ fn main() -> Result<(), String> {
         }
 
         // Periodic re-announces are handled by Transport::publish_destination
-        // (registered at startup): up-edge on interface online + refresh
-        // interval per destination. No bespoke timers here.
+        // (registered at startup): a refresh interval per destination.
+        // Interface state changes announce nothing (reference behaviour,
+        // Reticulum-rust B22). No bespoke timers here.
 
         // Drive pending peer sync sessions
         if let Ok(mut guard) = node.lock() {
