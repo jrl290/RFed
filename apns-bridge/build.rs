@@ -1,5 +1,5 @@
 include!("../build-stamp.rs");
 
 fn main() {
-    stamp("rfed");
+    stamp("apns_bridge");
 }

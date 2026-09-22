@@ -9,6 +9,10 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/build-fcm-bridge.yml'
+      - 'build-stamp.rs'
+  # A sibling repo's CI can ask for a rebuild (same event rfed listens to).
+  repository_dispatch:
+    types: [sibling-updated]
 
 permissions:
   contents: read
@@ -28,6 +32,30 @@ jobs:
           ./scripts/bootstrap-sibling-deps.sh \
             --deps-root "${{ github.workspace }}/.." \
             --disable-lxmf-reticulum-default-features
+
+      # Record exactly which sibling commits this build resolved to, as the
+      # rfed workflow does; build-stamp.rs prefers these over its own git
+      # lookups. Without it the image is unattributable.
+      - name: Resolve the sibling commits going into this build
+        id: stamp
+        run: |
+          set -euo pipefail
+          deps="${{ github.workspace }}/.."
+          sha_of() {
+            if [ -d "$1/.git" ]; then
+              git -C "$1" rev-parse --short=12 HEAD
+            else
+              echo unknown
+            fi
+          }
+          {
+            echo "RFED_BUILD_SHA=$(git rev-parse --short=12 HEAD)"
+            echo "RETICULUM_RUST_SHA=$(sha_of "$deps/Reticulum-rust")"
+            echo "LXMF_RUST_SHA=$(sha_of "$deps/LXMF-rust")"
+            echo "APP_LINKS_SHA=$(sha_of "$deps/app-links")"
+          } | tee -a "$GITHUB_ENV" >> "$GITHUB_OUTPUT"
+          echo "--- build stamp ---"
+          cat "$GITHUB_OUTPUT"
 
       - name: Install system dependencies
         run: |
@@ -57,6 +85,24 @@ jobs:
 
       - name: Strip binary
         run: strip target/x86_64-unknown-linux-musl/release/fcm_bridge
+
+      # "unknown" would leave the image unattributable, so fail instead of shipping it.
+      - name: Verify the build stamp
+        run: |
+          set -euo pipefail
+          stamp="$(./target/x86_64-unknown-linux-musl/release/fcm_bridge --build | tail -1)"
+          echo "$stamp"
+          for component in fcm_bridge reticulum lxmf app_links; do
+            case "$stamp" in
+              *"${component}=unknown"*)
+                echo "::error::${component} did not resolve to a commit"; exit 1 ;;
+              *"${component}="*"+dirty"*)
+                echo "::error::${component} is dirty in CI, which should be impossible"; exit 1 ;;
+              *"${component}="*) ;;
+              *)
+                echo "::error::${component} missing from the build stamp"; exit 1 ;;
+            esac
+          done
 
       - name: Show binary info
         run: |
@@ -90,6 +136,12 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/fcm_bridge:latest
             ghcr.io/${{ github.repository_owner }}/fcm_bridge:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            com.retichat.fcm_bridge.sha=${{ steps.stamp.outputs.RFED_BUILD_SHA }}
+            com.retichat.reticulum_rust.sha=${{ steps.stamp.outputs.RETICULUM_RUST_SHA }}
+            com.retichat.lxmf_rust.sha=${{ steps.stamp.outputs.LXMF_RUST_SHA }}
+            com.retichat.app_links.sha=${{ steps.stamp.outputs.APP_LINKS_SHA }}
 
       - name: Show image digest
         run: echo "Pushed ghcr.io/${{ github.repository_owner }}/fcm_bridge:latest"

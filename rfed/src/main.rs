@@ -75,7 +75,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// from — see `build.rs`. Logged at startup and returned in the CAPABILITIES
 /// response, so "which rfed is actually running on that node?" has an answer
 /// that does not depend on remembering when CI last ran.
-pub const BUILD_STAMP: &str = env!("RFED_BUILD_STAMP");
+pub const BUILD_STAMP: &str = env!("BUILD_STAMP");
 
 // ── CLI helpers ──────────────────────────────────────────────────────────────
 

@@ -29,6 +29,10 @@ use std::process;
 
 use log::{error, info};
 
+/// Commits of this repo and every sibling this binary was built from
+/// (see build-stamp.rs). Logged at startup and printed by `--build`.
+pub const BUILD_STAMP: &str = env!("BUILD_STAMP");
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut config_path = default_config_path();
@@ -47,12 +51,21 @@ fn main() {
                 }
             }
             "--debug" | "-d" => debug = true,
+            // Print what this binary was built from and exit — no config, no
+            // network. `docker run --rm <image> --build` on a node answers
+            // "is the fix live?" without a log to grep.
+            "--build" => {
+                println!("fcm_bridge v{}", env!("CARGO_PKG_VERSION"));
+                println!("{}", BUILD_STAMP);
+                process::exit(0);
+            }
             "--help" | "-h" => {
                 println!("rfed FCM Push Bridge\n");
                 println!("Usage: fcm_bridge [--config <file>] [--debug]");
                 println!("       fcm_bridge --help\n");
                 println!("  --config <file>  Path to config file (default: ./fcm_bridge.conf)");
                 println!("  --debug          Enable debug-level logging");
+                println!("  --build          Print the build provenance stamp and exit");
                 process::exit(0);
             }
             other => {
@@ -68,6 +81,7 @@ fn main() {
         .filter_level(log_level.parse().unwrap())
         .format_timestamp_secs()
         .init();
+    info!("fcm_bridge v{} build: {}", env!("CARGO_PKG_VERSION"), BUILD_STAMP);
 
     let config_file = Path::new(&config_path);
     if !config_file.exists() {

@@ -16,6 +16,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/build-rfed.yml'
+      - 'build-stamp.rs'
   # NOTE: rfed depends on sibling repos (Rusticulum, LXMF-rust, app-links) via
   # path deps cloned at build time. Pushes to those repos do NOT trigger this
   # workflow, and the siblings are cloned at their main-branch HEAD, so a build
@@ -24,7 +25,7 @@ on:
   # last ran, not of any ref.
   #
   # That used to be invisible. Every build now compiles the four commit shas
-  # into the binary (rfed/build.rs); `rfed --build` prints them, the startup
+  # into the binary (build-stamp.rs, shared with the two bridges); `rfed --build` prints them, the startup
   # banner logs them, the CAPABILITIES response returns them, and
   # `scripts/check-sibling-drift.sh` turns them into "N commits behind" against
   # local HEADs. Run that before concluding a fix did not work.
