@@ -468,6 +468,17 @@ pub fn replay_distro_announce(announce: &DistroAnnounce) -> Result<(), String> {
 /// completed in well under a second earlier the same day (18:35, 18:38, 18:43),
 /// i.e. the table had been wedged in between. Snapshot under the lock, release,
 /// then fan out.
+fn device_id_hash_of(entry: &DistroEntry) -> Option<Vec<u8>> {
+    Identity::from_public_key(&entry.device_pubkey).ok()?.hash
+}
+
+/// `on_missed(device_id_hash)` is the caller's deferral: it must do for one
+/// device what the caller does for the returned `missed` list (enqueue the
+/// blob in the distro deferred queue). It fires later, from the request
+/// timeout, when an rfed.link push was dispatched but never answered —
+/// Link.md "The response is the delivery proof": that blob moves to the pull
+/// path. Before 2026-09-22 the rfed.link tier passed no failure hook, logged
+/// "deferring", and deferred nothing.
 pub fn distro_fanout(
     distro_lxmf_hash: &[u8],
     lxmf_blob: &[u8],
@@ -475,6 +486,7 @@ pub fn distro_fanout(
     hook_registry: &HookRegistry,
     propagation_streams: Option<&Arc<Mutex<PropagationStreamRegistry>>>,
     link_sessions: Option<&Arc<Mutex<LinkSessionRegistry>>>,
+    on_missed: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
 ) -> Vec<Vec<u8>> {
     if devices.is_empty() {
         log(
@@ -504,18 +516,30 @@ pub fn distro_fanout(
     let mut missed: Vec<Vec<u8>> = Vec::new();
 
     for entry in devices {
-        // Build delivery payload: [ distro_lxmf_hash(16) | lxmf_blob ]
-        // Same format as channel delivery: [ routing_hash(16) | inner_blob ]
+        // The rfed.delivery PACKET tier (tier 3) carries
+        // [ distro_lxmf_hash(16) | lxmf_blob ], like channel delivery; the
+        // rfed.link and stream tiers carry the bare blob.
         let mut payload = distro_lxmf_hash.to_vec();
         payload.extend_from_slice(lxmf_blob);
 
         // ── Try the device's rfed.link session (RFed-spec/Link.md) ───
-        // Same `/lxmf/delivery` push a directly-addressed LXMF message takes;
-        // a device does not need a second link because its messages arrive by
-        // way of a distro identity.
+        // Same `/lxmf/delivery` push a directly-addressed LXMF message takes:
+        // the bare LXMF blob, whose leading 16 bytes are its destination —
+        // the distro's `lxmf.delivery` hash, which is what the device bound.
+        // A device does not need a second link because its messages arrive
+        // by way of a distro identity.
         if let Some(sessions) = link_sessions {
             if let Ok(mut registry) = sessions.lock() {
-                let result = registry.dispatch_lxmf(&entry.device_lxmf_hash, lxmf_blob, None);
+                // The deferred queue is drained by the device's IDENTITY hash
+                // (`/distro/pull`), so that is the key the hook receives.
+                let on_failed: Option<Arc<dyn Fn() + Send + Sync>> = match (&on_missed, device_id_hash_of(entry)) {
+                    (Some(hook), Some(device_id_hash)) => {
+                        let hook = Arc::clone(hook);
+                        Some(Arc::new(move || hook(device_id_hash.clone())))
+                    }
+                    _ => None,
+                };
+                let result = registry.dispatch_lxmf(&entry.device_lxmf_hash, lxmf_blob, on_failed);
                 if result.delivered() {
                     log(
                         format!(
@@ -743,6 +767,26 @@ pub fn lxmf_delivery_hash_from_pubkey(pubkey: &[u8]) -> Result<Vec<u8>, String> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_deferral_key_is_the_device_identity_hash() {
+        // `/distro/pull` drains the deferred queue by the caller's identity
+        // hash, so the hook for an unanswered rfed.link push must receive
+        // that hash, derived from the registered device pubkey.
+        let identity = reticulum_rust::identity::Identity::new(true);
+        let pubkey = identity.get_public_key().expect("pubkey");
+        let entry = DistroEntry {
+            distro_lxmf_hash: vec![1; 16],
+            device_lxmf_hash: vec![2; 16],
+            device_pubkey: pubkey,
+            added: 0.0,
+            last_refreshed: 0.0,
+            owner_node_hash: None,
+        };
+        assert_eq!(super::device_id_hash_of(&entry), identity.hash, "identity hash, not the lxmf.delivery hash");
+        let bad = DistroEntry { device_pubkey: vec![0; 3], ..entry };
+        assert!(super::device_id_hash_of(&bad).is_none(), "an invalid pubkey yields no key, so no hook fires");
+    }
+
     use super::*;
 
     fn temp_path(label: &str) -> PathBuf {

@@ -1411,6 +1411,20 @@ fn run_sync_session(
 
                                     // ── Distro fanout ────────────
                                     if let Some(devices) = distro_devices.get(routing_hash) {
+                                        // An rfed.link push that is dispatched but never answered
+                                        // defers exactly as a missed device does (Link.md).
+                                        let on_missed: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
+                                            let deferred_queue = Arc::clone(&ctx.deferred_queue);
+                                            let config = ctx.config.clone();
+                                            let routing_hash = routing_hash.clone();
+                                            let blob = blob.clone();
+                                            Arc::new(move |dev_hash: Vec<u8>| {
+                                                if let Ok(mut deferred) = deferred_queue.lock() {
+                                                    let limit = config.policy_for(&dev_hash).deferred_queue_limit;
+                                                    deferred.enqueue(dev_hash, routing_hash.clone(), blob.clone(), limit);
+                                                }
+                                            })
+                                        };
                                         let dmissed = match ctx.hook_registry.lock() {
                                             Ok(hooks) => crate::distro::distro_fanout(
                                                 routing_hash,
@@ -1419,6 +1433,7 @@ fn run_sync_session(
                                                 &hooks,
                                                 Some(&ctx.propagation_streams),
                                                 Some(&ctx.link_sessions),
+                                                Some(on_missed),
                                             ),
                                             Err(_) => Vec::new(),
                                         };

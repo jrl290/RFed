@@ -1347,6 +1347,15 @@ impl DeliveryHandles {
             Some(g) => &**g,
             None => &default_hooks,
         };
+        let on_missed: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>> = self.deferred_queue.as_ref().map(|queue| {
+            let queue = Arc::clone(queue);
+            let distro_hash = dest_hash.to_vec();
+            let blob = lxmf_data.to_vec();
+            let hook: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |device_id_hash: Vec<u8>| {
+                enqueue_distro_misses(Some(&queue), vec![device_id_hash], &distro_hash, &blob);
+            });
+            hook
+        });
         let missed = crate::distro::distro_fanout(
             dest_hash,
             lxmf_data,
@@ -1354,6 +1363,7 @@ impl DeliveryHandles {
             hooks,
             Some(&self.stream_registry),
             Some(&self.link_sessions),
+            on_missed,
         );
         if !missed.is_empty() {
             log(
