@@ -1273,11 +1273,31 @@ fn decode_propagation_batch(data: &[u8]) -> Option<Vec<Vec<u8>>> {
         }
     };
     match items.get(1) {
-        Some(Value::Array(values)) => Some(
-            values.iter()
+        Some(Value::Array(values)) => {
+            let messages: Vec<Vec<u8>> = values.iter()
                 .filter_map(|v| match v { Value::Binary(b) => Some(b.clone()), _ => None })
-                .collect(),
-        ),
+                .collect();
+            // An entry that is not msgpack bin is not a message and is dropped —
+            // but a batch that decodes to nothing must not vanish in silence.
+            // A sender packing bytes as msgpack str (PyPI `msgpack` without
+            // use_bin_type, where LXMF itself uses umsgpack) delivered a
+            // 6000-message flood of which rfed stored nothing, with no log line
+            // anywhere, while the sender saw every batch proven. Reference:
+            // LXMF/LXMRouter.py takes the same `[timebase, [bytes, ...]]` shape.
+            if messages.len() < values.len() {
+                log(
+                    format!(
+                        "[lxmf.prop] batch of {} entries: {} dropped for not being msgpack bin (sender packs bytes as {})",
+                        values.len(), values.len() - messages.len(),
+                        values.iter().find(|v| !matches!(v, Value::Binary(_))).map(|v| match v {
+                            Value::String(_) => "str", Value::Array(_) => "array", Value::Nil => "nil", _ => "another type",
+                        }).unwrap_or("?"),
+                    ),
+                    LOG_WARNING, false, false,
+                );
+            }
+            Some(messages)
+        }
         _ => {
             log("[lxmf.prop] packet missing message array", LOG_DEBUG, false, false);
             None
@@ -2727,6 +2747,36 @@ mod tests {
                 offset = at + 1;
             }
             assert!(calls > 0, "validate_pn_stamps is no longer called at all — this guard needs updating");
+        }
+    }
+
+    mod batch_decode_tests {
+        use super::super::*;
+
+        fn batch(entries: Vec<Value>) -> Vec<u8> {
+            let mut out = Vec::new();
+            write_value(&mut out, &Value::Array(vec![Value::F64(0.0), Value::Array(entries)])).unwrap();
+            out
+        }
+
+        #[test]
+        fn bin_entries_are_messages() {
+            let m = decode_propagation_batch(&batch(vec![Value::Binary(vec![1; 40]), Value::Binary(vec![2; 40])])).unwrap();
+            assert_eq!(m.len(), 2);
+        }
+
+        #[test]
+        fn str_entries_are_dropped_not_messages() {
+            // PyPI msgpack.packb(bytes) without use_bin_type=True produces exactly this.
+            let m = decode_propagation_batch(&batch(vec![Value::String("x".repeat(40).into())])).unwrap();
+            assert!(m.is_empty(), "a str entry is not a message");
+        }
+
+        #[test]
+        fn a_non_batch_is_none() {
+            let mut out = Vec::new();
+            write_value(&mut out, &Value::Integer(7.into())).unwrap();
+            assert!(decode_propagation_batch(&out).is_none());
         }
     }
 
