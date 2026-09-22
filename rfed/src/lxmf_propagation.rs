@@ -1091,15 +1091,16 @@ impl LxmfPropagationNode {
         // so the concluded callback dispatches into the same ingest helper.
         link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
-        // Resource-advertised callback: just a notification hook (presence
-        // of a `resource` callback is what enables ACCEPT_APP acceptance).
+        // Resource-advertised callback: accepts every advertisement (its
+        // return value is the ACCEPT_APP verdict, RNS/Link.py:1108).
         // Resource-concluded callback: invoked once the multi-segment
         // transfer is fully assembled. Decode and ingest the same way as
         // single-packet inbound propagation data.
         let weak_concluded = self.self_handle.clone();
         link.set_resource_callbacks(
-            Some(Arc::new(|_resource| {
+            Some(Arc::new(|_advertisement: &reticulum_rust::resource::ResourceAdvertisement| -> bool {
                 // Accept all advertised propagation resources.
+                true
             })),
             None,
             Some(Arc::new(move |resource| {

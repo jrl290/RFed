@@ -2508,7 +2508,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
             let ingest = Arc::clone(&resource_ingest);
             link.set_resource_callbacks(
-                Some(Arc::new(|_resource| {})),
+                Some(Arc::new(|_advertisement: &reticulum_rust::resource::ResourceAdvertisement| -> bool { true })),
                 None,
                 Some(Arc::new(move |resource: Arc<Mutex<reticulum_rust::resource::Resource>>| {
                     let data: Vec<u8> = match resource.lock() {
