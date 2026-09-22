@@ -136,6 +136,25 @@ impl LinkSession {
 }
 
 /// Every live `rfed.link` link that has bound itself for push, keyed by link id.
+/// Remove every session other than `keep` for which `predicate` holds, and
+/// return their ids. Generic over the session type so the rule can be tested
+/// without a live `LinkHandle`.
+pub(crate) fn evict_others<S, F>(sessions: &mut HashMap<Vec<u8>, S>, keep: &[u8], predicate: F) -> Vec<Vec<u8>>
+where
+    F: Fn(&S) -> bool,
+{
+    let mut evicted: Vec<Vec<u8>> = sessions
+        .iter()
+        .filter(|(link_id, session)| link_id.as_slice() != keep && predicate(session))
+        .map(|(link_id, _)| link_id.clone())
+        .collect();
+    evicted.sort();
+    for link_id in &evicted {
+        sessions.remove(link_id.as_slice());
+    }
+    evicted
+}
+
 #[derive(Default)]
 pub struct LinkSessionRegistry {
     sessions: HashMap<Vec<u8>, LinkSession>,
@@ -146,27 +165,46 @@ impl LinkSessionRegistry {
     ///
     /// Repeat calls are reconfiguration, not an error — the filter set is
     /// replaced, matching `rfed.channel.stream` semantics.
+    ///
+    /// Link.md "Binding the link for push": a subscriber holds ONE rfed.link
+    /// link, so binding a subscriber hash on a new link replaces any earlier
+    /// link bound for it; the replaced link ids are returned for the log.
+    /// Before 2026-09-22 every link a device had ever bound stayed bound
+    /// until RNS timed it out (~12 min for a browser page closed without
+    /// LINKCLOSE), and each push went to all of them, waiting a request
+    /// timeout on every dead one before the deferred queue took over.
     pub fn configure_channels(
         &mut self,
         link: LinkHandle,
         subscriber_hash: Vec<u8>,
         channel_hashes: Vec<Vec<u8>>,
-    ) {
+    ) -> Vec<Vec<u8>> {
+        let link_id = link.link_id();
+        let replaced = evict_others(&mut self.sessions, &link_id, |session| {
+            session.subscriber_hash.as_deref() == Some(subscriber_hash.as_slice())
+        });
         let entry = self
             .sessions
-            .entry(link.link_id())
+            .entry(link_id)
             .or_insert_with(|| LinkSession::new(link));
         entry.subscriber_hash = Some(subscriber_hash);
         entry.channel_hashes = channel_hashes;
+        replaced
     }
 
-    /// Bind (or rebind) this link's LXMF delivery hash.
-    pub fn configure_delivery(&mut self, link: LinkHandle, delivery_hash: Vec<u8>) {
+    /// Bind (or rebind) this link's LXMF delivery hash. Same replacement
+    /// rule as `configure_channels`; returns the replaced link ids.
+    pub fn configure_delivery(&mut self, link: LinkHandle, delivery_hash: Vec<u8>) -> Vec<Vec<u8>> {
+        let link_id = link.link_id();
+        let replaced = evict_others(&mut self.sessions, &link_id, |session| {
+            session.delivery_hash.as_deref() == Some(delivery_hash.as_slice())
+        });
         let entry = self
             .sessions
-            .entry(link.link_id())
+            .entry(link_id)
             .or_insert_with(|| LinkSession::new(link));
         entry.delivery_hash = Some(delivery_hash);
+        replaced
     }
 
     /// Drop a session. Called from the link-closed callback.
@@ -423,6 +461,30 @@ mod tests {
     /// RFed-spec/Link.md: an empty filter array clears the live filters. The
     /// link stays open with no channel fanout — "empty" must never be read as
     /// "everything".
+    #[test]
+    fn a_new_link_bound_for_the_same_subscriber_replaces_the_old_one() {
+        // Link.md "Binding the link for push": one link per subscriber.
+        let mut sessions: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> = Default::default();
+        sessions.insert(vec![1; 16], Some(b"device-A".to_vec()));
+        sessions.insert(vec![2; 16], Some(b"device-A".to_vec()));
+        sessions.insert(vec![3; 16], Some(b"device-B".to_vec()));
+        sessions.insert(vec![4; 16], None);
+        let replaced = super::evict_others(&mut sessions, &[9; 16], |bound| bound.as_deref() == Some(b"device-A".as_slice()));
+        assert_eq!(replaced, vec![vec![1; 16], vec![2; 16]], "both of device A's earlier links are replaced");
+        assert!(sessions.contains_key(&vec![3; 16]), "device B's link is untouched");
+        assert!(sessions.contains_key(&vec![4; 16]), "an unbound session is untouched");
+        assert_eq!(sessions.len(), 2);
+    }
+
+    #[test]
+    fn rebinding_the_same_link_replaces_nothing() {
+        let mut sessions: std::collections::HashMap<Vec<u8>, Option<Vec<u8>>> = Default::default();
+        sessions.insert(vec![1; 16], Some(b"device-A".to_vec()));
+        let replaced = super::evict_others(&mut sessions, &[1; 16], |bound| bound.as_deref() == Some(b"device-A".as_slice()));
+        assert!(replaced.is_empty(), "a repeat open on the same link is reconfiguration, not replacement");
+        assert_eq!(sessions.len(), 1);
+    }
+
     #[test]
     fn an_empty_filter_set_stops_pushes() {
         assert!(!wants_channel(Some(SUB), &[], SUB, CHAN));

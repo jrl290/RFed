@@ -2994,11 +2994,22 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
         if on_rfed_link {
             match link_registry.lock() {
-                Ok(mut registry) => registry.configure_channels(
-                    link.clone(),
-                    subscriber_hash.clone(),
-                    channel_hashes.clone(),
-                ),
+                Ok(mut registry) => {
+                    let replaced = registry.configure_channels(
+                        link.clone(),
+                        subscriber_hash.clone(),
+                        channel_hashes.clone(),
+                    );
+                    for old in replaced {
+                        log(
+                            format!(
+                                "[rfed.link] channel binding for {} moved to link {} (replaces {})",
+                                hexrep(&subscriber_hash, false), hexrep(&link.link_id(), false), hexrep(&old, false)
+                            ),
+                            LOG_DEBUG, false, false,
+                        );
+                    }
+                }
                 Err(_) => return encode_ok_reason(false, Some("internal_error")),
             }
             let cleanup_registry = Arc::clone(&link_registry);
@@ -3091,7 +3102,18 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             // rfed.link the same link also carries the channel binding, so a
             // second open is reconfiguration of one session, not a duplicate.
             match link_registry.lock() {
-                Ok(mut registry) => registry.configure_delivery(link.clone(), delivery_hash.clone()),
+                Ok(mut registry) => {
+                    let replaced = registry.configure_delivery(link.clone(), delivery_hash.clone());
+                    for old in replaced {
+                        log(
+                            format!(
+                                "[rfed.link] delivery binding for {} moved to link {} (replaces {})",
+                                hexrep(&delivery_hash, false), hexrep(&link.link_id(), false), hexrep(&old, false)
+                            ),
+                            LOG_DEBUG, false, false,
+                        );
+                    }
+                }
                 Err(_) => return encode_ok_reason(false, Some("internal_error")),
             }
             let cleanup_registry = Arc::clone(&link_registry);

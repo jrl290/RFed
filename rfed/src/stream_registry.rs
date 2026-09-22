@@ -31,6 +31,8 @@ pub struct ChannelStreamRegistry {
 }
 
 impl ChannelStreamRegistry {
+    /// One stream link per subscriber (Link.md "Binding the link for push"):
+    /// a new link for a subscriber hash replaces its earlier links.
     pub fn configure(
         &mut self,
         link: LinkHandle,
@@ -38,6 +40,9 @@ impl ChannelStreamRegistry {
         channel_hashes: Vec<Vec<u8>>,
     ) {
         let link_id = link.link_id();
+        crate::link_session::evict_others(&mut self.sessions, &link_id, |session| {
+            session.subscriber_hash == subscriber_hash
+        });
         self.sessions.insert(
             link_id,
             ChannelStreamSession {
@@ -114,6 +119,10 @@ impl PropagationStreamRegistry {
         if self.sessions.contains_key(&link_id) {
             return Err("already_open");
         }
+        // One stream link per delivery hash (Link.md "Binding the link for push").
+        crate::link_session::evict_others(&mut self.sessions, &link_id, |session| {
+            session.delivery_hash == delivery_hash
+        });
         self.sessions
             .insert(link_id, PropagationStreamSession { link, delivery_hash });
         Ok(())
