@@ -638,10 +638,10 @@ impl LxmfPropagationNode {
     /// so it is re-announced every `SERVICE_REFRESH_INTERVAL_SECS` (15 min).
     /// See DESIGN_PRINCIPLES.md §3-§4.
     ///
-    /// Transport announces nothing on interface state changes (as in the
-    /// reference, since Reticulum-rust B22), so the one immediate announce
-    /// fired here is what reaches interfaces that are already up; the
-    /// refresh covers the rest. `announce` with `send=true` routes through
+    /// Transport announces it once on each interface up-edge and on the
+    /// refresh, both held per interface to the refresh period
+    /// (Reticulum-rust B22); the one immediate announce fired here covers
+    /// interfaces that are already up. `announce` with `send=true` routes through
     /// `Transport::outbound`, which skips offline interfaces, so this is
     /// safe regardless of current link state. This is a single targeted
     /// announce, not a periodic timer.

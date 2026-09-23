@@ -801,8 +801,8 @@ impl FedNode {
     /// (channel, delivery, notify) immediately and synchronously.
     ///
     /// No sleeps, no spawned threads, no fixed delay before the first send
-    /// (see DESIGN_PRINCIPLES.md §3).  Periodic refresh is handled by
-    /// `publish_destinations()` registering with
+    /// (see DESIGN_PRINCIPLES.md §3).  Periodic refresh and the bounded
+    /// up-edge announce are handled by `publish_destinations()` registering with
     /// `Transport`'s announce daemon.
     pub fn announce(&mut self) {
         // Treat stamp_cost=0 as disabled (same as None) to avoid accidental
