@@ -212,26 +212,26 @@ pub fn run(cfg: &BridgeConfig, db: TokenDB, apns: ApnsSender) -> Result<(), Stri
     Transport::register_destination(unregister_dest.clone());
 
     // ── Initial announces ─────────────────────────────────────────────────────
-    relay_dest.announce(None, false, None, None, true)
-        .map_err(|e| format!("announce failed: {e}"))?;
-    register_dest.announce(None, false, None, None, true)
-        .map_err(|e| format!("announce failed: {e}"))?;
-    legacy_register_dest.announce(None, false, None, None, true)
-        .map_err(|e| format!("announce failed: {e}"))?;
-    unregister_dest.announce(None, false, None, None, true)
-        .map_err(|e| format!("announce failed: {e}"))?;
+    let _ = relay_dest.announce(None, false, None, None, true);
+    let _ = register_dest.announce(None, false, None, None, true);
+    let _ = legacy_register_dest.announce(None, false, None, None, true);
+    let _ = unregister_dest.announce(None, false, None, None, true);
 
     let reg_count = state.db.lock().unwrap().count().unwrap_or(0);
     info!("Bridge running — {} tokens registered", reg_count);
 
     // ── Main loop (periodic re-announce) ──────────────────────
+    // Hand the destinations to Transport's announce daemon: it announces them
+    // on every interface up-edge (the LAN link to the gateway coming back
+    // after a gateway restart — on 2026-09-23 a manual 6-hour loop left the
+    // bridges unannounced for the rest of the period) and every
+    // ANNOUNCE_INTERVAL after that, paced per interface.
+    Transport::publish_destination(relay_dest.hash.clone(), Some(ANNOUNCE_INTERVAL), None);
+    Transport::publish_destination(register_dest.hash.clone(), Some(ANNOUNCE_INTERVAL), None);
+    Transport::publish_destination(legacy_register_dest.hash.clone(), Some(ANNOUNCE_INTERVAL), None);
+    Transport::publish_destination(unregister_dest.hash.clone(), Some(ANNOUNCE_INTERVAL), None);
     loop {
-        thread::sleep(ANNOUNCE_INTERVAL);
-        let _ = relay_dest.announce(None, false, None, None, true);
-        let _ = register_dest.announce(None, false, None, None, true);
-        let _ = legacy_register_dest.announce(None, false, None, None, true);
-        let _ = unregister_dest.announce(None, false, None, None, true);
-        debug!("Periodic announces sent");
+        thread::park();
     }
 }
 
