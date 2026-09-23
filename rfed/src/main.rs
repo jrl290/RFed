@@ -153,6 +153,30 @@ fn write_status_file(
         arc.lock().ok().map(|g| hexrep(&g.destination.hash, false))
     }).unwrap_or_default();
 
+    // Peer sync state, so the backlog and the outbound budget are visible
+    // without debug logging (2026-09-23: 264k stored messages and twenty
+    // peers with queues nobody could see).
+    let propagation_json = lxmf_prop.as_ref().and_then(|arc| arc.lock().ok()).map(|g| {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let mut peers: Vec<(&Vec<u8>, &lxmf_propagation::PropPeer)> = g.peers.iter().collect();
+        peers.sort_by(|a, b| b.1.unhandled_ids.len().cmp(&a.1.unhandled_ids.len()));
+        let peers_json = peers.iter().map(|(hash, peer)| format!(
+            "      {{\"peer\": \"{}\", \"alive\": {}, \"unhandled\": {}, \"handled\": {}, \"next_sync_in_secs\": {:.0}, \"sync_transfer_rate\": {:.1}}}",
+            hexrep(hash, false), peer.alive, peer.unhandled_ids.len(), peer.handled_ids.len(),
+            (peer.next_sync_attempt - now_secs).max(0.0), peer.sync_transfer_rate,
+        )).collect::<Vec<_>>().join(",\n");
+        format!(
+            "{{\n    \"messagestore\": {},\n    \"outbound_sync\": {{\"sent_this_minute\": {}, \"budget_per_minute\": {}, \"startup_grace_left_secs\": {:.0}}},\n    \"peers\": [\n{}\n    ]\n  }}",
+            g.entries.len(),
+            g.outbound_sync_window_count, g.outbound_sync_msgs_per_min,
+            (lxmf_propagation::STARTUP_SYNC_GRACE_SECS - (now_secs - g.started_at)).max(0.0),
+            peers_json,
+        )
+    }).unwrap_or_else(|| "null".to_string());
+
     let sub_count = guard.subscription_table.lock()
         .map(|s| s.len()).unwrap_or(0);
     let blob_count = guard.blob_store.lock()
@@ -226,7 +250,8 @@ fn write_status_file(
                 "    \"subscribers\": {},\n",
                 "    \"blobs\": {},\n",
                 "    \"notify_registrations\": {}\n",
-                "  }}\n",
+                "  }},\n",
+                "  \"propagation\": {}\n",
                 "}}\n"
             ),
             name, identity_hash,
@@ -247,7 +272,7 @@ fn write_status_file(
             hexrep(&guard.distro_list_dest.hash, false),
             prop_hash,
             BUILD_STAMP,
-            uptime_secs, sub_count, blob_count, notify_count,
+            uptime_secs, sub_count, blob_count, notify_count, propagation_json,
         )
     } else {
         format!(
@@ -282,7 +307,8 @@ fn write_status_file(
                 "    \"subscribers\": {},\n",
                 "    \"blobs\": {},\n",
                 "    \"notify_registrations\": {}\n",
-                "  }}\n",
+                "  }},\n",
+                "  \"propagation\": {}\n",
                 "}}\n"
             ),
             name, identity_hash,
@@ -304,7 +330,7 @@ fn write_status_file(
             prop_hash,
             BUILD_STAMP,
             interfaces_json,
-            uptime_secs, sub_count, blob_count, notify_count,
+            uptime_secs, sub_count, blob_count, notify_count, propagation_json,
         )
     };
 
@@ -802,7 +828,43 @@ fn main() -> Result<(), String> {
     write_status_file(&node, &lxmf_prop_arc, &startup);
 
     // ── Main loop ────────────────────────────────────────────────────
+    // ── Main-loop watchdog ───────────────────────────────────────────
+    // Every section below runs under the FedNode lock. On 2026-09-23 one of
+    // them never returned: status.json stopped, every rfed.link handler that
+    // needs the lock hung, and nothing said so. The watchdog names the
+    // section and the stall length every 30 s so the next one is visible.
+    let loop_section: Arc<Mutex<(&'static str, Instant)>> =
+        Arc::new(Mutex::new(("startup", Instant::now())));
+    {
+        let section = Arc::clone(&loop_section);
+        thread::Builder::new()
+            .name("rfed-main-watchdog".into())
+            .spawn(move || loop {
+                thread::sleep(Duration::from_secs(30));
+                let (name, since) = match section.lock() {
+                    Ok(g) => *g,
+                    Err(_) => continue,
+                };
+                let stalled = since.elapsed();
+                if stalled >= Duration::from_secs(30) {
+                    log(
+                        format!(
+                            "[rfed] MAIN LOOP STALLED {:.0}s in section '{}' — the FedNode lock is held or awaited there; every rfed.link handler that needs it is blocked",
+                            stalled.as_secs_f64(), name
+                        ),
+                        reticulum_rust::LOG_ERROR, false, false,
+                    );
+                }
+            })
+            .expect("failed to spawn the rfed main-loop watchdog");
+    }
+    let enter = |name: &'static str| {
+        if let Ok(mut g) = loop_section.lock() {
+            *g = (name, Instant::now());
+        }
+    };
     loop {
+        enter("loop");
         if interrupted.load(Ordering::Relaxed) {
             eprintln!(
                 "\n[rfed] Shutting down (uptime: {:.1}h)",
@@ -829,16 +891,19 @@ fn main() -> Result<(), String> {
         // that period (Reticulum-rust B22). No bespoke timers here.
 
         // Drive pending peer sync sessions
+        enter("node.tick_sync");
         if let Ok(mut guard) = node.lock() {
             guard.tick_sync();
         }
 
         // Drive LXMF propagation peer sync
+        enter("propagation.tick_sync");
         if let Some(ref prop) = lxmf_prop_arc {
             lxmf_propagation::LxmfPropagationNode::tick_sync(prop);
         }
 
         // Backup delivery: forward pending registrations + check owner failover.
+        enter("backup_delivery+status");
         if last_backup_tick.elapsed() >= backup_tick_interval {
             if let Ok(mut guard) = node.lock() {
                 guard.tick_backup_delivery();
@@ -849,6 +914,7 @@ fn main() -> Result<(), String> {
 
         // Keep replayed distro announces fresh on behalf of the devices that
         // signed them; they have no other refresh path.
+        enter("replay_distro_announces");
         if last_distro_announce.elapsed() >= distro_announce_interval {
             if let Ok(guard) = node.lock() {
                 guard.replay_distro_announces();
@@ -857,6 +923,7 @@ fn main() -> Result<(), String> {
         }
 
         // Evict stale deferred-queue entries for gone-forever subscribers.
+        enter("evict");
         if last_evict.elapsed() >= evict_interval {
             if let Ok(guard) = node.lock() {
                 if let Ok(mut q) = guard.deferred_queue.lock() {
@@ -891,6 +958,7 @@ fn main() -> Result<(), String> {
             last_heartbeat = Instant::now();
         }
 
+        enter("idle");
         thread::sleep(Duration::from_millis(500));
     }
 }

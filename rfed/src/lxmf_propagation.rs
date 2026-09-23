@@ -92,6 +92,18 @@ const DISTRO_DEFERRED_QUEUE_LIMIT: usize = 256;
 /// building from exceeding the 5-second send budget when the messagestore
 /// is large (197k+ messages).
 pub const MAX_OFFER_IDS: usize = 500;
+
+/// No outbound peer sync for this long after start. A restart used to open
+/// with announces, peer links and a full-rate sync all at once; the announces
+/// and links settle first, then the backlog drains (2026-09-23).
+pub const STARTUP_SYNC_GRACE_SECS: f64 = 120.0;
+
+/// Outbound peer-sync budget: messages we push to peers per minute, all
+/// peers together. The reference paces syncs only by each peer's sync_limit
+/// per session every 6 s, which with 20 peers and a 264k-message store meant
+/// ~2000 messages/min for hours after every restart (2026-09-23). The budget
+/// caps the aggregate; a full minute's worth is still ten offers.
+pub const DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN: u64 = 600;
 /// Max time a peer is unreachable before removal (14 days).
 pub const MAX_UNREACHABLE_SECS: f64 = 14.0 * 24.0 * 3600.0;
 /// Peer OFFER request path.
@@ -425,6 +437,17 @@ pub struct LxmfPropagationNode {
 
     // ── Sync timing ───────────────────────────────────────────────────
     pub last_sync_tick: f64,
+    /// When this node started (unix seconds); outbound sync waits
+    /// STARTUP_SYNC_GRACE_SECS from here.
+    pub started_at: f64,
+    /// Outbound sync budget window: start (unix seconds) and messages sent
+    /// to peers within it.
+    pub outbound_sync_window_start: f64,
+    pub outbound_sync_window_count: u64,
+    pub outbound_sync_msgs_per_min: u64,
+    /// Set while the budget or the grace holds sync, so the hold is logged
+    /// once per episode rather than every tick.
+    pub outbound_sync_hold_logged: bool,
 
     // ── Self-reference ────────────────────────────────────────────────
     pub self_handle: Option<Weak<Mutex<LxmfPropagationNode>>>,
@@ -497,6 +520,11 @@ impl LxmfPropagationNode {
             messages_received: 0,
             messages_served: 0,
             last_sync_tick: 0.0,
+            started_at: now(),
+            outbound_sync_window_start: now(),
+            outbound_sync_window_count: 0,
+            outbound_sync_msgs_per_min: DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN,
+            outbound_sync_hold_logged: false,
             self_handle: None,
         }));
 
@@ -1735,6 +1763,45 @@ impl LxmfPropagationNode {
     ///
     /// Flow: select best candidate peer with unhandled messages → ensure
     /// peering key is ready → initiate outbound link + OFFER request.
+    /// May this tick start an outbound peer sync? False during the startup
+    /// grace and once the per-minute budget is spent. Logs the reason once
+    /// per hold and the release once, so the log tells the story without
+    /// repeating it every 6 s.
+    pub fn outbound_sync_allowed(&mut self) -> bool {
+        let t = now();
+        if t - self.outbound_sync_window_start >= 60.0 {
+            self.outbound_sync_window_start = t;
+            self.outbound_sync_window_count = 0;
+        }
+        let grace_left = STARTUP_SYNC_GRACE_SECS - (t - self.started_at);
+        let held = if grace_left > 0.0 {
+            Some(format!("startup grace, {grace_left:.0}s left"))
+        } else if self.outbound_sync_window_count >= self.outbound_sync_msgs_per_min {
+            Some(format!(
+                "budget spent, {}/{} messages this minute",
+                self.outbound_sync_window_count, self.outbound_sync_msgs_per_min
+            ))
+        } else {
+            None
+        };
+        match held {
+            Some(reason) => {
+                if !self.outbound_sync_hold_logged {
+                    log(format!("[lxmf.prop] outbound peer sync held: {reason}"), LOG_NOTICE, false, false);
+                    self.outbound_sync_hold_logged = true;
+                }
+                false
+            }
+            None => {
+                if self.outbound_sync_hold_logged {
+                    log("[lxmf.prop] outbound peer sync resumed", LOG_NOTICE, false, false);
+                    self.outbound_sync_hold_logged = false;
+                }
+                true
+            }
+        }
+    }
+
     pub fn tick_sync(arc: &Arc<Mutex<Self>>) {
         let mut guard = match arc.lock() {
             Ok(g) => g,
@@ -1745,6 +1812,9 @@ impl LxmfPropagationNode {
             return;
         }
         guard.last_sync_tick = now();
+        if !guard.outbound_sync_allowed() {
+            return;
+        }
 
         // Cull non-static peers we haven't heard from in MAX_UNREACHABLE_SECS.
         // Static peers are never culled — they're operator-configured.
@@ -2407,6 +2477,7 @@ impl LxmfPropagationNode {
         // handler — which is what we need for the client PUT wire format.
         match link.send_packet(&transfer_data) {
             Ok(_) => {
+                self.outbound_sync_window_count += msg_count as u64;
                 log(
                     format!("[lxmf.prop] sent {} message(s) to peer {}", msg_count, peer_hash_str),
                     LOG_NOTICE, false, false,
@@ -2633,12 +2704,43 @@ mod tests {
     // 73 s and 182 s for it behind message ingest, which held it for a whole
     // batch: stamp validation, a disk write and a linear scan of every peer's
     // queue per message, and live delivery. See `ingest_propagation_batch`.
+    /// The outbound sync gate: a restart no longer opens with a full-rate
+    /// sync, and the aggregate push to peers is budgeted per minute.
+    mod outbound_sync_gate_tests {
+        use super::ingest_lock_scope_tests::test_node;
+        use super::super::*;
+
+        #[test]
+        fn sync_is_held_during_the_startup_grace_then_released() {
+            let node = test_node("grace");
+            let mut g = node.lock().unwrap();
+            assert!(!g.outbound_sync_allowed(), "no outbound sync right after start");
+            g.started_at = now() - STARTUP_SYNC_GRACE_SECS - 1.0;
+            assert!(g.outbound_sync_allowed(), "allowed once the grace has passed");
+        }
+
+        #[test]
+        fn sync_is_held_once_the_minute_budget_is_spent_and_resets_next_minute() {
+            let node = test_node("budget");
+            let mut g = node.lock().unwrap();
+            g.started_at = now() - STARTUP_SYNC_GRACE_SECS - 1.0;
+            g.outbound_sync_window_count = g.outbound_sync_msgs_per_min;
+            assert!(!g.outbound_sync_allowed(), "budget spent holds sync");
+            assert!(g.outbound_sync_hold_logged, "the hold is logged once");
+            assert!(!g.outbound_sync_allowed(), "still held within the window");
+            g.outbound_sync_window_start = now() - 61.0;
+            assert!(g.outbound_sync_allowed(), "a new minute resets the budget");
+            assert_eq!(g.outbound_sync_window_count, 0);
+            assert!(!g.outbound_sync_hold_logged, "the release clears the hold flag");
+        }
+    }
+
     mod ingest_lock_scope_tests {
         use super::super::*;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::time::Instant;
 
-        fn test_node(tag: &str) -> Arc<Mutex<LxmfPropagationNode>> {
+        pub(super) fn test_node(tag: &str) -> Arc<Mutex<LxmfPropagationNode>> {
             let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
             let dir = std::env::temp_dir().join(format!("rfed_prop_{tag}_{unique}"));
             let config = NodeConfig {
