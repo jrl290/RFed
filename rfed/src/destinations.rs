@@ -438,11 +438,15 @@ pub const PROPAGATION_STREAM_OPEN_PATH: &str = "/rfed/propagation/stream/open";
 /// RNS app namespace for all rfed destinations.
 pub const APP_NAME: &str = "rfed";
 
-/// Service-path refresh interval (seconds).  Channel/delivery/notify/
-/// lxmf.propagation are kept fresh on every directly-connected interface
-/// well within the Reticulum 1-hour path TTL so clients never have to learn
-/// them via stale federation-flooded copies.
-pub const SERVICE_REFRESH_INTERVAL_SECS: u64 = 15 * 60;
+/// Service-path refresh interval (seconds): six hours, the reference's own
+/// cadence (lxmd `announce_interval = 360` minutes). A Reticulum path lives
+/// a week (`PATHFINDER_E`), not an hour as the previous comment claimed, and
+/// public transport nodes rate-limit re-announces to about one an hour
+/// (`announce_rate_target = 3600` in the manual's example): at the old 15
+/// minutes every rfed service destination was a rate violation and the
+/// backbones stopped relaying them (2026-09-23). Transport's own floor is
+/// `AUTO_ANNOUNCE_HOLDOFF_SECS`, the same six hours.
+pub const SERVICE_REFRESH_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
 /// Number of workblock expansion rounds for rfed stamp PoW.
 /// The actual anti-spam difficulty is controlled by `stamp_cost` (required leading
@@ -892,9 +896,9 @@ impl FedNode {
     /// both held per destination and per interface to that interval.
     ///
     /// rfed.node refreshes at the configured `announce_interval_secs`
-    /// (default 6h); the three service destinations refresh every
-    /// `SERVICE_REFRESH_INTERVAL_SECS` (15min) so they always stay fresh
-    /// inside the Reticulum 1-hour path TTL.
+    /// (default 6h); the service destinations refresh every
+    /// `SERVICE_REFRESH_INTERVAL_SECS` (also 6h). Paths live a week; the
+    /// refresh is for nodes that restarted and lost their table.
     pub fn publish_destinations(&self) {
         use reticulum_rust::transport::Transport;
         // Keep channel/node announce stamp policy aligned with SEND parsing:

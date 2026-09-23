@@ -671,7 +671,7 @@ impl LxmfPropagationNode {
     }
 
     /// Opt the propagation destination into Transport's announce daemon
-    /// so it is re-announced every `SERVICE_REFRESH_INTERVAL_SECS` (15 min).
+    /// so it is re-announced every `SERVICE_REFRESH_INTERVAL_SECS` (6 h).
     /// See DESIGN_PRINCIPLES.md §3-§4.
     ///
     /// Transport announces it once on each interface up-edge and on the

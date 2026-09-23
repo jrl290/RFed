@@ -38,7 +38,9 @@ const LEGACY_REGISTER_ASPECT: &str = "apns";
 const UNREGISTER_APP:   &str = "apns";
 const UNREGISTER_ASPECT: &str = "unregister";
 
-const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(600);
+// Six hours, the reference cadence (lxmd announce_interval = 360 min).
+// Every 10 minutes tripped the backbones' announce_rate_target (2026-09-23).
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 

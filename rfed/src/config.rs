@@ -253,7 +253,7 @@ mod tests {
             rns_config_dir: None,
             identity_file: PathBuf::from("/tmp/rfed_test_cfg/identity"),
             display_name: "test".into(),
-            announce_interval_secs: 600,
+            announce_interval_secs: 6 * 60 * 60,
             announce_at_start: false,
             default_policy: default,
             vip_policy: vip,
