@@ -829,9 +829,10 @@ impl FedNode {
         let _ = self.notify_dest.announce(None, false, None, None, true);
         // New split aspects (REFACTOR.md 2026-05-17).  Stamp policy rides on
         // the publish destination since that's where SEND lands (matches
-        // `publish_destinations()` below).  Set default_app_data so the
-        // Transport announce daemon's interface-up re-announces (which call
-        // `dest.announce(None, ...)`) still carry the stamp policy.
+        // `publish_destinations()` below).  Transport's announce daemon uses
+        // the app_data registered via `publish_destination`, falling back to
+        // the destination's default app_data; set it too so any announce
+        // without explicit app_data still carries the stamp policy.
         self.channel_publish_dest.set_default_app_data(Some(app_data.clone()));
         let _ = self.channel_subscribe_dest.announce(None, false, None, None, true);
         let _ = self.channel_unsubscribe_dest.announce(None, false, None, None, true);
@@ -887,7 +888,8 @@ impl FedNode {
     /// Opt all four locally-registered destinations into Transport's
     /// announce daemon so they are automatically re-announced:
     ///   * once on every false→true online transition of any interface, and
-    ///   * every `refresh_interval` thereafter.
+    ///   * every `refresh_interval` thereafter,
+    /// both held per destination and per interface to that interval.
     ///
     /// rfed.node refreshes at the configured `announce_interval_secs`
     /// (default 6h); the three service destinations refresh every

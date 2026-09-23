@@ -745,7 +745,8 @@ fn main() -> Result<(), String> {
     //
     // `Transport::publish_destination` opts each destination into the
     // announce daemon: it auto-re-announces once on every interface
-    // false→true online transition AND on every `refresh_interval` tick.
+    // false→true online transition AND on every `refresh_interval` tick,
+    // both held per destination and per interface to that period.
     // No sleeps, no startup-burst, no periodic main-loop announce ticks
     // (see DESIGN_PRINCIPLES.md §3-§4).
     if let Ok(guard) = node.lock() {

@@ -643,8 +643,9 @@ impl LxmfPropagationNode {
     /// (Reticulum-rust B22); the one immediate announce fired here covers
     /// interfaces that are already up. `announce` with `send=true` routes through
     /// `Transport::outbound`, which skips offline interfaces, so this is
-    /// safe regardless of current link state. This is a single targeted
-    /// announce, not a periodic timer.
+    /// safe regardless of current link state. This is a single untargeted
+    /// announce (it starts the period on every interface it goes out on),
+    /// not a periodic timer.
     pub fn publish_destination(arc: &Arc<Mutex<Self>>) {
         use reticulum_rust::transport::Transport;
         let mut immediate: Option<(Vec<u8>, Destination)> = None;
