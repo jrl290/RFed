@@ -2065,11 +2065,24 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
 
             let hooks = hook_registry.lock().ok();
             let mut failed: Vec<&crate::deferred_queue::PendingBlob> = Vec::new();
+            let mut oversized: Vec<&crate::deferred_queue::PendingBlob> = Vec::new();
             for pb in &pending {
                 // Delivery packet payload: channel_hash(16) | inner_blob
                 // Matches the format expected by the subscriber's onRfedBlob handler.
                 let mut payload = pb.channel_hash.clone();
                 payload.extend_from_slice(&pb.blob);
+                // A blob above the packet MDU can never leave here as a single
+                // DATA packet: Packet::send fails with "exceeds MTU" every time.
+                // Until 2026-09-23 that failure re-enqueued the blob and the
+                // next announce from the subscriber tried again — the same
+                // impossible send, a warning per blob per announce, for ever.
+                // Such blobs belong to the link tiers (`/channel/pull`, or a
+                // bound rfed.link / stream session), so keep them queued and
+                // do not attempt the packet.
+                if !fits_in_delivery_packet(payload.len()) {
+                    oversized.push(pb);
+                    continue;
+                }
                 let mut packet = reticulum_rust::packet::Packet::new(
                     Some(dest.clone()),
                     payload,
@@ -2118,6 +2131,20 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     }
                 }
             }
+            if !oversized.is_empty() {
+                log(
+                    format!(
+                        "[deferred] {} blob(s) for {} exceed the {}-byte packet MDU — left queued for /channel/pull or a bound rfed.link",
+                        oversized.len(),
+                        hexrep(&sub_id_hash, false),
+                        reticulum_rust::packet::ENCRYPTED_MDU,
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                failed.extend(oversized);
+            }
             // Re-enqueue the blobs that did not transmit so they survive for the
             // next announce / path-ready trigger instead of being dropped.
             if !failed.is_empty() {
@@ -2131,6 +2158,42 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+/// Whether a `channel_hash | blob` delivery payload fits one encrypted DATA
+/// packet to a Single destination. Above this only a link can carry it.
+pub(crate) fn fits_in_delivery_packet(payload_len: usize) -> bool {
+    payload_len <= reticulum_rust::packet::ENCRYPTED_MDU
+}
+
+#[cfg(test)]
+mod deferred_flush_size_tests {
+    use super::fits_in_delivery_packet;
+    use reticulum_rust::packet::ENCRYPTED_MDU;
+
+    #[test]
+    fn the_packet_mdu_is_the_boundary() {
+        assert!(fits_in_delivery_packet(ENCRYPTED_MDU));
+        assert!(!fits_in_delivery_packet(ENCRYPTED_MDU + 1));
+        // The production case of 2026-09-23: a 1795-byte channel blob plus the
+        // 16-byte channel hash, retried on every subscriber announce.
+        assert!(!fits_in_delivery_packet(16 + 1795));
+    }
+
+    /// The deferred flush must consult the size gate before it builds a packet,
+    /// otherwise the impossible-send loop comes back.
+    #[test]
+    fn deferred_flush_gates_on_size_before_building_a_packet() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/destinations.rs"))
+            .expect("read destinations.rs");
+        let start = source
+            .find("back online — flushing")
+            .expect("deferred flush present");
+        let fragment = &source[start..];
+        let gate = fragment.find("fits_in_delivery_packet(payload.len())").expect("size gate present");
+        let packet = fragment.find("reticulum_rust::packet::Packet::new(").expect("packet build present");
+        assert!(gate < packet, "the size gate must run before Packet::new in the deferred flush");
+    }
 }
 
 // ── rfed.node ────────────────────────────────────────────────────────────────
