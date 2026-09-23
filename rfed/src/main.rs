@@ -169,10 +169,10 @@ fn write_status_file(
             (peer.next_sync_attempt - now_secs).max(0.0), peer.sync_transfer_rate,
         )).collect::<Vec<_>>().join(",\n");
         format!(
-            "{{\n    \"messagestore\": {},\n    \"outbound_sync\": {{\"sent_this_minute\": {}, \"budget_per_minute\": {}, \"startup_grace_left_secs\": {:.0}}},\n    \"peers\": [\n{}\n    ]\n  }}",
-            g.entries.len(),
+            "{{\n    \"messagestore\": {},\n    \"fresh_since_start\": {},\n    \"outbound_sync\": {{\"sent_this_minute\": {}, \"budget_per_minute\": {}, \"backlog_hold_left_secs\": {:.0}}},\n    \"peers\": [\n{}\n    ]\n  }}",
+            g.entries.len(), g.fresh_since_start.len(),
             g.outbound_sync_window_count, g.outbound_sync_msgs_per_min,
-            (lxmf_propagation::STARTUP_SYNC_GRACE_SECS - (now_secs - g.started_at)).max(0.0),
+            (lxmf_propagation::STARTUP_BACKLOG_HOLD_SECS - (now_secs - g.started_at)).max(0.0),
             peers_json,
         )
     }).unwrap_or_else(|| "null".to_string());

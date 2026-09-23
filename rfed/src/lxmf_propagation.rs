@@ -93,10 +93,12 @@ const DISTRO_DEFERRED_QUEUE_LIMIT: usize = 256;
 /// is large (197k+ messages).
 pub const MAX_OFFER_IDS: usize = 500;
 
-/// No outbound peer sync for this long after start. A restart used to open
-/// with announces, peer links and a full-rate sync all at once; the announces
-/// and links settle first, then the backlog drains (2026-09-23).
-pub const STARTUP_SYNC_GRACE_SECS: f64 = 120.0;
+/// The backlog — every message already stored when this node started — is
+/// held back from outbound peer sync for this long after start. A restart
+/// used to open with announces, peer links and a full-rate drain of that
+/// backlog all at once (2026-09-23). Messages received after start are not
+/// backlog: they sync immediately, hold or no hold.
+pub const STARTUP_BACKLOG_HOLD_SECS: f64 = 3600.0;
 
 /// Outbound peer-sync budget: messages we push to peers per minute, all
 /// peers together. The reference paces syncs only by each peer's sync_limit
@@ -437,9 +439,13 @@ pub struct LxmfPropagationNode {
 
     // ── Sync timing ───────────────────────────────────────────────────
     pub last_sync_tick: f64,
-    /// When this node started (unix seconds); outbound sync waits
-    /// STARTUP_SYNC_GRACE_SECS from here.
+    /// When this node started (unix seconds). Everything stored before this
+    /// is backlog and waits STARTUP_BACKLOG_HOLD_SECS; see `sync_pool`.
     pub started_at: f64,
+    /// Transient ids received since start, in arrival order. During the
+    /// backlog hold these are the only ids offered to peers.
+    pub fresh_since_start: Vec<Vec<u8>>,
+    pub backlog_hold_logged: bool,
     /// Outbound sync budget window: start (unix seconds) and messages sent
     /// to peers within it.
     pub outbound_sync_window_start: f64,
@@ -521,6 +527,8 @@ impl LxmfPropagationNode {
             messages_served: 0,
             last_sync_tick: 0.0,
             started_at: now(),
+            fresh_since_start: Vec::new(),
+            backlog_hold_logged: false,
             outbound_sync_window_start: now(),
             outbound_sync_window_count: 0,
             outbound_sync_msgs_per_min: DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN,
@@ -1015,6 +1023,7 @@ impl LxmfPropagationNode {
                 peer.add_unhandled(transient_id.clone());
             }
         }
+        self.fresh_since_start.push(transient_id.clone());
 
         self.messages_received += 1;
 
@@ -1763,20 +1772,64 @@ impl LxmfPropagationNode {
     ///
     /// Flow: select best candidate peer with unhandled messages → ensure
     /// peering key is ready → initiate outbound link + OFFER request.
-    /// May this tick start an outbound peer sync? False during the startup
-    /// grace and once the per-minute budget is spent. Logs the reason once
-    /// per hold and the release once, so the log tells the story without
-    /// repeating it every 6 s.
+    /// Is the startup backlog still held back from peer sync?
+    pub fn backlog_held(&self) -> bool {
+        now() - self.started_at < STARTUP_BACKLOG_HOLD_SECS
+    }
+
+    /// The ids this peer may be offered right now: during the backlog hold
+    /// only messages received since start that it still lacks; afterwards
+    /// everything it still lacks. Cheap during the hold because it walks the
+    /// fresh list, not the peer's (possibly 150k-entry) queue.
+    pub fn sync_pool(&self, peer: &PropPeer) -> Vec<Vec<u8>> {
+        Self::sync_pool_for(self.backlog_held(), &self.fresh_since_start, peer)
+    }
+
+    /// `sync_pool` without `&self`, for callers already holding a mutable
+    /// borrow of one peer.
+    pub fn sync_pool_for(backlog_held: bool, fresh_since_start: &[Vec<u8>], peer: &PropPeer) -> Vec<Vec<u8>> {
+        if backlog_held {
+            fresh_since_start.iter()
+                .filter(|tid| peer.unhandled_ids.contains(tid))
+                .cloned()
+                .collect()
+        } else {
+            peer.unhandled_ids.to_vec()
+        }
+    }
+
+    /// Log the hold once and its release once.
+    fn note_backlog_hold(&mut self) {
+        let held = self.backlog_held();
+        if held && !self.backlog_hold_logged {
+            log(
+                format!(
+                    "[lxmf.prop] startup backlog held from peer sync for {:.0}s; messages received from now on sync immediately",
+                    STARTUP_BACKLOG_HOLD_SECS
+                ),
+                LOG_NOTICE, false, false,
+            );
+            self.backlog_hold_logged = true;
+        } else if !held && self.backlog_hold_logged {
+            log("[lxmf.prop] startup backlog released to peer sync", LOG_NOTICE, false, false);
+            self.backlog_hold_logged = false;
+            // No longer consulted once the hold is over; do not let it grow
+            // for the rest of the uptime.
+            self.fresh_since_start = Vec::new();
+            self.fresh_since_start.shrink_to_fit();
+        }
+    }
+
+    /// May this tick start an outbound peer sync? False once the per-minute
+    /// budget is spent. Logs the hold once and the release once, so the log
+    /// tells the story without repeating it every 6 s.
     pub fn outbound_sync_allowed(&mut self) -> bool {
         let t = now();
         if t - self.outbound_sync_window_start >= 60.0 {
             self.outbound_sync_window_start = t;
             self.outbound_sync_window_count = 0;
         }
-        let grace_left = STARTUP_SYNC_GRACE_SECS - (t - self.started_at);
-        let held = if grace_left > 0.0 {
-            Some(format!("startup grace, {grace_left:.0}s left"))
-        } else if self.outbound_sync_window_count >= self.outbound_sync_msgs_per_min {
+        let held = if self.outbound_sync_window_count >= self.outbound_sync_msgs_per_min {
             Some(format!(
                 "budget spent, {}/{} messages this minute",
                 self.outbound_sync_window_count, self.outbound_sync_msgs_per_min
@@ -1812,6 +1865,7 @@ impl LxmfPropagationNode {
             return;
         }
         guard.last_sync_tick = now();
+        guard.note_backlog_hold();
         if !guard.outbound_sync_allowed() {
             return;
         }
@@ -1837,6 +1891,7 @@ impl LxmfPropagationNode {
                     && !peer.unhandled_ids.is_empty()
                     && peer.alive
                     && now() >= peer.next_sync_attempt
+                    && !guard.sync_pool(peer).is_empty()
             })
             .map(|(hash, _)| hash.clone())
             .next();
@@ -2003,7 +2058,7 @@ impl LxmfPropagationNode {
                 log(format!("[lxmf.prop] sync: peer state={} not IDLE", peer.state), LOG_DEBUG, false, false);
                 return;
             }
-            (peer.unhandled_ids.to_vec(), peer.peering_key.is_some())
+            (guard.sync_pool(peer), peer.peering_key.is_some())
         };
 
         if !peering_key_ready {
@@ -2107,6 +2162,8 @@ impl LxmfPropagationNode {
             format!("[lxmf.prop] initiate_sync starting for {}", hexrep(peer_hash, false)),
             LOG_DEBUG, false, false,
         );
+        let backlog_held = self.backlog_held();
+        let fresh_since_start = if backlog_held { self.fresh_since_start.clone() } else { Vec::new() };
         let peer = match self.peers.get_mut(peer_hash) {
             Some(p) => p,
             None => { log("[lxmf.prop] sync: peer not found", LOG_DEBUG, false, false); return; }
@@ -2129,7 +2186,8 @@ impl LxmfPropagationNode {
         // This ensures small/recent messages are offered first, and oversized
         // messages that exceed the peer's transfer limit are auto-handled.
         let mut entries_with_weight: Vec<(Vec<u8>, f64, u64)> = Vec::new();
-        for tid in peer.unhandled_ids.iter() {
+        let pool = Self::sync_pool_for(backlog_held, &fresh_since_start, peer);
+        for tid in pool.iter() {
             if let Some(entry) = self.entries.get(tid) {
                 let age = ((now() - entry.received) / 86400.0 / 4.0).max(1.0);
                 let weight = age * entry.size as f64;
@@ -2710,20 +2768,46 @@ mod tests {
         use super::ingest_lock_scope_tests::test_node;
         use super::super::*;
 
+        fn entry(received: f64) -> PropagationEntry {
+            PropagationEntry { destination_hash: vec![0; 16], filepath: String::new(), received, size: 100, stamp_value: 0 }
+        }
+
         #[test]
-        fn sync_is_held_during_the_startup_grace_then_released() {
-            let node = test_node("grace");
+        fn backlog_is_held_for_an_hour_but_fresh_messages_sync_at_once() {
+            let node = test_node("backlog");
             let mut g = node.lock().unwrap();
-            assert!(!g.outbound_sync_allowed(), "no outbound sync right after start");
-            g.started_at = now() - STARTUP_SYNC_GRACE_SECS - 1.0;
-            assert!(g.outbound_sync_allowed(), "allowed once the grace has passed");
+            let old = vec![1u8; 32];
+            let fresh = vec![2u8; 32];
+            let t0 = g.started_at;
+            g.entries.insert(old.clone(), entry(t0 - 100.0));
+            g.entries.insert(fresh.clone(), entry(t0 + 1.0));
+            g.fresh_since_start.push(fresh.clone());
+            let mut peer = PropPeer::new(vec![9u8; 16]);
+            peer.add_unhandled(old.clone());
+            peer.add_unhandled(fresh.clone());
+            assert!(g.backlog_held());
+            assert_eq!(g.sync_pool(&peer), vec![fresh.clone()], "only the fresh message is offered during the hold");
+            let mut backlog_only = PropPeer::new(vec![8u8; 16]);
+            backlog_only.add_unhandled(old.clone());
+            assert!(g.sync_pool(&backlog_only).is_empty(), "a peer lacking only backlog is not synced yet");
+            g.started_at = now() - STARTUP_BACKLOG_HOLD_SECS - 1.0;
+            assert!(!g.backlog_held());
+            let pool = g.sync_pool(&peer);
+            assert!(pool.contains(&old) && pool.contains(&fresh), "after the hold everything the peer lacks is offered");
+        }
+
+        #[test]
+        fn outbound_sync_is_not_gated_by_the_backlog_hold() {
+            let node = test_node("fresh_allowed");
+            let mut g = node.lock().unwrap();
+            assert!(g.backlog_held());
+            assert!(g.outbound_sync_allowed(), "the budget alone gates the tick; fresh messages need no wait");
         }
 
         #[test]
         fn sync_is_held_once_the_minute_budget_is_spent_and_resets_next_minute() {
             let node = test_node("budget");
             let mut g = node.lock().unwrap();
-            g.started_at = now() - STARTUP_SYNC_GRACE_SECS - 1.0;
             g.outbound_sync_window_count = g.outbound_sync_msgs_per_min;
             assert!(!g.outbound_sync_allowed(), "budget spent holds sync");
             assert!(g.outbound_sync_hold_logged, "the hold is logged once");
