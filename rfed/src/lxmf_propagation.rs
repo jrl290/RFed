@@ -684,7 +684,11 @@ impl LxmfPropagationNode {
     /// not a periodic timer.
     pub fn publish_destination(arc: &Arc<Mutex<Self>>) {
         use reticulum_rust::transport::Transport;
-        let mut immediate: Option<(Vec<u8>, Destination)> = None;
+        // No immediate announce here: main.rs announces at start when
+        // announce_at_start is set, and otherwise Transport's daemon announces
+        // a never-announced published destination on its next sweep. The
+        // copy that used to fire here was a second announce of the same
+        // destination within a second (2026-09-23 logs).
         if let Ok(guard) = arc.lock() {
             let app_data = guard.build_app_data();
             Transport::publish_destination(
@@ -692,16 +696,8 @@ impl LxmfPropagationNode {
                 Some(Duration::from_secs(
                     crate::destinations::SERVICE_REFRESH_INTERVAL_SECS,
                 )),
-                Some(app_data.clone()),
+                Some(app_data),
             );
-            immediate = Some((app_data, guard.destination.clone()));
-        }
-        // Announce outside the lock: Destination::announce re-enters TRANSPORT
-        // via remember_ratchet, which would deadlock against the guard above.
-        if let Some((app_data, mut dest)) = immediate {
-            dest.set_default_app_data(Some(app_data.clone()));
-            let _ = dest.announce(Some(&app_data), false, None, None, true);
-            log("[lxmf.prop] announced propagation node (post-publish immediate)", LOG_NOTICE, false, false);
         }
     }
 
