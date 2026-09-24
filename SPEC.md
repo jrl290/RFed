@@ -1369,6 +1369,34 @@ The response format is identical to the `rfed.delivery` PULL response.
 The `distro_hash` field contains the distro's `lxmf.delivery` hash
 (the routing key), and `blob` is the raw LXMF propagation message.
 
+### 17.10 Distro Announce
+
+RFed rebroadcasts the pre-signed `lxmf.delivery` announce a device hands it
+on `/rfed/distro/announce` (§17.4). Its `app_data` is the LXMF 0.5.0+ list
+and marks the address as a distro:
+
+```
+[ nil,            // display_name: none (names travel inside encrypted messages)
+  nil,            // stamp_cost: none
+  [ 0xD0 ] ]      // supported_functionality: SF_RFED_DISTRO
+```
+
+`SF_RFED_DISTRO = 0xD0` is an entry in the supported-functionality list
+next to LXMF's `SF_COMPRESSION = 0x00`. The list has no custom range, so
+the value sits far above what upstream counts up from zero and outside the
+one-byte msgpack range it would fill first. Readers check membership only,
+so the reference ignores it, and a device that also wants to claim
+compression may list both.
+
+This is the only way an address is known to be a distro. No device answers
+a direct link to a distro address, so a sender that has seen the flag sends
+PROPAGATED at once (LXMF-rust `LXMRouter::handle_outbound`, Retichat-js
+`isDistro` contacts). The flag is learned from the announce a sender needs
+anyway to encrypt to the address; nothing is queried, and a contact link
+(`lxma://hash:pubkey`) carries a key, not this fact. `lxmf_rust::distro::
+announce_payload` always writes the flag; `lxmf_rust::lxmf::
+distro_from_app_data` reads it.
+
 ### 17.9 Distro Identity Transfer
 
 The distro identity (64-byte private key) is shared between devices
@@ -1386,10 +1414,19 @@ the private key on import.
 
 **LXMF transfer:**
 
-The sender encrypts the private key bytes to the recipient's
-`lxmf.delivery` address using standard RNS identity encryption.
-The recipient decrypts with their own identity key and imports the
-distro identity.
+The sender addresses an ordinary LXMF message to the recipient's
+`lxmf.delivery` address (signed as the sending *device*, not as the distro,
+so the recipient can judge the offer by who sent it) and carries the key in
+LXMF's custom-payload pair:
+
+```
+fields[0xFB] (FIELD_CUSTOM_TYPE) = "rfed.distro.transfer"
+fields[0xFC] (FIELD_CUSTOM_DATA) = <128 hex chars, the private key>
+```
+
+A receiver treats a message as a transfer only when `FIELD_CUSTOM_TYPE`
+equals that string. Field `0x0D`, used before 2026-09-24, is LXMF 1.1.1's
+`FIELD_EVENT` and is neither written nor read.
 
 **User flow:**
 
