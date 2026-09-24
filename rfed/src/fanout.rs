@@ -382,8 +382,14 @@ pub fn fanout_blob(
                     false,
                     FLAG_UNSET,
                 );
-                match packet.send() {
-                    Err(e) => {
+                // Packet::send() returns Ok(None) both when nothing was transmitted and
+                // when the packet went out without a receipt being requested (these
+                // packets never ask for one). Until 2026-09-24 the second case was read
+                // as the first: every successful send was re-queued and re-sent on the
+                // next announce. `packet.sent` is the transmitted flag (RNS/Packet.py
+                // send() returns False, not None, when no interface took it).
+                match (packet.send(), packet.sent) {
+                    (Err(e), _) => {
                         log(
                             format!("[fanout] send to {} failed: {e} — will defer", hexrep(sub_hash, false)),
                             LOG_WARNING,
@@ -392,7 +398,7 @@ pub fn fanout_blob(
                         );
                         missed.push(sub_hash.clone());
                     }
-                    Ok(None) => {
+                    (Ok(None), false) => {
                         // Transport::outbound returned false (e.g. subscriber's TCP
                         // session is gone but the path entry still exists).  Treat as
                         // delivery failure and defer the blob.
@@ -404,7 +410,7 @@ pub fn fanout_blob(
                         );
                         missed.push(sub_hash.clone());
                     }
-                    Ok(Some(_)) => {
+                    (Ok(Some(_)), _) | (Ok(None), true) => {
                         log(
                             format!(
                                 "[FANOUT] SENT channel={} sub={} payload_bytes={}",

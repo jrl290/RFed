@@ -2099,9 +2099,15 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     false,
                     reticulum_rust::packet::FLAG_UNSET,
                 );
-                match packet.send() {
+                // Packet::send() returns Ok(None) both when nothing was transmitted and
+                // when the packet went out without a receipt being requested (these
+                // packets never ask for one). Until 2026-09-24 the second case was read
+                // as the first: every successful send was re-queued and re-sent on the
+                // next announce. `packet.sent` is the transmitted flag (RNS/Packet.py
+                // send() returns False, not None, when no interface took it).
+                match (packet.send(), packet.sent) {
                     // Ok(Some) = transmitted (receipt); keep it drained.
-                    Ok(Some(_)) => {
+                    (Ok(Some(_)), _) | (Ok(None), true) => {
                         if let Some(ref hooks) = hooks {
                             hooks.on_deliver(&sub_id_hash, &pb.blob);
                         }
@@ -2112,7 +2118,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     // path-ready edge retries.  Previously Ok(None) fell through
                     // to on_deliver and the blob was silently lost, which is why
                     // fanned-out distro messages never reached devices.
-                    Ok(None) => {
+                    (Ok(None), false) => {
                         log(
                             format!("[deferred] send to {} not transmitted (no usable interface) — re-enqueueing",
                                 hexrep(&sub_id_hash, false)),
@@ -2123,7 +2129,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                         failed.push(pb);
                     }
                     // Err = hard send error — re-enqueue so a later announce retries.
-                    Err(e) => {
+                    (Err(e), _) => {
                         log(
                             format!("[deferred] send to {} failed: {e} — re-enqueueing",
                                 hexrep(&sub_id_hash, false)),
@@ -2187,6 +2193,27 @@ mod deferred_flush_size_tests {
     /// The deferred flush must consult the size gate before it builds a packet,
     /// otherwise the impossible-send loop comes back.
     #[test]
+    /// A receipt-less send that went out is a delivery, not a failure: every
+    /// fan-out reads `packet.sent` next to the send result, and the
+    /// transmitted arm is written so that arm order cannot swallow the
+    /// not-transmitted case (2026-09-24: 77 successful sends re-queued in a day).
+    #[test]
+    fn fanouts_read_the_transmitted_flag_not_the_receipt() {
+        for (name, src) in [
+            ("destinations.rs", include_str!("destinations.rs")),
+            ("distro.rs", include_str!("distro.rs")),
+            ("fanout.rs", include_str!("fanout.rs")),
+        ] {
+            // Everything before this test: destinations.rs has test modules above
+            // its deferred flush, so a #[cfg(test)] split would drop the code under test.
+            let production = src.split("fn fanouts_read_the_transmitted_flag_not_the_receipt").next().unwrap();
+            assert_eq!(production.matches("match packet.send() {").count(), 0, "{name}: a bare match on Packet::send cannot tell sent-without-receipt from not-sent");
+            assert_eq!(production.matches("match (packet.send(), packet.sent) {").count(), 1, "{name}");
+            assert!(production.contains("(Ok(None), false) =>"), "{name}: the not-transmitted arm");
+            assert!(production.contains("(Ok(Some(_)), _) | (Ok(None), true) =>"), "{name}: the transmitted arm names both shapes");
+        }
+    }
+
     fn deferred_flush_gates_on_size_before_building_a_packet() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/destinations.rs"))
             .expect("read destinations.rs");
