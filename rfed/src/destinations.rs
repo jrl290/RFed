@@ -2190,9 +2190,6 @@ mod deferred_flush_size_tests {
         assert!(!fits_in_delivery_packet(16 + 1795));
     }
 
-    /// The deferred flush must consult the size gate before it builds a packet,
-    /// otherwise the impossible-send loop comes back.
-    #[test]
     /// A receipt-less send that went out is a delivery, not a failure: every
     /// fan-out reads `packet.sent` next to the send result, and the
     /// transmitted arm is written so that arm order cannot swallow the
@@ -2214,6 +2211,10 @@ mod deferred_flush_size_tests {
         }
     }
 
+    /// The deferred flush must consult the size gate before it builds a packet,
+    /// otherwise the impossible-send loop comes back. (Until 2026-09-24 its
+    /// #[test] sat on the test above, so this one never ran.)
+    #[test]
     fn deferred_flush_gates_on_size_before_building_a_packet() {
         let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/destinations.rs"))
             .expect("read destinations.rs");
@@ -3490,9 +3491,20 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 .policy_for(&subscriber_hash)
                 .deferred_pull_batch_limit
                 .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
+            // Distro blobs only. The identity's bucket also holds the channel
+            // blobs deferred for it (the same identity subscribes to
+            // channels), which `/channel/pull` serves; the distro clients
+            // unwrap every blob they get here with the distro key and drop
+            // the rest, so a channel blob handed out here was lost.
+            let distros = guard
+                .distro_table
+                .lock()
+                .map(|table| table.registered_distro_hashes())
+                .unwrap_or_default();
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                let pending = deferred.drain_batch(&subscriber_hash, page_size);
-                let more_pending = deferred.has_pending(&subscriber_hash);
+                let is_distro = |routing: &[u8]| distros.contains(routing);
+                let pending = deferred.drain_matching_batch(&subscriber_hash, is_distro, page_size);
+                let more_pending = deferred.has_pending_matching(&subscriber_hash, is_distro);
                 return encode_pull_response(pending, more_pending);
             }
         }

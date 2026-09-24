@@ -165,6 +165,34 @@ pub struct PushContext {
     pub deferred_limits: HashMap<Vec<u8>, usize>,
 }
 
+/// The hand-off both live tiers use when the subscriber never confirms a
+/// push (tier 1: no response; tier 2: no link proof): the blob goes to the
+/// deferred queue, which `/channel/pull` drains. It runs on its own thread
+/// (a request's failed callback, or stream_registry's unproven hook), so it
+/// takes only the deferred-queue lock.
+fn defer_for_pull(ctx: &PushContext, sub_hash: &[u8], channel_dest_hash: &[u8], inner_blob: &[u8]) -> Arc<dyn Fn() + Send + Sync> {
+    let limit = ctx.deferred_limits.get(sub_hash).copied().unwrap_or(0);
+    let queue = Arc::clone(&ctx.deferred_queue);
+    let sub = sub_hash.to_vec();
+    let channel = channel_dest_hash.to_vec();
+    let blob = inner_blob.to_vec();
+    Arc::new(move || {
+        log(
+            format!(
+                "[fanout] channel {} push to subscriber {} unconfirmed — deferring for /channel/pull",
+                hexrep(&channel, false),
+                hexrep(&sub, false),
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+        if let Ok(mut deferred) = queue.lock() {
+            deferred.enqueue(sub.clone(), channel.clone(), blob.clone(), limit);
+        }
+    })
+}
+
 pub fn fanout_blob(
     inner_blob: &[u8],
     channel_dest_hash: &[u8],
@@ -243,16 +271,7 @@ pub fn fanout_blob(
             // the blob in the deferred queue and `/channel/pull` becomes the
             // delivery route — a tier change, not a retry
             // (DESIGN_PRINCIPLES §3).
-            let limit = ctx.deferred_limits.get(sub_hash).copied().unwrap_or(0);
-            let queue = Arc::clone(&ctx.deferred_queue);
-            let sub = sub_hash.clone();
-            let channel = channel_dest_hash.to_vec();
-            let blob = inner_blob.to_vec();
-            let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                if let Ok(mut deferred) = queue.lock() {
-                    deferred.enqueue(sub.clone(), channel.clone(), blob.clone(), limit);
-                }
-            });
+            let on_failed = defer_for_pull(ctx, sub_hash, channel_dest_hash, inner_blob);
 
             Some(registry.dispatch_channel(sub_hash, channel_dest_hash, &payload, Some(on_failed)))
         });
@@ -287,11 +306,17 @@ pub fn fanout_blob(
 
         if let Some(streams) = channel_streams {
             if let Ok(mut registry) = streams.lock() {
-                let result = registry.dispatch(sub_hash, channel_dest_hash, &payload);
+                // Proof-driven like tier 1 (stream_registry::PushOutcome): a
+                // push no link proves goes to the deferred queue for
+                // `/channel/pull`. Until 2026-09-24 a push to a subscriber
+                // that had died with its stream link still up (iOS uses this
+                // tier) counted as delivered and was lost.
+                let on_unproven = push.map(|ctx| defer_for_pull(ctx, sub_hash, channel_dest_hash, inner_blob));
+                let result = registry.dispatch(sub_hash, channel_dest_hash, &payload, on_unproven);
                 if result.delivered() {
                     log(
                         format!(
-                            "[fanout] streamed channel {} to subscriber {} on {} live link(s)",
+                            "[fanout] streamed channel {} to subscriber {} on {} live link(s), awaiting its proof",
                             hexrep(channel_dest_hash, false),
                             hexrep(sub_hash, false),
                             result.sent,

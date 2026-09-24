@@ -61,7 +61,7 @@ use crate::config::NodeConfig;
 use crate::distro::DistroTable;
 use crate::notify::NotifyRegistry;
 use crate::link_session::LinkSessionRegistry;
-use crate::stream_registry::{PropagationStreamRegistry, StreamDispatchResult};
+use crate::stream_registry::{OnUnproven, PropagationStreamRegistry, StreamDispatchResult};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1350,6 +1350,52 @@ struct DeliveryHandles {
     deferred_queue: Option<Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
 }
 
+/// Wake the recipient of `lxmf_data` through its notify registrations, so it
+/// fetches the message from the messagestore. Returns whether any
+/// registration was found. Used when no live tier delivered the message, and
+/// when a stream push to the recipient went unproven.
+fn notify_recipient(registry: &Arc<Mutex<NotifyRegistry>>, lxmf_data: &[u8], log_suffix: &str) -> bool {
+    if lxmf_data.len() < DESTINATION_LENGTH {
+        return false;
+    }
+    let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
+    let Ok(reg) = registry.lock() else { return false };
+    let regs = reg.get_for_channel(dest_hash, None);
+    if regs.is_empty() {
+        log(
+            format!(
+                "[lxmf.prop] NO notify registrations found for recipient {}{}",
+                hexrep(dest_hash, false),
+                log_suffix,
+            ),
+            LOG_DEBUG,
+            false,
+            false,
+        );
+        return false;
+    }
+    log(
+        format!(
+            "[lxmf.prop] found {} notify registrations for recipient {}{}",
+            regs.len(),
+            hexrep(dest_hash, false),
+            log_suffix,
+        ),
+        LOG_DEBUG,
+        false,
+        false,
+    );
+    let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
+        Some(&lxmf_data[DESTINATION_LENGTH..DESTINATION_LENGTH * 2])
+    } else {
+        None
+    };
+    for registration in &regs {
+        crate::notify::dispatch_notify(registration, sender, None);
+    }
+    true
+}
+
 impl DeliveryHandles {
     fn is_distro(&self, dest_hash: &[u8]) -> bool {
         self.distro_table
@@ -1456,17 +1502,42 @@ impl DeliveryHandles {
             );
         }
 
+        // Proof-driven (stream_registry::PushOutcome). The message stays in
+        // the messagestore either way, so a push nobody proves loses no data
+        // — but until 2026-09-24 the push counted as delivered and the notify
+        // wake below was skipped, so a device that had died with its stream
+        // link still up (an iOS app killed or suspended) got no push
+        // notification for anything sent until rfed noticed the dead link.
+        // An unproven push now wakes it, as a failed one does.
+        let wake: OnUnproven = {
+            let registry = Arc::clone(&self.registry);
+            let data = lxmf_data.to_vec();
+            let suffix = log_suffix.to_string();
+            Arc::new(move || {
+                log(
+                    format!(
+                        "[lxmf.prop] stream push to recipient {} unproven — notify fallback{}",
+                        hexrep(&data[..DESTINATION_LENGTH], false),
+                        suffix,
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                notify_recipient(&registry, &data, &suffix);
+            })
+        };
         let stream_result = self
             .stream_registry
             .lock()
             .ok()
-            .map(|mut registry| registry.dispatch(dest_hash, lxmf_data))
+            .map(|mut registry| registry.dispatch(dest_hash, lxmf_data, Some(wake)))
             .unwrap_or_else(StreamDispatchResult::default);
 
         if stream_result.delivered() {
             log(
                 format!(
-                    "[lxmf.prop] streamed recipient {} on {} live link(s){}",
+                    "[lxmf.prop] streamed recipient {} on {} live link(s), awaiting its proof{}",
                     hexrep(dest_hash, false),
                     stream_result.sent,
                     log_suffix,
@@ -1491,40 +1562,8 @@ impl DeliveryHandles {
             );
         }
 
-        if let Ok(reg) = self.registry.lock() {
-            let regs = reg.get_for_channel(dest_hash, None);
-            if !regs.is_empty() {
-                log(
-                    format!(
-                        "[lxmf.prop] found {} notify registrations for recipient {}{}",
-                        regs.len(),
-                        hexrep(dest_hash, false),
-                        log_suffix,
-                    ),
-                    LOG_DEBUG,
-                    false,
-                    false,
-                );
-                let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
-                    Some(&lxmf_data[DESTINATION_LENGTH..DESTINATION_LENGTH * 2])
-                } else {
-                    None
-                };
-                for registration in &regs {
-                    crate::notify::dispatch_notify(registration, sender, None);
-                }
-                return LiveDispatchOutcome::Notified;
-            }
-            log(
-                format!(
-                    "[lxmf.prop] NO notify registrations found for recipient {}{}",
-                    hexrep(dest_hash, false),
-                    log_suffix,
-                ),
-                LOG_DEBUG,
-                false,
-                false,
-            );
+        if notify_recipient(&self.registry, lxmf_data, log_suffix) {
+            return LiveDispatchOutcome::Notified;
         }
 
         LiveDispatchOutcome::None

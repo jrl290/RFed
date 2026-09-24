@@ -409,8 +409,12 @@ Two things are genuinely new rather than relocated:
   `/propagation/stream/open` binds the link, the node pushes back over it:
   `/delivery` (`channel_hash(16) | inner_blob`), `/lxmf/delivery` (packed
   LXMF), `/notify` (wake map). The client's `msgpack bool` response is the
-  delivery proof; an unanswered push moves the blob to the deferred queue and
-  the client collects it with `/channel/pull`.
+  delivery proof. An unanswered channel `/delivery` or distro `/lxmf/delivery`
+  push moves the blob to the deferred queue, and the client collects it with
+  `/channel/pull` or `/distro/pull`. An unanswered `/lxmf/delivery` of a
+  directly-addressed message is not deferred: the message stays in the
+  messagestore and propagation sync finds it. See §7 "Live delivery and its
+  proof".
 
 `rfed.link` is additive. Every destination above stays registered, announced,
 and answering, and no deployed client has to move.
@@ -667,8 +671,64 @@ automatically pruned.
 
 ## 7. Deferred Delivery
 
-When a subscriber is offline during fanout, blobs are queued in the
-deferred delivery queue and persisted to disk (`deferred_delivery.rmp`).
+When a subscriber is offline during fanout, or a live push to it is never
+confirmed, blobs are queued in the deferred delivery queue and persisted to
+disk (`deferred_delivery.rmp`).
+
+### Live delivery and its proof
+
+Channel and distro fan-out try the subscriber's live routes in order, and
+stop at the first one that takes the push:
+
+1. **`rfed.link`** — a `/delivery` (channel) or `/lxmf/delivery` (distro)
+   request on the subscriber's bound link. The client's `msgpack bool`
+   response is the proof.
+2. **Legacy stream link** (`rfed.channel.stream`, `rfed.propagation.stream`)
+   — a link DATA packet sent **with a packet receipt**. The client's link
+   proof of that packet is the proof. A client MUST prove every DATA packet
+   it receives on a stream link (the Reticulum-rust link proves each one
+   when it has a packet callback); a client that does not will see each push
+   deferred and delivered again by pull.
+3. **`rfed.delivery` packet** — a single packet to the subscriber's delivery
+   destination. It carries no proof today: a transmitted packet counts as
+   delivered.
+4. Otherwise the blob is deferred at once.
+
+A push that went out on tier 1 or 2 but is **never confirmed** is not lost
+and is not re-sent on another live tier: it moves to the deferred queue once,
+and the client collects it with `/channel/pull` or `/distro/pull`. That is a
+change of route, not a retry. No notify wake is sent for such a push today
+(one is sent only for a subscriber no live tier took at all), so a device
+that died with its link up learns of it at its next pull. Tier 1 is unconfirmed when the request fails
+(no response before the request timeout, or the link closes first); tier 2
+when no link proves the packet before its receipt concludes — the RNS
+receipt timeout (the link's RTT × traffic timeout factor) is the failure
+event, and a link that closes before the proof ends there too. The deferral
+runs at most once per push per subscriber.
+
+Before 2026-09-24 tier 2 counted a packet the link accepted as delivered. A
+device that died without closing its link (an iOS app killed or suspended,
+an Android app frozen) kept an ACTIVE-looking link until keepalive
+staleness, and every blob pushed in that window was lost.
+
+A proof can arrive after the receipt has timed out, so a client can receive
+the same blob live and again by pull. Clients dedupe: distro blobs by a seen
+key of `source + LXMF timestamp`, and a stored distro message by an id of
+source, timestamp and content (§17.11 rule 5); channel blobs by their own
+message identity.
+
+One deferred bucket holds everything for an identity, and one identity is
+often both a channel subscriber and a distro device. Each pull takes only its
+own kind: `/distro/pull` (and `/rfed/pull` on `rfed.distro.register`) returns
+only blobs for distros registered at this node, `/channel/pull` only the
+requested channel's, and `/rfed/pull` on `rfed.delivery` returns both, for
+the client to route by the leading hash.
+
+A directly-addressed LXMF message streamed on `rfed.propagation.stream`
+stays in the messagestore either way, so an unconfirmed push is not
+deferred: the recipient is sent its notify wake instead (the same wake a
+message gets when no live route took it), and fetches the message by
+propagation sync.
 
 ### Limits
 
@@ -686,7 +746,8 @@ When the global limit is reached, new entries are silently dropped.
 1. **Subscriber comes online** — delivery destination announces; node
    drains deferred queue and sends each blob.
 2. **PULL request** — subscriber explicitly requests pending blobs via
-   `/rfed/pull`; queue is drained and returned as a msgpack array.
+   `/rfed/pull` (or `/channel/pull`, `/distro/pull` on `rfed.link`); queue is
+   drained and returned as a msgpack array.
 3. **Periodic eviction** — entries older than 7 days are pruned hourly.
 
 ---
@@ -1291,7 +1352,12 @@ channel messages by the routing hash prefix.  The `lxmf_blob` is a standard
 LXMF propagation message (encrypted to the distro identity's X25519 key).
 RFed never decrypts it.
 
-Offline devices are handled via the **DeferredQueue** (same as channels).
+Live delivery tries each device's routes in the order of §7 "Live delivery
+and its proof": `/lxmf/delivery` on its bound `rfed.link` (bare LXMF blob),
+then its `rfed.propagation.stream` link (bare LXMF blob, proof-driven), then
+this `rfed.delivery` packet. Offline devices, and pushes a device never
+confirmed, are handled via the **DeferredQueue** (same as channels), keyed by
+the device's identity hash; the device collects them with `/distro/pull`.
 When the device announces `rfed.delivery`, pending distro blobs are flushed.
 
 ### 17.4 RNS Destinations & Request Paths

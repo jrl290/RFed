@@ -65,7 +65,7 @@ use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::notify::HookRegistry;
 use crate::link_session::LinkSessionRegistry;
-use crate::stream_registry::PropagationStreamRegistry;
+use crate::stream_registry::{OnUnproven, PropagationStreamRegistry};
 
 fn now() -> f64 {
     SystemTime::now()
@@ -472,13 +472,37 @@ fn device_id_hash_of(entry: &DistroEntry) -> Option<Vec<u8>> {
     Identity::from_public_key(&entry.device_pubkey).ok()?.hash
 }
 
+/// The stream tier's hand-off for `entry`: the caller's `on_missed` with the
+/// device IDENTITY hash, the key `/distro/pull` drains by (keyed by the
+/// lxmf.delivery hash, a blob lands in a bucket nothing drains).
+fn stream_unproven_hook(
+    on_missed: Option<&Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
+    entry: &DistroEntry,
+) -> Option<OnUnproven> {
+    let hook = Arc::clone(on_missed?);
+    let device_id_hash = device_id_hash_of(entry)?;
+    let device = hexrep(&entry.device_lxmf_hash, false);
+    Some(Arc::new(move || {
+        log(
+            format!("[distro] stream push to device {device} unproven — deferring for /distro/pull"),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+        hook(device_id_hash.clone());
+    }))
+}
+
 /// `on_missed(device_id_hash)` is the caller's deferral: it must do for one
 /// device what the caller does for the returned `missed` list (enqueue the
-/// blob in the distro deferred queue). It fires later, from the request
-/// timeout, when an rfed.link push was dispatched but never answered —
-/// Link.md "The response is the delivery proof": that blob moves to the pull
+/// blob in the distro deferred queue). It fires later, on a thread of its
+/// own, for a push a live tier dispatched but the device never confirmed:
+/// an rfed.link push with no response (Link.md "The response is the delivery
+/// proof"), or a propagation.stream push no link proved before its receipt
+/// timed out (stream_registry::PushOutcome). That blob moves to the pull
 /// path. Before 2026-09-22 the rfed.link tier passed no failure hook, logged
-/// "deferring", and deferred nothing.
+/// "deferring", and deferred nothing; before 2026-09-24 the stream tier had
+/// no proof at all.
 pub fn distro_fanout(
     distro_lxmf_hash: &[u8],
     lxmf_blob: &[u8],
@@ -560,11 +584,18 @@ pub fn distro_fanout(
         // ── Try propagation.stream live delivery ─────────────────────
         if let Some(streams) = propagation_streams {
             if let Ok(mut registry) = streams.lock() {
-                let result = registry.dispatch(&entry.device_lxmf_hash, lxmf_blob);
+                // Proof-driven (stream_registry::PushOutcome): a push no link
+                // proves goes to the deferred queue under the device IDENTITY
+                // hash, which `/distro/pull` drains — the same hand-off as the
+                // rfed.link tier's `on_failed`. Until 2026-09-24 a push to a
+                // device that had died with its link still up was counted as
+                // delivered and lost.
+                let on_unproven = stream_unproven_hook(on_missed.as_ref(), entry);
+                let result = registry.dispatch(&entry.device_lxmf_hash, lxmf_blob, on_unproven);
                 if result.delivered() {
                     log(
                         format!(
-                            "[distro] streamed to device {} on {} live link(s)",
+                            "[distro] streamed to device {} on {} live link(s), awaiting its proof",
                             hexrep(&entry.device_lxmf_hash, false),
                             result.sent,
                         ),
@@ -593,16 +624,19 @@ pub fn distro_fanout(
         let device_identity = match Identity::from_public_key(&entry.device_pubkey) {
             Ok(id) => id,
             Err(e) => {
+                // The deferred queue is drained by the device IDENTITY hash
+                // (`/distro/pull`), and without a valid pubkey there is none:
+                // queuing under the lxmf hash, as this did before 2026-09-24,
+                // filled a bucket nobody ever drains. Say it is dropped.
                 log(
                     format!(
-                        "[distro] device pubkey invalid for {}: {e} — will defer",
+                        "[distro] device pubkey invalid for {}: {e} — cannot defer (no identity hash); blob NOT delivered to this device",
                         hexrep(&entry.device_lxmf_hash, false)
                     ),
                     LOG_WARNING,
                     false,
                     false,
                 );
-                missed.push(entry.device_lxmf_hash.clone());
                 continue;
             }
         };
@@ -610,7 +644,15 @@ pub fn distro_fanout(
         let device_id_hash = match device_identity.hash.as_ref() {
             Some(h) => h.clone(),
             None => {
-                missed.push(entry.device_lxmf_hash.clone());
+                log(
+                    format!(
+                        "[distro] device {} has no identity hash — cannot defer; blob NOT delivered to this device",
+                        hexrep(&entry.device_lxmf_hash, false)
+                    ),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
                 continue;
             }
         };
@@ -789,8 +831,19 @@ mod tests {
             owner_node_hash: None,
         };
         assert_eq!(super::device_id_hash_of(&entry), identity.hash, "identity hash, not the lxmf.delivery hash");
+
+        // The stream tier's unproven push reaches `on_missed` under that key.
+        let keys = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let seen = Arc::clone(&keys);
+        let on_missed: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |key| seen.lock().unwrap().push(key));
+        let hook = super::stream_unproven_hook(Some(&on_missed), &entry).expect("a hook for a valid device");
+        hook();
+        assert_eq!(keys.lock().unwrap().as_slice(), &[identity.hash.clone().unwrap()], "deferred under the identity hash");
+        assert!(super::stream_unproven_hook(None, &entry).is_none(), "no caller route, no hook");
+
         let bad = DistroEntry { device_pubkey: vec![0; 3], ..entry };
         assert!(super::device_id_hash_of(&bad).is_none(), "an invalid pubkey yields no key, so no hook fires");
+        assert!(super::stream_unproven_hook(Some(&on_missed), &bad).is_none());
     }
 
     use super::*;

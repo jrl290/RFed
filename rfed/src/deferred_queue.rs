@@ -188,6 +188,25 @@ impl DeferredQueue {
         channel_hash: &[u8],
         max: usize,
     ) -> Vec<PendingBlob> {
+        self.drain_matching_batch(subscriber_hash, |routing| routing == channel_hash, max)
+    }
+
+    /// Drain at most `max` pending blobs for `subscriber_hash` whose routing
+    /// hash (`channel_hash`: a channel's hash, or a distro's lxmf.delivery
+    /// hash) satisfies `wanted`. Non-matching blobs remain queued in their
+    /// original relative order.
+    ///
+    /// One bucket holds everything deferred for an identity, channel and
+    /// distro blobs alike, so a pull that serves one kind must take only its
+    /// own: until 2026-09-24 the distro pull drained the whole bucket and the
+    /// clients, unwrapping every blob with the distro key, dropped the
+    /// channel blobs it handed them.
+    pub fn drain_matching_batch(
+        &mut self,
+        subscriber_hash: &[u8],
+        wanted: impl Fn(&[u8]) -> bool,
+        max: usize,
+    ) -> Vec<PendingBlob> {
         let mut removed = Vec::new();
 
         let drop_bucket = {
@@ -198,7 +217,7 @@ impl DeferredQueue {
 
             let mut kept = VecDeque::with_capacity(bucket.len());
             while let Some(entry) = bucket.pop_front() {
-                if removed.len() < max && entry.channel_hash == channel_hash {
+                if removed.len() < max && wanted(&entry.channel_hash) {
                     removed.push(entry);
                 } else {
                     kept.push_back(entry);
@@ -226,9 +245,15 @@ impl DeferredQueue {
     /// Whether there are any pending entries for `subscriber_hash` on the
     /// requested `channel_hash`.
     pub fn has_pending_channel(&self, subscriber_hash: &[u8], channel_hash: &[u8]) -> bool {
+        self.has_pending_matching(subscriber_hash, |routing| routing == channel_hash)
+    }
+
+    /// Whether there are any pending entries for `subscriber_hash` whose
+    /// routing hash satisfies `wanted` (see [`Self::drain_matching_batch`]).
+    pub fn has_pending_matching(&self, subscriber_hash: &[u8], wanted: impl Fn(&[u8]) -> bool) -> bool {
         self.queue
             .get(subscriber_hash)
-            .map(|bucket| bucket.iter().any(|entry| entry.channel_hash == channel_hash))
+            .map(|bucket| bucket.iter().any(|entry| wanted(&entry.channel_hash)))
             .unwrap_or(false)
     }
 
@@ -311,6 +336,44 @@ mod tests {
         for i in 0..n {
             q.enqueue(sub.to_vec(), chan.to_vec(), vec![i as u8], 1024);
         }
+    }
+
+    /// One identity is both a channel subscriber and a distro device, so its
+    /// bucket holds both kinds. The distro pull takes only the distro blobs;
+    /// the channel blob stays for `/channel/pull`.
+    #[test]
+    fn a_distro_pull_leaves_the_channel_blobs_in_a_shared_bucket() {
+        let mut q = fresh_queue();
+        let identity = vec![0xA1u8; 16];
+        let channel = vec![0xC1u8; 16];
+        let distro = vec![0xD1u8; 16];
+        q.enqueue(identity.clone(), channel.clone(), b"channel-1".to_vec(), 1024);
+        q.enqueue(identity.clone(), distro.clone(), b"distro-1".to_vec(), 1024);
+        q.enqueue(identity.clone(), channel.clone(), b"channel-2".to_vec(), 1024);
+        q.enqueue(identity.clone(), distro.clone(), b"distro-2".to_vec(), 1024);
+
+        let is_distro = |routing: &[u8]| routing == distro.as_slice();
+        let pulled = q.drain_matching_batch(&identity, is_distro, 25);
+        assert_eq!(
+            pulled.iter().map(|p| p.blob.clone()).collect::<Vec<_>>(),
+            vec![b"distro-1".to_vec(), b"distro-2".to_vec()],
+            "only the distro blobs, oldest first"
+        );
+        assert!(!q.has_pending_matching(&identity, is_distro), "no distro blob left");
+        assert!(q.has_pending_channel(&identity, &channel), "the channel blobs are still queued");
+        let channel_pull = q.drain_channel_batch(&identity, &channel, 25);
+        assert_eq!(channel_pull.len(), 2);
+        assert!(!q.has_pending(&identity));
+    }
+
+    #[test]
+    fn the_distro_pull_handler_drains_only_distro_blobs() {
+        let source = include_str!("destinations.rs");
+        let start = source.find("let pull_distro_cb = Arc::new(").expect("pull_distro_cb");
+        let body = &source[start..start + source[start..].find("});").expect("end of pull_distro_cb")];
+        assert!(!body.contains("drain_batch("), "a whole-bucket drain hands channel blobs to the distro clients");
+        assert!(body.contains("drain_matching_batch(&subscriber_hash, is_distro, page_size)"));
+        assert!(body.contains("registered_distro_hashes()"));
     }
 
     #[test]
