@@ -1431,15 +1431,45 @@ channel messages, messages whose destination is D itself, or when the device
 holds no distro identity.
 
 **Receiving.** A device unwraps a fan-out blob with its distro key (§17.3).
-When the unwrapped source is its own distro D and `fields[0xFB]` is
-`"rfed.distro.sent"`:
+A message whose `fields[0xFB]` is `"rfed.distro.sent"` is a copy, and the
+device applies these receive rules to it in order; the first rule that drops
+the copy ends the check. A message from D without the marker keeps its
+existing behaviour.
 
-1. If `fields[0xFD]` equals this device's own `lxmf.delivery` address, the
-   copy is this device's own echo. It is dropped silently, but still
-   recorded for deduplication.
-2. Otherwise `fields[0xFC]` must be exactly 32 hex characters; anything
-   else is dropped with a log line. A valid copy is stored as an
-   **outgoing** message in the direct conversation with R:
+1. **Source.** If the unwrapped source is **not** the device's own distro
+   D, the copy is ignored and logged: a genuine copy always comes from D,
+   and anyone else claiming the marker is filing words into the user's
+   conversations.
+2. **Signature.** A copy whose source is D MUST carry a valid LXMF
+   signature by D's key. A copy that fails the check is dropped with a log
+   line and is never stored or shown. Rule 1 alone proves nothing: the
+   LXMF source hash is plaintext inside the encrypted body, and D's public
+   key is announced (§17.10), so anyone can encrypt a message to D that
+   claims source D. Only the distro key can produce a genuine copy, and
+   that holds only because of this check. The check is the one LXMF makes
+   on every message it unpacks (`LXMessage.unpack_from_bytes`): with `dest`
+   D's 16-byte `lxmf.delivery` hash that prefixes the blob, `src` and
+   `signature` the first 16 and the next 64 bytes of the decrypted
+   plaintext, and `payload` the msgpack bytes after them, the signature
+   must be D's Ed25519 signature over
+   `dest || src || payload || SHA-256(dest || src || payload)`. If the
+   payload array carries a fifth element (a stamp), `payload` is instead
+   the first four elements, `[timestamp, title, content, fields]`,
+   re-packed with msgpack, because LXMF builds the signed data before it
+   appends the stamp.
+   `lxmf_rust::distro::unwrap_blob` enforces this rule for both native
+   bridges: it returns an error for a copy that claims source D without
+   D's signature, so Android's `nativeDistroUnwrap` and iOS's
+   `retichat_distro_unwrap` return no message and the client logs the
+   rejection.
+3. **Own echo.** If `fields[0xFD]` equals this device's own
+   `lxmf.delivery` address, the copy is this device's own echo. It is
+   dropped silently, but still recorded for deduplication.
+4. **Recipient.** `fields[0xFC]` must be exactly 32 hex characters and
+   must not be D itself (a sender never copies a message addressed to D,
+   so such a copy is malformed); anything else is dropped with a log line.
+5. **Store.** A copy that passes rules 1-4 is stored as an **outgoing**
+   message in the direct conversation with R:
    - sender D (it came from the distro, i.e. from "me");
    - state SENT, never DELIVERED: this device cannot know whether R
      received M;
@@ -1451,18 +1481,13 @@ When the unwrapped source is its own distro D and `fields[0xFB]` is
      contact request and no stranger filter, since the user wrote to R;
    - no push or local notification: it is the user's own sent message.
 
-A copy carrying the marker whose source is **not** the device's own distro
-is ignored and logged: only the distro key can produce a genuine copy, and
-anyone else claiming the marker is filing words into the user's
-conversations. A message from D without the marker keeps its existing
-behaviour.
-
 `lxmf_rust::distro::unwrap_blob` reads the marker for both native bridges:
 `DistroMessage.sent_to` is `fields[0xFC]` lowercased, and is set only when
 the type matches and the value is 32 hex characters. `DistroMessage.sent_by`
 is `fields[0xFD]` lowercased, and is set whenever the type matches (empty
-when 0xFD is absent). A set `sent_by` with no `sent_to` is therefore a copy
-with a malformed 0xFC, which is dropped. The unwrap JSON of Android's
+when 0xFD is absent), so the client can still apply rule 1 to a marker from
+another source. A set `sent_by` with no `sent_to` is therefore a copy with a
+malformed 0xFC, which rule 4 drops. The unwrap JSON of Android's
 `nativeDistroUnwrap` and iOS's `retichat_distro_unwrap` carries them as
 `"sent_to"` and `"sent_by"` (string or null).
 
