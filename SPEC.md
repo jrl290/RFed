@@ -711,8 +711,10 @@ device that died without closing its link (an iOS app killed or suspended,
 an Android app frozen) kept an ACTIVE-looking link until keepalive
 staleness, and every blob pushed in that window was lost.
 
-A proof can arrive after the receipt has timed out, so a client can receive
-the same blob live and again by pull. Clients dedupe: distro blobs by a seen
+A proof can arrive after the receipt has timed out. It still counts as
+delivery (Reticulum-rust B35): a push that is still open when it lands is
+delivered and not deferred, but a push already deferred stays deferred, so a
+client can receive the same blob live and again by pull. Clients dedupe: distro blobs by a seen
 key of `source + LXMF timestamp`, and a stored distro message by an id of
 source, timestamp and content (§17.11 rule 5); channel blobs by their own
 message identity.

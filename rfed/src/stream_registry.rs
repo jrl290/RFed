@@ -104,6 +104,23 @@ impl PushOutcome {
         self.conclude_one();
     }
 
+    /// A link proved its packet after that receipt timed out: the device has
+    /// it (Reticulum-rust delivers a timed-out receipt on a late proof, B35).
+    /// If the push is still open (another link outstanding, or the dispatch
+    /// still sending) this is a delivery and nothing is handed off. If it
+    /// was already handed off, that cannot be taken back: the pull copy (or
+    /// the wake) stays, and the client drops the duplicate by its dedupe key.
+    /// Same thread rules as [`Self::proved`].
+    pub(crate) fn proved_late(&self) {
+        self.proved.store(true, Ordering::SeqCst);
+        let note = if self.handed_off.load(Ordering::SeqCst) {
+            "after its hand-off; the device has it and drops the pull copy as a duplicate"
+        } else {
+            "late, before its hand-off; delivered"
+        };
+        log(format!("[stream] {} proved {note}", self.label), LOG_DEBUG, false, false);
+    }
+
     /// The dispatch has tried every matching link.
     pub(crate) fn dispatch_done(&self) {
         self.conclude_one();
@@ -123,6 +140,11 @@ impl PushOutcome {
     #[cfg(test)]
     pub(crate) fn is_settled(&self) -> bool {
         self.pending.load(Ordering::SeqCst) == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
     }
 
     fn conclude_one(&self) {
@@ -186,9 +208,10 @@ fn send_with_receipt(link: &LinkHandle, payload: &[u8], outcome: &Arc<PushOutcom
     Ok(())
 }
 
-/// Conclude `outcome` for this receipt once: proved on its delivery
-/// callback, unproven on its timeout callback. A proof that lands after the
-/// timeout (or any second callback) does not count again. The receipt shares
+/// Conclude `outcome` for this receipt: proved on its delivery callback,
+/// unproven on its timeout callback, each counted once. A proof that lands
+/// after the timeout still reaches the outcome as a late proof (the device
+/// has the packet) without counting the receipt twice. The receipt shares
 /// its state with the one Transport tracks, and a callback set after the
 /// receipt concluded — a proof faster than this call — still runs, once
 /// (Reticulum-rust B37).
@@ -198,6 +221,8 @@ pub(crate) fn tie_receipt(receipt: &PacketReceipt, outcome: &Arc<PushOutcome>) {
     let delivery: Arc<dyn Fn(&PacketReceipt) + Send + Sync> = Arc::new(move |_| {
         if !proof_done.swap(true, Ordering::SeqCst) {
             on_proof.proved();
+        } else {
+            on_proof.proved_late();
         }
     });
     let (on_timeout, timeout_done) = (Arc::clone(outcome), concluded);
@@ -410,9 +435,13 @@ mod tests {
     /// Wait until every conclusion has run (callbacks may run on their own
     /// threads). The bound is only the test's failure mechanism.
     fn settle(push: &PushOutcome) {
+        settle_until(|| push.is_settled());
+    }
+
+    fn settle_until(done: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !push.is_settled() {
-            assert!(std::time::Instant::now() < deadline, "the push never settled");
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "never reached the expected state");
             std::thread::yield_now();
         }
     }
@@ -455,13 +484,35 @@ mod tests {
         time_out(&mut r);
         hook_ran(&rx);
         assert!(push.was_handed_off());
-        // A proof after the timeout changes nothing: Reticulum-rust will not
-        // deliver a concluded receipt, and the push has already moved on.
-        let mut late = r.clone();
-        let mut proof = late.hash.clone();
-        proof.extend_from_slice(&device.sign(&late.hash));
-        assert!(!late.validate_proof(&proof));
-        assert!(!push.is_proved());
+        // The device proves it after all: Reticulum-rust delivers the
+        // timed-out receipt, and the push records the late proof. The
+        // hand-off already happened and stays; the client dedupes the copy.
+        prove(&mut r, &device);
+        assert!(push.is_proved(), "the late proof is recorded");
+        assert!(push.was_handed_off());
+    }
+
+    /// Link A times out, then proves late while link B is still out: the
+    /// device has the packet, so the push is delivered and nothing is
+    /// handed off when B times out.
+    #[test]
+    fn a_late_proof_before_the_push_settles_prevents_the_hand_off() {
+        let device = Identity::new(true);
+        let (push, _rx) = outcome();
+        let mut a = receipt(&device, 0x16);
+        let mut b = receipt(&device, 0x17);
+        push.receipt_pending();
+        tie_receipt(&a, &push);
+        push.receipt_pending();
+        tie_receipt(&b, &push);
+        push.dispatch_done();
+        time_out(&mut a);
+        settle_until(|| push.pending_count() == 1);
+        prove(&mut a, &device);
+        time_out(&mut b);
+        settle(&push);
+        assert!(push.is_proved());
+        assert!(!push.was_handed_off(), "a late proof is still a proof");
     }
 
     #[test]
