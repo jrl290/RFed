@@ -832,18 +832,22 @@ packets independently.
 
 ### 9.2 Relay Destination Addressing
 
-The rfed node addresses the relay as a **Reticulum Single destination**
-using the following namespace:
+The rfed node sends each wake to **exactly the registered relay hash**, as a
+**Reticulum Single destination**:
 
 | Component | Value |
 |-----------|-------|
-| App name | `"rfed"` |
-| Aspects | `["notify"]` |
+| Destination hash | The registered relay hash, unchanged |
+| Name | Whichever of `apns.relay` (apns-bridge) or `rfed.notify` (fcm-bridge) derives the registered hash from the identity |
 | Destination type | `Single` (asymmetric encryption, multi-hop routed) |
 | Identity | Recalled from Reticulum transport by the 16-byte relay hash |
+| Ratchet | The one the relay announced for that hash, if any |
 
-The full RNS destination name is `rfed.notify`.  The relay must announce
-this destination so that Reticulum transport can route packets to it.
+The relay must announce the registered destination so that Reticulum
+transport can route packets to it and rfed can recall its identity. A
+registration whose hash neither name derives from the recalled identity is
+logged as a WARNING and not woken. Until 2026-09-25 rfed built every wake
+as `rfed.notify` under the relay's identity, whatever hash was registered.
 
 ### 9.3 Wake Packet Wire Format
 
@@ -891,22 +895,29 @@ msgpack Map {
 ### 9.4 Dispatch Flow
 
 1. Blob arrives for a subscriber who has registered notify relays.
-2. For each registered relay, rfed spawns an async task that:
+2. rfed snapshots the subscriber's registrations, releases the registry (and
+   any node lock), and for each relay, on the calling thread (no network wait):
    a. Decodes the 32-char hex relay hash to 16 bytes.
-   b. Recalls the relay's identity from Reticulum transport.
-   c. Builds an outbound `rfed.notify` Single destination.
-   d. Sends the msgpack wake packet as a Reticulum packet.
-3. On send failure, **one retry** is attempted after **8 seconds**.
-4. If the retry also fails, the wake is silently dropped.  The subscriber
-   will still receive the message via deferred queue pull or live fanout
-   on their next connection.
+   b. Checks for a path to that hash; if none, requests one and drops the wake.
+   c. Recalls the relay's identity; if unknown, requests a path and drops the wake.
+   d. Builds the Single destination for the registered hash (§9.2); if no
+      known name derives it, requests a path and drops the wake. The path
+      response is the relay's announce, and its key replaces a stale one.
+   e. Sends the msgpack wake packet as a Reticulum packet.
+3. A wake counts as sent only when an interface took the packet. Drops are
+   logged at NOTICE (no path, no identity) or WARNING (anything else) and are
+   **not retried** (DESIGN_PRINCIPLES §3). The subscriber still receives the
+   message via deferred queue pull or live fanout on their next connection.
+4. A registration stores the registrant's key for the relay hash only when
+   that key derives it (a relay the subscriber hosts itself).
 
 ### 9.5 Relay Implementation Guide (e.g. Retichat iOS)
 
 A relay is a service that:
 
-1. **Announces** a Reticulum identity on the `rfed.notify` destination
-   (`app_name="rfed"`, `aspects=["notify"]`, `DestinationType::Single`).
+1. **Announces** a Reticulum identity on its wake destination, `apns.relay`
+   or `rfed.notify` (`DestinationType::Single`), and registers that
+   destination's hash with rfed (§9.2).
 2. **Receives** incoming Reticulum packets on that destination.
 3. **Decodes** the msgpack Map payload (see §9.3).
 4. **Maps** the `"receiver"` hash to a platform-specific device token

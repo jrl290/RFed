@@ -905,8 +905,14 @@ fn main() -> Result<(), String> {
         // Backup delivery: forward pending registrations + check owner failover.
         enter("backup_delivery+status");
         if last_backup_tick.elapsed() >= backup_tick_interval {
-            if let Ok(mut guard) = node.lock() {
-                guard.tick_backup_delivery();
+            // The guard drops at the end of the `let`; the wakes are packet
+            // sends and go out after it (2026-09-25).
+            let wakes = match node.lock() {
+                Ok(mut guard) => guard.tick_backup_delivery(),
+                Err(_) => Vec::new(),
+            };
+            for (registration, channel_hash) in &wakes {
+                notify::dispatch_notify(registration, None, Some(channel_hash.as_slice()));
             }
             write_status_file(&node, &lxmf_prop_arc, &startup);
             last_backup_tick = Instant::now();

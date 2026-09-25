@@ -328,8 +328,12 @@ fn handle_notify_command(
                 _ => return Err(format!("notify/register: invalid relay hash {relay_hash}")),
             };
 
+            // `pubkey` signed the registration: it is the subscriber's key, and
+            // the relay's only when the subscriber hosts the relay itself.
+            // Until 2026-09-25 it was stored for every relay hash, so a bridge
+            // relay was recalled with the subscriber's key until it announced.
             let pubkey = pubkey.ok_or("notify/register: missing pubkey")?;
-            let _ = Identity::remember_destination(&relay_hash_bytes, &pubkey, None);
+            crate::notify::rns::remember_self_hosted_relay(&relay_hash_bytes, &pubkey);
             Transport::request_path(&relay_hash_bytes, None, None, None, None);
 
             if let Ok(guard) = node.lock() {
@@ -1092,7 +1096,11 @@ impl FedNode {
     ///    entries to our backup so the chain extends.
     /// 3. **Prune**: remove stale backup entries whose upstream custodian
     ///    stopped refreshing them (owner recovered → chain unravels).
-    pub fn tick_backup_delivery(&mut self) {
+    ///
+    /// Returns the notify wakes for adopted subscribers. The caller sends
+    /// them after releasing the FedNode mutex (see [`BackupWake`]).
+    #[must_use = "the adopted subscribers' wakes must be sent once the FedNode guard drops"]
+    pub fn tick_backup_delivery(&mut self) -> Vec<BackupWake> {
         let tick_start = Instant::now();
         // ── Helper: resolve a backup node from config or auto-select ───
         let resolve_backup = |selected: &mut Vec<Vec<u8>>,
@@ -1203,7 +1211,7 @@ impl FedNode {
         }
 
         // ── Part 3: failover delivery + chain-of-custody re-push ──────
-        let adopted = backup_delivery_tick(
+        let (adopted, wakes) = backup_delivery_tick(
             Arc::clone(&self.subscription_table),
             Arc::clone(&self.blob_store),
             Arc::clone(&self.deferred_queue),
@@ -1252,6 +1260,7 @@ impl FedNode {
         if held > Duration::from_secs(1) {
             log(format!("[rfed] LOCK-WARN tick_backup_delivery: held FedNode lock for {:.2}s", held.as_secs_f64()), LOG_WARNING, false, false);
         }
+        wakes
     }
 }
 
@@ -1458,13 +1467,18 @@ fn run_sync_session(
                                                     );
                                                 }
                                             }
-                                            // Fire notify wake-ups for deferred devices
-                                            if let Ok(notify) = ctx.notify_registry.lock() {
-                                                for dev_hash in &dmissed {
-                                                    for reg in notify.get_for_channel(dev_hash, None) {
-                                                        dispatch_notify(reg, None, Some(routing_hash));
-                                                    }
-                                                }
+                                            // Fire notify wake-ups for deferred devices. Snapshot,
+                                            // then wake with the registry released: a wake is a send.
+                                            let wakes: Vec<_> = match ctx.notify_registry.lock() {
+                                                Ok(notify) => dmissed
+                                                    .iter()
+                                                    .flat_map(|dev_hash| notify.get_for_channel(dev_hash, None))
+                                                    .cloned()
+                                                    .collect(),
+                                                Err(_) => Vec::new(),
+                                            };
+                                            for reg in &wakes {
+                                                dispatch_notify(reg, None, Some(routing_hash));
                                             }
                                         }
                                     }
@@ -1711,10 +1725,17 @@ fn adopted_pairs_for_chain_extension(
         .collect()
 }
 
-/// Returns the list of `(subscriber_hash, channel_hash, owner_hash)` triples
-/// that were actually delivered ("adopted"). The caller may re-push these to
-/// its own backup node so the chain of custody extends further, unless doing
-/// so would send them straight back to the current owner.
+/// A notify wake decided during the backup tick, as `(registration,
+/// channel_hash)`. The tick runs under the FedNode mutex, so it returns its
+/// wakes and main.rs sends them once the guard has dropped: a wake is a packet
+/// send. Until 2026-09-25 each wake ran on a spawned thread.
+pub type BackupWake = (crate::notify::NotifyRegistration, Vec<u8>);
+
+/// Returns the `(subscriber_hash, channel_hash, owner_hash)` triples that were
+/// actually delivered ("adopted"), and the notify wakes owed to the adopted
+/// subscribers. The caller may re-push the triples to its own backup node so
+/// the chain of custody extends further, unless doing so would send them
+/// straight back to the current owner.
 fn backup_delivery_tick(
     subscription_table: Arc<Mutex<crate::subscription::SubscriptionTable>>,
     blob_store: Arc<Mutex<crate::blob_store::BlobStore>>,
@@ -1723,14 +1744,14 @@ fn backup_delivery_tick(
     config: &crate::config::NodeConfig,
     sync: Arc<Mutex<crate::sync::FedSync>>,
     owner_offline_secs: f64,
-) -> Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+) -> (Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>, Vec<BackupWake>) {
     let entries = subscription_table
         .lock()
         .ok()
         .map(|s| s.backup_entries_for_tick())
         .unwrap_or_default();
     if entries.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // Group by owner — one liveness check per owner node.
@@ -1742,6 +1763,7 @@ fn backup_delivery_tick(
     }
 
     let mut adopted: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut wakes: Vec<BackupWake> = Vec::new();
 
     for (owner_hash, subs) in &by_owner {
         // Suppress delivery if the owner node was heard recently via sync peer state.
@@ -1806,20 +1828,105 @@ fn backup_delivery_tick(
                     LOG_NOTICE, false, false,
                 );
                 adopted.push((sub_hash.clone(), ch_hash.clone(), owner_hash.clone()));
+                // Collected, not sent: the caller holds the FedNode mutex.
                 if let Ok(notify) = notify_registry.lock() {
-                    for reg in notify.get_for_channel(sub_hash.as_slice(), Some(ch_hash.as_slice())) {
-                        dispatch_notify(reg, None, Some(ch_hash.as_slice()));
-                    }
+                    wakes.extend(
+                        notify
+                            .get_for_channel(sub_hash.as_slice(), Some(ch_hash.as_slice()))
+                            .into_iter()
+                            .map(|reg| (reg.clone(), ch_hash.clone())),
+                    );
                 }
             }
         }
     }
-    adopted
+    (adopted, wakes)
 }
 
 #[cfg(test)]
 mod backup_chain_tests {
-    use super::adopted_pairs_for_chain_extension;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{adopted_pairs_for_chain_extension, backup_delivery_tick};
+    use crate::blob_store::BlobStore;
+    use crate::config::{NodeConfig, TierPolicy};
+    use crate::deferred_queue::DeferredQueue;
+    use crate::distro::DistroTable;
+    use crate::notify::NotifyRegistry;
+    use crate::subscription::SubscriptionTable;
+    use crate::sync::FedSync;
+
+    fn config(dir: &Path) -> NodeConfig {
+        NodeConfig {
+            config_dir: dir.to_path_buf(),
+            rns_config_dir: None,
+            identity_file: dir.join("identity"),
+            display_name: "test".into(),
+            announce_interval_secs: 600,
+            announce_at_start: false,
+            default_policy: TierPolicy::default(),
+            vip_policy: TierPolicy::vip_default(),
+            vip_subscribers: Vec::new(),
+            peering_cost: None,
+            storage_limit_bytes: 1 << 20,
+            transfer_limit_bytes: None,
+            sync_limit_bytes: None,
+            static_peers: Vec::new(),
+            from_static_only: false,
+            trusted_backup_peers: Vec::new(),
+            primary_node: None,
+            secondary_nodes: Vec::new(),
+            owner_offline_secs: 90.0,
+            lxmf_propagation_enabled: false,
+            lxmf_propagation_autopeer: false,
+            lxmf_propagation_peers: Vec::new(),
+        }
+    }
+
+    /// The backup tick runs under the FedNode mutex. It adopts the subscriber
+    /// of an owner gone offline and hands back the wake that subscriber is
+    /// owed, for main.rs to send once the guard has dropped.
+    #[test]
+    fn backup_adoption_returns_the_wakes_it_owes() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rfed_backup_wakes_{unique}"));
+        std::fs::create_dir_all(dir.join("blobs")).expect("temp dir");
+        let (subscriber, channel, owner) = (vec![0x31; 16], vec![0x41; 16], vec![0x11; 16]);
+        let relay = "7fd918372492bf099fc7f74ccf6739ac".to_string();
+
+        let subscriptions = Arc::new(Mutex::new(SubscriptionTable::load(dir.join("subs.rmp"))));
+        subscriptions.lock().unwrap().subscribe_backup(subscriber.clone(), channel.clone(), owner.clone());
+        let blobs = Arc::new(Mutex::new(BlobStore::open(dir.join("blobs"), 1 << 20)));
+        blobs.lock().unwrap().store(&channel, b"inner blob").expect("store blob");
+        let deferred = Arc::new(Mutex::new(DeferredQueue::load(dir.join("deferred.rmp"))));
+        let notify = Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp"))));
+        notify.lock().unwrap().register(subscriber.clone(), Some(channel.clone()), relay.clone());
+        let distro = Arc::new(Mutex::new(DistroTable::load(dir.join("distro.rmp"))));
+        // No peer heard: the owner counts as offline.
+        let sync = Arc::new(Mutex::new(FedSync::new(Arc::clone(&blobs), Arc::clone(&subscriptions), distro)));
+
+        let (adopted, wakes) = backup_delivery_tick(
+            subscriptions,
+            blobs,
+            Arc::clone(&deferred),
+            notify,
+            &config(&dir),
+            sync,
+            90.0,
+        );
+
+        assert_eq!(adopted, vec![(subscriber.clone(), channel.clone(), owner)]);
+        assert!(deferred.lock().unwrap().has_pending(&subscriber), "the blob waits for the subscriber");
+        assert_eq!(wakes.len(), 1, "one registration, one wake");
+        let (registration, wake_channel) = &wakes[0];
+        assert_eq!(registration.subscriber_hash, subscriber);
+        assert_eq!(registration.relay_hash, relay);
+        assert_eq!(wake_channel, &channel);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn adopted_pairs_skip_bounce_back_to_owner() {
@@ -4255,6 +4362,52 @@ mod fanout_lock_scope_tests {
             !fragment[plan_built + 1..].contains("guard."),
             "nothing may touch the FedNode guard after the fan-out plan is \
              built — that is the wedge from 2026-08-17"
+        );
+    }
+
+    /// The backup tick runs under the FedNode mutex (main.rs). Its wakes are
+    /// packet sends, so the tick only collects them and main.rs sends them
+    /// after the guard's `let` statement ends. Since 2026-09-25 a wake sends
+    /// on the caller's thread; before, each ran on a spawned thread.
+    #[test]
+    fn backup_wakes_are_sent_after_the_fednode_guard_drops() {
+        let source = destinations_source();
+        let start = source
+            .find("pub fn tick_backup_delivery(&mut self)")
+            .expect("tick_backup_delivery present");
+        let tick_end = start
+            + source[start..]
+                .find("\n    }\n}")
+                .expect("tick_backup_delivery closes the impl");
+        let helper = source
+            .find("fn backup_delivery_tick(")
+            .expect("backup_delivery_tick present");
+        let helper_end = helper
+            + source[helper..]
+                .find("\n}\n")
+                .expect("backup_delivery_tick closes");
+        for (name, body) in [
+            ("tick_backup_delivery", &source[start..tick_end]),
+            ("backup_delivery_tick", &source[helper..helper_end]),
+        ] {
+            assert!(
+                !body.contains("dispatch_notify("),
+                "{name} runs under the FedNode mutex and must return its wakes, not send them"
+            );
+        }
+
+        let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("read main.rs");
+        let tick = main
+            .find("Ok(mut guard) => guard.tick_backup_delivery(),")
+            .expect("main.rs takes the backup tick's wakes inside a `let`, so the guard drops at its end");
+        let after = &main[tick..];
+        let send = after
+            .find("notify::dispatch_notify(registration, None,")
+            .expect("main.rs sends the backup tick's wakes");
+        assert!(
+            !after[..send].contains("node.lock()"),
+            "nothing may take the FedNode lock between the tick and its wakes"
         );
     }
 

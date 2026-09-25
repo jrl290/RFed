@@ -130,13 +130,18 @@ impl FanoutPlan {
             }
         }
 
-        // Fire notify wake-ups for deferred subscribers.
-        if let Ok(notify) = self.notify_registry.lock() {
-            for sub_hash in &missed {
-                for reg in notify.get_for_channel(sub_hash, Some(channel_dest_hash)) {
-                    dispatch_notify(reg, None, Some(channel_dest_hash));
-                }
-            }
+        // Fire notify wake-ups for deferred subscribers. Snapshot, then wake
+        // with the registry released: a wake is a packet send.
+        let wakes: Vec<_> = match self.notify_registry.lock() {
+            Ok(notify) => missed
+                .iter()
+                .flat_map(|sub_hash| notify.get_for_channel(sub_hash, Some(channel_dest_hash)))
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        for reg in &wakes {
+            dispatch_notify(reg, None, Some(channel_dest_hash));
         }
     }
 }

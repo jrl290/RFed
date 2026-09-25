@@ -59,6 +59,7 @@ use rmpv::Value;
 
 use crate::config::NodeConfig;
 use crate::distro::DistroTable;
+use crate::notify::rns::{LiveStack, RelayStack};
 use crate::notify::NotifyRegistry;
 use crate::link_session::LinkSessionRegistry;
 use crate::stream_registry::{OnUnproven, PropagationStreamRegistry, StreamDispatchResult};
@@ -1351,16 +1352,26 @@ struct DeliveryHandles {
 }
 
 /// Wake the recipient of `lxmf_data` through its notify registrations, so it
-/// fetches the message from the messagestore. Returns whether any
-/// registration was found. Used when no live tier delivered the message, and
-/// when a stream push to the recipient went unproven.
-fn notify_recipient(registry: &Arc<Mutex<NotifyRegistry>>, lxmf_data: &[u8], log_suffix: &str) -> bool {
+/// fetches the message from the messagestore. Returns whether any wake packet
+/// left. Until 2026-09-25 it returned whether a registration existed, so a
+/// relay with no path or no known identity counted as notified (X7). Used
+/// when no live tier delivered the message, and when a stream push to the
+/// recipient went unproven.
+fn notify_recipient(
+    stack: &dyn RelayStack,
+    registry: &Arc<Mutex<NotifyRegistry>>,
+    lxmf_data: &[u8],
+    log_suffix: &str,
+) -> bool {
     if lxmf_data.len() < DESTINATION_LENGTH {
         return false;
     }
     let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
-    let Ok(reg) = registry.lock() else { return false };
-    let regs = reg.get_for_channel(dest_hash, None);
+    // Snapshot, then wake with the registry released: a wake is a packet send.
+    let regs: Vec<_> = match registry.lock() {
+        Ok(reg) => reg.get_for_channel(dest_hash, None).into_iter().cloned().collect(),
+        Err(_) => return false,
+    };
     if regs.is_empty() {
         log(
             format!(
@@ -1390,10 +1401,12 @@ fn notify_recipient(registry: &Arc<Mutex<NotifyRegistry>>, lxmf_data: &[u8], log
     } else {
         None
     };
-    for registration in &regs {
-        crate::notify::dispatch_notify(registration, sender, None);
-    }
-    true
+    // Every registration gets its wake; `count` drives the whole iterator.
+    let sent = regs
+        .iter()
+        .filter(|registration| crate::notify::dispatch_notify_via(stack, registration, sender, None).is_sent())
+        .count();
+    sent > 0
 }
 
 impl DeliveryHandles {
@@ -1524,7 +1537,7 @@ impl DeliveryHandles {
                     false,
                     false,
                 );
-                notify_recipient(&registry, &data, &suffix);
+                notify_recipient(&LiveStack, &registry, &data, &suffix);
             })
         };
         let stream_result = self
@@ -1562,7 +1575,7 @@ impl DeliveryHandles {
             );
         }
 
-        if notify_recipient(&self.registry, lxmf_data, log_suffix) {
+        if notify_recipient(&LiveStack, &self.registry, lxmf_data, log_suffix) {
             return LiveDispatchOutcome::Notified;
         }
 
@@ -2976,6 +2989,64 @@ mod tests {
                 offset = at + 1;
             }
             assert!(calls > 0, "validate_pn_stamps is no longer called at all — this guard needs updating");
+        }
+    }
+
+    /// X7: a recipient counts as notified only when a wake packet left.
+    mod notify_count_tests {
+        use super::super::*;
+        use crate::notify::rns::fake::FakeStack;
+
+        const RECIPIENT: [u8; 16] = [0x71; 16];
+        const SENDER: [u8; 16] = [0x72; 16];
+
+        /// An LXMF message for RECIPIENT, as it sits in the messagestore.
+        fn lxmf_data() -> Vec<u8> {
+            [&RECIPIENT[..], &SENDER[..], &[0x73; 80][..]].concat()
+        }
+
+        /// A registry holding one apns.relay registration for RECIPIENT, and
+        /// that relay's identity as an announce leaves it.
+        fn registered(tag: &str) -> (Arc<Mutex<NotifyRegistry>>, Vec<u8>, Identity, std::path::PathBuf) {
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("rfed_notify_count_{tag}_{unique}"));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            let relay = Identity::new(true);
+            let relay_hash = Destination::hash(relay.hash.as_deref(), "apns", &["relay"]);
+            let recalled = Identity::from_public_key(&relay.get_public_key().unwrap()).unwrap();
+            let mut registry = NotifyRegistry::load(dir.join("notify.rmp"));
+            registry.register(RECIPIENT.to_vec(), None, hexrep(&relay_hash, false));
+            (Arc::new(Mutex::new(registry)), relay_hash, recalled, dir)
+        }
+
+        #[test]
+        fn a_wake_counts_as_notified_only_when_its_packet_left() {
+            let (registry, relay_hash, relay, dir) = registered("counting");
+
+            let no_path = FakeStack::new(&relay_hash, Some(relay.clone())).without_path();
+            assert!(
+                !notify_recipient(&no_path, &registry, &lxmf_data(), ""),
+                "a registration whose relay has no path is not a notification",
+            );
+            assert_eq!(*no_path.path_requests.lock().unwrap(), vec![relay_hash.clone()]);
+
+            let no_identity = FakeStack::new(&relay_hash, None);
+            assert!(
+                !notify_recipient(&no_identity, &registry, &lxmf_data(), ""),
+                "a registration whose relay identity is unknown is not a notification",
+            );
+
+            let no_interface = FakeStack::new(&relay_hash, Some(relay.clone())).without_interface();
+            assert!(
+                !notify_recipient(&no_interface, &registry, &lxmf_data(), ""),
+                "a packet no interface took is not a notification",
+            );
+
+            let live = FakeStack::new(&relay_hash, Some(relay));
+            assert!(notify_recipient(&live, &registry, &lxmf_data(), ""), "a wake that left is");
+            assert_eq!(live.packets.lock().unwrap().len(), 1);
+
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 

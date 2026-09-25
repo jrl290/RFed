@@ -235,16 +235,30 @@ impl Default for HookRegistry {
 
 // ── Notify dispatch ───────────────────────────────────────────────────────────
 
-/// Send a notify wake-up for `reg` via the RNS adapter.
+/// Send a notify wake-up for `reg` via the RNS adapter and report whether its
+/// packet left.
 ///
 /// Called by the LXMF propagation ingest path when a message arrives for a
-/// notify-registered destination. Dispatch is fire-and-forget; the
-/// adapter MUST NOT block the calling thread.
+/// notify-registered destination, and by the channel and distro fan-outs for
+/// subscribers they deferred, and by main.rs for the backup tick's adopted
+/// subscribers. It never waits on the network, but it is a packet send:
+/// snapshot the registrations and release the registry and the FedNode mutex
+/// first.
 pub fn dispatch_notify(
     reg: &NotifyRegistration,
     sender: Option<&[u8]>,
     channel: Option<&[u8]>,
-) {
+) -> rns::WakeOutcome {
+    dispatch_notify_via(&rns::LiveStack, reg, sender, channel)
+}
+
+/// [`dispatch_notify`] on the given stack. The tests pass a fake one.
+pub fn dispatch_notify_via(
+    stack: &dyn rns::RelayStack,
+    reg: &NotifyRegistration,
+    sender: Option<&[u8]>,
+    channel: Option<&[u8]>,
+) -> rns::WakeOutcome {
     log(
         format!(
             "[notify] dispatch START relay={} subscriber={} sender={} channel={}",
@@ -257,5 +271,5 @@ pub fn dispatch_notify(
         false,
         false,
     );
-    rns::dispatch(reg, sender, channel);
+    rns::dispatch(stack, reg, sender, channel)
 }
