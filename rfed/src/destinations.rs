@@ -2187,11 +2187,12 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     true,
                     reticulum_rust::packet::FLAG_UNSET,
                 );
-                // Drained once sent, and delivered only on the subscriber's
-                // proof: on the RNS receipt timeout the blob is queued again
-                // and the subscriber pushed (crate::handoff), so a subscriber
-                // that announced and died, or never proves, pulls it. Until
-                // 2026-09-26 a packet that left counted as delivered.
+                // Drained once sent. With the proof Required, delivered only
+                // on the subscriber's proof: on the RNS receipt timeout the
+                // blob is queued again and the subscriber pushed
+                // (crate::handoff). Observed (DELIVERY_PACKET_PROOF, until the
+                // apps that prove are on most devices): sent once, the proof
+                // only logged, as before 2026-09-26.
                 match crate::notify::rns::RelayStack::send_with_receipt(&crate::notify::rns::LiveStack, &mut packet) {
                     Ok(Some(receipt)) => {
                         let limit_for: Arc<dyn Fn(&[u8]) -> usize + Send + Sync> = Arc::new(move |_| limit);
@@ -2208,13 +2209,12 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                             queue_key: sub_id_hash.clone(),
                             wake_key: sub_id_hash.clone(),
                         };
-                        let outcome = crate::stream_registry::PushOutcome::new(
+                        crate::handoff::await_packet_proof(
+                            &receipt,
                             format!("deferred flush of {} to {}", hexrep(&pb.channel_hash, false), hexrep(&sub_id_hash, false)),
-                            Some(Arc::new(move || hand_off(subscriber.clone()))),
+                            crate::handoff::DELIVERY_PACKET_PROOF,
+                            Arc::new(move || hand_off(subscriber.clone())),
                         );
-                        outcome.receipt_pending();
-                        crate::stream_registry::tie_receipt(&receipt, &outcome);
-                        outcome.dispatch_done();
                         if let Some(ref hooks) = hooks {
                             hooks.on_deliver(&sub_id_hash, &pb.blob);
                         }
@@ -2309,7 +2309,7 @@ mod deferred_flush_size_tests {
             let production = src.split("fn fanouts_read_the_transmitted_flag_not_the_receipt").next().unwrap();
             assert_eq!(production.matches("packet.send()").count(), 0, "{name}: no packet without a receipt");
             assert_eq!(production.matches("send_with_receipt(").count(), 1, "{name}");
-            assert_eq!(production.matches("tie_receipt(&receipt, &outcome)").count(), 1, "{name}: delivered on its proof");
+            assert_eq!(production.matches("await_packet_proof(").count(), 1, "{name}: its receipt decides, under the proof mode");
         }
         // Since 2026-09-26 the distro fan-out sends no rfed.delivery packet
         // (distro::tests::the_distro_fanout_sends_no_unconfirmed_packet).

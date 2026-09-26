@@ -694,6 +694,14 @@ stop at the first one that takes the push:
    a packet receipt**. The client's proof of that packet is the proof. A
    client MUST prove every packet it receives on `rfed.delivery` (PROVE_ALL);
    Retichat Android, iOS and web do since 2026-09-26.
+
+   **Interim (from 2026-09-26, about a month):** the packet's proof is
+   *observed*, not required (`handoff::DELIVERY_PACKET_PROOF`). The packet is
+   sent once and counts as delivered; the node logs `[push] … proved` or
+   `[push] … unproven; sent once`, which shows how many devices run an app
+   that proves. Required against apps that never prove, every packet would be
+   handed off and the announce flush would send the queued copy again on each
+   announce. When most devices prove, the proof becomes required as below.
 4. Otherwise the blob is handed off at once.
 
 A push that is **never confirmed** is not lost and is not re-sent on another
@@ -708,7 +716,8 @@ the link's RTT × traffic timeout factor; for a packet to a destination
 6 s plus 6 s per hop) is the failure event, and a link that closes before
 the proof ends there too. The hand-off runs at most once per push per
 subscriber. The `rfed.delivery` announce flush of queued channel blobs sends
-with a receipt too, and hands off what is not proved.
+with a receipt too, and, once the packet proof is required, hands off what
+is not proved.
 
 Until 2026-09-26 a tier-3 packet counted as delivered once it left, an
 unconfirmed tier-1 or tier-2 push was deferred but no one was pushed, and

@@ -8,13 +8,78 @@
 //! makes the recipient pull, and a pull that comes before the blob is queued
 //! finds nothing (DESIGN_PRINCIPLES §5).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use reticulum_rust::packet::PacketReceipt;
 use reticulum_rust::{hexrep, log, LOG_NOTICE, LOG_WARNING};
 
 use crate::deferred_queue::DeferredQueue;
 use crate::notify::rns::RelayStack;
 use crate::notify::{dispatch_notify_via, NotifyRegistration, NotifyRegistry};
+use crate::stream_registry::{tie_receipt, PushOutcome};
+
+/// What the proof of an `rfed.delivery` packet (the channel fan-out's
+/// packet, and the announce flush of queued channel blobs) decides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketProof {
+    /// Delivered only on the proof; on the receipt timeout the blob is
+    /// handed off (queued for the pull and pushed).
+    Required,
+    /// Sent once and counted delivered, as before 2026-09-26. The receipt is
+    /// still requested, and whether a proof came is logged: that shows how
+    /// many devices run an app that proves.
+    Observed,
+}
+
+/// OBSERVED UNTIL THE APPS THAT PROVE ARE ON MOST DEVICES (James, 2026-09-26:
+/// "we will reenable it in a month or so", so about 2026-10-26). Apps prove
+/// rfed.delivery from Retichat-android 21e520b, Retichat-ios fbc2e83 and
+/// Retichat-js 15f9ac5. Against an app that never proves, `Required` hands off
+/// every packet, and the announce flush then sends the queued copy again on
+/// each announce, again and again. To re-enable: set `Required` here and in
+/// `tests::the_packet_proof_is_observed_until_the_apps_are_updated`.
+pub const DELIVERY_PACKET_PROOF: PacketProof = PacketProof::Observed;
+
+/// Tie an `rfed.delivery` packet's receipt to its verdict under `mode`.
+/// `Required`: delivered on the proof, `hand_off` on the receipt timeout.
+/// `Observed`: sent once either way, and the proof or its absence is logged
+/// only.
+pub fn await_packet_proof(
+    receipt: &PacketReceipt,
+    label: String,
+    mode: PacketProof,
+    hand_off: Arc<dyn Fn() + Send + Sync>,
+) {
+    match mode {
+        PacketProof::Required => {
+            let outcome = PushOutcome::new(label, Some(hand_off));
+            outcome.receipt_pending();
+            tie_receipt(receipt, &outcome);
+            outcome.dispatch_done();
+        }
+        PacketProof::Observed => {
+            // One verdict per packet: a proof after the timeout is not logged twice.
+            let concluded = Arc::new(AtomicBool::new(false));
+            let (proved_label, proved_done) = (label.clone(), Arc::clone(&concluded));
+            receipt.set_delivery_callback(Arc::new(move |_| {
+                if !proved_done.swap(true, Ordering::SeqCst) {
+                    log(format!("[push] {proved_label} proved"), LOG_NOTICE, false, false);
+                }
+            }));
+            receipt.set_timeout_callback(Arc::new(move |_| {
+                if !concluded.swap(true, Ordering::SeqCst) {
+                    log(
+                        format!("[push] {label} unproven; sent once (the proof is observed, not yet required)"),
+                        LOG_NOTICE,
+                        false,
+                        false,
+                    );
+                }
+            }));
+        }
+    }
+}
 
 /// A recipient a fan-out could not confirm a delivery to, under both of the
 /// keys its hand-off needs.
@@ -91,4 +156,18 @@ pub fn defer_then_wake(
             false,
         );
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The intermediary step (James, 2026-09-26): the rfed.delivery packet's
+    /// proof is observed, not required, until the apps that prove are on
+    /// most devices (about 2026-10-26). Re-enabling is a deliberate change
+    /// to this test and to DELIVERY_PACKET_PROOF together.
+    #[test]
+    fn the_packet_proof_is_observed_until_the_apps_are_updated() {
+        assert_eq!(DELIVERY_PACKET_PROOF, PacketProof::Observed);
+    }
 }

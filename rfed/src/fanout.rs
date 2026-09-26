@@ -36,11 +36,11 @@ use reticulum_rust::packet::{Packet, DATA, NONE, HEADER_1, FLAG_UNSET};
 use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::deferred_queue::DeferredQueue;
-use crate::handoff::{OnUnconfirmed, Unconfirmed};
+use crate::handoff::{await_packet_proof, OnUnconfirmed, PacketProof, Unconfirmed, DELIVERY_PACKET_PROOF};
 use crate::link_session::LinkSessionRegistry;
 use crate::notify::rns::{LiveStack, RelayStack};
 use crate::notify::{HookRegistry, NotifyRegistry};
-use crate::stream_registry::{tie_receipt, ChannelStreamRegistry, PushOutcome};
+use crate::stream_registry::ChannelStreamRegistry;
 
 /// rfed app name used to compute destination hashes.
 pub const APP_NAME: &str = "rfed";
@@ -122,6 +122,7 @@ impl FanoutPlan {
             Some(&self.channel_streams),
             Some(&self.link_sessions),
             on_unconfirmed,
+            DELIVERY_PACKET_PROOF,
         );
     }
 }
@@ -130,11 +131,14 @@ impl FanoutPlan {
 /// hand every subscriber it cannot confirm to `on_unconfirmed`. Returns how
 /// many were handed off here and now; the proof-driven routes hand off later.
 ///
-/// A delivery is confirmed only by its proof (RFed SPEC §7): the rfed.link
-/// response, the stream link's proof, or the `rfed.delivery` packet's proof
-/// (the apps prove it since 2026-09-26). `on_unconfirmed` fires for a
-/// subscriber whose key or path is unknown, whose packet no interface took,
-/// and, later, for an unanswered or unproven push on any route. Until
+/// A delivery is confirmed by its proof (RFed SPEC §7): the rfed.link
+/// response, the stream link's proof, or, when `packet_proof` is `Required`,
+/// the `rfed.delivery` packet's proof (the apps prove it since 2026-09-26;
+/// until most run such an app the packet is `Observed`: sent once, its proof
+/// only logged). `on_unconfirmed` fires for a subscriber whose key or path is
+/// unknown, whose packet no interface took, and, later, for an unanswered or
+/// unproven push on the link or stream, or an unproven packet when proofs
+/// are required. Until
 /// 2026-09-26 the packet counted as delivered once it left, a subscriber whose
 /// app had died lost it, and an unanswered or unproven live push was queued
 /// but not pushed.
@@ -154,6 +158,7 @@ pub fn fanout_blob(
     channel_streams: Option<&Arc<Mutex<ChannelStreamRegistry>>>,
     link_sessions: Option<&Arc<Mutex<LinkSessionRegistry>>>,
     on_unconfirmed: OnUnconfirmed,
+    packet_proof: PacketProof,
 ) -> usize {
     if subscribers.is_empty() {
         log(
@@ -355,18 +360,18 @@ pub fn fanout_blob(
         );
         match stack.send_with_receipt(&mut packet) {
             Ok(Some(receipt)) => {
-                // Delivered on the subscriber's proof; handed off on the RNS
-                // receipt timeout, the same verdict the stream tier reaches.
-                let outcome = PushOutcome::new(
+                // Required: delivered on the subscriber's proof, handed off on
+                // the RNS receipt timeout, as the stream tier. Observed: sent
+                // once, the proof only logged.
+                await_packet_proof(
+                    &receipt,
                     format!("channel {} packet to subscriber {}", hexrep(channel_dest_hash, false), hexrep(sub_hash, false)),
-                    Some(hand_off_later()),
+                    packet_proof,
+                    hand_off_later(),
                 );
-                outcome.receipt_pending();
-                tie_receipt(&receipt, &outcome);
-                outcome.dispatch_done();
                 log(
                     format!(
-                        "[FANOUT] SENT channel={} sub={} payload_bytes={}, awaiting its proof",
+                        "[FANOUT] SENT channel={} sub={} payload_bytes={}",
                         hexrep(channel_dest_hash, false),
                         hexrep(sub_hash, false),
                         inner_blob.len() + channel_dest_hash.len(),
@@ -433,7 +438,7 @@ mod tests {
         (hook, rx)
     }
 
-    fn fan_out(stack: &FakeStack, sub_hash: &[u8], hook: OnUnconfirmed) -> usize {
+    fn fan_out_with(stack: &FakeStack, sub_hash: &[u8], hook: OnUnconfirmed, proof: PacketProof) -> usize {
         fanout_blob(
             stack,
             &[0xAB; 40],
@@ -443,17 +448,22 @@ mod tests {
             None,
             None,
             hook,
+            proof,
         )
+    }
+
+    fn fan_out(stack: &FakeStack, sub_hash: &[u8], hook: OnUnconfirmed) -> usize {
+        fan_out_with(stack, sub_hash, hook, PacketProof::Required)
     }
 
     fn the_subscriber(sub_hash: &[u8]) -> Unconfirmed {
         Unconfirmed { queue_key: sub_hash.to_vec(), wake_key: sub_hash.to_vec() }
     }
 
-    /// Until 2026-09-26 the packet counted as delivered once it left: a
-    /// subscriber whose app had died, its path still held, lost the message.
-    /// Now it waits for the proof, and on the RNS receipt timeout the
-    /// subscriber is queued and pushed.
+    /// With the proof required: until 2026-09-26 the packet counted as
+    /// delivered once it left, and a subscriber whose app had died, its path
+    /// still held, lost the message. It waits for the proof, and on the RNS
+    /// receipt timeout the subscriber is queued and pushed.
     #[test]
     fn a_channel_packet_nobody_proves_is_queued_and_pushed() {
         let (_, sub_hash, delivery) = known_subscriber();
@@ -468,6 +478,23 @@ mod tests {
         receipt.check_timeout();
         let who = handed_off.recv_timeout(Duration::from_secs(5)).expect("handed off on the receipt timeout");
         assert_eq!(who, the_subscriber(&sub_hash));
+    }
+
+    /// While the proof is observed (until the apps that prove are on most
+    /// devices): an unproven packet is sent once, not queued, so the announce
+    /// flush never sends it again, and nobody is pushed for it.
+    #[test]
+    fn while_the_proof_is_observed_an_unproven_packet_is_sent_once() {
+        let (_, sub_hash, delivery) = known_subscriber();
+        let stack = FakeStack::new(&delivery, None);
+        let (hook, handed_off) = recording();
+
+        assert_eq!(fan_out_with(&stack, &sub_hash, hook, PacketProof::Observed), 0);
+        assert_eq!(stack.packets.lock().unwrap().len(), 1, "sent once");
+        let mut receipt = stack.receipts.lock().unwrap()[0].clone();
+        receipt.set_timeout(0.0);
+        receipt.check_timeout();
+        assert!(handed_off.recv_timeout(Duration::from_millis(300)).is_err(), "not queued, not pushed");
     }
 
     #[test]
