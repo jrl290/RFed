@@ -1445,7 +1445,6 @@ fn run_sync_session(
                                         );
                                         if let Ok(hooks) = ctx.hook_registry.lock() {
                                             crate::distro::distro_fanout(
-                                                &crate::notify::rns::LiveStack,
                                                 routing_hash,
                                                 blob,
                                                 devices,
@@ -2079,20 +2078,26 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             // way the channel fan-out did (see FedNode::plan_channel_fanout).
             //
             // NEVER REMOVE the early drop.
-            let (deferred_queue, hook_registry, limit) = match arc.lock() {
+            let (deferred_queue, hook_registry, limit, distros) = match arc.lock() {
                 Ok(guard) => (
                     Arc::clone(&guard.deferred_queue),
                     Arc::clone(&guard.hook_registry),
                     guard.config.policy_for(&sub_id_hash).deferred_queue_limit,
+                    guard.distro_table.lock().map(|t| t.registered_distro_hashes()).unwrap_or_default(),
                 ),
                 Err(_) => return,
             };
+            // Distro blobs stay queued: they leave only by /rfed/pull, which
+            // the push that queued them asks the device to make. This flush
+            // sends an rfed.delivery packet nothing confirms; until 2026-09-26
+            // it took distro blobs too and counted them delivered.
+            let not_distro = |routing: &[u8]| !distros.contains(routing);
 
             // Fast-path: skip the lock chain if nothing is queued.
             let has_pending = deferred_queue
                 .lock()
                 .ok()
-                .map(|q| q.has_pending(&sub_id_hash))
+                .map(|q| q.has_pending_matching(&sub_id_hash, not_distro))
                 .unwrap_or(false);
             if !has_pending {
                 return;
@@ -2102,7 +2107,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             let pending = deferred_queue
                 .lock()
                 .ok()
-                .map(|mut q| q.drain(&sub_id_hash))
+                .map(|mut q| q.drain_matching_batch(&sub_id_hash, not_distro, usize::MAX))
                 .unwrap_or_default();
 
             if pending.is_empty() {
@@ -2290,17 +2295,25 @@ mod deferred_flush_size_tests {
             assert!(production.contains("(Ok(Some(_)), _) | (Ok(None), true) =>"), "{name}: the transmitted arm names both shapes");
         }
 
-        // Since 2026-09-26 the distro fan-out sends through `RelayStack::send`,
-        // whose live implementation reads the transmitted flag; distro.rs's
-        // fake-stack tests drive both arms.
-        let distro = include_str!("distro.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
-        assert_eq!(distro.matches("match packet.send() {").count(), 0, "distro.rs: no bare match on Packet::send");
-        assert_eq!(distro.matches("match stack.send(&mut packet) {").count(), 1, "distro.rs sends through the stack");
-        assert!(distro.contains("Ok(false) =>") && distro.contains("Ok(true) =>"), "distro.rs: both arms");
-        assert!(
-            include_str!("notify/rns.rs").contains("packet.send().map(|_| packet.sent)"),
-            "LiveStack::send reports the transmitted flag, not the receipt",
-        );
+        // Since 2026-09-26 the distro fan-out sends no rfed.delivery packet
+        // (distro::tests::the_distro_fanout_sends_no_unconfirmed_packet).
+    }
+
+    /// The rfed.delivery announce flush sends packets nothing confirms, so it
+    /// takes no distro blob: those leave only by /rfed/pull, after the push
+    /// that queued them. Until 2026-09-26 it drained the whole bucket.
+    #[test]
+    fn the_announce_flush_leaves_distro_blobs_queued() {
+        let source = include_str!("destinations.rs");
+        let start = source
+            .find("aspect_filter: Some(format!(\"{APP_NAME}.delivery\")),")
+            .expect("the rfed.delivery announce flush");
+        let end = start + source[start..].find("\n    });\n").expect("the flush closes");
+        let flush = &source[start..end];
+        assert!(flush.contains("registered_distro_hashes()"), "the flush knows the distro hashes");
+        assert!(flush.contains("drain_matching_batch(&sub_id_hash, not_distro"), "and drains only the rest");
+        assert!(flush.contains("has_pending_matching(&sub_id_hash, not_distro)"));
+        assert!(!flush.contains("q.drain(&sub_id_hash)"), "never the whole bucket");
     }
 
     /// The deferred flush must consult the size gate before it builds a packet,
@@ -4432,7 +4445,7 @@ mod fanout_lock_scope_tests {
         let fragment = &source[start..end];
 
         assert!(
-            fragment.contains("let (deferred_queue, hook_registry, limit) = match arc.lock()"),
+            fragment.contains("let (deferred_queue, hook_registry, limit, distros) = match arc.lock()"),
             "the deferred flush must snapshot its collaborators and release the \
              FedNode mutex before sending"
         );

@@ -1351,37 +1351,34 @@ Each RFed node maintains its own **DistroTable** — a per-node registry of
 which devices have registered locally.  A node pulls distro blobs from
 peers when it has at least one local device registered for that distro hash.
 
-### 17.3 Delivery Format
+### 17.3 Delivery
 
-Distro messages are delivered via `rfed.delivery` (same destination as
-channel blobs), using the same payload layout:
+A distro message reaches each registered device the way a propagated
+message reaches its recipient (§7 "Live delivery and its proof"):
 
-```
-[ distro_lxmf_hash(16) | lxmf_blob(*) ]
-```
+1. `/lxmf/delivery` on the device's bound `rfed.link`: the bare LXMF blob,
+   confirmed by the response;
+2. else its `rfed.propagation.stream` link: the bare LXMF blob, confirmed by
+   the link proof;
+3. else, and whenever 1 or 2 goes unconfirmed, a **hand-off**: the blob is
+   queued in the **DeferredQueue** under the device's identity hash, and then
+   the device is pushed through its LXMF notify registrations (§9), stored
+   under its `lxmf.delivery` hash, so that it collects the blob with
+   `/rfed/pull` (`distro::defer_then_wake`). Queue first: the push makes the
+   device pull. The push carries no sender and no channel.
 
-The device's `rfed.delivery` handler distinguishes distro messages from
-channel messages by the routing hash prefix.  The `lxmf_blob` is a standard
-LXMF propagation message (encrypted to the distro identity's X25519 key).
-RFed never decrypts it.
+The leading 16 bytes of the blob are its destination, the distro's
+`lxmf.delivery` hash, which is how the device tells a distro message from
+one addressed to itself. The blob is a standard LXMF propagation message,
+encrypted to the distro identity's X25519 key; RFed never decrypts it.
+`/rfed/pull` returns `[distro_lxmf_hash, lxmf_blob]` pairs (§17.8).
 
-Live delivery tries each device's routes in the order of §7 "Live delivery
-and its proof": `/lxmf/delivery` on its bound `rfed.link` (bare LXMF blob),
-then its `rfed.propagation.stream` link (bare LXMF blob, proof-driven), then
-this `rfed.delivery` packet. Offline devices, and pushes a device never
-confirmed, are handled via the **DeferredQueue** (same as channels), keyed by
-the device's identity hash; the device collects them with `/distro/pull`.
-Only the rfed.link response and the stream proof confirm a delivery. Nothing
-confirms the `rfed.delivery` packet, so a device sent one is handed off as
-well; a device that did receive it drops the pulled copy as a duplicate.
-
-Every hand-off queues the blob first, then wakes the device through its
-LXMF notify registrations (§9), stored under the device's `lxmf.delivery`
-hash, so that it pulls (`distro::defer_then_wake`). The wake carries no sender
-and no channel. Until 2026-09-26 no distro fan-out woke a device: an Android
+No distro message is sent as an `rfed.delivery` packet, and the
+`rfed.delivery` announce flush leaves distro blobs queued: nothing confirms
+such a packet. Until 2026-09-26 a device with no live session was sent one
+and it counted as delivered, and no distro fan-out pushed anyone: an Android
 or iOS device whose app was closed got no push for its distro, and a device
-sent the `rfed.delivery` packet after its app had died lost the message.
-When the device announces `rfed.delivery`, pending distro blobs are flushed.
+whose app had died, but whose path rfed still held, lost the message.
 
 ### 17.4 RNS Destinations & Request Paths
 

@@ -1437,7 +1437,6 @@ impl DeliveryHandles {
             None => &default_hooks,
         };
         let handed_off = crate::distro::distro_fanout(
-            &LiveStack,
             dest_hash,
             lxmf_data,
             &devices,
@@ -1449,7 +1448,7 @@ impl DeliveryHandles {
         if handed_off > 0 {
             log(
                 format!(
-                    "[distro] {} of {} device(s) unconfirmed for distro {} — queued for /rfed/pull and woken",
+                    "[distro] {} of {} device(s) with no live session for distro {} — queued for /rfed/pull and pushed",
                     handed_off,
                     devices.len(),
                     hexrep(dest_hash, false),
