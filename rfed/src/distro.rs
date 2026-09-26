@@ -60,10 +60,11 @@ use serde::{Deserialize, Serialize};
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::{Packet, ANNOUNCE, DATA, NONE, HEADER_1, FLAG_SET, FLAG_UNSET};
-use reticulum_rust::transport::Transport;
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
-use crate::notify::HookRegistry;
+use crate::deferred_queue::DeferredQueue;
+use crate::notify::rns::RelayStack;
+use crate::notify::{dispatch_notify_via, HookRegistry, NotifyRegistration, NotifyRegistry};
 use crate::link_session::LinkSessionRegistry;
 use crate::stream_registry::{OnUnproven, PropagationStreamRegistry};
 
@@ -472,46 +473,133 @@ fn device_id_hash_of(entry: &DistroEntry) -> Option<Vec<u8>> {
     Identity::from_public_key(&entry.device_pubkey).ok()?.hash
 }
 
-/// The stream tier's hand-off for `entry`: the caller's `on_missed` with the
-/// device IDENTITY hash, the key `/distro/pull` drains by (keyed by the
-/// lxmf.delivery hash, a blob lands in a bucket nothing drains).
-fn stream_unproven_hook(
-    on_missed: Option<&Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
-    entry: &DistroEntry,
-) -> Option<OnUnproven> {
-    let hook = Arc::clone(on_missed?);
-    let device_id_hash = device_id_hash_of(entry)?;
-    let device = hexrep(&entry.device_lxmf_hash, false);
+/// A device the fan-out could not confirm a delivery to, under both of the
+/// keys its hand-off needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnconfirmedDevice {
+    /// The device's identity hash: the key `/rfed/pull` drains the deferred
+    /// queue by. Keyed by the lxmf.delivery hash, a blob lands in a bucket
+    /// nothing drains.
+    pub device_id_hash: Vec<u8>,
+    /// The device's `lxmf.delivery` hash: the key its notify registration is
+    /// stored under (destinations.rs `notify/register stored lxmf`).
+    pub device_lxmf_hash: Vec<u8>,
+}
+
+/// What a fan-out caller does with a device it could not confirm. Build it
+/// with [`defer_then_wake`].
+pub type OnUnconfirmed = Arc<dyn Fn(UnconfirmedDevice) + Send + Sync>;
+
+fn unconfirmed(entry: &DistroEntry) -> Option<UnconfirmedDevice> {
+    Some(UnconfirmedDevice {
+        device_id_hash: device_id_hash_of(entry)?,
+        device_lxmf_hash: entry.device_lxmf_hash.clone(),
+    })
+}
+
+/// The one hand-off for a device a distro fan-out could not confirm: queue
+/// the blob for `/rfed/pull`, then wake the device through its notify
+/// registrations so that it pulls. Queue first: the wake makes the device
+/// pull, and a pull that comes before the blob is queued finds nothing
+/// (DESIGN_PRINCIPLES §5).
+///
+/// Until 2026-09-26 no distro fan-out woke anyone. The propagation-ingest
+/// caller only queued. The federation-sync caller woke, but looked the
+/// registrations up by the device's identity hash, and a device registers
+/// under its lxmf.delivery hash, so it found none. An Android or iOS device
+/// whose app was closed got no push for anything sent to its distro.
+pub fn defer_then_wake(
+    stack: Arc<dyn RelayStack + Send + Sync>,
+    deferred_queue: Arc<Mutex<DeferredQueue>>,
+    notify_registry: Arc<Mutex<NotifyRegistry>>,
+    limit_for: Arc<dyn Fn(&[u8]) -> usize + Send + Sync>,
+    distro_lxmf_hash: &[u8],
+    lxmf_blob: &[u8],
+) -> OnUnconfirmed {
+    let distro_lxmf_hash = distro_lxmf_hash.to_vec();
+    let lxmf_blob = lxmf_blob.to_vec();
+    Arc::new(move |device: UnconfirmedDevice| {
+        let queued = match deferred_queue.lock() {
+            Ok(mut queue) => {
+                let limit = limit_for(&device.device_id_hash);
+                queue.enqueue(device.device_id_hash.clone(), distro_lxmf_hash.clone(), lxmf_blob.clone(), limit);
+                true
+            }
+            Err(_) => false,
+        };
+        // Snapshot, then wake with the registry released: a wake is a send.
+        let registrations: Vec<NotifyRegistration> = match notify_registry.lock() {
+            Ok(registry) => registry
+                .get_for_channel(&device.device_lxmf_hash, None)
+                .into_iter()
+                .cloned()
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let woken = registrations
+            .iter()
+            .filter(|registration| dispatch_notify_via(&*stack, registration, None, None).is_sent())
+            .count();
+        log(
+            format!(
+                "[distro] device {} unconfirmed for distro {}: {} for /rfed/pull, woken via {} of {} notify registration(s)",
+                hexrep(&device.device_lxmf_hash, false),
+                hexrep(&distro_lxmf_hash, false),
+                if queued { "queued" } else { "NOT queued (deferred queue poisoned)" },
+                woken,
+                registrations.len(),
+            ),
+            if queued { LOG_NOTICE } else { LOG_WARNING },
+            false,
+            false,
+        );
+    })
+}
+
+/// The stream tier's hand-off for `entry`: the caller's `on_unconfirmed`,
+/// when the device's push is never proved.
+fn stream_unproven_hook(on_unconfirmed: &OnUnconfirmed, entry: &DistroEntry) -> Option<OnUnproven> {
+    let hook = Arc::clone(on_unconfirmed);
+    let device = unconfirmed(entry)?;
+    let label = hexrep(&entry.device_lxmf_hash, false);
     Some(Arc::new(move || {
         log(
-            format!("[distro] stream push to device {device} unproven — deferring for /distro/pull"),
+            format!("[distro] stream push to device {label} unproven — deferring for /rfed/pull"),
             LOG_NOTICE,
             false,
             false,
         );
-        hook(device_id_hash.clone());
+        hook(device.clone());
     }))
 }
 
-/// `on_missed(device_id_hash)` is the caller's deferral: it must do for one
-/// device what the caller does for the returned `missed` list (enqueue the
-/// blob in the distro deferred queue). It fires later, on a thread of its
-/// own, for a push a live tier dispatched but the device never confirmed:
-/// an rfed.link push with no response (Link.md "The response is the delivery
-/// proof"), or a propagation.stream push no link proved before its receipt
-/// timed out (stream_registry::PushOutcome). That blob moves to the pull
-/// path. Before 2026-09-22 the rfed.link tier passed no failure hook, logged
-/// "deferring", and deferred nothing; before 2026-09-24 the stream tier had
-/// no proof at all.
+/// Deliver `lxmf_blob` to every device of the distro, and hand every device
+/// it cannot confirm to `on_unconfirmed` (build it with [`defer_then_wake`]).
+/// Returns how many devices were handed off here and now; the live tiers'
+/// hand-offs come later. `stack` carries the `rfed.delivery` packet (the live
+/// Transport, [`crate::notify::rns::LiveStack`], outside tests).
+///
+/// A device is confirmed only by the rfed.link response or the
+/// propagation.stream proof. `on_unconfirmed` fires:
+/// - here, for a device with no path, no interface, or a failed send;
+/// - here, after the `rfed.delivery` packet: nothing ever confirms it, and a
+///   device whose app was killed keeps its path. Until 2026-09-26 that packet
+///   counted as delivered, and the blob was neither queued nor woken for, so
+///   the device lost it (production 2026-09-26 03:46-03:51 UTC: seven
+///   messages "SENT" to an Android phone Android had killed);
+/// - later, on a thread of its own, for an rfed.link push with no response
+///   (Link.md "The response is the delivery proof") or a propagation.stream
+///   push no link proved (stream_registry::PushOutcome).
 pub fn distro_fanout(
+    stack: &dyn RelayStack,
     distro_lxmf_hash: &[u8],
     lxmf_blob: &[u8],
     devices: &[DistroEntry],
     hook_registry: &HookRegistry,
     propagation_streams: Option<&Arc<Mutex<PropagationStreamRegistry>>>,
     link_sessions: Option<&Arc<Mutex<LinkSessionRegistry>>>,
-    on_missed: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>>,
-) -> Vec<Vec<u8>> {
+    on_unconfirmed: OnUnconfirmed,
+) -> usize {
     if devices.is_empty() {
         log(
             format!(
@@ -522,7 +610,7 @@ pub fn distro_fanout(
             false,
             false,
         );
-        return Vec::new();
+        return 0;
     }
 
     log(
@@ -537,7 +625,7 @@ pub fn distro_fanout(
         false,
     );
 
-    let mut missed: Vec<Vec<u8>> = Vec::new();
+    let mut handed_off = 0usize;
 
     for entry in devices {
         // The rfed.delivery PACKET tier (tier 3) carries
@@ -554,15 +642,13 @@ pub fn distro_fanout(
         // by way of a distro identity.
         if let Some(sessions) = link_sessions {
             if let Ok(mut registry) = sessions.lock() {
-                // The deferred queue is drained by the device's IDENTITY hash
-                // (`/distro/pull`), so that is the key the hook receives.
-                let on_failed: Option<Arc<dyn Fn() + Send + Sync>> = match (&on_missed, device_id_hash_of(entry)) {
-                    (Some(hook), Some(device_id_hash)) => {
-                        let hook = Arc::clone(hook);
-                        Some(Arc::new(move || hook(device_id_hash.clone())))
-                    }
-                    _ => None,
-                };
+                // A push with no response is handed off like any device the
+                // fan-out could not confirm.
+                let on_failed: Option<Arc<dyn Fn() + Send + Sync>> = unconfirmed(entry).map(|device| {
+                    let hook = Arc::clone(&on_unconfirmed);
+                    let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || hook(device.clone()));
+                    on_failed
+                });
                 let result = registry.dispatch_lxmf(&entry.device_lxmf_hash, lxmf_blob, on_failed);
                 if result.delivered() {
                     log(
@@ -585,12 +671,11 @@ pub fn distro_fanout(
         if let Some(streams) = propagation_streams {
             if let Ok(mut registry) = streams.lock() {
                 // Proof-driven (stream_registry::PushOutcome): a push no link
-                // proves goes to the deferred queue under the device IDENTITY
-                // hash, which `/distro/pull` drains — the same hand-off as the
-                // rfed.link tier's `on_failed`. Until 2026-09-24 a push to a
-                // device that had died with its link still up was counted as
-                // delivered and lost.
-                let on_unproven = stream_unproven_hook(on_missed.as_ref(), entry);
+                // proves is handed off — the same hand-off as the rfed.link
+                // tier's `on_failed`. Until 2026-09-24 a push to a device that
+                // had died with its link still up was counted as delivered
+                // and lost.
+                let on_unproven = stream_unproven_hook(&on_unconfirmed, entry);
                 let result = registry.dispatch(&entry.device_lxmf_hash, lxmf_blob, on_unproven);
                 if result.delivered() {
                     log(
@@ -656,6 +741,10 @@ pub fn distro_fanout(
                 continue;
             }
         };
+        let device = UnconfirmedDevice {
+            device_id_hash,
+            device_lxmf_hash: entry.device_lxmf_hash.clone(),
+        };
 
         // Ensure the device identity is known to Reticulum so we can
         // build an outbound destination.
@@ -683,13 +772,14 @@ pub fn distro_fanout(
                     false,
                     false,
                 );
-                missed.push(device_id_hash);
+                handed_off += 1;
+                on_unconfirmed(device);
                 continue;
             }
         };
 
         // Only attempt delivery if a network path is known.
-        if !Transport::has_path(&dest.hash) {
+        if !stack.has_path(&dest.hash) {
             log(
                 format!(
                     "[distro] no path to device {} — will defer",
@@ -699,7 +789,8 @@ pub fn distro_fanout(
                 false,
                 false,
             );
-            missed.push(device_id_hash);
+            handed_off += 1;
+            on_unconfirmed(device);
             continue;
         }
 
@@ -720,13 +811,17 @@ pub fn distro_fanout(
             FLAG_UNSET,
         );
         // Packet::send() returns Ok(None) both when nothing was transmitted and
-                // when the packet went out without a receipt being requested (these
-                // packets never ask for one). Until 2026-09-24 the second case was read
-                // as the first: every successful send was re-queued and re-sent on the
-                // next announce. `packet.sent` is the transmitted flag (RNS/Packet.py
-                // send() returns False, not None, when no interface took it).
-                match (packet.send(), packet.sent) {
-            (Err(e), _) => {
+        // when the packet went out without a receipt being requested (these
+        // packets never ask for one). Until 2026-09-24 the second case was read
+        // as the first: every successful send was re-queued and re-sent on the
+        // next announce. `packet.sent` is the transmitted flag (RNS/Packet.py
+        // send() returns False, not None, when no interface took it).
+        //
+        // Whichever way it goes, the device is handed off: a packet that left
+        // is still unconfirmed. A device that did get it drops the pulled copy
+        // as a duplicate (SPEC §17 message id: source + timestamp + content).
+        match stack.send(&mut packet) {
+            Err(e) => {
                 log(
                     format!(
                         "[distro] send to device {} failed: {e} — will defer",
@@ -736,10 +831,9 @@ pub fn distro_fanout(
                     false,
                     false,
                 );
-                missed.push(device_id_hash.clone());
             }
-            (Ok(None), false) => {
-                // Ok(None) = Transport::outbound returned sent=false: the path
+            Ok(false) => {
+                // Transport::outbound returned sent=false: the path
                 // to the device exists but has no usable (online) interface
                 // right now.  Request a fresh path so the NEXT fanout / the
                 // deferred flush finds a warm route, then defer.  Previously
@@ -754,10 +848,9 @@ pub fn distro_fanout(
                     false,
                     false,
                 );
-                Transport::request_path(&dest_hash_for_request, None, None, None, None);
-                missed.push(device_id_hash.clone());
+                stack.request_path(&dest_hash_for_request);
             }
-            (Ok(Some(_)), _) | (Ok(None), true) => {
+            Ok(true) => {
                 log(
                     format!(
                         "[DISTRO] SENT distro={} device={} payload_bytes={}",
@@ -772,12 +865,14 @@ pub fn distro_fanout(
                 // Only report delivery on an actual transmission.  Previously
                 // on_deliver fired unconditionally (even on defer/Ok(None)),
                 // marking blobs delivered that never left the node.
-                hook_registry.on_deliver(&device_id_hash, lxmf_blob);
+                hook_registry.on_deliver(&device.device_id_hash, lxmf_blob);
             }
         }
+        handed_off += 1;
+        on_unconfirmed(device);
     }
 
-    missed
+    handed_off
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -817,7 +912,7 @@ pub fn lxmf_delivery_hash_from_pubkey(pubkey: &[u8]) -> Result<Vec<u8>, String> 
 mod tests {
     #[test]
     fn the_deferral_key_is_the_device_identity_hash() {
-        // `/distro/pull` drains the deferred queue by the caller's identity
+        // `/rfed/pull` drains the deferred queue by the caller's identity
         // hash, so the hook for an unanswered rfed.link push must receive
         // that hash, derived from the registered device pubkey.
         let identity = reticulum_rust::identity::Identity::new(true);
@@ -832,21 +927,194 @@ mod tests {
         };
         assert_eq!(super::device_id_hash_of(&entry), identity.hash, "identity hash, not the lxmf.delivery hash");
 
-        // The stream tier's unproven push reaches `on_missed` under that key.
-        let keys = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
-        let seen = Arc::clone(&keys);
-        let on_missed: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |key| seen.lock().unwrap().push(key));
-        let hook = super::stream_unproven_hook(Some(&on_missed), &entry).expect("a hook for a valid device");
+        // The stream tier's unproven push reaches `on_unconfirmed` under both keys.
+        let (on_unconfirmed, seen) = recording_hand_off();
+        let hook = super::stream_unproven_hook(&on_unconfirmed, &entry).expect("a hook for a valid device");
         hook();
-        assert_eq!(keys.lock().unwrap().as_slice(), &[identity.hash.clone().unwrap()], "deferred under the identity hash");
-        assert!(super::stream_unproven_hook(None, &entry).is_none(), "no caller route, no hook");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[UnconfirmedDevice { device_id_hash: identity.hash.clone().unwrap(), device_lxmf_hash: vec![2; 16] }],
+            "handed off under the identity hash (queue) and the lxmf.delivery hash (wake)",
+        );
 
         let bad = DistroEntry { device_pubkey: vec![0; 3], ..entry };
         assert!(super::device_id_hash_of(&bad).is_none(), "an invalid pubkey yields no key, so no hook fires");
-        assert!(super::stream_unproven_hook(Some(&on_missed), &bad).is_none());
+        assert!(super::stream_unproven_hook(&on_unconfirmed, &bad).is_none());
+    }
+
+    // ── Every device the fan-out cannot confirm is handed off ───────────
+
+    fn recording_hand_off() -> (OnUnconfirmed, Arc<Mutex<Vec<UnconfirmedDevice>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let hook: OnUnconfirmed = Arc::new(move |device| record.lock().unwrap().push(device));
+        (hook, seen)
+    }
+
+    /// A registered device with a real key, and the hash of its
+    /// `rfed.delivery` destination, which the fan-out's packet goes to.
+    fn real_device(distro: &[u8]) -> (Identity, DistroEntry, Vec<u8>) {
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("pubkey");
+        let entry = DistroEntry {
+            distro_lxmf_hash: distro.to_vec(),
+            device_lxmf_hash: lxmf_delivery_hash_from_pubkey(&pubkey).expect("lxmf hash"),
+            device_pubkey: pubkey,
+            added: 0.0,
+            last_refreshed: 0.0,
+            owner_node_hash: None,
+        };
+        let rfed_delivery = Destination::hash(identity.hash.as_deref(), "rfed", &["delivery"]);
+        (identity, entry, rfed_delivery)
+    }
+
+    fn expected_hand_off(identity: &Identity, entry: &DistroEntry) -> UnconfirmedDevice {
+        UnconfirmedDevice {
+            device_id_hash: identity.hash.clone().expect("identity hash"),
+            device_lxmf_hash: entry.device_lxmf_hash.clone(),
+        }
+    }
+
+    /// Production 2026-09-26 03:46-03:51 UTC: Android killed Retichat, rfed
+    /// kept its path to the phone, and every message to the phone's distro
+    /// went out as an rfed.delivery packet that nothing confirms. It counted
+    /// as delivered: not queued for /rfed/pull, no wake. The phone never got
+    /// those seven messages, nor a push for any of them.
+    #[test]
+    fn a_device_sent_the_delivery_packet_is_still_queued_and_woken() {
+        let distro = vec![0xD1; 16];
+        let (identity, entry, rfed_delivery) = real_device(&distro);
+        let stack = FakeStack::new(&rfed_delivery, None);
+        let (on_unconfirmed, seen) = recording_hand_off();
+
+        let handed_off = distro_fanout(
+            &stack, &distro, &[0xAB; 40], &[entry.clone()], &HookRegistry::new(), None, None, on_unconfirmed,
+        );
+
+        let packets = stack.packets.lock().unwrap();
+        assert_eq!(packets.len(), 1, "the rfed.delivery packet still goes out");
+        assert_eq!(&packets[0].0[2..18], rfed_delivery.as_slice(), "addressed to the device's rfed.delivery");
+        assert_eq!(handed_off, 1, "a packet nothing confirms is not a delivery");
+        assert_eq!(seen.lock().unwrap().as_slice(), &[expected_hand_off(&identity, &entry)]);
+    }
+
+    #[test]
+    fn a_device_with_no_path_is_handed_off_and_nothing_is_sent() {
+        let distro = vec![0xD2; 16];
+        let (identity, entry, rfed_delivery) = real_device(&distro);
+        let stack = FakeStack::new(&rfed_delivery, None).without_path();
+        let (on_unconfirmed, seen) = recording_hand_off();
+
+        let handed_off = distro_fanout(
+            &stack, &distro, &[0xAB; 40], &[entry.clone()], &HookRegistry::new(), None, None, on_unconfirmed,
+        );
+
+        assert!(stack.packets.lock().unwrap().is_empty(), "no path, no packet");
+        assert_eq!(handed_off, 1);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[expected_hand_off(&identity, &entry)]);
+    }
+
+    #[test]
+    fn a_device_no_interface_takes_is_handed_off_and_its_path_requested() {
+        let distro = vec![0xD3; 16];
+        let (identity, entry, rfed_delivery) = real_device(&distro);
+        let stack = FakeStack::new(&rfed_delivery, None).without_interface();
+        let (on_unconfirmed, seen) = recording_hand_off();
+
+        let handed_off = distro_fanout(
+            &stack, &distro, &[0xAB; 40], &[entry.clone()], &HookRegistry::new(), None, None, on_unconfirmed,
+        );
+
+        assert_eq!(handed_off, 1);
+        assert_eq!(seen.lock().unwrap().as_slice(), &[expected_hand_off(&identity, &entry)]);
+        assert_eq!(stack.path_requests.lock().unwrap().as_slice(), &[rfed_delivery]);
+    }
+
+    // ── defer_then_wake ──────────────────────────────────────────────────
+
+    /// A relay stack that records, at each wake, whether the device's blob
+    /// was already queued.
+    struct ObservingStack {
+        inner: FakeStack,
+        queue: Arc<Mutex<DeferredQueue>>,
+        device_id_hash: Vec<u8>,
+        queued_at_wake: Mutex<Vec<bool>>,
+    }
+
+    impl RelayStack for ObservingStack {
+        fn has_path(&self, destination_hash: &[u8]) -> bool {
+            self.inner.has_path(destination_hash)
+        }
+        fn request_path(&self, destination_hash: &[u8]) {
+            self.inner.request_path(destination_hash)
+        }
+        fn recall(&self, destination_hash: &[u8]) -> Option<Identity> {
+            self.inner.recall(destination_hash)
+        }
+        fn send(&self, packet: &mut Packet) -> Result<bool, String> {
+            let queued = self.queue.lock().unwrap().has_pending(&self.device_id_hash);
+            self.queued_at_wake.lock().unwrap().push(queued);
+            self.inner.send(packet)
+        }
+    }
+
+    /// The device registers for wakes under its lxmf.delivery hash
+    /// (destinations.rs `notify/register stored lxmf`). The wake goes there,
+    /// and only after the blob is queued under its identity hash, which is
+    /// what /rfed/pull drains — a wake that beats the blob wakes the device
+    /// to an empty pull.
+    #[test]
+    fn defer_then_wake_queues_the_blob_then_wakes_the_registered_lxmf_hash() {
+        let dir = temp_path("defer_then_wake");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let queue = Arc::new(Mutex::new(DeferredQueue::load(dir.join("deferred.rmp"))));
+        let notify = Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp"))));
+
+        let (device_identity, entry, _) = real_device(&[0xD4; 16]);
+        let device = expected_hand_off(&device_identity, &entry);
+        let mut relay = Identity::new(true);
+        let relay_hash = Destination::hash(relay.hash.as_deref(), "rfed", &["notify"]);
+        let relay_public = Identity::from_public_key(&relay.get_public_key().expect("relay key")).expect("relay");
+        notify.lock().unwrap().register(entry.device_lxmf_hash.clone(), None, hexrep(&relay_hash, false));
+
+        let stack = Arc::new(ObservingStack {
+            inner: FakeStack::new(&relay_hash, Some(relay_public)),
+            queue: Arc::clone(&queue),
+            device_id_hash: device.device_id_hash.clone(),
+            queued_at_wake: Mutex::new(Vec::new()),
+        });
+        let distro = vec![0xD4; 16];
+        let blob = vec![0xAB; 40];
+        let hand_off = defer_then_wake(
+            Arc::clone(&stack) as Arc<dyn RelayStack + Send + Sync>,
+            Arc::clone(&queue),
+            Arc::clone(&notify),
+            Arc::new(|_| 8),
+            &distro,
+            &blob,
+        );
+
+        hand_off(device.clone());
+
+        assert_eq!(stack.queued_at_wake.lock().unwrap().as_slice(), &[true], "one wake, sent after the blob was queued");
+        let packets = stack.inner.packets.lock().unwrap();
+        let plaintext = relay.decrypt(&packets[0].0[19..]).expect("the relay reads its wake");
+        let wake = rmpv::decode::read_value(&mut std::io::Cursor::new(plaintext)).expect("wake payload");
+        let receiver = wake
+            .as_map()
+            .and_then(|map| map.iter().find(|(key, _)| key.as_str() == Some("receiver")))
+            .map(|(_, value)| value.clone());
+        assert_eq!(receiver, Some(rmpv::Value::Binary(entry.device_lxmf_hash.clone())), "the device's registered hash");
+
+        let pending = queue.lock().unwrap().drain(&device.device_id_hash);
+        assert_eq!(pending.len(), 1, "queued under the identity hash /rfed/pull drains by");
+        assert_eq!(pending[0].channel_hash, distro);
+        assert_eq!(pending[0].blob, blob);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     use super::*;
+    use crate::notify::rns::fake::FakeStack;
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()

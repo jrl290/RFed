@@ -1371,6 +1371,16 @@ then its `rfed.propagation.stream` link (bare LXMF blob, proof-driven), then
 this `rfed.delivery` packet. Offline devices, and pushes a device never
 confirmed, are handled via the **DeferredQueue** (same as channels), keyed by
 the device's identity hash; the device collects them with `/distro/pull`.
+Only the rfed.link response and the stream proof confirm a delivery. Nothing
+confirms the `rfed.delivery` packet, so a device sent one is handed off as
+well; a device that did receive it drops the pulled copy as a duplicate.
+
+Every hand-off queues the blob first, then wakes the device through its
+LXMF notify registrations (§9), stored under the device's `lxmf.delivery`
+hash, so that it pulls (`distro::defer_then_wake`). The wake carries no sender
+and no channel. Until 2026-09-26 no distro fan-out woke a device: an Android
+or iOS device whose app was closed got no push for its distro, and a device
+sent the `rfed.delivery` packet after its app had died lost the message.
 When the device announces `rfed.delivery`, pending distro blobs are flushed.
 
 ### 17.4 RNS Destinations & Request Paths

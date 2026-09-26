@@ -1436,36 +1436,64 @@ impl DeliveryHandles {
             Some(g) => &**g,
             None => &default_hooks,
         };
-        let on_missed: Option<Arc<dyn Fn(Vec<u8>) + Send + Sync>> = self.deferred_queue.as_ref().map(|queue| {
-            let queue = Arc::clone(queue);
-            let distro_hash = dest_hash.to_vec();
-            let blob = lxmf_data.to_vec();
-            let hook: Arc<dyn Fn(Vec<u8>) + Send + Sync> = Arc::new(move |device_id_hash: Vec<u8>| {
-                enqueue_distro_misses(Some(&queue), vec![device_id_hash], &distro_hash, &blob);
-            });
-            hook
-        });
-        let missed = crate::distro::distro_fanout(
+        let handed_off = crate::distro::distro_fanout(
+            &LiveStack,
             dest_hash,
             lxmf_data,
             &devices,
             hooks,
             Some(&self.stream_registry),
             Some(&self.link_sessions),
-            on_missed,
+            self.distro_hand_off(Arc::new(LiveStack), dest_hash, lxmf_data),
         );
-        if !missed.is_empty() {
+        if handed_off > 0 {
             log(
                 format!(
-                    "[distro] {} device(s) unreachable for distro {} — enqueuing in deferred queue",
-                    missed.len(),
+                    "[distro] {} of {} device(s) unconfirmed for distro {} — queued for /rfed/pull and woken",
+                    handed_off,
+                    devices.len(),
                     hexrep(dest_hash, false),
                 ),
                 LOG_NOTICE,
                 false,
                 false,
             );
-            enqueue_distro_misses(self.deferred_queue.as_ref(), missed, dest_hash, lxmf_data);
+        }
+    }
+
+    /// What a distro fan-out from propagation ingest does with a device it
+    /// could not confirm: [`crate::distro::defer_then_wake`] on the deferred
+    /// queue `/rfed/pull` drains and the notify registry the device registered
+    /// with. Until 2026-09-26 it only queued: no device was ever woken.
+    fn distro_hand_off(
+        &self,
+        stack: Arc<dyn RelayStack + Send + Sync>,
+        dest_hash: &[u8],
+        lxmf_data: &[u8],
+    ) -> crate::distro::OnUnconfirmed {
+        match &self.deferred_queue {
+            Some(queue) => crate::distro::defer_then_wake(
+                stack,
+                Arc::clone(queue),
+                Arc::clone(&self.registry),
+                Arc::new(|_| DISTRO_DEFERRED_QUEUE_LIMIT),
+                dest_hash,
+                lxmf_data,
+            ),
+            None => {
+                let distro = hexrep(dest_hash, false);
+                Arc::new(move |device: crate::distro::UnconfirmedDevice| {
+                    log(
+                        format!(
+                            "[distro] device {} unconfirmed for distro {distro}, and this node has no deferred queue: NOT queued, NOT woken",
+                            hexrep(&device.device_lxmf_hash, false),
+                        ),
+                        LOG_WARNING,
+                        false,
+                        false,
+                    );
+                })
+            }
         }
     }
 
@@ -2778,28 +2806,6 @@ pub(crate) fn encode_error(code: u8) -> Vec<u8> {
     encode_value(Value::Integer((code as i64).into()))
 }
 
-fn enqueue_distro_misses(
-    deferred_queue: Option<&Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
-    missed: Vec<Vec<u8>>,
-    distro_hash: &[u8],
-    lxmf_data: &[u8],
-) {
-    let Some(deferred_queue) = deferred_queue else {
-        return;
-    };
-    let Ok(mut queue) = deferred_queue.lock() else {
-        return;
-    };
-    for device_hash in missed {
-        queue.enqueue(
-            device_hash,
-            distro_hash.to_vec(),
-            lxmf_data.to_vec(),
-            DISTRO_DEFERRED_QUEUE_LIMIT,
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -3136,30 +3142,57 @@ mod tests {
         }
     }
 
+    /// The propagation-ingest distro fan-out's hand-off both queues the blob
+    /// for /rfed/pull and wakes the device. Until 2026-09-26 it only queued,
+    /// so a device whose app was closed got no push for its distro.
     #[test]
-    fn distro_misses_are_queued_for_pull() {
+    fn distro_misses_are_queued_for_pull_and_woken() {
+        use crate::notify::rns::fake::FakeStack;
+        use crate::notify::rns::RelayStack;
+
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("rfed_distro_deferred_{unique}.rmp"));
-        let queue = Arc::new(Mutex::new(crate::deferred_queue::DeferredQueue::load(path.clone())));
-        let device_hash = vec![0x11; 16];
+        let dir = std::env::temp_dir().join(format!("rfed_distro_hand_off_{unique}"));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let queue = Arc::new(Mutex::new(crate::deferred_queue::DeferredQueue::load(dir.join("deferred.rmp"))));
+        let notify = Arc::new(Mutex::new(super::NotifyRegistry::load(dir.join("notify.rmp"))));
+        let relay = reticulum_rust::identity::Identity::new(true);
+        let relay_hash = reticulum_rust::destination::Destination::hash(relay.hash.as_deref(), "rfed", &["notify"]);
+        let relay_public = reticulum_rust::identity::Identity::from_public_key(&relay.get_public_key().expect("key"))
+            .expect("relay");
+        let device = crate::distro::UnconfirmedDevice { device_id_hash: vec![0x11; 16], device_lxmf_hash: vec![0x44; 16] };
+        notify
+            .lock()
+            .unwrap()
+            .register(device.device_lxmf_hash.clone(), None, reticulum_rust::hexrep(&relay_hash, false));
+        let handles = super::DeliveryHandles {
+            registry: Arc::clone(&notify),
+            stream_registry: Arc::new(Mutex::new(super::PropagationStreamRegistry::default())),
+            link_sessions: Arc::new(Mutex::new(super::LinkSessionRegistry::default())),
+            distro_table: None,
+            distro_blob_store: None,
+            distro_hook_registry: None,
+            deferred_queue: Some(Arc::clone(&queue)),
+        };
+        let stack = Arc::new(FakeStack::new(&relay_hash, Some(relay_public)));
         let distro_hash = vec![0x22; 16];
         let lxmf_data = vec![0x33; 64];
 
-        super::enqueue_distro_misses(
-            Some(&queue),
-            vec![device_hash.clone()],
+        let hand_off = handles.distro_hand_off(
+            Arc::clone(&stack) as Arc<dyn RelayStack + Send + Sync>,
             &distro_hash,
             &lxmf_data,
         );
+        hand_off(device.clone());
 
-        let pending = queue.lock().expect("queue lock").drain(&device_hash);
-        assert_eq!(pending.len(), 1);
+        let pending = queue.lock().expect("queue lock").drain(&device.device_id_hash);
+        assert_eq!(pending.len(), 1, "queued under the identity hash");
         assert_eq!(pending[0].channel_hash, distro_hash);
         assert_eq!(pending[0].blob, lxmf_data);
-        let _ = std::fs::remove_file(path);
+        assert_eq!(stack.packets.lock().unwrap().len(), 1, "and the device's registration was woken");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

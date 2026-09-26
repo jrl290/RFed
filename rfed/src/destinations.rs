@@ -413,7 +413,7 @@ use crate::distro::{self, DistroAnnounceStore, DistroTable};
 use crate::fanout;
 use crate::link_session::{paths as link_paths, LinkSessionRegistry};
 use crate::lxmf_propagation::LxmfPropagationNode;
-use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry, validate_relay_hash};
+use crate::notify::{HookRegistry, NotifyRegistry, validate_relay_hash};
 use crate::stream_registry::{ChannelStreamRegistry, PropagationStreamRegistry};
 use crate::subscription::SubscriptionTable;
 use crate::sync::{FedSync, OFFER_PATH, MESSAGE_GET_PATH, BACKUP_PUSH_PATH};
@@ -1426,60 +1426,34 @@ fn run_sync_session(
 
                                     // ── Distro fanout ────────────
                                     if let Some(devices) = distro_devices.get(routing_hash) {
-                                        // An rfed.link push that is dispatched but never answered
-                                        // defers exactly as a missed device does (Link.md).
-                                        let on_missed: Arc<dyn Fn(Vec<u8>) + Send + Sync> = {
-                                            let deferred_queue = Arc::clone(&ctx.deferred_queue);
-                                            let config = ctx.config.clone();
-                                            let routing_hash = routing_hash.clone();
-                                            let blob = blob.clone();
-                                            Arc::new(move |dev_hash: Vec<u8>| {
-                                                if let Ok(mut deferred) = deferred_queue.lock() {
-                                                    let limit = config.policy_for(&dev_hash).deferred_queue_limit;
-                                                    deferred.enqueue(dev_hash, routing_hash.clone(), blob.clone(), limit);
-                                                }
-                                            })
-                                        };
-                                        let dmissed = match ctx.hook_registry.lock() {
-                                            Ok(hooks) => crate::distro::distro_fanout(
+                                        // Every device the fan-out cannot confirm — unreachable,
+                                        // sent a packet nothing confirms, or pushed on rfed.link or
+                                        // a stream and never answered (Link.md) — is queued for
+                                        // /rfed/pull and woken. Until 2026-09-26 this caller woke by
+                                        // the device's identity hash, which no registration is
+                                        // stored under, so it woke no one.
+                                        let config = ctx.config.clone();
+                                        let on_unconfirmed = crate::distro::defer_then_wake(
+                                            Arc::new(crate::notify::rns::LiveStack),
+                                            Arc::clone(&ctx.deferred_queue),
+                                            Arc::clone(&ctx.notify_registry),
+                                            Arc::new(move |device_id_hash: &[u8]| {
+                                                config.policy_for(device_id_hash).deferred_queue_limit
+                                            }),
+                                            routing_hash,
+                                            blob,
+                                        );
+                                        if let Ok(hooks) = ctx.hook_registry.lock() {
+                                            crate::distro::distro_fanout(
+                                                &crate::notify::rns::LiveStack,
                                                 routing_hash,
                                                 blob,
                                                 devices,
                                                 &hooks,
                                                 Some(&ctx.propagation_streams),
                                                 Some(&ctx.link_sessions),
-                                                Some(on_missed),
-                                            ),
-                                            Err(_) => Vec::new(),
-                                        };
-                                        // Enqueue missed distro devices in deferred queue
-                                        if !dmissed.is_empty() {
-                                            if let Ok(mut deferred) = ctx.deferred_queue.lock() {
-                                                for dev_hash in &dmissed {
-                                                    let limit = ctx.config
-                                                        .policy_for(dev_hash)
-                                                        .deferred_queue_limit;
-                                                    deferred.enqueue(
-                                                        dev_hash.clone(),
-                                                        routing_hash.clone(),
-                                                        blob.clone(),
-                                                        limit,
-                                                    );
-                                                }
-                                            }
-                                            // Fire notify wake-ups for deferred devices. Snapshot,
-                                            // then wake with the registry released: a wake is a send.
-                                            let wakes: Vec<_> = match ctx.notify_registry.lock() {
-                                                Ok(notify) => dmissed
-                                                    .iter()
-                                                    .flat_map(|dev_hash| notify.get_for_channel(dev_hash, None))
-                                                    .cloned()
-                                                    .collect(),
-                                                Err(_) => Vec::new(),
-                                            };
-                                            for reg in &wakes {
-                                                dispatch_notify(reg, None, Some(routing_hash));
-                                            }
+                                                on_unconfirmed,
+                                            );
                                         }
                                     }
                                 }
@@ -2305,7 +2279,6 @@ mod deferred_flush_size_tests {
     fn fanouts_read_the_transmitted_flag_not_the_receipt() {
         for (name, src) in [
             ("destinations.rs", include_str!("destinations.rs")),
-            ("distro.rs", include_str!("distro.rs")),
             ("fanout.rs", include_str!("fanout.rs")),
         ] {
             // Everything before this test: destinations.rs has test modules above
@@ -2316,6 +2289,18 @@ mod deferred_flush_size_tests {
             assert!(production.contains("(Ok(None), false) =>"), "{name}: the not-transmitted arm");
             assert!(production.contains("(Ok(Some(_)), _) | (Ok(None), true) =>"), "{name}: the transmitted arm names both shapes");
         }
+
+        // Since 2026-09-26 the distro fan-out sends through `RelayStack::send`,
+        // whose live implementation reads the transmitted flag; distro.rs's
+        // fake-stack tests drive both arms.
+        let distro = include_str!("distro.rs").split("#[cfg(test)]\nmod tests").next().unwrap();
+        assert_eq!(distro.matches("match packet.send() {").count(), 0, "distro.rs: no bare match on Packet::send");
+        assert_eq!(distro.matches("match stack.send(&mut packet) {").count(), 1, "distro.rs sends through the stack");
+        assert!(distro.contains("Ok(false) =>") && distro.contains("Ok(true) =>"), "distro.rs: both arms");
+        assert!(
+            include_str!("notify/rns.rs").contains("packet.send().map(|_| packet.sent)"),
+            "LiveStack::send reports the transmitted flag, not the receipt",
+        );
     }
 
     /// The deferred flush must consult the size gate before it builds a packet,
@@ -4409,6 +4394,27 @@ mod fanout_lock_scope_tests {
             !after[..send].contains("node.lock()"),
             "nothing may take the FedNode lock between the tick and its wakes"
         );
+    }
+
+    /// The federation-sync distro fan-out hands every device it cannot
+    /// confirm to `defer_then_wake`, which queues under the identity hash and
+    /// wakes under the lxmf.delivery hash. Until 2026-09-26 this caller did
+    /// both itself and woke by the identity hash, under which no registration
+    /// is stored: no device was ever woken from here.
+    #[test]
+    fn federation_sync_distro_fanout_hands_off_through_defer_then_wake() {
+        let source = destinations_source();
+        let start = source
+            .find("// ── Distro fanout ────────────")
+            .expect("federation-sync distro fan-out present");
+        let end = start
+            + source[start..]
+                .find("crate::distro::distro_fanout(")
+                .expect("the fan-out call follows its hand-off");
+        let block = &source[start..end];
+        assert!(block.contains("crate::distro::defer_then_wake("), "the hand-off is defer_then_wake");
+        assert!(!block.contains("get_for_channel("), "no wake of its own, under any key");
+        assert!(!block.contains(".enqueue("), "no queueing of its own");
     }
 
     /// The deferred-flush announce handler sends one packet per queued blob.
