@@ -105,22 +105,75 @@ pub struct NotifyRegistration {
 // ── NotifyRegistry ────────────────────────────────────────────────────────────
 
 /// Per-node notify registration table.  Never synced between peers.
+///
+/// Persisted in `notify_registrations.sqlite3`, one row per registration
+/// (crate::store_db); the channel of an LXMF registration (`None`) is stored
+/// as an empty blob, so the triple stays unique.
 pub struct NotifyRegistry {
     registrations: Vec<NotifyRegistration>,
-    file_path: PathBuf,
+    db: Option<rusqlite::Connection>,
+}
+
+const NOTIFY_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS notify_registrations (
+        subscriber_hash BLOB NOT NULL,
+        channel_hash    BLOB NOT NULL,
+        relay_hash      TEXT NOT NULL,
+        registered      REAL NOT NULL,
+        UNIQUE (subscriber_hash, channel_hash, relay_hash)
+    );";
+
+fn channel_key(channel_hash: Option<&[u8]>) -> &[u8] {
+    channel_hash.unwrap_or(&[])
+}
+
+fn put_registration(conn: &rusqlite::Connection, r: &NotifyRegistration) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO notify_registrations (subscriber_hash, channel_hash, relay_hash, registered)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (subscriber_hash, channel_hash, relay_hash) DO UPDATE SET registered = excluded.registered",
+        rusqlite::params![r.subscriber_hash, channel_key(r.channel_hash.as_deref()), r.relay_hash, r.registered],
+    )
 }
 
 impl NotifyRegistry {
+    /// Load the registrations kept beside `file_path` (the old msgpack file,
+    /// imported once if present).
     pub fn load(file_path: PathBuf) -> Self {
-        let registrations = if file_path.exists() {
-            std::fs::read(&file_path)
-                .ok()
-                .and_then(|b| rmp_serde::from_slice::<Vec<NotifyRegistration>>(&b).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        let db = crate::store_db::open(&file_path, NOTIFY_SCHEMA);
+        let registrations = match &db {
+            Some(conn) => {
+                crate::store_db::import_legacy(conn, &file_path, "notify registrations", |tx, old: Vec<NotifyRegistration>| {
+                    let mut n = 0;
+                    for r in &old {
+                        n += put_registration(tx, r)?;
+                    }
+                    Ok(n)
+                });
+                Self::read_all(conn).unwrap_or_else(|e| {
+                    log(format!("[store] notify registrations could not be read: {e}"), reticulum_rust::LOG_ERROR, false, false);
+                    Vec::new()
+                })
+            }
+            None => crate::store_db::read_legacy(&file_path).unwrap_or_default(),
         };
-        NotifyRegistry { registrations, file_path }
+        NotifyRegistry { registrations, db }
+    }
+
+    fn read_all(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<NotifyRegistration>> {
+        let mut stmt = conn.prepare(
+            "SELECT subscriber_hash, channel_hash, relay_hash, registered FROM notify_registrations ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let channel: Vec<u8> = row.get(1)?;
+            Ok(NotifyRegistration {
+                subscriber_hash: row.get(0)?,
+                channel_hash: if channel.is_empty() { None } else { Some(channel) },
+                relay_hash: row.get(2)?,
+                registered: row.get(3)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Register or refresh a notify relay for `(subscriber_hash, channel_hash)`.
@@ -132,21 +185,27 @@ impl NotifyRegistry {
     /// timestamp is refreshed.  Otherwise a new entry is appended.
     /// A subscriber may register multiple relay hashes for the same channel.
     pub fn register(&mut self, subscriber_hash: Vec<u8>, channel_hash: Option<Vec<u8>>, relay_hash: String) {
-        if let Some(existing) = self.registrations.iter_mut().find(|r| {
+        let index = match self.registrations.iter().position(|r| {
             r.subscriber_hash == subscriber_hash
                 && r.channel_hash == channel_hash
                 && r.relay_hash == relay_hash
         }) {
-            existing.registered = now();
-        } else {
-            self.registrations.push(NotifyRegistration {
-                subscriber_hash,
-                channel_hash,
-                relay_hash,
-                registered: now(),
-            });
-        }
-        let _ = self.save();
+            Some(i) => {
+                self.registrations[i].registered = now();
+                i
+            }
+            None => {
+                self.registrations.push(NotifyRegistration {
+                    subscriber_hash,
+                    channel_hash,
+                    relay_hash,
+                    registered: now(),
+                });
+                self.registrations.len() - 1
+            }
+        };
+        let r = &self.registrations[index];
+        crate::store_db::write(self.db.as_ref(), "notify registration", |c| put_registration(c, r).map(|_| ()));
     }
 
     /// Remove a specific relay registration for `(subscriber_hash, channel_hash)`.
@@ -158,7 +217,13 @@ impl NotifyRegistry {
               && r.relay_hash == relay_hash)
         });
         if self.registrations.len() != before {
-            let _ = self.save();
+            crate::store_db::write(self.db.as_ref(), "notify unregistration", |c| {
+                c.execute(
+                    "DELETE FROM notify_registrations WHERE subscriber_hash = ?1 AND channel_hash = ?2 AND relay_hash = ?3",
+                    rusqlite::params![subscriber_hash, channel_key(channel_hash), relay_hash],
+                )
+                .map(|_| ())
+            });
         }
     }
 
@@ -167,7 +232,10 @@ impl NotifyRegistry {
         let before = self.registrations.len();
         self.registrations.retain(|r| r.subscriber_hash.as_slice() != subscriber_hash);
         if self.registrations.len() != before {
-            let _ = self.save();
+            crate::store_db::write(self.db.as_ref(), "notify clear", |c| {
+                c.execute("DELETE FROM notify_registrations WHERE subscriber_hash = ?1", [subscriber_hash])
+                    .map(|_| ())
+            });
         }
     }
 
@@ -183,14 +251,6 @@ impl NotifyRegistry {
                     && r.channel_hash.as_deref() == channel_hash
             })
             .collect()
-    }
-
-    pub fn save(&self) -> Result<(), String> {
-        let bytes = rmp_serde::to_vec(&self.registrations)
-            .map_err(|e| format!("NotifyRegistry serialize: {e}"))?;
-        std::fs::write(&self.file_path, &bytes)
-            .map_err(|e| format!("NotifyRegistry write: {e}"))?;
-        Ok(())
     }
 
     pub fn count(&self) -> usize {

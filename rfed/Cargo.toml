@@ -17,6 +17,9 @@ app_links      = { path = "../../app-links" }
 rmp          = "0.8.14"
 rmpv         = "=1.0.0"
 rmp-serde    = "1.1"
+# Stores (src/store_db.rs). 0.31 bundled, as reticulum_rust, apns-bridge and
+# fcm-bridge use: one libsqlite3-sys per build.
+rusqlite     = { version = "0.31", features = ["bundled"] }
 serde        = { version = "1.0", features = ["derive"] }
 configparser = "3"
 sha2       = "0.10"

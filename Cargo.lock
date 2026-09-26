@@ -1727,6 +1727,7 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "rmpv",
+ "rusqlite",
  "serde",
  "sha2 0.10.9",
  "x25519-dalek",

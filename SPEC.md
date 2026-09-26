@@ -642,8 +642,8 @@ evicted first.
 
 ## 6. Subscription Table
 
-Subscriptions map subscribers to channels and are persisted to disk as
-msgpack (`subscriptions.rmp`).
+Subscriptions map subscribers to channels and are persisted to disk in
+SQLite (`subscriptions.sqlite3`, one row per entry; see §13 Data Files).
 
 ### Entry Fields
 
@@ -673,7 +673,7 @@ automatically pruned.
 
 When a subscriber is offline during fanout, or a live push to it is never
 confirmed, blobs are queued in the deferred delivery queue and persisted to
-disk (`deferred_delivery.rmp`).
+disk (`deferred_delivery.sqlite3`, one row per blob, in queue order).
 
 ### Live delivery and its proof
 
@@ -833,7 +833,7 @@ relay_hash = "aabbccdd11223344aabbccdd11223344"  # exactly 32 hex chars
 Any other value is rejected.
 
 **Persistence:** Registrations are stored on disk in
-`~/.rfed/notify_registrations.rmp` and survive node restarts.
+`~/.rfed/notify_registrations.sqlite3` and survive node restarts.
 
 #### NotifyRegistration Record
 
@@ -1189,14 +1189,25 @@ All persisted to `<config_dir>/`:
 | File | Format | Contents |
 |------|--------|----------|
 | `identity` | Reticulum identity | Node X25519 + Ed25519 keypair |
-| `subscriptions.rmp` | msgpack | Subscription table |
-| `notify_registrations.rmp` | msgpack | Notify relay registrations |
-| `deferred_delivery.rmp` | msgpack | Offline blob queue |
+| `subscriptions.sqlite3` | SQLite | Subscription table |
+| `notify_registrations.sqlite3` | SQLite | Notify relay registrations |
+| `deferred_delivery.sqlite3` | SQLite | Offline blob queue |
+| `distro.sqlite3` | SQLite | Distro device registrations (§17.6) |
+| `distro_announces.sqlite3` | SQLite | Pre-signed distro announces |
 | `peers.rmp` | msgpack | Peer sync state & backoff timers |
-| `blobs/<ch_hex>/<id_hex>` | raw bytes | Stored inner blobs |
+| `blobs/<ch_hex>/<id_hex>` | raw bytes | Stored inner blobs (written as `<id_hex>.tmp`, then renamed) |
 | `lxmf_propagation/messagestore/<message_id_hex>` | raw bytes | Stored LXMF propagated messages (when enabled) |
 | `lxmf_propagation/peers` | msgpack | Propagation peer state and sync backoff |
 | `lxmf_propagation/node_stats` | msgpack map | Propagation message counters |
+
+The SQLite stores run in WAL mode (each has `-wal` and `-shm` files beside
+it) and write one row per change, so a node stopped at any moment keeps every
+committed change. Until 2026-09-26 they were msgpack files of the same name
+with `.rmp`, each rewritten whole on every change, and one that did not decode
+loaded as empty and was overwritten. On first start a node imports each
+`.rmp` file once and renames it `<name>.rmp.imported-<unix secs>`; a file that
+cannot be read is renamed `<name>.rmp.unreadable-<unix secs>` and logged
+(`[store]`), never overwritten. Neither is deleted.
 
 ---
 
@@ -1431,7 +1442,7 @@ Response: msgpack [ bin(16) device_lxmf_hash, ... ]
 
 ### 17.6 DistroTable Schema
 
-Per-node table persisted to `distro.rmp`:
+Per-node table persisted to `distro.sqlite3` (one row per device registration):
 
 | Field | Type | Description |
 |---|---|---|

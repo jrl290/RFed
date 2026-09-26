@@ -55,6 +55,7 @@ mod subscription;
 mod channel;
 mod blob_store;
 mod deferred_queue;
+mod store_db;
 mod distro;
 mod fanout;
 mod handoff;

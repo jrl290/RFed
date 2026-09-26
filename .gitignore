@@ -27,6 +27,11 @@ identity
 subscriptions.rmp
 notify_registrations.rmp
 deferred_delivery.rmp
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.rmp.imported-*
+*.rmp.unreadable-*
 peers.rmp
 
 # APNs credentials (never commit)

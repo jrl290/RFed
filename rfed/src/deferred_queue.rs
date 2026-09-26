@@ -7,7 +7,10 @@
 //!
 //! # Storage format
 //!
-//! On disk: msgpack-encoded `Vec<DeferredEntry>`.
+//! On disk: `deferred_delivery.sqlite3`, one row per queued blob, its rowid
+//! giving FIFO order (crate::store_db); each enqueue, eviction and drain
+//! writes only its own rows. Until 2026-09-26 a msgpack `Vec<DeferredEntry>`
+//! rewritten whole on every change (imported once if still present).
 //! In memory: a `HashMap<subscriber_hash, VecDeque<PendingBlob>>`.
 //!
 //! Each `PendingBlob` stores the channel hash alongside the raw inner blob
@@ -29,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 // ── Wire representation (for msgpack serialisation) ───────────────────────────
 
-/// A single deferred delivery record as stored on disk.
+/// A single deferred delivery record as the old msgpack file stored it.
 #[derive(Clone, Serialize, Deserialize)]
 struct DeferredEntry {
     /// 16-byte truncated RNS destination hash of the subscriber.
@@ -49,6 +52,8 @@ pub struct PendingBlob {
     pub channel_hash: Vec<u8>,
     pub blob: Vec<u8>,
     pub enqueued_at: f64,
+    /// Its row in the database (0 when it was not stored).
+    id: i64,
 }
 
 // ── DeferredQueue ─────────────────────────────────────────────────────────────
@@ -57,10 +62,20 @@ pub struct PendingBlob {
 pub struct DeferredQueue {
     /// `subscriber_hash → ordered list of pending blobs`.
     queue: HashMap<Vec<u8>, VecDeque<PendingBlob>>,
-    file_path: PathBuf,
+    db: Option<rusqlite::Connection>,
     /// Maximum total entries across all subscribers.
     pub global_limit: usize,
 }
+
+const DEFERRED_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS deferred (
+        id              INTEGER PRIMARY KEY,
+        subscriber_hash BLOB NOT NULL,
+        channel_hash    BLOB NOT NULL,
+        blob            BLOB NOT NULL,
+        enqueued_at     REAL NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS deferred_subscriber ON deferred (subscriber_hash);";
 
 fn now() -> f64 {
     SystemTime::now()
@@ -69,32 +84,91 @@ fn now() -> f64 {
         .unwrap_or(0.0)
 }
 
-impl DeferredQueue {
-    /// Load (or create) a queue backed by `file_path`.
-    pub fn load(file_path: PathBuf) -> Self {
-        let entries: Vec<DeferredEntry> = if file_path.exists() {
-            std::fs::read(&file_path)
-                .ok()
-                .and_then(|b| rmp_serde::from_slice(&b).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+fn insert_row(
+    conn: &rusqlite::Connection,
+    subscriber_hash: &[u8],
+    channel_hash: &[u8],
+    blob: &[u8],
+    enqueued_at: f64,
+) -> rusqlite::Result<i64> {
+    conn.execute(
+        "INSERT INTO deferred (subscriber_hash, channel_hash, blob, enqueued_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![subscriber_hash, channel_hash, blob, enqueued_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
 
+impl DeferredQueue {
+    /// Load the queue kept beside `file_path` (the old msgpack file,
+    /// imported once if present, in its order).
+    pub fn load(file_path: PathBuf) -> Self {
+        let db = crate::store_db::open(&file_path, DEFERRED_SCHEMA);
         let mut queue: HashMap<Vec<u8>, VecDeque<PendingBlob>> = HashMap::new();
-        for e in entries {
-            queue.entry(e.subscriber_hash).or_default().push_back(PendingBlob {
-                channel_hash: e.channel_hash,
-                blob: e.blob,
-                enqueued_at: e.enqueued_at,
-            });
+        match &db {
+            Some(conn) => {
+                crate::store_db::import_legacy(conn, &file_path, "deferred blobs", |tx, old: Vec<DeferredEntry>| {
+                    for e in &old {
+                        insert_row(tx, &e.subscriber_hash, &e.channel_hash, &e.blob, e.enqueued_at)?;
+                    }
+                    Ok(old.len())
+                });
+                if let Err(e) = Self::read_all(conn, &mut queue) {
+                    reticulum_rust::log(
+                        format!("[store] deferred blobs could not be read: {e}"),
+                        reticulum_rust::LOG_ERROR,
+                        false,
+                        false,
+                    );
+                }
+            }
+            None => {
+                let old: Vec<DeferredEntry> = crate::store_db::read_legacy(&file_path).unwrap_or_default();
+                for e in old {
+                    queue.entry(e.subscriber_hash).or_default().push_back(PendingBlob {
+                        channel_hash: e.channel_hash,
+                        blob: e.blob,
+                        enqueued_at: e.enqueued_at,
+                        id: 0,
+                    });
+                }
+            }
         }
 
         DeferredQueue {
             queue,
-            file_path,
+            db,
             global_limit: 4096,
         }
+    }
+
+    fn read_all(
+        conn: &rusqlite::Connection,
+        queue: &mut HashMap<Vec<u8>, VecDeque<PendingBlob>>,
+    ) -> rusqlite::Result<()> {
+        let mut stmt =
+            conn.prepare("SELECT id, subscriber_hash, channel_hash, blob, enqueued_at FROM deferred ORDER BY id")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let subscriber_hash: Vec<u8> = row.get(1)?;
+            queue.entry(subscriber_hash).or_default().push_back(PendingBlob {
+                channel_hash: row.get(2)?,
+                blob: row.get(3)?,
+                enqueued_at: row.get(4)?,
+                id: row.get(0)?,
+            });
+        }
+        Ok(())
+    }
+
+    /// Delete the rows of blobs that left the queue, in one transaction.
+    fn delete_rows(&self, removed: &[PendingBlob], what: &str) {
+        crate::store_db::write_all(self.db.as_ref(), what, |c| {
+            let mut stmt = c.prepare_cached("DELETE FROM deferred WHERE id = ?1")?;
+            for pb in removed.iter().filter(|pb| pb.id != 0) {
+                stmt.execute([pb.id])?;
+            }
+            Ok(())
+        });
     }
 
     /// Enqueue a blob for a subscriber who is currently unreachable.
@@ -118,20 +192,32 @@ impl DeferredQueue {
             return;
         }
 
-        let bucket = self.queue.entry(subscriber_hash).or_default();
+        let enqueued_at = now();
+        let bucket = self.queue.entry(subscriber_hash.clone()).or_default();
 
         // Per-subscriber overflow: drop oldest.
-        if bucket.len() >= per_subscriber_limit {
-            bucket.pop_front();
-        }
+        let evicted = if bucket.len() >= per_subscriber_limit {
+            bucket.pop_front()
+        } else {
+            None
+        };
+
+        // The eviction and the new row, together.
+        let mut id = 0;
+        crate::store_db::write_all(self.db.as_ref(), "deferred enqueue", |c| {
+            if let Some(old) = evicted.as_ref().filter(|old| old.id != 0) {
+                c.execute("DELETE FROM deferred WHERE id = ?1", [old.id])?;
+            }
+            id = insert_row(c, &subscriber_hash, &channel_hash, &blob, enqueued_at)?;
+            Ok(())
+        });
 
         bucket.push_back(PendingBlob {
             channel_hash,
             blob,
-            enqueued_at: now(),
+            enqueued_at,
+            id,
         });
-
-        let _ = self.save();
     }
 
     /// Drain and return all pending blobs for `subscriber_hash`.
@@ -146,7 +232,7 @@ impl DeferredQueue {
             .map(|d| d.into_iter().collect())
             .unwrap_or_default();
         if !removed.is_empty() {
-            let _ = self.save();
+            self.delete_rows(&removed, "deferred drain");
         }
         removed
     }
@@ -173,7 +259,7 @@ impl DeferredQueue {
             self.queue.remove(subscriber_hash);
         }
         if !removed.is_empty() {
-            let _ = self.save();
+            self.delete_rows(&removed, "deferred drain");
         }
         removed
     }
@@ -232,7 +318,7 @@ impl DeferredQueue {
             self.queue.remove(subscriber_hash);
         }
         if !removed.is_empty() {
-            let _ = self.save();
+            self.delete_rows(&removed, "deferred drain");
         }
         removed
     }
@@ -272,28 +358,10 @@ impl DeferredQueue {
         // Remove now-empty buckets.
         self.queue.retain(|_, v| !v.is_empty());
         if changed {
-            let _ = self.save();
+            crate::store_db::write(self.db.as_ref(), "deferred expiry", |c| {
+                c.execute("DELETE FROM deferred WHERE enqueued_at < ?1", [threshold]).map(|_| ())
+            });
         }
-    }
-
-    pub fn save(&self) -> Result<(), String> {
-        let entries: Vec<DeferredEntry> = self
-            .queue
-            .iter()
-            .flat_map(|(sub_hash, bucket)| {
-                bucket.iter().map(|pb| DeferredEntry {
-                    subscriber_hash: sub_hash.clone(),
-                    channel_hash: pb.channel_hash.clone(),
-                    blob: pb.blob.clone(),
-                    enqueued_at: pb.enqueued_at,
-                })
-            })
-            .collect();
-        let bytes = rmp_serde::to_vec(&entries)
-            .map_err(|e| format!("DeferredQueue serialize: {e}"))?;
-        std::fs::write(&self.file_path, &bytes)
-            .map_err(|e| format!("DeferredQueue write: {e}"))?;
-        Ok(())
     }
 }
 
@@ -328,7 +396,7 @@ mod tests {
 
     fn fresh_queue() -> DeferredQueue {
         let p = tmp_path();
-        let _ = std::fs::remove_file(&p);
+        crate::store_db::remove_store_files(&p);
         DeferredQueue::load(p)
     }
 
@@ -524,7 +592,7 @@ mod tests {
     #[test]
     fn enqueue_persists_and_reload_preserves_order() {
         let p = tmp_path();
-        let _ = std::fs::remove_file(&p);
+        crate::store_db::remove_store_files(&p);
         {
             let mut q = DeferredQueue::load(p.clone());
             let sub = vec![0xFFu8; 16];
@@ -539,6 +607,6 @@ mod tests {
         assert_eq!(page.len(), 3);
         assert_eq!(page[0].blob, vec![0]);
         assert_eq!(page[2].blob, vec![2]);
-        let _ = std::fs::remove_file(&p);
+        crate::store_db::remove_store_files(&p);
     }
 }

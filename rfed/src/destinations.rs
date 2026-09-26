@@ -941,27 +941,15 @@ impl FedNode {
         Transport::publish_destination(self.distro_list_dest.hash.clone(),         svc, None);
     }
 
-    /// Explicitly persist all in-memory state to disk.
+    /// Explicitly persist the state not already stored on each change.
     ///
-    /// Called during graceful shutdown so that no pending mutations are lost.
+    /// Called during graceful shutdown. Subscriptions, notify registrations,
+    /// the deferred queue and the distro devices and announces are written to
+    /// their databases as each change happens (crate::store_db), so only the
+    /// sync peers remain.
     pub fn save_all(&self) {
         if let Ok(s) = self.sync.lock() {
             s.save_peers();
-        }
-        if let Ok(s) = self.subscription_table.lock() {
-            let _ = s.save();
-        }
-        if let Ok(n) = self.notify_registry.lock() {
-            let _ = n.save();
-        }
-        if let Ok(q) = self.deferred_queue.lock() {
-            let _ = q.save();
-        }
-        if let Ok(d) = self.distro_table.lock() {
-            let _ = d.save();
-        }
-        if let Ok(a) = self.distro_announces.lock() {
-            let _ = a.save();
         }
         log("[rfed] all state persisted to disk", LOG_NOTICE, false, false);
     }

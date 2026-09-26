@@ -123,9 +123,15 @@ impl BlobStore {
         std::fs::create_dir_all(&dest_dir)
             .map_err(|e| format!("create_dir_all({:?}): {e}", dest_dir))?;
 
+        // Written beside its place and renamed in: a process killed mid-write
+        // leaves a stray .tmp, never a truncated blob (until 2026-09-26 the
+        // blob was written in place).
         let blob_path = dest_dir.join(hex(message_id));
-        std::fs::write(&blob_path, blob)
-            .map_err(|e| format!("write blob {:?}: {e}", blob_path))?;
+        let tmp_path = dest_dir.join(format!("{}.tmp", hex(message_id)));
+        std::fs::write(&tmp_path, blob)
+            .map_err(|e| format!("write blob {:?}: {e}", tmp_path))?;
+        std::fs::rename(&tmp_path, &blob_path)
+            .map_err(|e| format!("rename blob {:?}: {e}", blob_path))?;
 
         let meta = BlobMeta {
             message_id: message_id.to_vec(),
@@ -237,6 +243,12 @@ impl BlobStore {
             let Ok(msg_entries) = std::fs::read_dir(dest_entry.path()) else { continue };
             for msg_entry in msg_entries.flatten() {
                 let msg_hex = msg_entry.file_name().to_string_lossy().to_string();
+                // A write that never completed (see store_with_id): never
+                // indexed, so never served; remove it.
+                if msg_hex.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(msg_entry.path());
+                    continue;
+                }
                 let message_id = match reticulum_rust::decode_hex(&msg_hex) {
                     Some(id) => id,
                     None => continue,

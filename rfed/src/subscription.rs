@@ -37,23 +37,85 @@ pub struct SubscriptionEntry {
     pub last_refreshed: f64,
 }
 
+/// Persisted in `subscriptions.sqlite3`, one row per entry (crate::store_db);
+/// a node's own subscription (no owner) stores its owner as an empty blob, so
+/// (subscriber, channel, owner) stays unique.
 pub struct SubscriptionTable {
     entries: Vec<SubscriptionEntry>,
-    file_path: PathBuf,
+    db: Option<rusqlite::Connection>,
+}
+
+const SUBSCRIPTION_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS subscriptions (
+        subscriber_hash BLOB NOT NULL,
+        channel_hash    BLOB NOT NULL,
+        owner_node_hash BLOB NOT NULL,
+        added           REAL NOT NULL,
+        last_refreshed  REAL NOT NULL,
+        UNIQUE (subscriber_hash, channel_hash, owner_node_hash)
+    );";
+
+fn put_entry(conn: &rusqlite::Connection, e: &SubscriptionEntry) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO subscriptions (subscriber_hash, channel_hash, owner_node_hash, added, last_refreshed)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (subscriber_hash, channel_hash, owner_node_hash) DO UPDATE SET last_refreshed = excluded.last_refreshed",
+        rusqlite::params![
+            e.subscriber_hash,
+            e.channel_hash,
+            e.owner_node_hash.as_deref().unwrap_or(&[]),
+            e.added,
+            e.last_refreshed,
+        ],
+    )
 }
 
 impl SubscriptionTable {
     /// Load from disk, or start empty if the file doesn't exist yet.
+    /// Load the subscriptions kept beside `file_path` (the old msgpack
+    /// file, imported once if present).
     pub fn load(file_path: PathBuf) -> Self {
-        let entries = if file_path.exists() {
-            std::fs::read(&file_path)
-                .ok()
-                .and_then(|bytes| rmp_serde::from_slice::<Vec<SubscriptionEntry>>(&bytes).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        let db = crate::store_db::open(&file_path, SUBSCRIPTION_SCHEMA);
+        let entries = match &db {
+            Some(conn) => {
+                crate::store_db::import_legacy(conn, &file_path, "channel subscriptions", |tx, old: Vec<SubscriptionEntry>| {
+                    let mut n = 0;
+                    for e in &old {
+                        n += put_entry(tx, e)?;
+                    }
+                    Ok(n)
+                });
+                Self::read_all(conn).unwrap_or_else(|e| {
+                    reticulum_rust::log(
+                        format!("[store] channel subscriptions could not be read: {e}"),
+                        reticulum_rust::LOG_ERROR,
+                        false,
+                        false,
+                    );
+                    Vec::new()
+                })
+            }
+            None => crate::store_db::read_legacy(&file_path).unwrap_or_default(),
         };
-        SubscriptionTable { entries, file_path }
+        SubscriptionTable { entries, db }
+    }
+
+    fn read_all(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<SubscriptionEntry>> {
+        let mut stmt = conn.prepare(
+            "SELECT subscriber_hash, channel_hash, owner_node_hash, added, last_refreshed
+             FROM subscriptions ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let owner: Vec<u8> = row.get(2)?;
+            Ok(SubscriptionEntry {
+                subscriber_hash: row.get(0)?,
+                channel_hash: row.get(1)?,
+                added: row.get(3)?,
+                owner_node_hash: if owner.is_empty() { None } else { Some(owner) },
+                last_refreshed: row.get(4)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Register (subscriber_hash, channel_hash).  Idempotent.
@@ -70,7 +132,8 @@ impl SubscriptionTable {
                 owner_node_hash: None,
                 last_refreshed: t,
             });
-            let _ = self.save();
+            let e = self.entries.last().expect("just pushed");
+            crate::store_db::write(self.db.as_ref(), "channel subscription", |c| put_entry(c, e).map(|_| ()));
         }
     }
 
@@ -88,24 +151,29 @@ impl SubscriptionTable {
         channel_hash: Vec<u8>,
         owner_hash: Vec<u8>,
     ) {
-        if let Some(existing) = self.entries.iter_mut().find(|e| {
+        let index = match self.entries.iter().position(|e| {
             e.subscriber_hash == subscriber_hash
                 && e.channel_hash == channel_hash
                 && e.owner_node_hash.as_deref() == Some(owner_hash.as_slice())
         }) {
-            existing.last_refreshed = now();
-            let _ = self.save();
-        } else {
-            let t = now();
-            self.entries.push(SubscriptionEntry {
-                subscriber_hash,
-                channel_hash,
-                added: t,
-                owner_node_hash: Some(owner_hash),
-                last_refreshed: t,
-            });
-            let _ = self.save();
-        }
+            Some(i) => {
+                self.entries[i].last_refreshed = now();
+                i
+            }
+            None => {
+                let t = now();
+                self.entries.push(SubscriptionEntry {
+                    subscriber_hash,
+                    channel_hash,
+                    added: t,
+                    owner_node_hash: Some(owner_hash),
+                    last_refreshed: t,
+                });
+                self.entries.len() - 1
+            }
+        };
+        let e = &self.entries[index];
+        crate::store_db::write(self.db.as_ref(), "backup subscription", |c| put_entry(c, e).map(|_| ()));
     }
 
     /// Unregister (subscriber_hash, channel_hash).
@@ -116,7 +184,13 @@ impl SubscriptionTable {
                 && e.channel_hash.as_slice() == channel_hash)
         });
         if self.entries.len() != before {
-            let _ = self.save();
+            crate::store_db::write(self.db.as_ref(), "channel unsubscription", |c| {
+                c.execute(
+                    "DELETE FROM subscriptions WHERE subscriber_hash = ?1 AND channel_hash = ?2",
+                    rusqlite::params![subscriber_hash, channel_hash],
+                )
+                .map(|_| ())
+            });
         }
     }
 
@@ -205,7 +279,13 @@ impl SubscriptionTable {
         });
         let pruned = before - self.entries.len();
         if pruned > 0 {
-            let _ = self.save();
+            crate::store_db::write(self.db.as_ref(), "stale backup subscriptions", |c| {
+                c.execute(
+                    "DELETE FROM subscriptions WHERE owner_node_hash != X'' AND last_refreshed < ?1",
+                    [cutoff],
+                )
+                .map(|_| ())
+            });
         }
         pruned
     }
@@ -219,13 +299,5 @@ impl SubscriptionTable {
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    pub fn save(&self) -> Result<(), String> {
-        let bytes = rmp_serde::to_vec(&self.entries)
-            .map_err(|e| format!("Serialize subscriptions: {e}"))?;
-        std::fs::write(&self.file_path, bytes)
-            .map_err(|e| format!("Write subscriptions: {e}"))?;
-        Ok(())
     }
 }

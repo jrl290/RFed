@@ -60,7 +60,7 @@ use serde::{Deserialize, Serialize};
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::{Packet, ANNOUNCE, NONE, HEADER_1, FLAG_SET, FLAG_UNSET};
-use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
+use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_WARNING};
 
 pub use crate::handoff::{defer_then_wake, OnUnconfirmed, Unconfirmed};
 use crate::notify::HookRegistry;
@@ -111,23 +111,81 @@ pub struct DistroEntry {
 /// Never synced between nodes.  Each device registers with its local RFed node.
 /// Cross-node distribution happens via FedSync: every node pulls blobs for any
 /// distro hash it has at least one local device registered for.
+///
+/// Persisted in `distro.sqlite3`, one row per device registration
+/// (crate::store_db).
 pub struct DistroTable {
     entries: Vec<DistroEntry>,
-    file_path: PathBuf,
+    db: Option<rusqlite::Connection>,
+}
+
+const DISTRO_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS distro_devices (
+        distro_lxmf_hash BLOB NOT NULL,
+        device_lxmf_hash BLOB NOT NULL,
+        device_pubkey    BLOB NOT NULL,
+        added            REAL NOT NULL,
+        owner_node_hash  BLOB,
+        last_refreshed   REAL NOT NULL,
+        UNIQUE (distro_lxmf_hash, device_lxmf_hash)
+    );";
+
+fn put_device(conn: &rusqlite::Connection, e: &DistroEntry) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT OR IGNORE INTO distro_devices
+             (distro_lxmf_hash, device_lxmf_hash, device_pubkey, added, owner_node_hash, last_refreshed)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            e.distro_lxmf_hash,
+            e.device_lxmf_hash,
+            e.device_pubkey,
+            e.added,
+            e.owner_node_hash,
+            e.last_refreshed,
+        ],
+    )
 }
 
 impl DistroTable {
-    /// Load from disk, or start empty if the file doesn't exist.
+    /// Load the device registrations kept beside `file_path` (the old
+    /// msgpack file, imported once if present).
     pub fn load(file_path: PathBuf) -> Self {
-        let entries = if file_path.exists() {
-            std::fs::read(&file_path)
-                .ok()
-                .and_then(|bytes| rmp_serde::from_slice::<Vec<DistroEntry>>(&bytes).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        let db = crate::store_db::open(&file_path, DISTRO_SCHEMA);
+        let entries = match &db {
+            Some(conn) => {
+                crate::store_db::import_legacy(conn, &file_path, "distro devices", |tx, old: Vec<DistroEntry>| {
+                    let mut n = 0;
+                    for e in &old {
+                        n += put_device(tx, e)?;
+                    }
+                    Ok(n)
+                });
+                Self::read_all(conn).unwrap_or_else(|e| {
+                    log(format!("[store] distro devices could not be read: {e}"), LOG_ERROR, false, false);
+                    Vec::new()
+                })
+            }
+            None => crate::store_db::read_legacy(&file_path).unwrap_or_default(),
         };
-        DistroTable { entries, file_path }
+        DistroTable { entries, db }
+    }
+
+    fn read_all(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<DistroEntry>> {
+        let mut stmt = conn.prepare(
+            "SELECT distro_lxmf_hash, device_lxmf_hash, device_pubkey, added, owner_node_hash, last_refreshed
+             FROM distro_devices ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DistroEntry {
+                distro_lxmf_hash: row.get(0)?,
+                device_lxmf_hash: row.get(1)?,
+                device_pubkey: row.get(2)?,
+                added: row.get(3)?,
+                owner_node_hash: row.get(4)?,
+                last_refreshed: row.get(5)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Register a device for a distro identity.  Idempotent.
@@ -151,7 +209,8 @@ impl DistroTable {
                 owner_node_hash: None,
                 last_refreshed: t,
             });
-            let _ = self.save();
+            let e = self.entries.last().expect("just pushed");
+            crate::store_db::write(self.db.as_ref(), "distro device registration", |c| put_device(c, e).map(|_| ()));
         }
     }
 
@@ -163,7 +222,13 @@ impl DistroTable {
                 && e.device_lxmf_hash.as_slice() == device_lxmf_hash)
         });
         if self.entries.len() != before {
-            let _ = self.save();
+            crate::store_db::write(self.db.as_ref(), "distro device unregistration", |c| {
+                c.execute(
+                    "DELETE FROM distro_devices WHERE distro_lxmf_hash = ?1 AND device_lxmf_hash = ?2",
+                    rusqlite::params![distro_lxmf_hash, device_lxmf_hash],
+                )
+                .map(|_| ())
+            });
         }
     }
 
@@ -211,14 +276,6 @@ impl DistroTable {
         self.entries.len()
     }
 
-    /// Persist to disk.
-    pub fn save(&self) -> Result<(), String> {
-        let bytes = rmp_serde::to_vec(&self.entries)
-            .map_err(|e| format!("DistroTable serialize: {e}"))?;
-        std::fs::write(&self.file_path, &bytes)
-            .map_err(|e| format!("DistroTable write: {e}"))?;
-        Ok(())
-    }
 }
 
 // ── Pre-signed announces ─────────────────────────────────────────────────────
@@ -252,23 +309,69 @@ pub struct DistroAnnounce {
 ///
 /// Kept in its own file rather than folded into `DistroTable` so the existing
 /// on-disk `Vec<DistroEntry>` shape needs no migration.
+///
+/// Persisted in `distro_announces.sqlite3`, one row per distro
+/// (crate::store_db).
 pub struct DistroAnnounceStore {
     entries: Vec<DistroAnnounce>,
-    file_path: PathBuf,
+    db: Option<rusqlite::Connection>,
+}
+
+const DISTRO_ANNOUNCE_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS distro_announces (
+        distro_lxmf_hash BLOB NOT NULL UNIQUE,
+        announce_data    BLOB NOT NULL,
+        ratchet          INTEGER NOT NULL,
+        updated          REAL NOT NULL
+    );";
+
+/// Insert or replace; a replaced announce gets a new rowid, so it moves to
+/// the end, as `put` moves it in memory.
+fn put_announce(conn: &rusqlite::Connection, a: &DistroAnnounce) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT OR REPLACE INTO distro_announces (distro_lxmf_hash, announce_data, ratchet, updated)
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![a.distro_lxmf_hash, a.announce_data, a.ratchet, a.updated],
+    )
 }
 
 impl DistroAnnounceStore {
-    /// Load from disk, or start empty if the file doesn't exist.
+    /// Load the announces kept beside `file_path` (the old msgpack file,
+    /// imported once if present).
     pub fn load(file_path: PathBuf) -> Self {
-        let entries = if file_path.exists() {
-            std::fs::read(&file_path)
-                .ok()
-                .and_then(|bytes| rmp_serde::from_slice::<Vec<DistroAnnounce>>(&bytes).ok())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
+        let db = crate::store_db::open(&file_path, DISTRO_ANNOUNCE_SCHEMA);
+        let entries = match &db {
+            Some(conn) => {
+                crate::store_db::import_legacy(conn, &file_path, "distro announces", |tx, old: Vec<DistroAnnounce>| {
+                    let mut n = 0;
+                    for a in &old {
+                        n += put_announce(tx, a)?;
+                    }
+                    Ok(n)
+                });
+                Self::read_all(conn).unwrap_or_else(|e| {
+                    log(format!("[store] distro announces could not be read: {e}"), LOG_ERROR, false, false);
+                    Vec::new()
+                })
+            }
+            None => crate::store_db::read_legacy(&file_path).unwrap_or_default(),
         };
-        DistroAnnounceStore { entries, file_path }
+        DistroAnnounceStore { entries, db }
+    }
+
+    fn read_all(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<DistroAnnounce>> {
+        let mut stmt = conn.prepare(
+            "SELECT distro_lxmf_hash, announce_data, ratchet, updated FROM distro_announces ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(DistroAnnounce {
+                distro_lxmf_hash: row.get(0)?,
+                announce_data: row.get(1)?,
+                ratchet: row.get(2)?,
+                updated: row.get(3)?,
+            })
+        })?;
+        rows.collect()
     }
 
     /// Store or replace the announce for a distro identity.
@@ -285,7 +388,8 @@ impl DistroAnnounceStore {
             ratchet,
             updated: now(),
         });
-        let _ = self.save();
+        let a = self.entries.last().expect("just pushed");
+        crate::store_db::write(self.db.as_ref(), "distro announce", |c| put_announce(c, a).map(|_| ()));
     }
 
     /// Drop the announce for a distro identity.  No-op if absent.
@@ -294,7 +398,10 @@ impl DistroAnnounceStore {
         self.entries
             .retain(|e| e.distro_lxmf_hash.as_slice() != distro_lxmf_hash);
         if self.entries.len() != before {
-            let _ = self.save();
+            crate::store_db::write(self.db.as_ref(), "distro announce removal", |c| {
+                c.execute("DELETE FROM distro_announces WHERE distro_lxmf_hash = ?1", [distro_lxmf_hash])
+                    .map(|_| ())
+            });
         }
     }
 
@@ -315,14 +422,6 @@ impl DistroAnnounceStore {
         self.entries.len()
     }
 
-    /// Persist to disk.
-    pub fn save(&self) -> Result<(), String> {
-        let bytes = rmp_serde::to_vec(&self.entries)
-            .map_err(|e| format!("DistroAnnounceStore serialize: {e}"))?;
-        std::fs::write(&self.file_path, &bytes)
-            .map_err(|e| format!("DistroAnnounceStore write: {e}"))?;
-        Ok(())
-    }
 }
 
 /// Split a `/rfed/distro/announce` payload value into its ratchet flag and
@@ -900,7 +999,7 @@ mod tests {
 
     fn make_table(label: &str) -> DistroTable {
         let path = temp_path(label);
-        let _ = std::fs::remove_file(&path);
+        crate::store_db::remove_store_files(&path);
         DistroTable::load(path)
     }
 
@@ -1129,7 +1228,7 @@ mod tests {
     #[test]
     fn announce_store_replaces_on_resubmission() {
         let path = temp_path("announce_replace");
-        let _ = std::fs::remove_file(&path);
+        crate::store_db::remove_store_files(&path);
         let mut store = DistroAnnounceStore::load(path);
         let hash = dummy_hash(0xAB);
 
@@ -1145,7 +1244,7 @@ mod tests {
     #[test]
     fn announce_store_round_trips_through_disk() {
         let path = temp_path("announce_persist");
-        let _ = std::fs::remove_file(&path);
+        crate::store_db::remove_store_files(&path);
         let hash = dummy_hash(0xCD);
         {
             let mut store = DistroAnnounceStore::load(path.clone());
@@ -1162,7 +1261,7 @@ mod tests {
     #[test]
     fn announce_store_remove_drops_the_entry() {
         let path = temp_path("announce_remove");
-        let _ = std::fs::remove_file(&path);
+        crate::store_db::remove_store_files(&path);
         let mut store = DistroAnnounceStore::load(path);
         let hash = dummy_hash(0xEF);
         store.put(hash.clone(), vec![0x01; 180], false);
@@ -1271,7 +1370,7 @@ mod tests {
     #[test]
     fn save_and_load_roundtrip() {
         let path = temp_path("roundtrip");
-        let _ = std::fs::remove_file(&path);
+        crate::store_db::remove_store_files(&path);
 
         let dh = dummy_hash(0xAA);
         let dev_h = dummy_hash(0x11);
@@ -1294,7 +1393,7 @@ mod tests {
             assert_eq!(devices[0].device_pubkey, pk);
         }
 
-        let _ = std::fs::remove_file(&path);
+        crate::store_db::remove_store_files(&path);
     }
 
     #[test]
