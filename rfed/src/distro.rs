@@ -62,9 +62,8 @@ use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::{Packet, ANNOUNCE, NONE, HEADER_1, FLAG_SET, FLAG_UNSET};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
-use crate::deferred_queue::DeferredQueue;
-use crate::notify::rns::RelayStack;
-use crate::notify::{dispatch_notify_via, HookRegistry, NotifyRegistration, NotifyRegistry};
+pub use crate::handoff::{defer_then_wake, OnUnconfirmed, Unconfirmed};
+use crate::notify::HookRegistry;
 use crate::link_session::LinkSessionRegistry;
 use crate::stream_registry::{OnUnproven, PropagationStreamRegistry};
 
@@ -473,86 +472,10 @@ fn device_id_hash_of(entry: &DistroEntry) -> Option<Vec<u8>> {
     Identity::from_public_key(&entry.device_pubkey).ok()?.hash
 }
 
-/// A device the fan-out could not confirm a delivery to, under both of the
-/// keys its hand-off needs.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnconfirmedDevice {
-    /// The device's identity hash: the key `/rfed/pull` drains the deferred
-    /// queue by. Keyed by the lxmf.delivery hash, a blob lands in a bucket
-    /// nothing drains.
-    pub device_id_hash: Vec<u8>,
-    /// The device's `lxmf.delivery` hash: the key its notify registration is
-    /// stored under (destinations.rs `notify/register stored lxmf`).
-    pub device_lxmf_hash: Vec<u8>,
-}
-
-/// What a fan-out caller does with a device it could not confirm. Build it
-/// with [`defer_then_wake`].
-pub type OnUnconfirmed = Arc<dyn Fn(UnconfirmedDevice) + Send + Sync>;
-
-fn unconfirmed(entry: &DistroEntry) -> Option<UnconfirmedDevice> {
-    Some(UnconfirmedDevice {
-        device_id_hash: device_id_hash_of(entry)?,
-        device_lxmf_hash: entry.device_lxmf_hash.clone(),
-    })
-}
-
-/// The one hand-off for a device a distro fan-out could not confirm: queue
-/// the blob for `/rfed/pull`, then wake the device through its notify
-/// registrations so that it pulls. Queue first: the wake makes the device
-/// pull, and a pull that comes before the blob is queued finds nothing
-/// (DESIGN_PRINCIPLES §5).
-///
-/// Until 2026-09-26 no distro fan-out woke anyone. The propagation-ingest
-/// caller only queued. The federation-sync caller woke, but looked the
-/// registrations up by the device's identity hash, and a device registers
-/// under its lxmf.delivery hash, so it found none. An Android or iOS device
-/// whose app was closed got no push for anything sent to its distro.
-pub fn defer_then_wake(
-    stack: Arc<dyn RelayStack + Send + Sync>,
-    deferred_queue: Arc<Mutex<DeferredQueue>>,
-    notify_registry: Arc<Mutex<NotifyRegistry>>,
-    limit_for: Arc<dyn Fn(&[u8]) -> usize + Send + Sync>,
-    distro_lxmf_hash: &[u8],
-    lxmf_blob: &[u8],
-) -> OnUnconfirmed {
-    let distro_lxmf_hash = distro_lxmf_hash.to_vec();
-    let lxmf_blob = lxmf_blob.to_vec();
-    Arc::new(move |device: UnconfirmedDevice| {
-        let queued = match deferred_queue.lock() {
-            Ok(mut queue) => {
-                let limit = limit_for(&device.device_id_hash);
-                queue.enqueue(device.device_id_hash.clone(), distro_lxmf_hash.clone(), lxmf_blob.clone(), limit);
-                true
-            }
-            Err(_) => false,
-        };
-        // Snapshot, then wake with the registry released: a wake is a send.
-        let registrations: Vec<NotifyRegistration> = match notify_registry.lock() {
-            Ok(registry) => registry
-                .get_for_channel(&device.device_lxmf_hash, None)
-                .into_iter()
-                .cloned()
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        let woken = registrations
-            .iter()
-            .filter(|registration| dispatch_notify_via(&*stack, registration, None, None).is_sent())
-            .count();
-        log(
-            format!(
-                "[distro] device {} unconfirmed for distro {}: {} for /rfed/pull, woken via {} of {} notify registration(s)",
-                hexrep(&device.device_lxmf_hash, false),
-                hexrep(&distro_lxmf_hash, false),
-                if queued { "queued" } else { "NOT queued (deferred queue poisoned)" },
-                woken,
-                registrations.len(),
-            ),
-            if queued { LOG_NOTICE } else { LOG_WARNING },
-            false,
-            false,
-        );
+fn unconfirmed(entry: &DistroEntry) -> Option<Unconfirmed> {
+    Some(Unconfirmed {
+        queue_key: device_id_hash_of(entry)?,
+        wake_key: entry.device_lxmf_hash.clone(),
     })
 }
 
@@ -787,7 +710,7 @@ mod tests {
         hook();
         assert_eq!(
             seen.lock().unwrap().as_slice(),
-            &[UnconfirmedDevice { device_id_hash: identity.hash.clone().unwrap(), device_lxmf_hash: vec![2; 16] }],
+            &[Unconfirmed { queue_key: identity.hash.clone().unwrap(), wake_key: vec![2; 16] }],
             "handed off under the identity hash (queue) and the lxmf.delivery hash (wake)",
         );
 
@@ -798,7 +721,7 @@ mod tests {
 
     // ── Every device the fan-out cannot confirm is handed off ───────────
 
-    fn recording_hand_off() -> (OnUnconfirmed, Arc<Mutex<Vec<UnconfirmedDevice>>>) {
+    fn recording_hand_off() -> (OnUnconfirmed, Arc<Mutex<Vec<Unconfirmed>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&seen);
         let hook: OnUnconfirmed = Arc::new(move |device| record.lock().unwrap().push(device));
@@ -822,10 +745,10 @@ mod tests {
         (identity, entry, rfed_delivery)
     }
 
-    fn expected_hand_off(identity: &Identity, entry: &DistroEntry) -> UnconfirmedDevice {
-        UnconfirmedDevice {
-            device_id_hash: identity.hash.clone().expect("identity hash"),
-            device_lxmf_hash: entry.device_lxmf_hash.clone(),
+    fn expected_hand_off(identity: &Identity, entry: &DistroEntry) -> Unconfirmed {
+        Unconfirmed {
+            queue_key: identity.hash.clone().expect("identity hash"),
+            wake_key: entry.device_lxmf_hash.clone(),
         }
     }
 
@@ -900,6 +823,9 @@ mod tests {
             self.queued_at_wake.lock().unwrap().push(queued);
             self.inner.send(packet)
         }
+        fn send_with_receipt(&self, packet: &mut Packet) -> Result<Option<reticulum_rust::packet::PacketReceipt>, String> {
+            self.inner.send_with_receipt(packet)
+        }
     }
 
     /// The device registers for wakes under its lxmf.delivery hash
@@ -924,7 +850,7 @@ mod tests {
         let stack = Arc::new(ObservingStack {
             inner: FakeStack::new(&relay_hash, Some(relay_public)),
             queue: Arc::clone(&queue),
-            device_id_hash: device.device_id_hash.clone(),
+            device_id_hash: device.queue_key.clone(),
             queued_at_wake: Mutex::new(Vec::new()),
         });
         let distro = vec![0xD4; 16];
@@ -936,6 +862,7 @@ mod tests {
             Arc::new(|_| 8),
             &distro,
             &blob,
+            None,
         );
 
         hand_off(device.clone());
@@ -950,7 +877,7 @@ mod tests {
             .map(|(_, value)| value.clone());
         assert_eq!(receiver, Some(rmpv::Value::Binary(entry.device_lxmf_hash.clone())), "the device's registered hash");
 
-        let pending = queue.lock().unwrap().drain(&device.device_id_hash);
+        let pending = queue.lock().unwrap().drain(&device.queue_key);
         assert_eq!(pending.len(), 1, "queued under the identity hash /rfed/pull drains by");
         assert_eq!(pending[0].channel_hash, distro);
         assert_eq!(pending[0].blob, blob);
@@ -958,7 +885,10 @@ mod tests {
     }
 
     use super::*;
+    use crate::deferred_queue::DeferredQueue;
     use crate::notify::rns::fake::FakeStack;
+    use crate::notify::rns::RelayStack;
+    use crate::notify::NotifyRegistry;
 
     fn temp_path(label: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()

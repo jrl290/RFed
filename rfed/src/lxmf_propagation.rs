@@ -1478,14 +1478,15 @@ impl DeliveryHandles {
                 Arc::new(|_| DISTRO_DEFERRED_QUEUE_LIMIT),
                 dest_hash,
                 lxmf_data,
+                None,
             ),
             None => {
                 let distro = hexrep(dest_hash, false);
-                Arc::new(move |device: crate::distro::UnconfirmedDevice| {
+                Arc::new(move |device: crate::distro::Unconfirmed| {
                     log(
                         format!(
                             "[distro] device {} unconfirmed for distro {distro}, and this node has no deferred queue: NOT queued, NOT woken",
-                            hexrep(&device.device_lxmf_hash, false),
+                            hexrep(&device.wake_key, false),
                         ),
                         LOG_WARNING,
                         false,
@@ -3161,11 +3162,11 @@ mod tests {
         let relay_hash = reticulum_rust::destination::Destination::hash(relay.hash.as_deref(), "rfed", &["notify"]);
         let relay_public = reticulum_rust::identity::Identity::from_public_key(&relay.get_public_key().expect("key"))
             .expect("relay");
-        let device = crate::distro::UnconfirmedDevice { device_id_hash: vec![0x11; 16], device_lxmf_hash: vec![0x44; 16] };
+        let device = crate::distro::Unconfirmed { queue_key: vec![0x11; 16], wake_key: vec![0x44; 16] };
         notify
             .lock()
             .unwrap()
-            .register(device.device_lxmf_hash.clone(), None, reticulum_rust::hexrep(&relay_hash, false));
+            .register(device.wake_key.clone(), None, reticulum_rust::hexrep(&relay_hash, false));
         let handles = super::DeliveryHandles {
             registry: Arc::clone(&notify),
             stream_registry: Arc::new(Mutex::new(super::PropagationStreamRegistry::default())),
@@ -3186,7 +3187,7 @@ mod tests {
         );
         hand_off(device.clone());
 
-        let pending = queue.lock().expect("queue lock").drain(&device.device_id_hash);
+        let pending = queue.lock().expect("queue lock").drain(&device.queue_key);
         assert_eq!(pending.len(), 1, "queued under the identity hash");
         assert_eq!(pending[0].channel_hash, distro_hash);
         assert_eq!(pending[0].blob, lxmf_data);

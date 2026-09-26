@@ -1433,7 +1433,7 @@ fn run_sync_session(
                                         // the device's identity hash, which no registration is
                                         // stored under, so it woke no one.
                                         let config = ctx.config.clone();
-                                        let on_unconfirmed = crate::distro::defer_then_wake(
+                                        let on_unconfirmed = crate::handoff::defer_then_wake(
                                             Arc::new(crate::notify::rns::LiveStack),
                                             Arc::clone(&ctx.deferred_queue),
                                             Arc::clone(&ctx.notify_registry),
@@ -1442,6 +1442,7 @@ fn run_sync_session(
                                             }),
                                             routing_hash,
                                             blob,
+                                            None,
                                         );
                                         if let Ok(hooks) = ctx.hook_registry.lock() {
                                             crate::distro::distro_fanout(
@@ -2078,10 +2079,11 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
             // way the channel fan-out did (see FedNode::plan_channel_fanout).
             //
             // NEVER REMOVE the early drop.
-            let (deferred_queue, hook_registry, limit, distros) = match arc.lock() {
+            let (deferred_queue, hook_registry, notify_registry, limit, distros) = match arc.lock() {
                 Ok(guard) => (
                     Arc::clone(&guard.deferred_queue),
                     Arc::clone(&guard.hook_registry),
+                    Arc::clone(&guard.notify_registry),
                     guard.config.policy_for(&sub_id_hash).deferred_queue_limit,
                     guard.distro_table.lock().map(|t| t.registered_distro_hashes()).unwrap_or_default(),
                 ),
@@ -2182,29 +2184,44 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     reticulum_rust::packet::HEADER_1,
                     None,
                     None,
-                    false,
+                    true,
                     reticulum_rust::packet::FLAG_UNSET,
                 );
-                // Packet::send() returns Ok(None) both when nothing was transmitted and
-                // when the packet went out without a receipt being requested (these
-                // packets never ask for one). Until 2026-09-24 the second case was read
-                // as the first: every successful send was re-queued and re-sent on the
-                // next announce. `packet.sent` is the transmitted flag (RNS/Packet.py
-                // send() returns False, not None, when no interface took it).
-                match (packet.send(), packet.sent) {
-                    // Ok(Some) = transmitted (receipt); keep it drained.
-                    (Ok(Some(_)), _) | (Ok(None), true) => {
+                // Drained once sent, and delivered only on the subscriber's
+                // proof: on the RNS receipt timeout the blob is queued again
+                // and the subscriber pushed (crate::handoff), so a subscriber
+                // that announced and died, or never proves, pulls it. Until
+                // 2026-09-26 a packet that left counted as delivered.
+                match crate::notify::rns::RelayStack::send_with_receipt(&crate::notify::rns::LiveStack, &mut packet) {
+                    Ok(Some(receipt)) => {
+                        let limit_for: Arc<dyn Fn(&[u8]) -> usize + Send + Sync> = Arc::new(move |_| limit);
+                        let hand_off = crate::handoff::defer_then_wake(
+                            Arc::new(crate::notify::rns::LiveStack),
+                            Arc::clone(&deferred_queue),
+                            Arc::clone(&notify_registry),
+                            limit_for,
+                            &pb.channel_hash,
+                            &pb.blob,
+                            Some(&pb.channel_hash),
+                        );
+                        let subscriber = crate::handoff::Unconfirmed {
+                            queue_key: sub_id_hash.clone(),
+                            wake_key: sub_id_hash.clone(),
+                        };
+                        let outcome = crate::stream_registry::PushOutcome::new(
+                            format!("deferred flush of {} to {}", hexrep(&pb.channel_hash, false), hexrep(&sub_id_hash, false)),
+                            Some(Arc::new(move || hand_off(subscriber.clone()))),
+                        );
+                        outcome.receipt_pending();
+                        crate::stream_registry::tie_receipt(&receipt, &outcome);
+                        outcome.dispatch_done();
                         if let Some(ref hooks) = hooks {
                             hooks.on_deliver(&sub_id_hash, &pb.blob);
                         }
                     }
-                    // Ok(None) = Transport::outbound returned sent=false (no
-                    // usable interface/path right now).  Do NOT mark delivered
-                    // and do NOT drop it — re-enqueue so the next announce /
-                    // path-ready edge retries.  Previously Ok(None) fell through
-                    // to on_deliver and the blob was silently lost, which is why
-                    // fanned-out distro messages never reached devices.
-                    (Ok(None), false) => {
+                    // No usable interface/path right now. Do NOT drop it:
+                    // re-enqueue for the next announce or the pull.
+                    Ok(None) => {
                         log(
                             format!("[deferred] send to {} not transmitted (no usable interface) — re-enqueueing",
                                 hexrep(&sub_id_hash, false)),
@@ -2214,8 +2231,8 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                         );
                         failed.push(pb);
                     }
-                    // Err = hard send error — re-enqueue so a later announce retries.
-                    (Err(e), _) => {
+                    // Err = hard send error — re-enqueue.
+                    Err(e) => {
                         log(
                             format!("[deferred] send to {} failed: {e} — re-enqueueing",
                                 hexrep(&sub_id_hash, false)),
@@ -2276,10 +2293,11 @@ mod deferred_flush_size_tests {
         assert!(!fits_in_delivery_packet(16 + 1795));
     }
 
-    /// A receipt-less send that went out is a delivery, not a failure: every
-    /// fan-out reads `packet.sent` next to the send result, and the
-    /// transmitted arm is written so that arm order cannot swallow the
-    /// not-transmitted case (2026-09-24: 77 successful sends re-queued in a day).
+    /// Every rfed.delivery packet asks for a receipt and is delivered only on
+    /// its proof; an unproven one is queued and pushed (crate::handoff).
+    /// Until 2026-09-26 a packet that left counted as delivered, and before
+    /// 2026-09-24 even the "left" was misread (a receipt-less Ok(None) is not a
+    /// failure). The stack reports "left" from the transmitted flag.
     #[test]
     fn fanouts_read_the_transmitted_flag_not_the_receipt() {
         for (name, src) in [
@@ -2289,14 +2307,15 @@ mod deferred_flush_size_tests {
             // Everything before this test: destinations.rs has test modules above
             // its deferred flush, so a #[cfg(test)] split would drop the code under test.
             let production = src.split("fn fanouts_read_the_transmitted_flag_not_the_receipt").next().unwrap();
-            assert_eq!(production.matches("match packet.send() {").count(), 0, "{name}: a bare match on Packet::send cannot tell sent-without-receipt from not-sent");
-            assert_eq!(production.matches("match (packet.send(), packet.sent) {").count(), 1, "{name}");
-            assert!(production.contains("(Ok(None), false) =>"), "{name}: the not-transmitted arm");
-            assert!(production.contains("(Ok(Some(_)), _) | (Ok(None), true) =>"), "{name}: the transmitted arm names both shapes");
+            assert_eq!(production.matches("packet.send()").count(), 0, "{name}: no packet without a receipt");
+            assert_eq!(production.matches("send_with_receipt(").count(), 1, "{name}");
+            assert_eq!(production.matches("tie_receipt(&receipt, &outcome)").count(), 1, "{name}: delivered on its proof");
         }
-
         // Since 2026-09-26 the distro fan-out sends no rfed.delivery packet
         // (distro::tests::the_distro_fanout_sends_no_unconfirmed_packet).
+        let live = include_str!("notify/rns.rs");
+        assert!(live.contains("packet.create_receipt = true;"), "LiveStack asks for the receipt");
+        assert!(live.contains("Ok(if packet.sent { receipt } else { None })"), "and reports it only if the packet left");
     }
 
     /// The rfed.delivery announce flush sends packets nothing confirms, so it
@@ -4425,7 +4444,7 @@ mod fanout_lock_scope_tests {
                 .find("crate::distro::distro_fanout(")
                 .expect("the fan-out call follows its hand-off");
         let block = &source[start..end];
-        assert!(block.contains("crate::distro::defer_then_wake("), "the hand-off is defer_then_wake");
+        assert!(block.contains("crate::handoff::defer_then_wake("), "the hand-off is defer_then_wake");
         assert!(!block.contains("get_for_channel("), "no wake of its own, under any key");
         assert!(!block.contains(".enqueue("), "no queueing of its own");
     }
@@ -4445,7 +4464,7 @@ mod fanout_lock_scope_tests {
         let fragment = &source[start..end];
 
         assert!(
-            fragment.contains("let (deferred_queue, hook_registry, limit, distros) = match arc.lock()"),
+            fragment.contains("let (deferred_queue, hook_registry, notify_registry, limit, distros) = match arc.lock()"),
             "the deferred flush must snapshot its collaborators and release the \
              FedNode mutex before sending"
         );

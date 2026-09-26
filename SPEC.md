@@ -688,23 +688,32 @@ stop at the first one that takes the push:
    proof of that packet is the proof. A client MUST prove every DATA packet
    it receives on a stream link (the Reticulum-rust link proves each one
    when it has a packet callback); a client that does not will see each push
-   deferred and delivered again by pull.
-3. **`rfed.delivery` packet** — a single packet to the subscriber's delivery
-   destination. It carries no proof today: a transmitted packet counts as
-   delivered.
-4. Otherwise the blob is deferred at once.
+   handed off and delivered again by pull.
+3. **`rfed.delivery` packet** (channels only; distro never uses it, §17.3) —
+   a single DATA packet to the subscriber's delivery destination, sent **with
+   a packet receipt**. The client's proof of that packet is the proof. A
+   client MUST prove every packet it receives on `rfed.delivery` (PROVE_ALL);
+   Retichat Android, iOS and web do since 2026-09-26.
+4. Otherwise the blob is handed off at once.
 
-A push that went out on tier 1 or 2 but is **never confirmed** is not lost
-and is not re-sent on another live tier: it moves to the deferred queue once,
-and the client collects it with `/channel/pull` or `/distro/pull`. That is a
-change of route, not a retry. No notify wake is sent for such a push today
-(one is sent only for a subscriber no live tier took at all), so a device
-that died with its link up learns of it at its next pull. Tier 1 is unconfirmed when the request fails
-(no response before the request timeout, or the link closes first); tier 2
-when no link proves the packet before its receipt concludes — the RNS
-receipt timeout (the link's RTT × traffic timeout factor) is the failure
-event, and a link that closes before the proof ends there too. The deferral
-runs at most once per push per subscriber.
+A push that is **never confirmed** is not lost and is not re-sent on another
+live tier: it is **handed off** once (`handoff::defer_then_wake`). The blob
+moves to the deferred queue, and then the subscriber is pushed through its
+notify registrations (§9) so that it collects the blob with `/channel/pull`
+or `/rfed/pull`. That is a change of route, not a retry. Tier 1 is
+unconfirmed when the request fails (no response before the request
+timeout, or the link closes first); tiers 2 and 3 when no proof arrives
+before the receipt concludes — the RNS receipt timeout (for a link packet
+the link's RTT × traffic timeout factor; for a packet to a destination
+6 s plus 6 s per hop) is the failure event, and a link that closes before
+the proof ends there too. The hand-off runs at most once per push per
+subscriber. The `rfed.delivery` announce flush of queued channel blobs sends
+with a receipt too, and hands off what is not proved.
+
+Until 2026-09-26 a tier-3 packet counted as delivered once it left, an
+unconfirmed tier-1 or tier-2 push was deferred but no one was pushed, and
+distro fan-out pushed no one at all: a subscriber whose app had died, its
+path still held, lost the message or learnt of it only at its next pull.
 
 Before 2026-09-24 tier 2 counted a packet the link accepted as delivered. A
 device that died without closing its link (an iOS app killed or suspended,

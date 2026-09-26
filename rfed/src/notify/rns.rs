@@ -34,7 +34,7 @@
 
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
-use reticulum_rust::packet::{self, Packet};
+use reticulum_rust::packet::{self, Packet, PacketReceipt};
 use reticulum_rust::transport::{self, Transport};
 use reticulum_rust::{decode_hex, hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
@@ -146,6 +146,10 @@ pub trait RelayStack {
     /// Hand the packet to Transport. `Ok(true)` only if an interface took it:
     /// `Packet::send` also returns `Ok(None)` when none did.
     fn send(&self, packet: &mut Packet) -> Result<bool, String>;
+    /// Hand the packet to Transport with a delivery receipt. `Ok(Some)` only
+    /// if an interface took it; the receipt then concludes on the
+    /// recipient's proof or on the RNS receipt timeout.
+    fn send_with_receipt(&self, packet: &mut Packet) -> Result<Option<PacketReceipt>, String>;
 }
 
 pub struct LiveStack;
@@ -165,6 +169,12 @@ impl RelayStack for LiveStack {
 
     fn send(&self, packet: &mut Packet) -> Result<bool, String> {
         packet.send().map(|_| packet.sent)
+    }
+
+    fn send_with_receipt(&self, packet: &mut Packet) -> Result<Option<PacketReceipt>, String> {
+        packet.create_receipt = true;
+        let receipt = packet.send()?;
+        Ok(if packet.sent { receipt } else { None })
     }
 }
 
@@ -357,7 +367,7 @@ pub(crate) mod fake {
     use std::sync::Mutex;
 
     use reticulum_rust::identity::Identity;
-    use reticulum_rust::packet::Packet;
+    use reticulum_rust::packet::{Packet, PacketReceipt};
 
     use super::RelayStack;
 
@@ -369,6 +379,9 @@ pub(crate) mod fake {
         pub(crate) path_requests: Mutex<Vec<Vec<u8>>>,
         /// Every packet handed to `send`, packed: `(raw, ratchet_id)`.
         pub(crate) packets: Mutex<Vec<(Vec<u8>, Option<Vec<u8>>)>>,
+        /// The receipt of every packet `send_with_receipt` transmitted, for
+        /// the test to prove or time out.
+        pub(crate) receipts: Mutex<Vec<PacketReceipt>>,
     }
 
     impl FakeStack {
@@ -382,6 +395,7 @@ pub(crate) mod fake {
                 transmits: true,
                 path_requests: Mutex::new(Vec::new()),
                 packets: Mutex::new(Vec::new()),
+                receipts: Mutex::new(Vec::new()),
             }
         }
 
@@ -420,6 +434,15 @@ pub(crate) mod fake {
                 .unwrap()
                 .push((packet.raw.clone(), packet.ratchet_id.clone()));
             Ok(self.transmits)
+        }
+
+        fn send_with_receipt(&self, packet: &mut Packet) -> Result<Option<PacketReceipt>, String> {
+            if !self.send(packet)? {
+                return Ok(None);
+            }
+            let receipt = PacketReceipt::new_with_timeout(packet, 3600.0);
+            self.receipts.lock().unwrap().push(receipt.clone());
+            Ok(Some(receipt))
         }
     }
 }

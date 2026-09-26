@@ -94,7 +94,7 @@ impl PushOutcome {
     /// never holds up that interface's traffic.
     pub(crate) fn proved(&self) {
         if !self.proved.swap(true, Ordering::SeqCst) {
-            log(format!("[stream] {} proved", self.label), LOG_DEBUG, false, false);
+            log(format!("[push] {} proved", self.label), LOG_DEBUG, false, false);
         }
         self.conclude_one();
     }
@@ -118,7 +118,7 @@ impl PushOutcome {
         } else {
             "late, before its hand-off; delivered"
         };
-        log(format!("[stream] {} proved {note}", self.label), LOG_DEBUG, false, false);
+        log(format!("[push] {} proved {note}", self.label), LOG_DEBUG, false, false);
     }
 
     /// The dispatch has tried every matching link.
@@ -161,7 +161,7 @@ impl PushOutcome {
         match self.on_unproven.clone() {
             Some(hook) => {
                 log(
-                    format!("[stream] {} unproven — no link proved it before its receipt timed out; handing it to the next route", self.label),
+                    format!("[push] {} unproven — no proof before its receipt timed out; handing it to the next route", self.label),
                     LOG_WARNING,
                     false,
                     false,
@@ -172,7 +172,7 @@ impl PushOutcome {
                 std::thread::spawn(move || hook());
             }
             None => log(
-                format!("[stream] {} unproven and this caller has no other route — the device did not get it", self.label),
+                format!("[push] {} unproven and this caller has no other route — the device did not get it", self.label),
                 LOG_WARNING,
                 false,
                 false,

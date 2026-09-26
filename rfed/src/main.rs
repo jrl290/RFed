@@ -57,6 +57,7 @@ mod blob_store;
 mod deferred_queue;
 mod distro;
 mod fanout;
+mod handoff;
 mod sync;
 mod ini_config;
 mod destinations;

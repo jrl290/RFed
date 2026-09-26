@@ -7,7 +7,12 @@
 //!
 //! Run with:
 //!   cargo run --example rfed_channel_e2e -- --rfed-port <port>
-//!       [--channel-name <name>] [--message <text>] [--timeout <secs>]
+//!       [--rfed-host <host>] [--channel-name <name>] [--message <text>]
+//!       [--timeout <secs>] [--prove]
+//!
+//! `--prove`: the receiver proves every rfed.delivery packet (PROVE_ALL), as
+//! the apps do since 2026-09-26; without it rfed never gets a proof for the
+//! channel packet and hands it off (queued for pull and pushed).
 //!
 //! Exit 0 = PASS, exit 1 = FAIL.
 
@@ -165,6 +170,8 @@ fn main() {
     let rfed_port: u16 = arg_value(&args, "--rfed-port")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4246);
+    let rfed_host = arg_value(&args, "--rfed-host").unwrap_or_else(|| "127.0.0.1".to_string());
+    let prove = args.iter().any(|a| a == "--prove");
     let rfed_channel_hash_hex = arg_value(&args, "--rfed-channel-hash");
     let channel_name = arg_value(&args, "--channel-name")
         .unwrap_or_else(|| "public.test.channel".to_string());
@@ -193,12 +200,12 @@ fn main() {
             "[reticulum]\n  enable_transport = false\n  share_instance = false\n\n\
              [interfaces]\n\
              \n  [[rfed-local]]\n    type = TCPClientInterface\n    enabled = true\n    \
-             target_host = 127.0.0.1\n    target_port = {rfed_port}\n"
+             target_host = {rfed_host}\n    target_port = {rfed_port}\n"
         ),
     )
     .expect("write rns config");
 
-    eprintln!("[e2e] Initialising Reticulum → 127.0.0.1:{rfed_port}");
+    eprintln!("[e2e] Initialising Reticulum → {rfed_host}:{rfed_port} (receiver proves: {prove})");
     Reticulum::init(Some(rns_dir), None, None, None, false, None).expect("RNS init");
     eprintln!("[e2e] RNS ready — waiting 2s for TCP interface to connect...");
     thread::sleep(Duration::from_secs(2));
@@ -277,6 +284,11 @@ fn main() {
         vec!["delivery".to_string()],
     )
     .expect("create delivery dest");
+    if prove {
+        delivery_dest
+            .set_proof_strategy(reticulum_rust::destination::PROVE_ALL)
+            .expect("proof strategy");
+    }
 
     delivery_dest.set_packet_callback(Some(Arc::new(
         move |data: &[u8], _pkt: &reticulum_rust::packet::Packet| {

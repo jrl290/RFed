@@ -18,8 +18,10 @@
 //!      client already has open.
 //!   3. Then any active `rfed.channel.stream` link for that subscriber.
 //!   4. Fall back to the legacy `rfed.delivery` packet path when no session
-//!      is active (compatibility during migration).
-//!   5. Fire registered delivery hooks (notify adapters).
+//!      is active (compatibility during migration), with a delivery receipt.
+//!   5. Queue for `/channel/pull` and push every subscriber no route
+//!      confirmed: no response, no proof, or no route at all
+//!      (`crate::handoff::defer_then_wake`).
 //!
 //! Tiers 2 and 3 are mutually exclusive per subscriber: a client that has
 //! migrated to `rfed.link` must not also receive the legacy copy.
@@ -31,13 +33,14 @@ use std::sync::{Arc, Mutex};
 use reticulum_rust::destination::{Destination, DestinationType};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::{Packet, DATA, NONE, HEADER_1, FLAG_UNSET};
-use reticulum_rust::transport::Transport;
 use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::deferred_queue::DeferredQueue;
+use crate::handoff::{OnUnconfirmed, Unconfirmed};
 use crate::link_session::LinkSessionRegistry;
-use crate::notify::{dispatch_notify, HookRegistry, NotifyRegistry};
-use crate::stream_registry::ChannelStreamRegistry;
+use crate::notify::rns::{LiveStack, RelayStack};
+use crate::notify::{HookRegistry, NotifyRegistry};
+use crate::stream_registry::{tie_receipt, ChannelStreamRegistry, PushOutcome};
 
 /// rfed app name used to compute destination hashes.
 pub const APP_NAME: &str = "rfed";
@@ -86,126 +89,72 @@ pub struct FanoutPlan {
 }
 
 impl FanoutPlan {
-    /// Deliver `inner_blob` to every subscriber in the plan, then defer and
-    /// wake whoever could not be reached.
+    /// Deliver `inner_blob` to every subscriber in the plan; every subscriber
+    /// the delivery is not confirmed for is queued for `/channel/pull` and
+    /// pushed ([`crate::handoff::defer_then_wake`]).
     ///
     /// Callers must not hold the `FedNode` mutex here — see the type's docs.
     pub fn run(&self, channel_dest_hash: &[u8], inner_blob: &[u8]) {
-        let missed = {
-            let hooks = match self.hook_registry.lock() {
-                Ok(h) => h,
-                Err(_) => {
-                    log("[fanout] hook registry poisoned — skipping fanout",
-                        LOG_WARNING, false, false);
-                    return;
-                }
-            };
-            fanout_blob(
-                inner_blob,
-                channel_dest_hash,
-                &self.subscribers,
-                &hooks,
-                Some(&self.channel_streams),
-                Some(&PushContext {
-                    link_sessions: Arc::clone(&self.link_sessions),
-                    deferred_queue: Arc::clone(&self.deferred_queue),
-                    deferred_limits: self.deferred_limits.clone(),
-                }),
-            )
-        };
-
-        if missed.is_empty() {
-            return;
-        }
-
-        if let Ok(mut deferred) = self.deferred_queue.lock() {
-            for sub_hash in &missed {
-                let limit = self.deferred_limits.get(sub_hash).copied().unwrap_or(0);
-                deferred.enqueue(
-                    sub_hash.clone(),
-                    channel_dest_hash.to_vec(),
-                    inner_blob.to_vec(),
-                    limit,
-                );
+        let limits = self.deferred_limits.clone();
+        let on_unconfirmed = crate::handoff::defer_then_wake(
+            Arc::new(LiveStack),
+            Arc::clone(&self.deferred_queue),
+            Arc::clone(&self.notify_registry),
+            Arc::new(move |sub_hash: &[u8]| limits.get(sub_hash).copied().unwrap_or(0)),
+            channel_dest_hash,
+            inner_blob,
+            Some(channel_dest_hash),
+        );
+        let hooks = match self.hook_registry.lock() {
+            Ok(h) => h,
+            Err(_) => {
+                log("[fanout] hook registry poisoned — skipping fanout",
+                    LOG_WARNING, false, false);
+                return;
             }
-        }
-
-        // Fire notify wake-ups for deferred subscribers. Snapshot, then wake
-        // with the registry released: a wake is a packet send.
-        let wakes: Vec<_> = match self.notify_registry.lock() {
-            Ok(notify) => missed
-                .iter()
-                .flat_map(|sub_hash| notify.get_for_channel(sub_hash, Some(channel_dest_hash)))
-                .cloned()
-                .collect(),
-            Err(_) => Vec::new(),
         };
-        for reg in &wakes {
-            dispatch_notify(reg, None, Some(channel_dest_hash));
-        }
+        fanout_blob(
+            &LiveStack,
+            inner_blob,
+            channel_dest_hash,
+            &self.subscribers,
+            &hooks,
+            Some(&self.channel_streams),
+            Some(&self.link_sessions),
+            on_unconfirmed,
+        );
     }
 }
 
-/// Fanout an inner blob to the given subscribers of `channel_dest_hash`.
+/// Fanout an inner blob to the given subscribers of `channel_dest_hash`, and
+/// hand every subscriber it cannot confirm to `on_unconfirmed`. Returns how
+/// many were handed off here and now; the proof-driven routes hand off later.
 ///
-/// Returns the dest hashes of subscribers whose identity was not yet known
-/// to the local Reticulum node (i.e. `Identity::recall` returned `None`).
-/// The caller is responsible for enqueuing those in the deferred delivery
-/// queue and firing notify hooks for them — `FanoutPlan::run` does both.
+/// A delivery is confirmed only by its proof (RFed SPEC §7): the rfed.link
+/// response, the stream link's proof, or the `rfed.delivery` packet's proof
+/// (the apps prove it since 2026-09-26). `on_unconfirmed` fires for a
+/// subscriber whose key or path is unknown, whose packet no interface took,
+/// and, later, for an unanswered or unproven push on any route. Until
+/// 2026-09-26 the packet counted as delivered once it left, a subscriber whose
+/// app had died lost it, and an unanswered or unproven live push was queued
+/// but not pushed.
 ///
 /// NEVER REMOVE the `subscribers` snapshot parameter in favour of a
 /// `&SubscriptionTable`. Taking the table forced every caller to hold
 /// `subscription_table` — and in practice the whole `FedNode` mutex — across
 /// the delivery loop, which wedged `/rfed/subscribe` in production on
 /// 2026-08-17. See `FanoutPlan`.
-/// What an `rfed.link` push needs beyond the blob itself: the sessions to push
-/// over, and somewhere to put the blob when a push is dispatched but never
-/// acknowledged.
-///
-/// Owned `Arc`s and an owned limit map, for the same reason `FanoutPlan` is —
-/// nothing here may borrow from the `FedNode` guard.
-pub struct PushContext {
-    pub link_sessions: Arc<Mutex<LinkSessionRegistry>>,
-    pub deferred_queue: Arc<Mutex<DeferredQueue>>,
-    pub deferred_limits: HashMap<Vec<u8>, usize>,
-}
-
-/// The hand-off both live tiers use when the subscriber never confirms a
-/// push (tier 1: no response; tier 2: no link proof): the blob goes to the
-/// deferred queue, which `/channel/pull` drains. It runs on its own thread
-/// (a request's failed callback, or stream_registry's unproven hook), so it
-/// takes only the deferred-queue lock.
-fn defer_for_pull(ctx: &PushContext, sub_hash: &[u8], channel_dest_hash: &[u8], inner_blob: &[u8]) -> Arc<dyn Fn() + Send + Sync> {
-    let limit = ctx.deferred_limits.get(sub_hash).copied().unwrap_or(0);
-    let queue = Arc::clone(&ctx.deferred_queue);
-    let sub = sub_hash.to_vec();
-    let channel = channel_dest_hash.to_vec();
-    let blob = inner_blob.to_vec();
-    Arc::new(move || {
-        log(
-            format!(
-                "[fanout] channel {} push to subscriber {} unconfirmed — deferring for /channel/pull",
-                hexrep(&channel, false),
-                hexrep(&sub, false),
-            ),
-            LOG_NOTICE,
-            false,
-            false,
-        );
-        if let Ok(mut deferred) = queue.lock() {
-            deferred.enqueue(sub.clone(), channel.clone(), blob.clone(), limit);
-        }
-    })
-}
-
+#[allow(clippy::too_many_arguments)]
 pub fn fanout_blob(
+    stack: &dyn RelayStack,
     inner_blob: &[u8],
     channel_dest_hash: &[u8],
     subscribers: &[(Vec<u8>, Option<Vec<u8>>)],
     hook_registry: &HookRegistry,
     channel_streams: Option<&Arc<Mutex<ChannelStreamRegistry>>>,
-    push: Option<&PushContext>,
-) -> Vec<Vec<u8>> {
+    link_sessions: Option<&Arc<Mutex<LinkSessionRegistry>>>,
+    on_unconfirmed: OnUnconfirmed,
+) -> usize {
     if subscribers.is_empty() {
         log(
             format!(
@@ -216,7 +165,7 @@ pub fn fanout_blob(
             false,
             false,
         );
-        return Vec::new();
+        return 0;
     }
 
     log(
@@ -231,7 +180,7 @@ pub fn fanout_blob(
         false,
     );
 
-    let mut missed: Vec<Vec<u8>> = Vec::new();
+    let mut handed_off = 0usize;
 
     for (sub_hash, owner_hash) in subscribers {
         // Backup subscriptions: suppress delivery while the owner node is reachable.
@@ -260,25 +209,27 @@ pub fn fanout_blob(
             );
         }
 
+        // A channel subscriber is queued and pushed under its subscriber
+        // hash (the identity hash subscribe_cb stored).
+        let subscriber = Unconfirmed { queue_key: sub_hash.clone(), wake_key: sub_hash.clone() };
+        let hand_off_later = || -> Arc<dyn Fn() + Send + Sync> {
+            let hook = Arc::clone(&on_unconfirmed);
+            let subscriber = subscriber.clone();
+            Arc::new(move || hook(subscriber.clone()))
+        };
+
         let mut payload = channel_dest_hash.to_vec();
         payload.extend_from_slice(inner_blob);
 
         // ── Tier 1: rfed.link session (RFed-spec/Link.md) ────────────
-        let link_result = push.and_then(|ctx| {
-            let mut registry = ctx.link_sessions.lock().ok()?;
+        let link_result = link_sessions.and_then(|sessions| {
+            let mut registry = sessions.lock().ok()?;
             if !registry.has_channel_session(sub_hash, channel_dest_hash) {
-                // No session — fall through to the next tier without copying
-                // the blob into a failure hook that could never fire.
                 return None;
             }
-
-            // The client answers this push. If it never does, `on_failed` puts
-            // the blob in the deferred queue and `/channel/pull` becomes the
-            // delivery route — a tier change, not a retry
-            // (DESIGN_PRINCIPLES §3).
-            let on_failed = defer_for_pull(ctx, sub_hash, channel_dest_hash, inner_blob);
-
-            Some(registry.dispatch_channel(sub_hash, channel_dest_hash, &payload, Some(on_failed)))
+            // The client answers this push; if it never does, the blob is
+            // handed off — a route change, not a retry (DESIGN_PRINCIPLES §3).
+            Some(registry.dispatch_channel(sub_hash, channel_dest_hash, &payload, Some(hand_off_later())))
         });
 
         if let Some(result) = link_result {
@@ -309,15 +260,10 @@ pub fn fanout_blob(
             );
         }
 
+        // ── Tier 2: rfed.channel.stream (proof-driven) ───────────────
         if let Some(streams) = channel_streams {
             if let Ok(mut registry) = streams.lock() {
-                // Proof-driven like tier 1 (stream_registry::PushOutcome): a
-                // push no link proves goes to the deferred queue for
-                // `/channel/pull`. Until 2026-09-24 a push to a subscriber
-                // that had died with its stream link still up (iOS uses this
-                // tier) counted as delivered and was lost.
-                let on_unproven = push.map(|ctx| defer_for_pull(ctx, sub_hash, channel_dest_hash, inner_blob));
-                let result = registry.dispatch(sub_hash, channel_dest_hash, &payload, on_unproven);
+                let result = registry.dispatch(sub_hash, channel_dest_hash, &payload, Some(hand_off_later()));
                 if result.delivered() {
                     log(
                         format!(
@@ -336,7 +282,7 @@ pub fn fanout_blob(
                 if result.had_sessions() {
                     log(
                         format!(
-                            "[fanout] stream delivery failed for subscriber {} on channel {} — falling back to legacy delivery",
+                            "[fanout] stream delivery failed for subscriber {} on channel {} — falling back to the rfed.delivery packet",
                             hexrep(sub_hash, false),
                             hexrep(channel_dest_hash, false),
                         ),
@@ -348,128 +294,214 @@ pub fn fanout_blob(
             }
         }
 
+        // ── Tier 3: the rfed.delivery packet, with a delivery receipt ─
         // subscriber_hash is the identity hash stored by subscribe_cb.
-        // Use recall_from_identity_hash (not recall by destination hash).
-        let maybe_identity = Identity::recall_from_identity_hash(sub_hash);
-
-        let identity = match maybe_identity {
-            Some(id) => id,
-            None => {
-                log(
-                    format!(
-                        "[fanout] subscriber {} unknown — will defer",
-                        hexrep(sub_hash, false)
-                    ),
-                    LOG_DEBUG,
-                    false,
-                    false,
-                );
-                missed.push(sub_hash.clone());
-                continue;
-            }
+        let Some(identity) = Identity::recall_from_identity_hash(sub_hash) else {
+            log(
+                format!("[fanout] subscriber {} unknown — queueing and pushing", hexrep(sub_hash, false)),
+                LOG_DEBUG,
+                false,
+                false,
+            );
+            handed_off += 1;
+            on_unconfirmed(subscriber);
+            continue;
         };
-
-        // Construct an outbound destination to the subscriber's rfed.delivery
-        // endpoint.  Reticulum handles X25519 encryption + node signing.
-        match Destination::new_outbound(
+        let dest = match Destination::new_outbound(
             Some(identity),
             DestinationType::Single,
             APP_NAME.to_string(),
             vec!["delivery".to_string()],
         ) {
-            Ok(dest) => {
-                // Only attempt live delivery if a network path is known.
-                // Without a path, Transport::outbound falls back to broadcast
-                // (sending to all interfaces), which falsely returns sent=true
-                // even though the subscriber is unreachable.
-                if !Transport::has_path(&dest.hash) {
-                    log(
-                        format!(
-                            "[fanout] no path to subscriber {} delivery — will defer",
-                            hexrep(sub_hash, false)
-                        ),
-                        LOG_DEBUG,
-                        false,
-                        false,
-                    );
-                    missed.push(sub_hash.clone());
-                    continue;
-                }
-
-                // Delivery packet payload: channel_id_hash(16) | inner_blob.
-                // This remains as a compatibility fallback while clients migrate
-                // to rfed.channel.stream.
-
-                let mut packet = Packet::new(
-                    Some(dest),
-                    payload,
-                    DATA,
-                    NONE,
-                    reticulum_rust::transport::BROADCAST,
-                    HEADER_1,
-                    None,
-                    None,
-                    false,
-                    FLAG_UNSET,
-                );
-                // Packet::send() returns Ok(None) both when nothing was transmitted and
-                // when the packet went out without a receipt being requested (these
-                // packets never ask for one). Until 2026-09-24 the second case was read
-                // as the first: every successful send was re-queued and re-sent on the
-                // next announce. `packet.sent` is the transmitted flag (RNS/Packet.py
-                // send() returns False, not None, when no interface took it).
-                match (packet.send(), packet.sent) {
-                    (Err(e), _) => {
-                        log(
-                            format!("[fanout] send to {} failed: {e} — will defer", hexrep(sub_hash, false)),
-                            LOG_WARNING,
-                            false,
-                            false,
-                        );
-                        missed.push(sub_hash.clone());
-                    }
-                    (Ok(None), false) => {
-                        // Transport::outbound returned false (e.g. subscriber's TCP
-                        // session is gone but the path entry still exists).  Treat as
-                        // delivery failure and defer the blob.
-                        log(
-                            format!("[fanout] no interface for {} — will defer", hexrep(sub_hash, false)),
-                            LOG_WARNING,
-                            false,
-                            false,
-                        );
-                        missed.push(sub_hash.clone());
-                    }
-                    (Ok(Some(_)), _) | (Ok(None), true) => {
-                        log(
-                            format!(
-                                "[FANOUT] SENT channel={} sub={} payload_bytes={}",
-                                hexrep(channel_dest_hash, false),
-                                hexrep(sub_hash, false),
-                                inner_blob.len() + channel_dest_hash.len(),
-                            ),
-                            reticulum_rust::LOG_NOTICE,
-                            false,
-                            false,
-                        );
-                    }
-                }
-                // Also fire delivery hooks (notify adapters etc.)
-                hook_registry.on_deliver(sub_hash, inner_blob);
-            }
+            Ok(dest) => dest,
             Err(e) => {
                 log(
-                    format!(
-                        "[fanout] failed to build destination for {}: {e}",
-                        hexrep(sub_hash, false)
-                    ),
+                    format!("[fanout] failed to build destination for {}: {e} — queueing and pushing", hexrep(sub_hash, false)),
                     LOG_WARNING,
                     false,
                     false,
                 );
+                handed_off += 1;
+                on_unconfirmed(subscriber);
+                continue;
+            }
+        };
+        // Without a path, Transport::outbound falls back to broadcast, which
+        // reports sent=true although the subscriber is unreachable.
+        if !stack.has_path(&dest.hash) {
+            log(
+                format!("[fanout] no path to subscriber {} delivery — queueing and pushing", hexrep(sub_hash, false)),
+                LOG_DEBUG,
+                false,
+                false,
+            );
+            handed_off += 1;
+            on_unconfirmed(subscriber);
+            continue;
+        }
+
+        let dest_hash_for_request = dest.hash.clone();
+        let mut packet = Packet::new(
+            Some(dest),
+            payload,
+            DATA,
+            NONE,
+            reticulum_rust::transport::BROADCAST,
+            HEADER_1,
+            None,
+            None,
+            true,
+            FLAG_UNSET,
+        );
+        match stack.send_with_receipt(&mut packet) {
+            Ok(Some(receipt)) => {
+                // Delivered on the subscriber's proof; handed off on the RNS
+                // receipt timeout, the same verdict the stream tier reaches.
+                let outcome = PushOutcome::new(
+                    format!("channel {} packet to subscriber {}", hexrep(channel_dest_hash, false), hexrep(sub_hash, false)),
+                    Some(hand_off_later()),
+                );
+                outcome.receipt_pending();
+                tie_receipt(&receipt, &outcome);
+                outcome.dispatch_done();
+                log(
+                    format!(
+                        "[FANOUT] SENT channel={} sub={} payload_bytes={}, awaiting its proof",
+                        hexrep(channel_dest_hash, false),
+                        hexrep(sub_hash, false),
+                        inner_blob.len() + channel_dest_hash.len(),
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                hook_registry.on_deliver(sub_hash, inner_blob);
+            }
+            Ok(None) => {
+                // The path exists but no interface took the packet (e.g. the
+                // subscriber's TCP session is gone but the path entry stays).
+                log(
+                    format!("[fanout] no interface for {} — requesting a path, queueing and pushing", hexrep(sub_hash, false)),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
+                stack.request_path(&dest_hash_for_request);
+                handed_off += 1;
+                on_unconfirmed(subscriber);
+            }
+            Err(e) => {
+                log(
+                    format!("[fanout] send to {} failed: {e} — queueing and pushing", hexrep(sub_hash, false)),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
+                handed_off += 1;
+                on_unconfirmed(subscriber);
             }
         }
     }
 
-    missed
+    handed_off
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+    use crate::notify::rns::fake::FakeStack;
+
+    /// A subscriber whose key rfed knows, and the hash of its rfed.delivery.
+    fn known_subscriber() -> (Identity, Vec<u8>, Vec<u8>) {
+        let identity = Identity::new(true);
+        let pubkey = identity.get_public_key().expect("pubkey");
+        let sub_hash = identity.hash.clone().expect("identity hash");
+        let delivery = Destination::hash(identity.hash.as_deref(), APP_NAME, &["delivery"]);
+        let _ = Identity::remember_destination(&delivery, &pubkey, None);
+        (identity, sub_hash, delivery)
+    }
+
+    fn recording() -> (OnUnconfirmed, mpsc::Receiver<Unconfirmed>) {
+        let (tx, rx) = mpsc::channel();
+        let tx = Mutex::new(tx);
+        let hook: OnUnconfirmed = Arc::new(move |who| {
+            let _ = tx.lock().unwrap().send(who);
+        });
+        (hook, rx)
+    }
+
+    fn fan_out(stack: &FakeStack, sub_hash: &[u8], hook: OnUnconfirmed) -> usize {
+        fanout_blob(
+            stack,
+            &[0xAB; 40],
+            &[0xC1; 16],
+            &[(sub_hash.to_vec(), None)],
+            &HookRegistry::new(),
+            None,
+            None,
+            hook,
+        )
+    }
+
+    fn the_subscriber(sub_hash: &[u8]) -> Unconfirmed {
+        Unconfirmed { queue_key: sub_hash.to_vec(), wake_key: sub_hash.to_vec() }
+    }
+
+    /// Until 2026-09-26 the packet counted as delivered once it left: a
+    /// subscriber whose app had died, its path still held, lost the message.
+    /// Now it waits for the proof, and on the RNS receipt timeout the
+    /// subscriber is queued and pushed.
+    #[test]
+    fn a_channel_packet_nobody_proves_is_queued_and_pushed() {
+        let (_, sub_hash, delivery) = known_subscriber();
+        let stack = FakeStack::new(&delivery, None);
+        let (hook, handed_off) = recording();
+
+        assert_eq!(fan_out(&stack, &sub_hash, hook), 0, "nothing handed off before the receipt concludes");
+        let mut receipt = stack.receipts.lock().unwrap()[0].clone();
+        assert!(handed_off.try_recv().is_err());
+
+        receipt.set_timeout(0.0);
+        receipt.check_timeout();
+        let who = handed_off.recv_timeout(Duration::from_secs(5)).expect("handed off on the receipt timeout");
+        assert_eq!(who, the_subscriber(&sub_hash));
+    }
+
+    #[test]
+    fn a_proved_channel_packet_is_delivered() {
+        let (identity, sub_hash, delivery) = known_subscriber();
+        let stack = FakeStack::new(&delivery, None);
+        let (hook, handed_off) = recording();
+
+        fan_out(&stack, &sub_hash, hook);
+        let mut receipt = stack.receipts.lock().unwrap()[0].clone();
+        let mut proof = receipt.hash.clone();
+        proof.extend_from_slice(&identity.sign(&receipt.hash));
+        assert!(receipt.validate_proof(&proof), "the subscriber's proof validates");
+
+        assert!(handed_off.recv_timeout(Duration::from_millis(300)).is_err(), "a proved packet is not handed off");
+    }
+
+    #[test]
+    fn an_unknown_subscriber_is_queued_and_pushed_at_once() {
+        let stranger = Identity::new(true).hash.expect("hash");
+        let stack = FakeStack::new(&[0; 16], None);
+        let (hook, handed_off) = recording();
+        assert_eq!(fan_out(&stack, &stranger, hook), 1);
+        assert_eq!(handed_off.try_recv().expect("handed off"), the_subscriber(&stranger));
+        assert!(stack.packets.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_packet_no_interface_takes_is_queued_and_pushed_and_its_path_requested() {
+        let (_, sub_hash, delivery) = known_subscriber();
+        let stack = FakeStack::new(&delivery, None).without_interface();
+        let (hook, handed_off) = recording();
+        assert_eq!(fan_out(&stack, &sub_hash, hook), 1);
+        assert_eq!(handed_off.try_recv().expect("handed off"), the_subscriber(&sub_hash));
+        assert_eq!(stack.path_requests.lock().unwrap().as_slice(), &[delivery]);
+    }
 }
