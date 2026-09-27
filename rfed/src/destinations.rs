@@ -517,9 +517,18 @@ pub(crate) enum OwnedDest {
 
 /// The order rfed announces its destinations at startup
 /// (`FedNode::announce`) and publishes them to Transport
-/// (`FedNode::publish_destinations`). Transport re-announces published
-/// destinations in publish order on every interface up-edge and refresh, so
-/// this is also rfed's reconnect order.
+/// (`FedNode::publish_destinations`).
+///
+/// The startup announce covers only interfaces already online when
+/// `FedNode::announce` runs. Everything else is Transport's announce daemon:
+/// an interface that comes up later (an initial connect that failed, any
+/// reconnect), the 6-hour refresh, and every announce when
+/// `announce_at_start` is off. That daemon goes in this order only from
+/// Reticulum-rust b45ba7b ("Announce sweeps in publish order"); 6c36547 and
+/// earlier keep the published set in a HashMap and announce in hash order,
+/// so there rfed.link comes first only in the startup announce. rfed must
+/// not be built or deployed against a Reticulum-rust older than b45ba7b:
+/// `publish_order_matches_the_startup_announce_order` fails against one.
 ///
 /// Order matters because backbones pace announces, one per 10 s per
 /// interface on staging: with ~18 destinations the last one goes out about
@@ -553,6 +562,35 @@ pub(crate) const ANNOUNCE_ORDER: [OwnedDest; 17] = [
     OwnedDest::DistroUnregister,
     OwnedDest::DistroList,
 ];
+
+/// One step of rfed's startup announce sequence; see `startup_steps`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartupStep {
+    /// `FedNode::announce`: every destination, on every interface online now.
+    Announce,
+    /// `FedNode::publish_destinations`: hand them to Transport's daemon.
+    Publish,
+}
+
+/// The steps main.rs runs at startup, in order.
+///
+/// Announce comes before publish. A destination Transport has published is
+/// due at once on an interface that is already online (registering it
+/// online is its up-edge, and nothing has announced there yet), so if
+/// publish came first, a jobs tick landing before the announce would send
+/// one destination ahead of `FedNode::announce`: against a hash-ordered
+/// Transport the lowest hash, not rfed.link, would go out first; against a
+/// publish-ordered one rfed.link would go out twice and everything after it
+/// would slip one paced slot. Announcing first records each destination as
+/// sent (or queued) on every online interface, so by the time it is
+/// published the daemon has nothing due there until its refresh.
+pub(crate) fn startup_steps(announce_at_start: bool) -> &'static [StartupStep] {
+    if announce_at_start {
+        &[StartupStep::Announce, StartupStep::Publish]
+    } else {
+        &[StartupStep::Publish]
+    }
+}
 
 /// Central state for a running Federation Node.
 ///
@@ -925,6 +963,15 @@ impl FedNode {
             OwnedDest::DistroUnregister => &mut self.distro_unregister_dest,
             OwnedDest::DistroList => &mut self.distro_list_dest,
         })
+    }
+
+    /// Run one step of the startup sequence (`startup_steps`). Returns the
+    /// hashes announced or published, in order.
+    pub(crate) fn run_startup_step(&mut self, step: StartupStep) -> Vec<Vec<u8>> {
+        match step {
+            StartupStep::Announce => self.announce(),
+            StartupStep::Publish => self.publish_destinations(),
+        }
     }
 
     /// Announce every owned destination once, immediately and synchronously,
@@ -5227,6 +5274,13 @@ mod announce_order_tests {
         }
     }
 
+    /// Serialises the tests here that publish to Transport's process-wide
+    /// published set or drive its jobs.
+    fn transport_guard() -> std::sync::MutexGuard<'static, ()> {
+        static GUARD: Mutex<()> = Mutex::new(());
+        GUARD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// A node wired as main.rs wires it: the propagation node attached to
     /// `FedNode::lxmf_propagation` before anything is published or announced.
     fn node_with_propagation(tag: &str) -> FedNode {
@@ -5275,17 +5329,22 @@ mod announce_order_tests {
 
     #[test]
     fn startup_announce_goes_link_then_distro_register_then_propagation_then_node() {
+        let _guard = transport_guard();
         let mut node = node_with_propagation("announce");
         let expected = expected_order(&node);
         assert_eq!(expected.len(), ANNOUNCE_ORDER.len());
         assert_eq!(node.announce(), expected);
     }
 
-    /// Transport re-announces published destinations in publish order on
-    /// every interface up-edge and refresh, so the publish order is rfed's
-    /// reconnect order and must match the startup order.
+    /// Transport's daemon re-announces published destinations in the order
+    /// it stores them, on every interface up-edge and refresh. From
+    /// Reticulum-rust b45ba7b that is publish order, which must match the
+    /// startup order; against a Reticulum-rust that stores them in a HashMap
+    /// (6c36547 and earlier) this test fails, and rfed's reconnect order
+    /// would be hash order.
     #[test]
     fn publish_order_matches_the_startup_announce_order() {
+        let _guard = transport_guard();
         let mut node = node_with_propagation("publish");
         let expected = expected_order(&node);
         let published = node.publish_destinations();
@@ -5293,11 +5352,105 @@ mod announce_order_tests {
         for hash in &published {
             assert!(Transport::is_published(hash), "{} not published", hexrep(hash, false));
         }
+        let stored: Vec<Vec<u8>> = Transport::published_destinations()
+            .into_iter()
+            .map(|(hash, _)| hash)
+            .filter(|hash| expected.contains(hash))
+            .collect();
+        assert_eq!(stored, expected, "Transport must keep the published set in publish order");
+    }
+
+    /// James, 2026-09-27: "When rfed restarts, the first announce should be
+    /// rfed.link." On an interface already online at startup, rfed's
+    /// announces go out once each, rfed.link first, in `ANNOUNCE_ORDER`,
+    /// even when Transport's jobs tick runs between the startup steps.
+    ///
+    /// Before `startup_steps` announced first, main.rs published first: a
+    /// jobs tick in that gap found every destination due on the interface
+    /// (registering it online is its up-edge) and sent one ahead of
+    /// `FedNode::announce`, which then sent it again.
+    #[test]
+    fn startup_sequence_sends_each_destination_once_link_first() {
+        use std::sync::mpsc;
+
+        use reticulum_rust::transport::{InterfaceStub, InterfaceStubConfig};
+
+        let _guard = transport_guard();
+        // Only this node's destinations are published while it runs, as in a
+        // real rfed process.
+        for (hash, _) in Transport::published_destinations() {
+            Transport::unpublish_destination(&hash);
+        }
+
+        let mut node = node_with_propagation("startup");
+        let expected = expected_order(&node);
+        // Registered with Transport as `enable` and the propagation node's
+        // wiring do before main.rs starts announcing; the daemon announces
+        // only registered destinations.
+        for which in ANNOUNCE_ORDER {
+            if which == OwnedDest::Propagation {
+                let prop = node.lxmf_propagation.as_ref().unwrap();
+                Transport::register_destination(prop.lock().unwrap().destination.clone());
+            } else if let Some(dest) = node.owned_dest_mut(which) {
+                Transport::register_destination(dest.clone());
+            }
+        }
+
+        let iface = format!("rfed-startup-order-{}", hexrep(&node.link_dest.hash, false));
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let tx = Mutex::new(tx);
+        Transport::register_outbound_handler(
+            &iface,
+            Arc::new(move |raw: &[u8]| tx.lock().unwrap().send(raw.to_vec()).is_ok()),
+        );
+        let mut stub = InterfaceStubConfig::default();
+        stub.name = iface.clone();
+        stub.online = Some(true);
+        stub.out = true;
+        stub.mode = InterfaceStub::MODE_FULL;
+        Transport::register_interface_stub_config(stub);
+
+        // The worst case for the gap: a jobs tick after every step.
+        for &step in startup_steps(true) {
+            node.run_startup_step(step);
+            Transport::jobs();
+        }
+        // Let the interface's own-announce pacing release everything queued,
+        // one per call, each call past the previous spacing window.
+        let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        for i in 1..=64 {
+            Transport::release_own_announces_now(start + 3600.0 * i as f64);
+        }
+        // The interface writer delivers in order, so everything handed to it
+        // has arrived once this marker has.
+        let marker = b"rfed-startup-order-marker".to_vec();
+        assert!(Transport::dispatch_outbound(&iface, &marker));
+        let mut sent: Vec<Vec<u8>> = Vec::new();
+        loop {
+            let raw = rx.recv_timeout(Duration::from_secs(5)).expect("interface writer delivers");
+            if raw == marker {
+                break;
+            }
+            // HEADER_1 announce: flags, hops, then the destination hash.
+            if raw.len() >= 18 && raw[0] & 0x03 == 0x01 {
+                let hash = raw[2..18].to_vec();
+                if expected.contains(&hash) {
+                    sent.push(hash);
+                }
+            }
+        }
+        Transport::deregister_interface_stub(&iface);
+        Transport::unregister_outbound_handler(&iface);
+
+        let hex = |hashes: &[Vec<u8>]| -> Vec<String> { hashes.iter().map(|h| hexrep(h, false)).collect() };
+        assert_eq!(sent.first(), Some(&node.link_dest.hash), "rfed.link goes out first");
+        assert_eq!(hex(&sent), hex(&expected), "each destination once, in ANNOUNCE_ORDER");
     }
 
     /// Without a propagation node the order is the same, minus its slot.
     #[test]
     fn without_propagation_the_order_skips_its_slot() {
+        let _guard = transport_guard();
         let config = config("no_prop", false);
         let mut node = FedNode::new(Identity::new(true), config).expect("node");
         let expected = expected_order(&node);

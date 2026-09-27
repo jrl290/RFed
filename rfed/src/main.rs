@@ -781,16 +781,18 @@ fn main() -> Result<(), String> {
     // Both go in `destinations::ANNOUNCE_ORDER`: rfed.link, then
     // rfed.distro.register, then lxmf.propagation (attached to the node
     // above), then rfed.node and the rest. Backbones pace announces, so the
-    // order is how long a client waits after a restart; and Transport
-    // re-announces in publish order, so it is the reconnect order too.
+    // order is how long a client waits after a restart. Transport's daemon
+    // re-announces in publish order from Reticulum-rust b45ba7b, so it is the
+    // reconnect order too; see the doc on `ANNOUNCE_ORDER`.
+    //
+    // `destinations::startup_steps` announces before it publishes, so the
+    // daemon cannot send a destination ahead of the startup announce.
     if let Ok(mut guard) = node.lock() {
-        guard.publish_destinations();
-    }
-
-    if announce_at_start {
-        if let Ok(mut guard) = node.lock() {
-            guard.announce();
+        for &step in destinations::startup_steps(announce_at_start) {
+            guard.run_startup_step(step);
         }
+    }
+    if announce_at_start {
         eprintln!("[rfed] Initial announce sent");
     }
 
