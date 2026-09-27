@@ -67,9 +67,10 @@ Layer 4 (innermost — application):
         source_hash         = the sender's lxmf.delivery DESTINATION hash
                             = truncated_hash( name_hash("lxmf.delivery") || identity_hash )
                               — NOT truncated_hash(sender_identity_pub).
-        msgpack_payload     = the LXMF payload; its fields map may carry 0xD1
-                              (FIELD_DISPLAY_NAME), the poster's Channel Display
-                              Name (see "Display name" below).
+        msgpack_payload     = the LXMF payload; its fields map may carry the
+                              Retichat field 0xD1 (FIELD_RETICHAT, a map) whose
+                              key 0 is the poster's Channel Display Name (see
+                              "Display name" below).
 
 Layer 3 (LXMF EC envelope, addressed to the CHANNEL identity):
     inner_blob = EC_encrypt( channel_identity.X25519_pub , plaintext )
@@ -132,17 +133,18 @@ Layer 1' (Reticulum transport — fanout hop, one per subscriber):
    channel name, so anyone who knows the name reaches step 3, and without
    step 5 a post claiming a contact's `source_hash` would overwrite that
    contact's stored key. Step 5 is what prevents that.
-9. Only if steps 5 and 8 passed, read `0xD1` from the fields (below).
+9. Only if steps 5 and 8 passed, read key 0 of `0xD1` from the fields (below).
 
 `lxmf_rust::channel::unpack` implements steps 2–9 (and `pack` the
 sender side) for both Retichat bridges.
 
-### Display name (field 0xD1)
+### Display name (key 0 of field 0xD1)
 
-The LXMF message may carry `0xD1` (`FIELD_DISPLAY_NAME`): the poster's
-Channel Display Name as msgpack bin (receivers accept bin or str), or a
-zero-length value meaning "no name now". No `0xD1` means the post
-carries no name. Receivers use it only after the key binding and the
+The LXMF message may carry the Retichat field `0xD1` (`FIELD_RETICHAT`),
+a msgpack map. Its key 0 is the poster's Channel Display Name as msgpack
+bin (receivers accept bin or str), or a zero-length value meaning "no
+name now": `{0xD1: {0: <name or empty>}}`. A `0xD1` that is not a map is
+ignored whole. No key 0 means the post carries no name. Receivers use it only after the key binding and the
 signature pass, and store it per `(channel, sender)`. The contract,
 including when a client includes it, is LXMF-rust/DISPLAY_NAMES.md
 (§2.3, §4.2, §5.2). RFed never sees it.
@@ -490,8 +492,9 @@ and answering, and no deployed client has to move.
   `identity_pub` → `SIGNATURE_INVALID`); the key binding protects the
   known-destinations cache, which the channel key alone does not,
   since anyone who knows the channel name holds it. The LXMF fields
-  may carry `0xD1`, the poster's Channel Display Name, used only once
-  both checks pass (see "Display name (field 0xD1)" above).
+  may carry key 0 of the Retichat field `0xD1`, the poster's Channel
+  Display Name, used only once both checks pass (see "Display name
+  (key 0 of field 0xD1)" above).
   RFed never sees the prelude (it's inside the EC envelope). See the
   **CANONICAL WIRE FORMAT** section at the top of this file for the
   full layered diagram and decode procedure — that section is
@@ -1524,7 +1527,8 @@ and marks the address as a distro:
 ```
 [ announce_name,  // bin, or nil: the user's Announce Display Name, empty by
                   // default (LXMF-rust/DISPLAY_NAMES.md §2.2); other names
-                  // travel inside encrypted messages in field 0xD1
+                  // travel inside encrypted messages, in key 0 of
+                  // the Retichat field 0xD1
   nil,            // stamp_cost: none
   [ 0xD0 ] ]      // supported_functionality: SF_RFED_DISTRO
 ```
