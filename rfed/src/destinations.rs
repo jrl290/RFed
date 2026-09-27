@@ -688,6 +688,24 @@ impl FedNode {
         let notify_registry = Arc::new(Mutex::new(NotifyRegistry::load(
             config.notify_registry_file(),
         )));
+        // Channel registrations stored before 2026-09-26 are keyed by the
+        // subscriber's identity hash; move them to the key their push token
+        // is under (NotifyRegistry::rekey_identity_channel_rows).
+        {
+            let subscriptions = subscription_table.lock().map_err(|_| "subscription table lock poisoned")?;
+            let moved = notify_registry
+                .lock()
+                .map_err(|_| "notify registry lock poisoned")?
+                .rekey_identity_channel_rows(|hash| subscriptions.has_subscriber(hash));
+            if moved > 0 {
+                log(
+                    format!("[store] re-keyed {moved} channel notify registration(s) to the lxmf.delivery hash"),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+            }
+        }
         let deferred_queue = Arc::new(Mutex::new(DeferredQueue::load(
             config.deferred_queue_file(),
         )));

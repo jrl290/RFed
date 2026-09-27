@@ -228,6 +228,12 @@ impl SubscriptionTable {
     }
 
     /// Whether a subscriber currently has a registration for a channel.
+    /// Whether `subscriber_hash` holds any subscription here. Subscriptions
+    /// are keyed by identity hash, so a hash found here is one.
+    pub fn has_subscriber(&self, subscriber_hash: &[u8]) -> bool {
+        self.entries.iter().any(|e| e.subscriber_hash.as_slice() == subscriber_hash)
+    }
+
     pub fn is_subscribed(&self, subscriber_hash: &[u8], channel_hash: &[u8]) -> bool {
         self.entries.iter().any(|e| {
             e.subscriber_hash.as_slice() == subscriber_hash

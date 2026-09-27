@@ -250,10 +250,9 @@ mod tests {
         drop(registry);
         let registry = NotifyRegistry::load(legacy);
         assert_eq!(registry.count(), 3, "stored, and not imported twice");
-        // An imported channel row was stored under the identity hash; the
-        // one-time re-key moved it to the delivery hash.
-        assert!(registry.get_for_channel(&[2; 16], Some(&[9; 16])).is_empty());
-        assert_eq!(registry.get_for_channel(&crate::notify::notify_key(&[2; 16]), Some(&[9; 16])).len(), 1);
+        // Imported as stored; moving identity-keyed channel rows is
+        // NotifyRegistry::rekey_identity_channel_rows, run by FedNode::new.
+        assert_eq!(registry.get_for_channel(&[2; 16], Some(&[9; 16])).len(), 1);
         fs::remove_dir_all(dir).ok();
     }
 
