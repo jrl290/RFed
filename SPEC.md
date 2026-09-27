@@ -543,7 +543,7 @@ Sent as a msgpack Map:
 
 ```
 {
-  "receiver": bin(16),    // subscriber destination hash (always present)
+  "receiver": bin(16),    // subscriber's lxmf.delivery hash (always present)
   "sender":   bin(16),    // optional — present when known (e.g. LXMF)
   "channel":  bin(16),    // optional — present for rfed.channel fanout
 }
@@ -841,7 +841,7 @@ Each registration is stored as:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `subscriber_hash` | `bin(16)` | Subscriber's RNS identity hash (derived from caller's public key) |
+| `subscriber_hash` | `bin(16)` | Subscriber's `lxmf.delivery` destination hash, derived from the identity hash of the key that signed the registration, for LXMF and channel registrations alike. It is the key the device registers its push token under with the bridge. (Until 2026-09-26 channel registrations used the identity hash, which no bridge had a token for; stored rows are re-keyed once on load.) |
 | `relay_hash` | `string(32)` | Hex-encoded relay destination hash |
 | `registered` | `f64` | Unix timestamp of registration (for expiry/refresh) |
 
@@ -874,7 +874,7 @@ values.  It contains only destination hashes — never message content.
 
 | Key | Type | Present | Description |
 |-----|------|---------|-------------|
-| `"receiver"` | `bin(16)` | **Always** | Subscriber's RNS destination hash |
+| `"receiver"` | `bin(16)` | **Always** | Subscriber's `lxmf.delivery` destination hash: the key its registration and its push token are stored under, for LXMF, channel and distro wakes alike |
 | `"sender"` | `bin(16)` | Optional | Sender's RNS destination hash (LXMF path only) |
 | `"channel"` | `bin(16)` | Optional | Channel hash (rfed.channel fanout path only) |
 
@@ -889,7 +889,7 @@ When a blob arrives on `rfed.channel.publish` for a subscribed channel:
 
 ```
 msgpack Map {
-  "receiver" → bin(16)   ← subscriber destination hash
+  "receiver" → bin(16)   ← subscriber's lxmf.delivery hash
   "channel"  → bin(16)   ← channel hash the blob was published to
 }
 ```

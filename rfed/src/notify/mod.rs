@@ -57,6 +57,22 @@ fn now() -> f64 {
         .unwrap_or(0.0)
 }
 
+// ── Registration key ──────────────────────────────────────────────────────────
+
+/// The key every notify registration is stored under and every wake carries
+/// as `receiver`: the subscriber's `lxmf.delivery` destination hash, derived
+/// from the identity hash that signed the registration. The apps register
+/// their push token with the bridges under this same hash (iOS
+/// `ApnsTokenRegistrar`, Android `FcmTokenRegistrar`), so a wake finds it.
+///
+/// Until 2026-09-26 channel registrations and channel wakes used the raw
+/// identity hash while LXMF and distro used this one: every channel wake
+/// reached the bridge under a hash no token was registered for, and was
+/// dropped there ("no APNs token registered"), since 1edc791 (2026-04-20).
+pub fn notify_key(identity_hash: &[u8]) -> Vec<u8> {
+    reticulum_rust::destination::Destination::hash(Some(identity_hash), "lxmf", &["delivery"])
+}
+
 // ── Relay hash validation ─────────────────────────────────────────────────────
 
 /// Validate a push relay destination hash at registration time.
@@ -123,6 +139,39 @@ const NOTIFY_SCHEMA: &str = "
         UNIQUE (subscriber_hash, channel_hash, relay_hash)
     );";
 
+/// Channel registrations stored before 2026-09-26 are keyed by the identity
+/// hash; re-key them to [`notify_key`] once (PRAGMA user_version 0 -> 1), in
+/// one transaction. LXMF rows already use the delivery hash and are left
+/// alone. A row the new key already holds keeps the later timestamp.
+fn rekey_channel_rows(conn: &rusqlite::Connection) -> rusqlite::Result<usize> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version >= 1 {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let rows: Vec<(i64, Vec<u8>, Vec<u8>, String, f64)> = {
+        let mut stmt = tx.prepare(
+            "SELECT rowid, subscriber_hash, channel_hash, relay_hash, registered
+             FROM notify_registrations WHERE channel_hash != X''",
+        )?;
+        let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)))?;
+        mapped.collect::<rusqlite::Result<_>>()?
+    };
+    for (rowid, subscriber, channel, relay, registered) in &rows {
+        tx.execute(
+            "INSERT INTO notify_registrations (subscriber_hash, channel_hash, relay_hash, registered)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (subscriber_hash, channel_hash, relay_hash)
+             DO UPDATE SET registered = max(registered, excluded.registered)",
+            rusqlite::params![notify_key(subscriber), channel, relay, registered],
+        )?;
+        tx.execute("DELETE FROM notify_registrations WHERE rowid = ?1", [rowid])?;
+    }
+    tx.execute_batch("PRAGMA user_version = 1")?;
+    tx.commit()?;
+    Ok(rows.len())
+}
+
 fn channel_key(channel_hash: Option<&[u8]>) -> &[u8] {
     channel_hash.unwrap_or(&[])
 }
@@ -150,12 +199,38 @@ impl NotifyRegistry {
                     }
                     Ok(n)
                 });
+                match rekey_channel_rows(conn) {
+                    Ok(0) => {}
+                    Ok(n) => log(
+                        format!("[store] re-keyed {n} channel notify registration(s) to the lxmf.delivery hash"),
+                        LOG_NOTICE,
+                        false,
+                        false,
+                    ),
+                    Err(e) => log(
+                        format!("[store] channel notify registrations could not be re-keyed: {e}"),
+                        reticulum_rust::LOG_ERROR,
+                        false,
+                        false,
+                    ),
+                }
                 Self::read_all(conn).unwrap_or_else(|e| {
                     log(format!("[store] notify registrations could not be read: {e}"), reticulum_rust::LOG_ERROR, false, false);
                     Vec::new()
                 })
             }
-            None => crate::store_db::read_legacy(&file_path).unwrap_or_default(),
+            // No database: the old file is read as-is, and its channel
+            // rows were stored under the identity hash.
+            None => crate::store_db::read_legacy::<Vec<NotifyRegistration>>(&file_path)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|mut r| {
+                    if r.channel_hash.is_some() {
+                        r.subscriber_hash = notify_key(&r.subscriber_hash);
+                    }
+                    r
+                })
+                .collect(),
         };
         NotifyRegistry { registrations, db }
     }
@@ -332,4 +407,65 @@ pub fn dispatch_notify_via(
         false,
     );
     rns::dispatch(stack, reg, sender, channel)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rfed_notify_{label}_{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_notify_key_is_the_lxmf_delivery_hash() {
+        let identity = reticulum_rust::identity::Identity::new(true);
+        let hash = identity.hash.clone().unwrap();
+        let delivery = reticulum_rust::destination::Destination::hash(Some(&hash), "lxmf", &["delivery"]);
+        assert_eq!(notify_key(&hash), delivery);
+    }
+
+    /// A database from before 2026-09-26 holds channel rows under the
+    /// identity hash. The first load re-keys them to the delivery hash, once;
+    /// LXMF rows and rows stored the new way are left alone.
+    #[test]
+    fn channel_rows_stored_under_the_identity_hash_are_rekeyed_once() {
+        let dir = temp_dir("rekey");
+        let legacy = dir.join("notify_registrations.rmp");
+        let identity_hash = vec![7u8; 16];
+        let channel = vec![9u8; 16];
+        let relay = "a".repeat(32);
+        {
+            let conn = crate::store_db::open(&legacy, NOTIFY_SCHEMA).unwrap();
+            let old = |sub: Vec<u8>, ch: Option<Vec<u8>>, t: f64| NotifyRegistration {
+                subscriber_hash: sub, channel_hash: ch, relay_hash: relay.clone(), registered: t,
+            };
+            put_registration(&conn, &old(identity_hash.clone(), Some(channel.clone()), 1.0)).unwrap();
+            put_registration(&conn, &old(notify_key(&identity_hash), None, 2.0)).unwrap();
+            // user_version stays 0: a database written before the re-key.
+        }
+
+        let mut registry = NotifyRegistry::load(legacy.clone());
+        assert_eq!(registry.count(), 2);
+        assert!(registry.get_for_channel(&identity_hash, Some(&channel)).is_empty());
+        assert_eq!(registry.get_for_channel(&notify_key(&identity_hash), Some(&channel)).len(), 1);
+        assert_eq!(registry.get_for_channel(&notify_key(&identity_hash), None).len(), 1, "LXMF row untouched");
+
+        // Stored the new way after the re-key: a later load does not move it.
+        let other = notify_key(&[8u8; 16]);
+        registry.register(other.clone(), Some(channel.clone()), relay.clone());
+        drop(registry);
+        let mut registry = NotifyRegistry::load(legacy.clone());
+        assert_eq!(registry.count(), 3);
+        assert_eq!(registry.get_for_channel(&other, Some(&channel)).len(), 1, "not re-keyed twice");
+
+        // A channel unregister (under the new key) reaches the re-keyed row.
+        registry.unregister(&notify_key(&identity_hash), Some(&channel), &relay);
+        drop(registry);
+        assert_eq!(NotifyRegistry::load(legacy).count(), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

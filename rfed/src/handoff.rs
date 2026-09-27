@@ -85,12 +85,12 @@ pub fn await_packet_proof(
 /// keys its hand-off needs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unconfirmed {
-    /// The deferred-queue bucket the pull drains: a distro device's identity
-    /// hash, a channel subscriber's hash.
+    /// The deferred-queue bucket the pull drains: the identity hash of a
+    /// distro device or a channel subscriber.
     pub queue_key: Vec<u8>,
-    /// The key its notify registrations are stored under: a distro device's
-    /// `lxmf.delivery` hash (destinations.rs `notify/register stored lxmf`),
-    /// a channel subscriber's hash.
+    /// The key its notify registrations are stored under: its
+    /// `lxmf.delivery` hash (crate::notify::notify_key), for distro devices
+    /// and channel subscribers alike.
     pub wake_key: Vec<u8>,
 }
 

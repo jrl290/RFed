@@ -214,9 +214,13 @@ pub fn fanout_blob(
             );
         }
 
-        // A channel subscriber is queued and pushed under its subscriber
-        // hash (the identity hash subscribe_cb stored).
-        let subscriber = Unconfirmed { queue_key: sub_hash.clone(), wake_key: sub_hash.clone() };
+        // A channel subscriber is queued under its subscriber hash (the
+        // identity hash subscribe_cb stored, which the pull drains by) and
+        // woken under its lxmf.delivery hash, the key its notify
+        // registration and push token are under (crate::notify::notify_key).
+        // Until 2026-09-26 it was woken under the identity hash, which no
+        // bridge had a token for.
+        let subscriber = Unconfirmed { queue_key: sub_hash.clone(), wake_key: crate::notify::notify_key(sub_hash) };
         let hand_off_later = || -> Arc<dyn Fn() + Send + Sync> {
             let hook = Arc::clone(&on_unconfirmed);
             let subscriber = subscriber.clone();
@@ -456,8 +460,10 @@ mod tests {
         fan_out_with(stack, sub_hash, hook, PacketProof::Required)
     }
 
+    /// Queued under its identity hash, woken under its lxmf.delivery hash
+    /// (crate::notify::notify_key), where its push token is.
     fn the_subscriber(sub_hash: &[u8]) -> Unconfirmed {
-        Unconfirmed { queue_key: sub_hash.to_vec(), wake_key: sub_hash.to_vec() }
+        Unconfirmed { queue_key: sub_hash.to_vec(), wake_key: crate::notify::notify_key(sub_hash) }
     }
 
     /// With the proof required: until 2026-09-26 the packet counted as

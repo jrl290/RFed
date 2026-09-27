@@ -304,6 +304,33 @@ fn parse_notify_command(
     })
 }
 
+/// Apply a verified notify command to the registry and return the key it
+/// used. Every registration, LXMF (no channel) or channel, is stored under
+/// the subscriber's lxmf.delivery hash (crate::notify::notify_key), the key
+/// the device's push token is registered under; clear removes all of them.
+/// `subscriber_hash` is the identity hash of the key that signed the command.
+fn store_notify_command(
+    notify: &mut NotifyRegistry,
+    command: &NotifyCommand,
+    subscriber_hash: &[u8],
+) -> Vec<u8> {
+    let key = crate::notify::notify_key(subscriber_hash);
+    match command.kind {
+        NotifyCommandKind::Register => {
+            if let Some(relay) = &command.relay_hash {
+                notify.register(key.clone(), command.channel_hash.clone(), relay.clone());
+            }
+        }
+        NotifyCommandKind::Unregister => {
+            if let Some(relay) = &command.relay_hash {
+                notify.unregister(&key, command.channel_hash.as_deref(), relay);
+            }
+        }
+        NotifyCommandKind::Clear => notify.clear(&key),
+    }
+    key
+}
+
 fn handle_notify_command(
     node: &Arc<Mutex<FedNode>>,
     command: NotifyCommand,
@@ -314,6 +341,7 @@ fn handle_notify_command(
         NotifyCommandKind::Register => {
             let relay_hash = command
                 .relay_hash
+                .clone()
                 .ok_or("notify/register: empty relay hash")?;
 
             validate_relay_hash(&relay_hash)
@@ -344,54 +372,34 @@ fn handle_notify_command(
                     ));
                 }
                 if let Ok(mut notify) = guard.notify_registry.lock() {
-                    if let Some(ref ch) = command.channel_hash {
-                        notify.register(subscriber_hash.clone(), Some(ch.clone()), relay_hash.clone());
-                        log(
-                            format!(
-                                "[rfed] notify/register stored channel subscriber={} channel={} relay={}",
-                                reticulum_rust::hexrep(&subscriber_hash, false),
-                                reticulum_rust::hexrep(ch, false),
-                                relay_hash,
-                            ),
-                            LOG_NOTICE,
-                            false,
-                            false,
-                        );
-                    } else {
-                        let lxmf_delivery_hash = Destination::hash(
-                            Some(&subscriber_hash), "lxmf", &["delivery"],
-                        );
-                        notify.register(lxmf_delivery_hash.clone(), None, relay_hash.clone());
-                        log(
-                            format!(
-                                "[rfed] notify/register stored lxmf subscriber={} delivery={} relay={}",
-                                reticulum_rust::hexrep(&subscriber_hash, false),
-                                reticulum_rust::hexrep(&lxmf_delivery_hash, false),
-                                relay_hash,
-                            ),
-                            LOG_NOTICE,
-                            false,
-                            false,
-                        );
-                    }
+                    let key = store_notify_command(&mut notify, &command, &subscriber_hash);
+                    let kind = match command.channel_hash {
+                        Some(ref ch) => format!("channel={}", reticulum_rust::hexrep(ch, false)),
+                        None => "lxmf".to_string(),
+                    };
+                    log(
+                        format!(
+                            "[rfed] notify/register stored {kind} subscriber={} delivery={} relay={}",
+                            reticulum_rust::hexrep(&subscriber_hash, false),
+                            reticulum_rust::hexrep(&key, false),
+                            relay_hash,
+                        ),
+                        LOG_NOTICE,
+                        false,
+                        false,
+                    );
                 }
             }
             Ok(())
         }
         NotifyCommandKind::Unregister => {
-            let relay_hash = command
+            command
                 .relay_hash
+                .as_ref()
                 .ok_or("notify/unregister: empty relay hash")?;
             if let Ok(guard) = node.lock() {
                 if let Ok(mut notify) = guard.notify_registry.lock() {
-                    if let Some(ref ch) = command.channel_hash {
-                        notify.unregister(&subscriber_hash, Some(ch.as_slice()), &relay_hash);
-                    } else {
-                        let lxmf_delivery_hash = Destination::hash(
-                            Some(&subscriber_hash), "lxmf", &["delivery"],
-                        );
-                        notify.unregister(&lxmf_delivery_hash, None, &relay_hash);
-                    }
+                    store_notify_command(&mut notify, &command, &subscriber_hash);
                 }
             }
             Ok(())
@@ -399,7 +407,7 @@ fn handle_notify_command(
         NotifyCommandKind::Clear => {
             if let Ok(guard) = node.lock() {
                 if let Ok(mut notify) = guard.notify_registry.lock() {
-                    notify.clear(&subscriber_hash);
+                    store_notify_command(&mut notify, &command, &subscriber_hash);
                 }
             }
             Ok(())
@@ -1794,7 +1802,7 @@ fn backup_delivery_tick(
                 if let Ok(notify) = notify_registry.lock() {
                     wakes.extend(
                         notify
-                            .get_for_channel(sub_hash.as_slice(), Some(ch_hash.as_slice()))
+                            .get_for_channel(&crate::notify::notify_key(sub_hash), Some(ch_hash.as_slice()))
                             .into_iter()
                             .map(|reg| (reg.clone(), ch_hash.clone())),
                     );
@@ -1864,7 +1872,9 @@ mod backup_chain_tests {
         blobs.lock().unwrap().store(&channel, b"inner blob").expect("store blob");
         let deferred = Arc::new(Mutex::new(DeferredQueue::load(dir.join("deferred.rmp"))));
         let notify = Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp"))));
-        notify.lock().unwrap().register(subscriber.clone(), Some(channel.clone()), relay.clone());
+        // Stored as handle_notify_command stores it: under the delivery hash.
+        let key = crate::notify::notify_key(&subscriber);
+        notify.lock().unwrap().register(key.clone(), Some(channel.clone()), relay.clone());
         let distro = Arc::new(Mutex::new(DistroTable::load(dir.join("distro.rmp"))));
         // No peer heard: the owner counts as offline.
         let sync = Arc::new(Mutex::new(FedSync::new(Arc::clone(&blobs), Arc::clone(&subscriptions), distro)));
@@ -1883,7 +1893,7 @@ mod backup_chain_tests {
         assert!(deferred.lock().unwrap().has_pending(&subscriber), "the blob waits for the subscriber");
         assert_eq!(wakes.len(), 1, "one registration, one wake");
         let (registration, wake_channel) = &wakes[0];
-        assert_eq!(registration.subscriber_hash, subscriber);
+        assert_eq!(registration.subscriber_hash, key, "woken under the delivery hash");
         assert_eq!(registration.relay_hash, relay);
         assert_eq!(wake_channel, &channel);
 
@@ -2193,9 +2203,11 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                             &pb.blob,
                             Some(&pb.channel_hash),
                         );
+                        // Queued under the identity hash the pull drains by;
+                        // woken under the key its registration is stored under.
                         let subscriber = crate::handoff::Unconfirmed {
                             queue_key: sub_id_hash.clone(),
-                            wake_key: sub_id_hash.clone(),
+                            wake_key: crate::notify::notify_key(&sub_id_hash),
                         };
                         crate::handoff::await_packet_proof(
                             &receipt,
@@ -3027,15 +3039,13 @@ fn wire_notify_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         }
     });
 
-    // NOTIFY_REGISTER — client sends a 32-char hex relay destination hash.
-    // Multiple calls with different hashes register additional relays for the
-    // same subscriber; duplicate hashes refresh the timestamp only.
-    //
-    // Two entries are inserted per registration:
-    //   1. subscriber_identity_hash → relay_hash  (for channel notify)
-    //   2. lxmf.delivery_dest_hash  → relay_hash  (for LXMF propagation notify)
-    // This dual-hash approach ensures the propagation handler (which only knows
-    // the lxmf.delivery dest hash from message headers) can look up the relay.
+    // NOTIFY_REGISTER — a signed [op, relay_hex, channel_hash|nil]. Multiple
+    // calls with different relays register additional relays for the same
+    // subscriber; duplicates refresh the timestamp only. Every registration,
+    // LXMF (channel nil) or channel, is stored under the subscriber's
+    // lxmf.delivery hash (crate::notify::notify_key): the key the propagation
+    // handler knows from message headers, and the key the device's push
+    // token is registered under.
     let reg_node = Arc::clone(node);
     let register_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                       _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
@@ -4988,5 +4998,79 @@ mod wire_format_tests {
             arr[1].as_i64().is_none(),
             "stamp_cost=0 MUST NOT encode as integer 0 in subscribe response"
         );
+    }
+}
+
+#[cfg(test)]
+mod notify_key_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A notify command as both apps sign it: [bin(value), bin(pubkey),
+    /// bin(sig)], value = [op, relay_hex, channel_hash | nil] (iOS
+    /// RfedNotifyRegistrar.buildSignedPayload, Android RfedNotifyRegistrar).
+    fn signed(identity: &Identity, op: &str, relay: &str, channel: Option<&[u8]>) -> Vec<u8> {
+        let value = rmpv::Value::Array(vec![
+            rmpv::Value::String(op.into()),
+            rmpv::Value::String(relay.into()),
+            channel.map(|c| rmpv::Value::Binary(c.to_vec())).unwrap_or(rmpv::Value::Nil),
+        ]);
+        let mut value_bytes = Vec::new();
+        rmpv::encode::write_value(&mut value_bytes, &value).unwrap();
+        let sig = identity.sign(&value_bytes);
+        let outer = rmpv::Value::Array(vec![
+            rmpv::Value::Binary(value_bytes),
+            rmpv::Value::Binary(identity.get_public_key().unwrap()),
+            rmpv::Value::Binary(sig),
+        ]);
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &outer).unwrap();
+        out
+    }
+
+    /// The path a DATA packet on rfed.notify.* takes: verify, parse, store.
+    fn apply(notify: &mut NotifyRegistry, data: &[u8], kind: NotifyCommandKind) -> Vec<u8> {
+        let (value, subscriber, _pubkey) = verify_signed_payload(data).expect("signature verifies");
+        let command = parse_notify_command(&value, Some(kind)).expect("command parses");
+        store_notify_command(notify, &command, &subscriber)
+    }
+
+    /// The bug of 1edc791..2026-09-26: a channel registration was stored
+    /// under the identity hash, the LXMF one under the lxmf.delivery hash the
+    /// apps register their push token under, so no channel wake found a token.
+    #[test]
+    fn channel_and_lxmf_registrations_are_stored_under_the_push_token_key() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rfed_notify_key_{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut notify = NotifyRegistry::load(dir.join("notify_registrations.rmp"));
+
+        let identity = Identity::new(true);
+        let identity_hash = identity.hash.clone().unwrap();
+        // What iOS ApnsTokenRegistrar and Android FcmTokenRegistrar send as
+        // subscriber_hash: the device's lxmf.delivery destination hash.
+        let token_key = Destination::hash(Some(&identity_hash), "lxmf", &["delivery"]);
+        let relay = "7fd918372492bf099fc7f74ccf6739ac";
+        let channel = [0xC1u8; 16];
+
+        let lxmf = apply(&mut notify, &signed(&identity, "register", relay, None), NotifyCommandKind::Register);
+        let chan = apply(&mut notify, &signed(&identity, "register", relay, Some(&channel)), NotifyCommandKind::Register);
+        assert_eq!(lxmf, token_key);
+        assert_eq!(chan, token_key, "a channel registration uses the push token's key");
+        assert_eq!(notify.get_for_channel(&token_key, None).len(), 1);
+        assert_eq!(notify.get_for_channel(&token_key, Some(&channel)).len(), 1);
+        assert!(notify.get_for_channel(&identity_hash, Some(&channel)).is_empty(), "nothing under the identity hash");
+
+        // The channel's unregister removes the channel row only.
+        apply(&mut notify, &signed(&identity, "unregister", relay, Some(&channel)), NotifyCommandKind::Unregister);
+        assert!(notify.get_for_channel(&token_key, Some(&channel)).is_empty());
+        assert_eq!(notify.get_for_channel(&token_key, None).len(), 1, "the LXMF row stays");
+
+        // Clear removes every registration of the subscriber.
+        apply(&mut notify, &signed(&identity, "register", relay, Some(&channel)), NotifyCommandKind::Register);
+        apply(&mut notify, &signed(&identity, "clear", "", None), NotifyCommandKind::Clear);
+        assert_eq!(notify.count(), 0);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
