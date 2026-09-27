@@ -662,13 +662,16 @@ impl LxmfPropagationNode {
         buf
     }
 
-    pub fn announce(arc: &Arc<Mutex<Self>>) {
-        if let Ok(mut guard) = arc.lock() {
-            let app_data = guard.build_app_data();
-            guard.destination.set_default_app_data(Some(app_data.clone()));
-            let _ = guard.destination.announce(Some(&app_data), false, None, None, true);
-            log("[lxmf.prop] announced propagation node", LOG_NOTICE, false, false);
-        }
+    /// Announce the propagation destination once. Returns its hash, or
+    /// `None` when the lock is poisoned and nothing was sent. Called from
+    /// `FedNode::announce`, in `ANNOUNCE_ORDER`.
+    pub fn announce(arc: &Arc<Mutex<Self>>) -> Option<Vec<u8>> {
+        let mut guard = arc.lock().ok()?;
+        let app_data = guard.build_app_data();
+        guard.destination.set_default_app_data(Some(app_data.clone()));
+        let _ = guard.destination.announce(Some(&app_data), false, None, None, true);
+        log("[lxmf.prop] announced propagation node", LOG_NOTICE, false, false);
+        Some(guard.destination.hash.clone())
     }
 
     /// Opt the propagation destination into Transport's announce daemon
@@ -677,29 +680,29 @@ impl LxmfPropagationNode {
     ///
     /// Transport announces it once on each interface up-edge and on the
     /// refresh, both held per interface to the refresh period
-    /// (Reticulum-rust B22); the one immediate announce fired here covers
-    /// interfaces that are already up. `announce` with `send=true` routes through
-    /// `Transport::outbound`, which skips offline interfaces, so this is
-    /// safe regardless of current link state. This is a single untargeted
-    /// announce (it starts the period on every interface it goes out on),
-    /// not a periodic timer.
-    pub fn publish_destination(arc: &Arc<Mutex<Self>>) {
+    /// (Reticulum-rust B22). Interfaces already up are covered by the
+    /// immediate announce in `FedNode::announce`, not here.
+    ///
+    /// Returns the published hash, or `None` when the lock is poisoned.
+    /// Called from `FedNode::publish_destinations`, in `ANNOUNCE_ORDER`.
+    pub fn publish_destination(arc: &Arc<Mutex<Self>>) -> Option<Vec<u8>> {
         use reticulum_rust::transport::Transport;
-        // No immediate announce here: main.rs announces at start when
-        // announce_at_start is set, and otherwise Transport's daemon announces
-        // a never-announced published destination on its next sweep. The
-        // copy that used to fire here was a second announce of the same
-        // destination within a second (2026-09-23 logs).
-        if let Ok(guard) = arc.lock() {
-            let app_data = guard.build_app_data();
-            Transport::publish_destination(
-                guard.destination.hash.clone(),
-                Some(Duration::from_secs(
-                    crate::destinations::SERVICE_REFRESH_INTERVAL_SECS,
-                )),
-                Some(app_data),
-            );
-        }
+        // No immediate announce here: FedNode::announce announces at start
+        // when announce_at_start is set, and otherwise Transport's daemon
+        // announces a never-announced published destination on its next
+        // sweep. The copy that used to fire here was a second announce of the
+        // same destination within a second (2026-09-23 logs).
+        let guard = arc.lock().ok()?;
+        let app_data = guard.build_app_data();
+        let hash = guard.destination.hash.clone();
+        Transport::publish_destination(
+            hash.clone(),
+            Some(Duration::from_secs(
+                crate::destinations::SERVICE_REFRESH_INTERVAL_SECS,
+            )),
+            Some(app_data),
+        );
+        Some(hash)
     }
 
     // ── Announce handler (discover peers) ─────────────────────────────────────

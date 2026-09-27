@@ -492,10 +492,73 @@ const ERROR_INVALID_DATA: u8 = 0xF4;
 
 // ── FedNode ──────────────────────────────────────────────────────────────────
 
+/// One destination rfed announces and publishes. See `ANNOUNCE_ORDER`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnedDest {
+    Link,
+    DistroRegister,
+    /// The `lxmf.propagation` node's destination, when one is attached.
+    Propagation,
+    Node,
+    Channel,
+    Delivery,
+    Notify,
+    ChannelSubscribe,
+    ChannelUnsubscribe,
+    ChannelPublish,
+    ChannelPull,
+    ChannelStream,
+    PropagationStream,
+    NotifyRegister,
+    NotifyUnregister,
+    DistroUnregister,
+    DistroList,
+}
+
+/// The order rfed announces its destinations at startup
+/// (`FedNode::announce`) and publishes them to Transport
+/// (`FedNode::publish_destinations`). Transport re-announces published
+/// destinations in publish order on every interface up-edge and refresh, so
+/// this is also rfed's reconnect order.
+///
+/// Order matters because backbones pace announces, one per 10 s per
+/// interface on staging: with ~18 destinations the last one goes out about
+/// three minutes after a restart (2026-09-27, when rfed.link was 16th and
+/// lxmf.propagation last). So the destinations clients actually connect
+/// through go first:
+///   1. rfed.link — the single bidirectional endpoint (RFed-spec/Link.md):
+///      every operation is reachable over it.
+///   2. rfed.distro.register — the bootstrap route for all Distro clients
+///      (it was first until 2026-09-27).
+///   3. lxmf.propagation — LXMF clients' propagation node.
+///   4. rfed.node — peer federation and discovery.
+///   5. The remaining service destinations.
+/// `FedNode::announce` then replays the stored distro announces.
+pub(crate) const ANNOUNCE_ORDER: [OwnedDest; 17] = [
+    OwnedDest::Link,
+    OwnedDest::DistroRegister,
+    OwnedDest::Propagation,
+    OwnedDest::Node,
+    OwnedDest::Channel,
+    OwnedDest::Delivery,
+    OwnedDest::Notify,
+    OwnedDest::ChannelSubscribe,
+    OwnedDest::ChannelUnsubscribe,
+    OwnedDest::ChannelPublish,
+    OwnedDest::ChannelPull,
+    OwnedDest::ChannelStream,
+    OwnedDest::PropagationStream,
+    OwnedDest::NotifyRegister,
+    OwnedDest::NotifyUnregister,
+    OwnedDest::DistroUnregister,
+    OwnedDest::DistroList,
+];
+
 /// Central state for a running Federation Node.
 ///
-/// Owns all four RNS inbound destinations, the blob store, subscription table,
-/// deferred delivery queue, notify registry, and inter-node sync engine.
+/// Owns rfed's RNS inbound destinations (see `ANNOUNCE_ORDER`), the blob
+/// store, subscription table, deferred delivery queue, notify registry, and
+/// inter-node sync engine.
 /// Wrapped in `Arc<Mutex<FedNode>>` and shared across all callback closures
 /// via a `Weak` self-reference to avoid reference cycles.
 pub struct FedNode {
@@ -831,60 +894,87 @@ impl FedNode {
         })
     }
 
-    /// Broadcast the rfed.node announce + the three service announces
-    /// (channel, delivery, notify) immediately and synchronously.
+    /// The node app_data (display name + channel stamp policy) carried by
+    /// rfed.node, rfed.link and the channel SEND destinations.
+    fn node_app_data(&self) -> Vec<u8> {
+        // Treat stamp_cost=0 as disabled (same as None) to avoid accidental
+        // stamp-tail stripping when operators mean "no PoW required".
+        let announce_stamp_cost = self.config.default_policy.stamp_cost.filter(|c| *c > 0);
+        announce::encode_node_announce(&self.config.display_name, announce_stamp_cost)
+    }
+
+    /// The owned destination behind `which`; `None` for the propagation
+    /// node, which lives in its own `LxmfPropagationNode`.
+    fn owned_dest_mut(&mut self, which: OwnedDest) -> Option<&mut Destination> {
+        Some(match which {
+            OwnedDest::Link => &mut self.link_dest,
+            OwnedDest::DistroRegister => &mut self.distro_register_dest,
+            OwnedDest::Propagation => return None,
+            OwnedDest::Node => &mut self.node_dest,
+            OwnedDest::Channel => &mut self.channel_dest,
+            OwnedDest::Delivery => &mut self.delivery_dest,
+            OwnedDest::Notify => &mut self.notify_dest,
+            OwnedDest::ChannelSubscribe => &mut self.channel_subscribe_dest,
+            OwnedDest::ChannelUnsubscribe => &mut self.channel_unsubscribe_dest,
+            OwnedDest::ChannelPublish => &mut self.channel_publish_dest,
+            OwnedDest::ChannelPull => &mut self.channel_pull_dest,
+            OwnedDest::ChannelStream => &mut self.channel_stream_dest,
+            OwnedDest::PropagationStream => &mut self.propagation_stream_dest,
+            OwnedDest::NotifyRegister => &mut self.notify_register_dest,
+            OwnedDest::NotifyUnregister => &mut self.notify_unregister_dest,
+            OwnedDest::DistroUnregister => &mut self.distro_unregister_dest,
+            OwnedDest::DistroList => &mut self.distro_list_dest,
+        })
+    }
+
+    /// Announce every owned destination once, immediately and synchronously,
+    /// in `ANNOUNCE_ORDER` (the propagation node's too, when one is attached),
+    /// then replay the stored distro announces. Returns the hashes announced,
+    /// in the order they went out.
     ///
     /// No sleeps, no spawned threads, no fixed delay before the first send
     /// (see DESIGN_PRINCIPLES.md §3).  Periodic refresh and the bounded
     /// up-edge announce are handled by `publish_destinations()` registering with
     /// `Transport`'s announce daemon.
-    pub fn announce(&mut self) {
-        // Treat stamp_cost=0 as disabled (same as None) to avoid accidental
-        // stamp-tail stripping when operators mean "no PoW required".
-        let announce_stamp_cost = self.config.default_policy.stamp_cost.filter(|c| *c > 0);
-        let app_data = announce::encode_node_announce(
-            &self.config.display_name,
-            announce_stamp_cost,
-        );
-        // Distro registration is the bootstrap route for all Distro clients.
-        // Announce it first so backbone announce pacing cannot strand it behind
-        // the rest of the service-destination burst.
-        let _ = self.distro_register_dest.announce(None, false, None, None, true);
-        self.node_dest.set_default_app_data(Some(app_data.clone()));
-        let _ = self.node_dest.announce(Some(&app_data), false, None, None, true);
-        log(
-            format!("[rfed] announced node {}", hexrep(&self.node_dest.hash, false)),
-            LOG_NOTICE, false, false,
-        );
-        // Service destinations: clients can discover them via path requests
-        // without knowing the hash in advance.
-        let _ = self.channel_dest.announce(None, false, None, None, true);
-        let _ = self.delivery_dest.announce(None, false, None, None, true);
-        let _ = self.notify_dest.announce(None, false, None, None, true);
-        // New split aspects (REFACTOR.md 2026-05-17).  Stamp policy rides on
-        // the publish destination since that's where SEND lands (matches
-        // `publish_destinations()` below).  Transport's announce daemon uses
-        // the app_data registered via `publish_destination`, falling back to
-        // the destination's default app_data; set it too so any announce
-        // without explicit app_data still carries the stamp policy.
-        self.channel_publish_dest.set_default_app_data(Some(app_data.clone()));
-        let _ = self.channel_subscribe_dest.announce(None, false, None, None, true);
-        let _ = self.channel_unsubscribe_dest.announce(None, false, None, None, true);
-        let _ = self.channel_publish_dest.announce(Some(&app_data), false, None, None, true);
-        let _ = self.channel_pull_dest.announce(None, false, None, None, true);
-        let _ = self.channel_stream_dest.announce(None, false, None, None, true);
-        let _ = self.propagation_stream_dest.announce(None, false, None, None, true);
-        let _ = self.notify_register_dest.announce(None, false, None, None, true);
-        let _ = self.notify_unregister_dest.announce(None, false, None, None, true);
-        let _ = self.distro_unregister_dest.announce(None, false, None, None, true);
-        let _ = self.distro_list_dest.announce(None, false, None, None, true);
-        // rfed.link carries the node app_data because it carries
-        // `/channel/publish`: a client that has learned only this destination
-        // must still be able to read the stamp policy before its first send,
-        // exactly as one that learned rfed.channel.publish can.
-        self.link_dest.set_default_app_data(Some(app_data.clone()));
-        let _ = self.link_dest.announce(Some(&app_data), false, None, None, true);
+    pub fn announce(&mut self) -> Vec<Vec<u8>> {
+        let app_data = self.node_app_data();
+        let mut announced = Vec::with_capacity(ANNOUNCE_ORDER.len());
+        for which in ANNOUNCE_ORDER {
+            if which == OwnedDest::Propagation {
+                if let Some(prop) = &self.lxmf_propagation {
+                    announced.extend(LxmfPropagationNode::announce(prop));
+                }
+                continue;
+            }
+            // rfed.node carries the node app_data. rfed.channel.publish does
+            // because SEND lands there (matches `publish_destinations()`).
+            // rfed.link does because it carries `/channel/publish`: a client
+            // that has learned only this destination must still be able to
+            // read the stamp policy before its first send, exactly as one that
+            // learned rfed.channel.publish can. Transport's announce daemon
+            // uses the app_data registered via `publish_destination`, falling
+            // back to the destination's default app_data; set it too so any
+            // announce without explicit app_data still carries it.
+            let carries_app_data = matches!(
+                which,
+                OwnedDest::Node | OwnedDest::ChannelPublish | OwnedDest::Link
+            );
+            let Some(dest) = self.owned_dest_mut(which) else { continue };
+            if carries_app_data {
+                dest.set_default_app_data(Some(app_data.clone()));
+            }
+            let explicit = if carries_app_data { Some(app_data.as_slice()) } else { None };
+            let _ = dest.announce(explicit, false, None, None, true);
+            announced.push(dest.hash.clone());
+            if which == OwnedDest::Node {
+                log(
+                    format!("[rfed] announced node {}", hexrep(&self.node_dest.hash, false)),
+                    LOG_NOTICE, false, false,
+                );
+            }
+        }
         self.replay_distro_announces();
+        announced
     }
 
     /// Rebroadcast every stored pre-signed distro announce.
@@ -919,52 +1009,54 @@ impl FedNode {
         }
     }
 
-    /// Opt all four locally-registered destinations into Transport's
-    /// announce daemon so they are automatically re-announced:
+    /// Opt every owned destination (and the propagation node's, when one is
+    /// attached) into Transport's announce daemon, in `ANNOUNCE_ORDER`, so
+    /// they are automatically re-announced:
     ///   * once on every false→true online transition of any interface, and
     ///   * every `refresh_interval` thereafter,
     /// both held per destination and per interface to that interval.
+    /// Returns the hashes published, in publish order.
     ///
     /// rfed.node refreshes at the configured `announce_interval_secs`
     /// (default 6h); the service destinations refresh every
     /// `SERVICE_REFRESH_INTERVAL_SECS` (also 6h). Paths live a week; the
     /// refresh is for nodes that restarted and lost their table.
-    pub fn publish_destinations(&self) {
+    pub fn publish_destinations(&mut self) -> Vec<Vec<u8>> {
         use reticulum_rust::transport::Transport;
         // Keep channel/node announce stamp policy aligned with SEND parsing:
         // only positive costs mean "stamp required".
-        let announce_stamp_cost = self.config.default_policy.stamp_cost.filter(|c| *c > 0);
-        let app_data = announce::encode_node_announce(
-            &self.config.display_name,
-            announce_stamp_cost,
-        );
-        Transport::publish_destination(
-            self.node_dest.hash.clone(),
-            Some(Duration::from_secs(self.config.announce_interval_secs)),
-            Some(app_data.clone()),
-        );
+        let app_data = self.node_app_data();
+        let node_refresh = Some(Duration::from_secs(self.config.announce_interval_secs));
         let svc = Some(Duration::from_secs(SERVICE_REFRESH_INTERVAL_SECS));
-        // Publish the channel SEND stamp policy on rfed.channel itself so
-        // senders can autoconfigure before their first fire-and-forget send.
-        Transport::publish_destination(self.channel_dest.hash.clone(), svc, Some(app_data.clone()));
-        Transport::publish_destination(self.delivery_dest.hash.clone(), svc, None);
-        Transport::publish_destination(self.notify_dest.hash.clone(), svc, None);
-        // New split aspects (REFACTOR.md 2026-05-17). Stamp policy rides on
-        // the publish destination since that's where SEND lands.
-        Transport::publish_destination(self.channel_subscribe_dest.hash.clone(),   svc, None);
-        Transport::publish_destination(self.channel_unsubscribe_dest.hash.clone(), svc, None);
-        Transport::publish_destination(self.channel_publish_dest.hash.clone(),     svc, Some(app_data.clone()));
-        // Same refresh cadence as every other service destination: a client
-        // that only knows rfed.link must never have to wait out a stale path.
-        Transport::publish_destination(self.link_dest.hash.clone(),                svc, Some(app_data));
-        Transport::publish_destination(self.channel_pull_dest.hash.clone(),        svc, None);
-        Transport::publish_destination(self.channel_stream_dest.hash.clone(),      svc, None);
-        Transport::publish_destination(self.propagation_stream_dest.hash.clone(),  svc, None);
-        Transport::publish_destination(self.notify_register_dest.hash.clone(),     svc, None);
-        Transport::publish_destination(self.notify_unregister_dest.hash.clone(),   svc, None);
-        Transport::publish_destination(self.distro_register_dest.hash.clone(),     svc, None);
-        Transport::publish_destination(self.distro_unregister_dest.hash.clone(),   svc, None);
-        Transport::publish_destination(self.distro_list_dest.hash.clone(),         svc, None);
+        let mut published = Vec::with_capacity(ANNOUNCE_ORDER.len());
+        for which in ANNOUNCE_ORDER {
+            if which == OwnedDest::Propagation {
+                if let Some(prop) = &self.lxmf_propagation {
+                    published.extend(LxmfPropagationNode::publish_destination(prop));
+                }
+                continue;
+            }
+            // rfed.channel publishes the channel SEND stamp policy on itself
+            // so senders can autoconfigure before their first fire-and-forget
+            // send; rfed.channel.publish because SEND lands there; rfed.link
+            // because it carries `/channel/publish`. rfed.link refreshes on the
+            // same cadence as every other service destination: a client that
+            // only knows rfed.link must never have to wait out a stale path.
+            let carries_app_data = matches!(
+                which,
+                OwnedDest::Node | OwnedDest::Channel | OwnedDest::ChannelPublish | OwnedDest::Link
+            );
+            let refresh = if which == OwnedDest::Node { node_refresh } else { svc };
+            let Some(dest) = self.owned_dest_mut(which) else { continue };
+            let hash = dest.hash.clone();
+            Transport::publish_destination(
+                hash.clone(),
+                refresh,
+                if carries_app_data { Some(app_data.clone()) } else { None },
+            );
+            published.push(hash);
+        }
+        published
     }
 
     /// Explicitly persist the state not already stored on each change.
@@ -5090,5 +5182,127 @@ mod notify_key_tests {
         assert_eq!(notify.count(), 0);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// rfed's announce and publish order (`ANNOUNCE_ORDER`). James, 2026-09-27:
+/// "When rfed restarts, the first announce should be rfed.link." Staging
+/// showed rfed.link going out 16th and lxmf.propagation last, about three
+/// minutes after a restart behind the backbone's announce pacing.
+#[cfg(test)]
+mod announce_order_tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+    use crate::config::TierPolicy;
+
+    fn config(tag: &str, propagation: bool) -> NodeConfig {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rfed_announce_order_{tag}_{unique}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        NodeConfig {
+            config_dir: dir.clone(),
+            rns_config_dir: None,
+            identity_file: dir.join("identity"),
+            display_name: "test".into(),
+            announce_interval_secs: 600,
+            announce_at_start: false,
+            default_policy: TierPolicy::default(),
+            vip_policy: TierPolicy::vip_default(),
+            vip_subscribers: Vec::new(),
+            peering_cost: None,
+            storage_limit_bytes: 1 << 20,
+            transfer_limit_bytes: None,
+            sync_limit_bytes: None,
+            static_peers: Vec::new(),
+            from_static_only: false,
+            trusted_backup_peers: Vec::new(),
+            primary_node: None,
+            secondary_nodes: Vec::new(),
+            owner_offline_secs: 90.0,
+            lxmf_propagation_enabled: propagation,
+            lxmf_propagation_autopeer: false,
+            lxmf_propagation_peers: Vec::new(),
+        }
+    }
+
+    /// A node wired as main.rs wires it: the propagation node attached to
+    /// `FedNode::lxmf_propagation` before anything is published or announced.
+    fn node_with_propagation(tag: &str) -> FedNode {
+        let config = config(tag, true);
+        let prop = LxmfPropagationNode::new(
+            Identity::new(true),
+            &config,
+            Arc::new(Mutex::new(NotifyRegistry::load(config.config_dir.join("prop_notify.rmp")))),
+            Arc::new(Mutex::new(PropagationStreamRegistry::default())),
+            Arc::new(Mutex::new(LinkSessionRegistry::default())),
+            None, None, None, None,
+        )
+        .expect("propagation node");
+        let mut node = FedNode::new(Identity::new(true), config).expect("node");
+        node.lxmf_propagation = Some(prop);
+        node
+    }
+
+    /// rfed.link, rfed.distro.register, lxmf.propagation, rfed.node, then the
+    /// remaining service destinations in their earlier order.
+    fn expected_order(node: &FedNode) -> Vec<Vec<u8>> {
+        let prop_hash = node
+            .lxmf_propagation
+            .as_ref()
+            .map(|p| p.lock().unwrap().destination.hash.clone());
+        let mut expected = vec![node.link_dest.hash.clone(), node.distro_register_dest.hash.clone()];
+        expected.extend(prop_hash);
+        expected.extend([
+            node.node_dest.hash.clone(),
+            node.channel_dest.hash.clone(),
+            node.delivery_dest.hash.clone(),
+            node.notify_dest.hash.clone(),
+            node.channel_subscribe_dest.hash.clone(),
+            node.channel_unsubscribe_dest.hash.clone(),
+            node.channel_publish_dest.hash.clone(),
+            node.channel_pull_dest.hash.clone(),
+            node.channel_stream_dest.hash.clone(),
+            node.propagation_stream_dest.hash.clone(),
+            node.notify_register_dest.hash.clone(),
+            node.notify_unregister_dest.hash.clone(),
+            node.distro_unregister_dest.hash.clone(),
+            node.distro_list_dest.hash.clone(),
+        ]);
+        expected
+    }
+
+    #[test]
+    fn startup_announce_goes_link_then_distro_register_then_propagation_then_node() {
+        let mut node = node_with_propagation("announce");
+        let expected = expected_order(&node);
+        assert_eq!(expected.len(), ANNOUNCE_ORDER.len());
+        assert_eq!(node.announce(), expected);
+    }
+
+    /// Transport re-announces published destinations in publish order on
+    /// every interface up-edge and refresh, so the publish order is rfed's
+    /// reconnect order and must match the startup order.
+    #[test]
+    fn publish_order_matches_the_startup_announce_order() {
+        let mut node = node_with_propagation("publish");
+        let expected = expected_order(&node);
+        let published = node.publish_destinations();
+        assert_eq!(published, expected);
+        for hash in &published {
+            assert!(Transport::is_published(hash), "{} not published", hexrep(hash, false));
+        }
+    }
+
+    /// Without a propagation node the order is the same, minus its slot.
+    #[test]
+    fn without_propagation_the_order_skips_its_slot() {
+        let config = config("no_prop", false);
+        let mut node = FedNode::new(Identity::new(true), config).expect("node");
+        let expected = expected_order(&node);
+        assert_eq!(expected.len(), ANNOUNCE_ORDER.len() - 1);
+        assert_eq!(node.publish_destinations(), expected);
+        assert_eq!(node.announce(), expected);
     }
 }

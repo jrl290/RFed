@@ -777,19 +777,19 @@ fn main() -> Result<(), String> {
     // both held per destination and per interface to that period.
     // No sleeps, no startup-burst, no periodic main-loop announce ticks
     // (see DESIGN_PRINCIPLES.md §3-§4).
-    if let Ok(guard) = node.lock() {
+    //
+    // Both go in `destinations::ANNOUNCE_ORDER`: rfed.link, then
+    // rfed.distro.register, then lxmf.propagation (attached to the node
+    // above), then rfed.node and the rest. Backbones pace announces, so the
+    // order is how long a client waits after a restart; and Transport
+    // re-announces in publish order, so it is the reconnect order too.
+    if let Ok(mut guard) = node.lock() {
         guard.publish_destinations();
-    }
-    if let Some(ref prop) = lxmf_prop_arc {
-        lxmf_propagation::LxmfPropagationNode::publish_destination(prop);
     }
 
     if announce_at_start {
         if let Ok(mut guard) = node.lock() {
             guard.announce();
-        }
-        if let Some(ref prop) = lxmf_prop_arc {
-            lxmf_propagation::LxmfPropagationNode::announce(prop);
         }
         eprintln!("[rfed] Initial announce sent");
     }
