@@ -67,6 +67,9 @@ Layer 4 (innermost — application):
         source_hash         = the sender's lxmf.delivery DESTINATION hash
                             = truncated_hash( name_hash("lxmf.delivery") || identity_hash )
                               — NOT truncated_hash(sender_identity_pub).
+        msgpack_payload     = the LXMF payload; its fields map may carry 0xD1
+                              (FIELD_DISPLAY_NAME), the poster's Channel Display
+                              Name (see "Display name" below).
 
 Layer 3 (LXMF EC envelope, addressed to the CHANNEL identity):
     inner_blob = EC_encrypt( channel_identity.X25519_pub , plaintext )
@@ -112,16 +115,37 @@ Layer 1' (Reticulum transport — fanout hop, one per subscriber):
    `truncated_hash(sender_identity_pub)` against `source_hash` — those
    are different hashes.** `source_hash` is the lxmf.delivery
    destination hash; the bare identity hash is just one of its inputs.
-5. Call `Identity::remember_destination(source_hash, sender_identity_pub, None)`
+5. **Key binding (MUST, before step 6).** Compute the `lxmf.delivery`
+   destination hash of `sender_identity_pub`
+   (`truncated_hash(name_hash("lxmf.delivery") || truncated_hash(sender_identity_pub))`)
+   and compare it with `source_hash`. On mismatch reject the post and
+   remember nothing (LXMF-rust/DISPLAY_NAMES.md §2.3).
+6. Call `Identity::remember_destination(source_hash, sender_identity_pub, None)`
    to populate Reticulum's known-destinations cache.
-6. Prepend the channel's `lxmf.delivery` destination hash to the
+7. Prepend the channel's `lxmf.delivery` destination hash to the
    LXMF tail and feed to
    `LXMessage::unpack_from_bytes(_, Some(PROPAGATED))`.
-7. LXMF Ed25519 signature validation runs against the just-cached
-   `sender_identity_pub`. **This is the integrity check** — a forged
-   `sender_identity_pub` produces `SIGNATURE_INVALID`. Cache poisoning
-   by an unauthorised party is impossible because reaching step 3
-   already required the channel EC private key.
+8. LXMF Ed25519 signature validation runs against the just-cached
+   `sender_identity_pub`. **This is the integrity check of the post** —
+   a forged `sender_identity_pub` produces `SIGNATURE_INVALID`. It does
+   **not** protect the cache: the channel private key is derived from the
+   channel name, so anyone who knows the name reaches step 3, and without
+   step 5 a post claiming a contact's `source_hash` would overwrite that
+   contact's stored key. Step 5 is what prevents that.
+9. Only if steps 5 and 8 passed, read `0xD1` from the fields (below).
+
+`lxmf_rust::channel::unpack` implements steps 2–9 (and `pack` the
+sender side) for both Retichat bridges.
+
+### Display name (field 0xD1)
+
+The LXMF message may carry `0xD1` (`FIELD_DISPLAY_NAME`): the poster's
+Channel Display Name as msgpack bin (receivers accept bin or str), or a
+zero-length value meaning "no name now". No `0xD1` means the post
+carries no name. Receivers use it only after the key binding and the
+signature pass, and store it per `(channel, sender)`. The contract,
+including when a client includes it, is LXMF-rust/DISPLAY_NAMES.md
+(§2.3, §4.2, §5.2). RFed never sees it.
 
 ### Why the prelude exists
 
@@ -144,6 +168,9 @@ sees, period.
   `truncated_hash(public_key)`.
 - **The prelude is mandatory.** No legacy fallback path. Receivers
   MUST refuse blobs without `"RTID"`.
+- **The prelude key must bind to `source_hash`** (its `lxmf.delivery`
+  destination hash equals `source_hash`), checked before it is
+  remembered. Receivers MUST reject posts that fail.
 - **RFed never inspects the prelude** — it lives inside the EC
   envelope. RFed only sees `[ channel_hash | inner_blob | stamp ]`.
 - **`STAMP_EXPAND_ROUNDS = 16`** on every implementation, forever.
@@ -450,17 +477,21 @@ and answering, and no deployed client has to move.
   ASCII magic `"RTID"` followed by 64 bytes of sender identity public
   key (the format produced by Reticulum-rust's
   `Identity::get_public_key()` — 32 X25519 enc pub || 32 Ed25519 sign
-  pub), then the LXMF tail. Receivers MUST call
+  pub), then the LXMF tail. Receivers MUST first check the key
+  binding: the `lxmf.delivery` destination hash of `identity_pub`
+  must equal `source_hash` taken verbatim from the LXMF tail, or the
+  post is rejected and nothing is remembered. Only then call
   `Identity::remember_destination(source_hash, identity_pub, None)`
-  with `source_hash` taken verbatim from the LXMF tail, then invoke
-  `LXMessage::unpack_from_bytes`. **Do NOT pre-check
-  `truncated_hash(identity_pub) == source_hash`** — `source_hash` is
-  the lxmf.delivery DESTINATION hash, not the bare identity hash, so
-  that equality never holds and would reject every legitimate
-  message. The integrity guarantee is provided by LXMF's own Ed25519
-  signature validation (forged `identity_pub` → `SIGNATURE_INVALID`),
-  and cache poisoning is impossible because reaching this code path
-  required the channel EC private key (i.e. authorised subscriber).
+  and invoke `LXMessage::unpack_from_bytes`. **Do NOT compare
+  `truncated_hash(identity_pub)` itself with `source_hash`** — that is
+  the bare identity hash, not the lxmf.delivery DESTINATION hash, so
+  the equality never holds and would reject every legitimate message.
+  LXMF's Ed25519 signature validation authenticates the post (forged
+  `identity_pub` → `SIGNATURE_INVALID`); the key binding protects the
+  known-destinations cache, which the channel key alone does not,
+  since anyone who knows the channel name holds it. The LXMF fields
+  may carry `0xD1`, the poster's Channel Display Name, used only once
+  both checks pass (see "Display name (field 0xD1)" above).
   RFed never sees the prelude (it's inside the EC envelope). See the
   **CANONICAL WIRE FORMAT** section at the top of this file for the
   full layered diagram and decode procedure — that section is
@@ -1491,7 +1522,9 @@ on `/rfed/distro/announce` (§17.4). Its `app_data` is the LXMF 0.5.0+ list
 and marks the address as a distro:
 
 ```
-[ nil,            // display_name: none (names travel inside encrypted messages)
+[ announce_name,  // bin, or nil: the user's Announce Display Name, empty by
+                  // default (LXMF-rust/DISPLAY_NAMES.md §2.2); other names
+                  // travel inside encrypted messages in field 0xD1
   nil,            // stamp_cost: none
   [ 0xD0 ] ]      // supported_functionality: SF_RFED_DISTRO
 ```
