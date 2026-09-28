@@ -1151,12 +1151,23 @@ The LXMF propagation destination announces with app_data:
   false,                            // protocol version marker
   unix_timestamp,                   // announce time
   true,                             // is active propagation node
-  transfer_limit_mb,                // per-transfer limit
-  sync_limit_mb,                    // per-sync-period limit
+  transfer_limit_kb,                // per-message limit, KB of 1000 B
+  sync_limit_kb,                    // per-sync limit, KB of 1000 B
   [stamp_cost, flexibility, cost],  // PoW parameters
   {0x01: node_name}                 // metadata map
 ]
 ```
+
+Both limits are integers in the reference's kilobytes of 1000 bytes, as LXMF
+1.1.1 announces them and as every reader (`LXMPeer.sync`, rfed's own offer
+planning) multiplies them back by 1000. `[storage] transfer_limit_mb` /
+`sync_limit_mb` stay in MB (× 1024² bytes) and are divided by 1000 for the
+announce; unset they are 256 and 10240 (LXMF's `PROPAGATION_LIMIT` and
+`SYNC_LIMIT`). The sync limit is never below the per-message limit, as in
+`LXMRouter.__init__`. Until 2026-09-28 rfed announced MB here, truncated, so a
+default rfed announced `0` and `10`: every peer, Python or rfed, read a 0 KB
+per-message limit and marked every message for rfed handled without sending
+it.
 
 ---
 

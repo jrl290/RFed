@@ -29,9 +29,10 @@
 //!
 //! Standard LXMF propagation announce:
 //! ```text
-//! [false, timestamp, is_active, transfer_limit, sync_limit,
+//! [false, timestamp, is_active, transfer_limit_kb, sync_limit_kb,
 //!  [stamp_cost, flexibility, peering_cost], {PN_META_NAME: name}]
 //! ```
+//! The limits are kilobytes of 1000 bytes, as the reference announces them.
 //!
 //! # Peer sync
 //!
@@ -84,9 +85,9 @@ pub const DEFAULT_STAMP_FLEXIBILITY: u32 = 3;
 pub const DEFAULT_PEERING_COST: u32 = 18;
 /// Maximum peering cost we accept from remote peers.
 pub const MAX_PEERING_COST: u32 = 26;
-/// Default per-transfer limit in KB.
+/// Default per-transfer limit in KB of 1000 bytes (LXMRouter.PROPAGATION_LIMIT).
 pub const DEFAULT_TRANSFER_LIMIT_KB: f64 = 256.0;
-/// Default per-sync limit in KB.
+/// Default per-sync limit in KB of 1000 bytes (LXMRouter.SYNC_LIMIT).
 pub const DEFAULT_SYNC_LIMIT_KB: f64 = 10240.0;
 /// Message expiry: 7 days.  Matches BlobStore TTL.
 pub const MESSAGE_EXPIRY_SECS: f64 = 7.0 * 24.0 * 3600.0;
@@ -159,6 +160,18 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+}
+
+/// The per-transfer and per-sync limits rfed announces, in the reference's
+/// kilobytes of 1000 bytes: every reader multiplies them by 1000
+/// (LXMPeer.sync, LXMRouter.propagation_resource_advertised). The config gives
+/// them in bytes (`[storage] transfer_limit_mb` × 1024²); unset they are
+/// LXMRouter's PROPAGATION_LIMIT and SYNC_LIMIT. As LXMRouter.__init__ does,
+/// the sync limit is never below the per-transfer limit.
+pub(crate) fn propagation_limits_kb(transfer_limit_bytes: Option<u64>, sync_limit_bytes: Option<u64>) -> (f64, f64) {
+    let transfer = transfer_limit_bytes.map(|b| b as f64 / 1000.0).unwrap_or(DEFAULT_TRANSFER_LIMIT_KB);
+    let sync = sync_limit_bytes.map(|b| b as f64 / 1000.0).unwrap_or(DEFAULT_SYNC_LIMIT_KB);
+    (transfer, sync.max(transfer))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -560,12 +573,8 @@ impl LxmfPropagationNode {
 
         let stamp_cost = config.default_policy.stamp_cost.unwrap_or(DEFAULT_STAMP_COST);
         let stamp_flexibility = config.default_policy.stamp_flexibility.unwrap_or(DEFAULT_STAMP_FLEXIBILITY);
-        let transfer_limit_kb = config.transfer_limit_bytes
-            .map(|b| b as f64 / 1024.0)
-            .unwrap_or(DEFAULT_TRANSFER_LIMIT_KB);
-        let sync_limit_kb = config.sync_limit_bytes
-            .map(|b| b as f64 / 1024.0)
-            .unwrap_or(DEFAULT_SYNC_LIMIT_KB);
+        let (transfer_limit_kb, sync_limit_kb) =
+            propagation_limits_kb(config.transfer_limit_bytes, config.sync_limit_bytes);
 
         let storage_path = config.config_dir.join("lxmf_propagation");
         let messagestore_path = storage_path.join("messagestore");
@@ -743,12 +752,18 @@ impl LxmfPropagationNode {
             Value::Integer((PN_META_NAME as i64).into()),
             Value::Binary(self.node_name.as_bytes().to_vec()),
         )]);
+        // [3] and [4] are kilobytes of 1000 bytes, as LXMF 1.1.1 announces
+        // them and as every reader — LXMPeer.sync, and rfed's own
+        // `plan_offer` — multiplies them back. Until 2026-09-28 rfed divided
+        // its KB by 1024 once more and announced MB, truncated: a default
+        // rfed announced a 0 KB per-message limit, so every peer, Python or
+        // rfed, marked every message for it handled without sending it.
         let announce_data = Value::Array(vec![
             Value::Boolean(false),
             Value::Integer(ts.into()),
             Value::Boolean(true),
-            Value::Integer(((self.transfer_limit_kb / 1024.0) as i64).into()),
-            Value::Integer(((self.sync_limit_kb / 1024.0) as i64).into()),
+            Value::Integer((self.transfer_limit_kb as i64).into()),
+            Value::Integer((self.sync_limit_kb as i64).into()),
             stamp_costs,
             metadata,
         ]);
@@ -4728,6 +4743,48 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// The wire defect (2026-09-28): rfed announced its limits as MB where
+        /// the reference and rfed's own reader take KB, so a default rfed
+        /// announced a 0 KB per-message limit and every peer marked every
+        /// message for it handled unsent. rfed's own announce, read back by an
+        /// rfed peer, must let a 1 KB message through.
+        #[test]
+        fn rfed_announces_its_limits_in_kb_and_its_peers_offer_it_messages() {
+            let h = Harness::new("limits_kb");
+            let mut g = h.node.lock().unwrap();
+            let app_data = g.build_app_data();
+            assert!(lxmf_rust::lxmf::pn_announce_data_is_valid(&app_data));
+            match read_value(&mut Cursor::new(&app_data)).expect("announce msgpack") {
+                Value::Array(items) => {
+                    assert_eq!(items[3], Value::Integer(256.into()), "per-message limit: LXMF 1.1.1's 256 KB");
+                    assert_eq!(items[4], Value::Integer(10240.into()), "per-sync limit: LXMF 1.1.1's 10240 KB");
+                }
+                other => panic!("announce not an array: {other:?}"),
+            }
+
+            // Another rfed hears it (autopeer) and plans an offer to it.
+            g.autopeer = true;
+            let other = [0x61u8; 16];
+            g.handle_propagation_announce(&other, &app_data, false);
+            let peer = g.peers.get(&other[..]).expect("peered on the announce");
+            assert_eq!((peer.propagation_transfer_limit, peer.propagation_sync_limit), (Some(256.0), Some(10240.0)));
+            let plan = plan_offer(
+                vec![OfferCandidate { tid: id(1), size: 1000, weight: 1.0 }],
+                peer.propagation_transfer_limit,
+                peer.propagation_sync_limit,
+                MAX_OFFER_IDS,
+            );
+            assert!(plan.too_big.is_empty(), "a 1 KB message is not over the announced limit");
+            assert_eq!(plan.offer, vec![id(1)]);
+
+            // Configured limits (`[storage] transfer_limit_mb` is MB of 1024²
+            // bytes) are divided by 1000, as the reference multiplies them
+            // back, and the sync limit is never below the per-message one.
+            assert_eq!(propagation_limits_kb(None, None), (256.0, 10240.0));
+            assert_eq!(propagation_limits_kb(Some(100 * 1024 * 1024), Some(1000 * 1024 * 1024)), (104857.6, 1048576.0));
+            assert_eq!(propagation_limits_kb(Some(2 * 1024 * 1024), Some(1024 * 1024)), (2097.152, 2097.152));
         }
     }
 }
