@@ -1063,7 +1063,12 @@ notify-only shim.
   for that peer, every message in it including ones rfed already held, and is
   queued for the other peers only (LXMF 1.1.1
   `propagation_resource_concluded`, `from_peer`). A client's PUT goes to
-  every peer.
+  every peer. The reference reads the identity off the link when the
+  Resource concludes; rfed records it when the Resource is advertised,
+  because by the time the Resource concludes the proof has gone out and the
+  sender may already have closed the link, which rfed can then no longer
+  ask. The per-batch log line names the origin: a peer, a non-peer identity,
+  or a sender with no identity.
 4. Recipients retrieve stored messages with the standard LXMF `GET` path, and
   peers exchange OFFER / GET sync with LXMF-rust `lxmd` instances and other
   rfed nodes.

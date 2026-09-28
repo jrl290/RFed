@@ -1269,41 +1269,89 @@ impl LxmfPropagationNode {
         // so the concluded callback dispatches into the same ingest helper.
         link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
-        // Resource-advertised callback: accepts every advertisement (its
-        // return value is the ACCEPT_APP verdict, RNS/Link.py:1108).
-        // Resource-concluded callback: invoked once the multi-segment
-        // transfer is fully assembled. Decode and ingest the same way as
-        // single-packet inbound propagation data.
-        let weak_concluded = self.self_handle.clone();
-        link.set_resource_callbacks(
-            Some(Arc::new(|_advertisement: &reticulum_rust::resource::ResourceAdvertisement| -> bool {
-                // Accept all advertised propagation resources.
-                true
-            })),
-            None,
-            Some(Arc::new(move |resource| {
-                let (data, link): (Vec<u8>, LinkHandle) = match resource.lock() {
-                    Ok(r) => {
-                        if r.status != reticulum_rust::resource::ResourceStatus::Complete {
-                            return;
-                        }
-                        match r.data.clone() {
-                            Some(d) => (d, r.link.clone()),
-                            None => return,
+        let (advertised, concluded) = Self::inbound_resource_callbacks(self.self_handle.clone());
+        link.set_resource_callbacks(Some(advertised), None, Some(concluded));
+    }
+
+    /// The Resource callbacks of an inbound link. Resource-advertised: accepts
+    /// every advertisement (its return value is the ACCEPT_APP verdict,
+    /// RNS/Link.py:1108). Resource-concluded: invoked once the multi-segment
+    /// transfer is fully assembled; decodes and ingests the same way as
+    /// single-packet inbound propagation data.
+    ///
+    /// The two share the identity the sender proved on the link, which says
+    /// whose batch it is (`ingest_propagation_batch`). It is recorded when the
+    /// Resource is advertised, not asked for when it concludes.
+    /// LXMRouter.propagation_resource_concluded reads
+    /// `resource.link.get_remote_identity()` at the end, an attribute that
+    /// outlives the link. rfed's is a request to the link's actor, and by the
+    /// time the concluded callback runs Reticulum-rust has already sent the
+    /// proof (resource.rs `prove()` comes before the callback), on which the
+    /// sender tears the link down (LXMPeer.resource_concluded, and rfed's own
+    /// `end_sync`). When its LINKCLOSE got there first the actor had exited,
+    /// the request came back LinkGone, and the batch was ingested as a
+    /// client's: queued back to the peer that sent it, with no log line.
+    ///
+    /// At advertisement the link is up and the sender is waiting on us: the
+    /// ACCEPT_APP callback runs off the actor thread and its verdict is what
+    /// sends our first RESOURCE_REQ (Reticulum-rust link.rs, ACCEPT_APP), so
+    /// no part, and so no proof, moves before the identity is recorded. The
+    /// peer identified before it offered (LXMPeer.link_established), long
+    /// before that. The remote-identified callback would not do: the actor
+    /// spawns it and moves on, so nothing orders it before the conclusion.
+    fn inbound_resource_callbacks(
+        weak: Option<Weak<Mutex<Self>>>,
+    ) -> (
+        reticulum_rust::link::ResourceAcceptCallback,
+        Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync>,
+    ) {
+        let sender: Arc<Mutex<Option<Identity>>> = Arc::new(Mutex::new(None));
+
+        let recorded = sender.clone();
+        let advertised = Arc::new(move |advertisement: &reticulum_rust::resource::ResourceAdvertisement| -> bool {
+            if let Some(link) = &advertisement.link {
+                match link.remote_identity() {
+                    Ok(Some(identity)) => {
+                        if let Ok(mut slot) = recorded.lock() {
+                            *slot = Some(identity);
                         }
                     }
-                    Err(_) => return,
-                };
-                // The sender is the identity it proved on this link, as
-                // LXMRouter.propagation_resource_concluded takes it; asked
-                // with the Resource released.
-                let sender = link.remote_identity().ok().flatten();
-                // NOT under the node lock — see `ingest_propagation_batch`.
-                if let Some(arc) = weak_concluded.as_ref().and_then(|w| w.upgrade()) {
-                    LxmfPropagationNode::ingest_propagation_batch(&arc, &data, sender.as_ref());
+                    // A client that never identified: its batch is a client's.
+                    Ok(None) => {}
+                    Err(_) => log(
+                        format!(
+                            "[lxmf.prop] resource advertised on link {} after the link closed: it cannot be received",
+                            hexrep(&link.link_id(), false),
+                        ),
+                        LOG_NOTICE, false, false,
+                    ),
                 }
-            })),
-        );
+            }
+            // Accept all advertised propagation resources.
+            true
+        });
+
+        let concluded = Arc::new(move |resource: Arc<Mutex<reticulum_rust::resource::Resource>>| {
+            let data: Vec<u8> = match resource.lock() {
+                Ok(r) => {
+                    if r.status != reticulum_rust::resource::ResourceStatus::Complete {
+                        return;
+                    }
+                    match r.data.clone() {
+                        Some(d) => d,
+                        None => return,
+                    }
+                }
+                Err(_) => return,
+            };
+            let sender = sender.lock().ok().and_then(|s| s.clone());
+            // NOT under the node lock — see `ingest_propagation_batch`.
+            if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
+                LxmfPropagationNode::ingest_propagation_batch(&arc, &data, sender.as_ref());
+            }
+        });
+
+        (advertised, concluded)
     }
 
     // ── Packet handler (client PUTs) ─────────────────────────────────────────
@@ -1418,10 +1466,24 @@ impl LxmfPropagationNode {
 
         let total = messages.len();
         let invalid_stamps = total - validated.len();
+        // Whose batch it was, as the reference's "Received N messages from
+        // {remote_str}": a batch treated as a client's says so. (The staging
+        // harnesses parse the counts; the origin stays at the end.)
+        let origin = match (sender, &from_peer) {
+            (_, Some(peer)) => format!("peer {}", hexrep(peer, false)),
+            (Some(identity), None) => format!(
+                "{} (not a peer)",
+                hexrep(
+                    &Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(identity)),
+                    false,
+                ),
+            ),
+            (None, None) => "a sender with no identity (handled as a client's)".to_string(),
+        };
         log(
             format!(
-                "[lxmf.prop] processed {} msgs: {} stored, {} streamed, {} notified, {} bad-stamp",
-                total, stored, streamed, notified, invalid_stamps,
+                "[lxmf.prop] processed {} msgs: {} stored, {} streamed, {} notified, {} bad-stamp, from {}",
+                total, stored, streamed, notified, invalid_stamps, origin,
             ),
             LOG_NOTICE, false, false,
         );
@@ -5422,6 +5484,79 @@ mod tests {
             LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(vec![client]), None);
             assert!(h.peer(&sender, |p| p.unhandled_ids.contains(&client_id)));
             assert!(h.peer(&other, |p| p.unhandled_ids.contains(&client_id)));
+        }
+
+        /// The sender of a sync Resource is the identity recorded when it
+        /// advertised, while its link was up. rfed asked the link when the
+        /// Resource concluded, after Reticulum-rust had sent the proof on
+        /// which the sender tears the link down; when that LINKCLOSE won, the
+        /// ask came back LinkGone and the batch went in as a client's, queued
+        /// straight back to the peer that sent it, with no log line.
+        #[test]
+        fn a_peer_batch_stays_its_own_after_the_sender_closes_the_link() {
+            use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceAdvertisement, ResourceStatus};
+
+            let h = Harness::new("sync_from_peer_link_gone");
+            {
+                // Any stamp meets cost 0; the test is about who gets what.
+                let mut g = h.node.lock().unwrap();
+                g.stamp_cost = 0;
+                g.stamp_flexibility = 0;
+            }
+            let sender_identity = Identity::new(true);
+            let sender = Destination::hash_from_name_and_identity("lxmf.propagation", Some(&sender_identity));
+            let other = [0x73u8; 16];
+            h.add_peer(&sender, true);
+            h.add_peer(&other, true);
+
+            // rfed's end of the sender's link, which the sender identified on
+            // (LXMPeer.link_established identifies before it offers).
+            let owner = Destination::new_inbound(
+                Some(Identity::new(true)), DestinationType::Single, "lxmf".into(), vec!["propagation".into()],
+            ).expect("destination");
+            let mut link = Link::new_inbound(owner).expect("link");
+            link.state = reticulum_rust::link::STATE_ACTIVE;
+            link.status = reticulum_rust::link::STATE_ACTIVE;
+            *link.remote_identity.lock().unwrap() = Some(sender_identity.clone());
+            let link = LinkHandle::spawn(link);
+
+            // The callbacks link_established installs on that link.
+            let weak = h.node.lock().unwrap().self_handle.clone();
+            let (advertised, concluded) = LxmfPropagationNode::inbound_resource_callbacks(weak);
+
+            // The sender advertises its batch; rfed accepts it.
+            let advertisement = ResourceAdvertisement {
+                t: 0, d: 0, n: 0, h: vec![0xAD; 32], r: vec![0; 4], o: vec![0xAD; 32], i: 1, l: 1,
+                q: None, f: 0, m: Vec::new(), e: true, c: false, s: false, u: false, p: false, x: false,
+                link: Some(link.clone()),
+            };
+            assert!(advertised(&advertisement), "every propagation Resource is accepted");
+
+            // The proof has gone out and the sender has closed the link: its
+            // actor is gone before the concluded callback runs.
+            link.teardown();
+            assert!(link.remote_identity().is_err(), "the link can no longer be asked");
+
+            let mut lxmf = vec![0x7Au8; 300 - lx_stamper::STAMP_SIZE];
+            lxmf[..16].copy_from_slice(&[0x5E; 16]);
+            let id = reticulum_rust::identity::full_hash(&lxmf);
+            let batch = encode_value(Value::Array(vec![
+                Value::F64(0.0),
+                Value::Array(vec![Value::Binary([lxmf, vec![0x33u8; lx_stamper::STAMP_SIZE]].concat())]),
+            ]));
+            let mut resource = Resource::new_internal(
+                None, link, None, false, AutoCompressOption::Disabled, None, None, None, 1, None, None, false, 0, None,
+            ).expect("resource");
+            resource.status = ResourceStatus::Complete;
+            resource.data = Some(batch);
+            concluded(Arc::new(Mutex::new(resource)));
+
+            assert!(h.node.lock().unwrap().entries.contains_key(&id), "the batch is stored");
+            h.peer(&sender, |p| {
+                assert!(!p.unhandled_ids.contains(&id), "not queued back to the peer that sent it");
+                assert!(p.handled_ids.contains(&id), "handled for it");
+            });
+            h.peer(&other, |p| assert!(p.unhandled_ids.contains(&id), "queued for the other peer"));
         }
 
         /// The wire defect (2026-09-28): rfed announced its limits as MB where
