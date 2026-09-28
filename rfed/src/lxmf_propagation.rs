@@ -3700,7 +3700,12 @@ impl PeerSyncIo for AppLinksSyncIo {
         use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
         let link = Self::held(peer, link_id)?;
         // The Resource's own RTT-scaled timeouts decide its outcome, and its
-        // callback fires once, COMPLETE or not (a closed link cancels it).
+        // callback fires once, COMPLETE or not, for a Resource that has been
+        // advertised (a closed link cancels those). One whose link closes
+        // before it is advertised never concludes: Reticulum-rust's
+        // `advertise_shared` thread waits on the dead link for good, holding
+        // the batch (SPEC.md §10). The session does not wait on it: the link's
+        // DISCONNECTED ends it (`on_link_down`).
         // It runs with the Resource locked: it only forwards the outcome.
         let concluded: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource| {
             let outcome = match resource.lock() {

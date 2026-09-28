@@ -1172,6 +1172,32 @@ Departures from the reference, each for a reason:
   completion scales with size and RTT (as for app-links' Resources). The
   offer's round trip keeps its assertion.
 
+Known departures not yet fixed, both outside rfed:
+
+- **AppLinks re-opens a lost sync link once** (Reticulum-rust `SUBSYSTEMS.md`
+  §1: "one automatic re-open attempt"). `open_persistent` is the only
+  AppLinks mode that holds a link, and it re-arms that re-open on every
+  establishment, so when the peer closes the sync link, or it goes stale,
+  AppLinks expires the path, requests it and builds a new link that no
+  session asked for (DESIGN_PRINCIPLES §3); the reference's
+  `LXMPeer.link_closed` only returns to IDLE. rfed ends the session on the
+  DISCONNECTED and closes the stray link when it comes up (above). Because
+  `AppLinks::close` does not cancel an attempt already in flight, a session
+  started while that re-open is still racing can run a second attempt beside
+  it, and the one overwritten in AppLinks' registry is never torn down
+  locally (a Python peer drops it after 180 s idle; an rfed peer keeps
+  it). The fix belongs in AppLinks: a held-link mode without the
+  close-triggered re-open, and a per-registration generation that `close`
+  bumps and an attempt checks before it registers its link.
+- **A sync Resource whose link closes before it is advertised is leaked.**
+  Reticulum-rust's `Resource::advertise_shared` thread waits on
+  `ready_for_new_resource`, which is false for ever once the link's actor
+  has exited, so it spins every 250 ms for the life of the process, holding
+  the batch (up to ~1 MiB) and its callback, and never concludes. RNS 1.5.2
+  cancels such a Resource (`ensure_link`), which concludes it FAILED. rfed's
+  session does not wait on it (the DISCONNECTED ends it, ids unhandled); the
+  leaked thread and buffer are Reticulum-rust's to fix.
+
 ### Announce Metadata
 
 The LXMF propagation destination announces with app_data:
