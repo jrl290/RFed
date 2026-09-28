@@ -166,8 +166,9 @@ fn write_status_file(
         let mut peers: Vec<(&Vec<u8>, &lxmf_propagation::PropPeer)> = g.peers.iter().collect();
         peers.sort_by(|a, b| b.1.unhandled_ids.len().cmp(&a.1.unhandled_ids.len()));
         let peers_json = peers.iter().map(|(hash, peer)| format!(
-            "      {{\"peer\": \"{}\", \"alive\": {}, \"unhandled\": {}, \"handled\": {}, \"next_sync_in_secs\": {:.0}, \"sync_transfer_rate\": {:.1}}}",
-            hexrep(hash, false), peer.alive, peer.unhandled_ids.len(), peer.handled_ids.len(),
+            "      {{\"peer\": \"{}\", \"alive\": {}, \"state\": \"{}\", \"unhandled\": {}, \"handled\": {}, \"next_sync_in_secs\": {:.0}, \"sync_transfer_rate\": {:.1}}}",
+            hexrep(hash, false), peer.alive, lxmf_propagation::PropPeer::state_name(peer.state),
+            peer.unhandled_ids.len(), peer.handled_ids.len(),
             (peer.next_sync_attempt - now_secs).max(0.0), peer.sync_transfer_rate,
         )).collect::<Vec<_>>().join(",\n");
         format!(

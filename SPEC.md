@@ -1068,6 +1068,80 @@ notify-only shim.
 `lxmf_propagation_autopeer` controls announce-based discovery, while
 `[peering].propagation_peers` pins static propagation peers.
 
+### Outbound peer sync
+
+rfed pushes stored messages to its propagation peers as the Python reference
+does (LXMF 1.1.1 `LXMRouter.sync_peers`, `LXMPeer.sync` / `offer_response` /
+`resource_concluded`); code in `rfed/src/lxmf_propagation.rs`, "Outbound peer
+sync".
+
+1. **Choice.** Every 24 s (the reference's `JOB_PEERSYNC_INTERVAL` × 4 s) one
+   IDLE peer with unhandled messages is chosen: at random among the 2 fastest
+   alive peers (by the rate of their last completed sync) plus as many of
+   unknown speed; only when no alive peer waits, at random among unresponsive
+   peers whose backoff has run out. Sessions already running continue on
+   their own events, so several peers sync at once.
+2. **Link.** The session opens a held link to the peer's `lxmf.propagation`
+   destination through AppLinks. Each attempt adds 12 min to the peer's
+   backoff; an established link clears it.
+3. **Offer.** On the link: identify, then `/offer` `[peering_key, [id, ...]]`,
+   back to back. Ids go lightest first (age × size); an id over the peer's
+   per-message transfer limit is marked handled unsent; the batch stays under
+   the peer's sync limit (KB, estimated as size + 16 B per message + 24 B).
+4. **Response.** `false`: all offered ids handled. `true` / `[ids]`: the
+   unwanted ones handled, the wanted ones sent. Errors: `0xF0` identify again,
+   `0xF1` unpeer, `0xF3` regenerate the peering key, `0xF6` no sync for 180 s.
+5. **Transfer.** The wanted messages (each stored file: message + stamp) go as
+   ONE `RNS.Resource` of msgpack `[time, [lxm, ...]]` (float, array of bin) —
+   the format the reference and rfed's own inbound path ingest. They are
+   marked handled **only when the Resource concludes COMPLETE**. A failed
+   offer, a failed Resource or a lost link returns the peer to IDLE with every
+   id still unhandled.
+6. **Persistent strategy.** After a COMPLETE the session carries on with the
+   next batch while the peer still lacks messages.
+
+Departures from the reference, each for a reason:
+
+- **Links through AppLinks**, never built by rfed (Reticulum-rust
+  `SUBSYSTEMS.md` §1). AppLinks' path race replaces the reference's path
+  request and 7.5 s sleep; its DISCONNECTED report is the failure event. The
+  held link is released (`AppLinks::close`) wherever the reference tears its
+  link down, except that the persistent strategy's next batch goes on the
+  still-up link instead of a new one.
+- **Not-ready peers are never chosen.** A peer whose stamp costs are unknown
+  or whose peering key is still being generated is skipped; keys are ground
+  in the background. The reference chooses such a peer and only postpones,
+  and rfed used to choose the first IDLE peer every tick, so one peer grinding
+  its key held up every peer (3.5 min, staging 2026-09-27). An alive peer
+  still in backoff is marked unresponsive when found, as the reference's
+  `sync()` does when it chooses one.
+- **Per-minute outbound budget** (`DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN`, 600).
+  Each offer is cut to what is left of the minute, and an offer awaiting its
+  response reserves its size, so no minute sends more than the budget however
+  many sessions run. Offers are also capped at 500 ids.
+- **One Resource segment per batch** (`MAX_SYNC_RESOURCE_BYTES`, ~1 MiB).
+  Reticulum-rust sends an in-memory Resource as one segment of any size, and
+  receivers refuse a segment over ~3 MiB; the rest goes in the next batch. A
+  message larger than a segment is marked handled for the peer unsent, and
+  logged.
+- **`0xF0` (no identity)** is answered with one more identify per link, not
+  one per answer, so a peer that never records the identity cannot loop the
+  session. **`0xF6` (throttled)** ends the session at once (the reference
+  leaves it waiting for its link to close). **`0xF3`** discards and
+  regenerates the peering key.
+- **A lost link ends the session at once**, even with a Resource in flight:
+  a Resource not yet advertised when its link closed never concludes in
+  Reticulum-rust. Its ids stay unhandled; if it had in fact completed, the
+  next offer finds the peer has them. Callbacks of an ended session are
+  recognised by a session number and ignored.
+- **Unreadable message files** stay unhandled, with a warning (the reference
+  skips them silently and marks them handled on COMPLETE).
+- **Backoff is not reset by announces**, and the **startup backlog** (messages
+  stored before start) is held back from sync for an hour; both predate this.
+- **No 5-second assertion on the Resource** (DESIGN_PRINCIPLES §1): its
+  completion scales with size and RTT (as for app-links' Resources). The
+  offer's round trip keeps its assertion.
+
 ### Announce Metadata
 
 The LXMF propagation destination announces with app_data:

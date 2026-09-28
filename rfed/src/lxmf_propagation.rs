@@ -35,9 +35,14 @@
 //!
 //! # Peer sync
 //!
-//! On a timer, the node iterates peers with unhandled messages and initiates
-//! outbound links to send OFFER requests.  The remote responds with which
-//! transient_ids it wants, and we transfer those messages via resource.
+//! As LXMF 1.1.1 does it (LXMRouter.sync_peers, LXMPeer): every 24 s one
+//! ready peer with unhandled messages is chosen, at random among the fastest;
+//! its session opens an AppLinks-held link, identifies, OFFERs a batch sized
+//! to the peer's limits and to rfed's per-minute budget, and sends what the
+//! peer wants as one Resource `[time, [lxm, ...]]`. Those ids are marked
+//! handled only when the Resource concludes COMPLETE. Sessions run
+//! concurrently, each on its own events. See "Outbound peer sync" below and
+//! SPEC.md §10.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -47,6 +52,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_links::AppLinks;
+use rand::Rng;
 use lxmf_rust::lx_stamper;
 use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
 use reticulum_rust::identity::Identity;
@@ -84,15 +90,42 @@ pub const DEFAULT_TRANSFER_LIMIT_KB: f64 = 256.0;
 pub const DEFAULT_SYNC_LIMIT_KB: f64 = 10240.0;
 /// Message expiry: 7 days.  Matches BlobStore TTL.
 pub const MESSAGE_EXPIRY_SECS: f64 = 7.0 * 24.0 * 3600.0;
-/// Peer sync interval in seconds.
-pub const PEER_SYNC_INTERVAL_SECS: f64 = 6.0;
-/// Peer sync backoff step.
+/// How often one peer is chosen to start a sync: the reference runs
+/// `LXMRouter.sync_peers` every JOB_PEERSYNC_INTERVAL (6) jobs of
+/// PROCESSING_INTERVAL (4 s), i.e. every 24 s. This was 6 s — the job count
+/// read as seconds — so rfed chose peers four times as often.
+pub const PEER_SYNC_INTERVAL_SECS: f64 = 24.0;
+/// Peer sync backoff step (LXMPeer.SYNC_BACKOFF_STEP), added each time a sync
+/// link is attempted and cleared once one is established.
 pub const SYNC_BACKOFF_STEP_SECS: f64 = 12.0 * 60.0;
+/// LXMRouter.FASTEST_N_RANDOM_POOL: the sync choice is random among this many
+/// of the fastest waiting peers, plus as many peers of unknown speed.
+pub const FASTEST_N_RANDOM_POOL: usize = 2;
+/// LXMRouter.PN_STAMP_THROTTLE: a peer that answers an offer with
+/// ERROR_THROTTLED is not offered anything again for this long.
+pub const PN_STAMP_THROTTLE_SECS: f64 = 180.0;
+/// Largest peer sync Resource rfed sends: one Resource segment.
+///
+/// The reference packs any batch up to the peer's sync limit (10 MB by
+/// default) into one `RNS.Resource`, which splits data over
+/// `Resource.MAX_EFFICIENT_SIZE` into segments. Reticulum-rust's
+/// `Resource::new_internal` sends `ResourceData::Bytes` as ONE segment
+/// whatever its size, and a receiver refuses an advertisement over three
+/// segments' worth (RNS/Resource.py `ResourceAdvertisement.unpack`). So a
+/// batch is capped at one segment; what does not fit goes in the next batch,
+/// which the persistent sync strategy starts as soon as this one completes.
+pub const MAX_SYNC_RESOURCE_BYTES: usize = reticulum_rust::resource::Resource::MAX_EFFICIENT_SIZE;
 const DISTRO_DEFERRED_QUEUE_LIMIT: usize = 256;
-/// Max messages to offer in a single OFFER request. Prevents the offer
-/// building from exceeding the 5-second send budget when the messagestore
-/// is large (197k+ messages).
+/// Max messages in one offer, and so in one sync batch. The reference has no
+/// count cap (only the peer's sync limit in bytes); this bounds the offer
+/// request and the batch alongside the per-minute outbound budget.
 pub const MAX_OFFER_IDS: usize = 500;
+
+/// Offer response error codes (LXMPeer.ERROR_*).
+const ERROR_NO_IDENTITY: u8 = 0xF0;
+const ERROR_NO_ACCESS: u8 = 0xF1;
+const ERROR_INVALID_KEY: u8 = 0xF3;
+const ERROR_THROTTLED: u8 = 0xF6;
 
 /// The backlog — every message already stored when this node started — is
 /// held back from outbound peer sync for this long after start. A restart
@@ -102,10 +135,11 @@ pub const MAX_OFFER_IDS: usize = 500;
 pub const STARTUP_BACKLOG_HOLD_SECS: f64 = 3600.0;
 
 /// Outbound peer-sync budget: messages we push to peers per minute, all
-/// peers together. The reference paces syncs only by each peer's sync_limit
-/// per session every 6 s, which with 20 peers and a 264k-message store meant
-/// ~2000 messages/min for hours after every restart (2026-09-23). The budget
-/// caps the aggregate; a full minute's worth is still ten offers.
+/// peers together. The reference paces syncs only by each peer's sync limit,
+/// which with 20 peers and a 264k-message store meant ~2000 messages/min for
+/// hours after every restart (2026-09-23). The budget caps the aggregate:
+/// every offer is sized to what is left of it (`outbound_allowance`), so no
+/// minute sends more than this.
 pub const DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN: u64 = 600;
 /// Max time a peer is unreachable before removal (14 days).
 pub const MAX_UNREACHABLE_SECS: f64 = 14.0 * 24.0 * 3600.0;
@@ -150,9 +184,12 @@ pub struct PropagationEntry {
 
 /// Tracks sync state with a single LXMF propagation peer.
 ///
-/// Each peer goes through a lifecycle:  IDLE → LINK_ESTABLISHING → LINK_READY
-/// → REQUEST_SENT → RESPONSE_RECEIVED → IDLE.  Sync backoff increases on
-/// failure and resets when the peer is heard via announce.
+/// A sync session (LXMPeer.sync) goes IDLE → LINK_ESTABLISHING → LINK_READY
+/// → REQUEST_SENT → RESPONSE_RECEIVED → RESOURCE_TRANSFERRING → IDLE, each
+/// step on an event: the link coming up, the offer's response, the Resource
+/// concluding. Any failure returns the peer to IDLE with its unhandled ids
+/// untouched. Sync backoff grows by SYNC_BACKOFF_STEP_SECS with each link
+/// attempt and is cleared once a link is established.
 pub struct PropPeer {
     /// 16-byte truncated destination hash of the peer's `lxmf.propagation` dest.
     pub destination_hash: Vec<u8>,
@@ -179,13 +216,16 @@ pub struct PropPeer {
     /// Generated in a background thread via `spawn_peering_key_gen()` to avoid
     /// blocking the main loop during the expensive Hashcash grind.
     pub peering_key: Option<(Vec<u8>, u32)>,
-    /// Current exponential backoff interval in seconds (doubles on failure).
+    /// Backoff in seconds: SYNC_BACKOFF_STEP_SECS more with each sync link
+    /// attempt, cleared once a link is established (LXMPeer.sync_backoff).
     pub sync_backoff: f64,
     /// Earliest Unix timestamp when the next sync attempt is allowed.
     pub next_sync_attempt: f64,
     /// Unix timestamp of the most recent sync attempt (success or failure).
     pub last_sync_attempt: f64,
-    /// Rolling average bytes/sec achieved during transfers (unused, reserved).
+    /// Bits per second of the last completed sync Resource
+    /// (LXMPeer.sync_transfer_rate); 0 until one completes. Chooses the
+    /// fastest-peer pool in `select_sync_peer`.
     pub sync_transfer_rate: f64,
 
     /// Transient IDs this peer has already received (or declined).
@@ -193,15 +233,28 @@ pub struct PropPeer {
     /// Transient IDs this peer has NOT yet received — drives the OFFER payload.
     pub unhandled_ids: IdQueue,
 
-    /// Messages currently being transferred (in-flight guard).
+    /// The ids in the sync Resource now in flight
+    /// (LXMPeer.currently_transferring_messages). They are marked handled
+    /// only when that Resource concludes COMPLETE.
     pub transferring: Option<Vec<Vec<u8>>>,
-    /// The last set of IDs we offered — used to reconcile the response.
+    /// When the in-flight sync Resource was started, for the transfer rate.
+    pub current_sync_transfer_started: Option<f64>,
+    /// The last set of IDs we offered — used to reconcile the response. While
+    /// the peer is REQUEST_SENT these reserve outbound budget.
     pub last_offer: Vec<Vec<u8>>,
-    /// Session-scoped mirror of the active AppLinks-owned link while a sync
-    /// exchange is in flight.
-    pub link: Option<LinkHandle>,
+    /// Id of the AppLinks-held link this sync session runs on.
+    pub link_id: Option<Vec<u8>>,
     /// Link id of the currently identified AppLinks-owned sync link.
     pub identified_link_id: Option<Vec<u8>>,
+    /// Whether this link has already been identified a second time after the
+    /// peer answered ERROR_NO_IDENTITY (the reference does so once per
+    /// answer; rfed once per link, so a peer that never records the identity
+    /// cannot keep the session looping).
+    pub reidentified: bool,
+    /// Bumped at each link attempt, each offer and each end of a session.
+    /// Every network callback carries the value it was issued under, and one
+    /// that no longer matches belongs to an ended session and is ignored.
+    pub sync_session: u64,
     /// Current sync state machine position (see `IDLE`, `LINK_ESTABLISHING`, etc.).
     pub state: u8,
 }
@@ -212,6 +265,19 @@ impl PropPeer {
     pub const LINK_READY: u8 = 2;
     pub const REQUEST_SENT: u8 = 3;
     pub const RESPONSE_RECEIVED: u8 = 4;
+    pub const RESOURCE_TRANSFERRING: u8 = 5;
+
+    pub fn state_name(state: u8) -> &'static str {
+        match state {
+            Self::IDLE => "IDLE",
+            Self::LINK_ESTABLISHING => "LINK_ESTABLISHING",
+            Self::LINK_READY => "LINK_READY",
+            Self::REQUEST_SENT => "REQUEST_SENT",
+            Self::RESPONSE_RECEIVED => "RESPONSE_RECEIVED",
+            Self::RESOURCE_TRANSFERRING => "RESOURCE_TRANSFERRING",
+            _ => "UNKNOWN",
+        }
+    }
 
     pub fn new(destination_hash: Vec<u8>) -> Self {
         PropPeer {
@@ -233,9 +299,12 @@ impl PropPeer {
             handled_ids: IdQueue::default(),
             unhandled_ids: IdQueue::default(),
             transferring: None,
+            current_sync_transfer_started: None,
             last_offer: Vec::new(),
-            link: None,
+            link_id: None,
             identified_link_id: None,
+            reidentified: false,
+            sync_session: 0,
             state: Self::IDLE,
         }
     }
@@ -456,6 +525,14 @@ pub struct LxmfPropagationNode {
     /// once per episode rather than every tick.
     pub outbound_sync_hold_logged: bool,
 
+    // ── Outbound peer sync plumbing ───────────────────────────────────
+    /// How outbound peer sync reaches the network: AppLinks-held links in
+    /// production (`AppLinksSyncIo`), a recording fake in the unit tests.
+    sync_io: Arc<dyn PeerSyncIo>,
+    /// Where network callbacks deliver sync events: the channel of the one
+    /// sync worker thread `enable` starts. `None` until then.
+    sync_event_sink: Option<SyncEventSink>,
+
     // ── Self-reference ────────────────────────────────────────────────
     pub self_handle: Option<Weak<Mutex<LxmfPropagationNode>>>,
 }
@@ -534,6 +611,8 @@ impl LxmfPropagationNode {
             outbound_sync_window_count: 0,
             outbound_sync_msgs_per_min: DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN,
             outbound_sync_hold_logged: false,
+            sync_io: Arc::new(AppLinksSyncIo),
+            sync_event_sink: None,
             self_handle: None,
         }));
 
@@ -604,6 +683,22 @@ impl LxmfPropagationNode {
             None,
             false,
         )?;
+
+        // Outbound peer sync: one worker thread takes every sync event in
+        // arrival order — the offer responses, the Resources concluding, and
+        // AppLinks' status for the peers' held links, subscribed here.
+        // Events for destinations that are not propagation peers (rfed.node
+        // links, for one) are dropped by the worker.
+        let sink = Self::start_sync_worker(arc, &mut guard);
+        AppLinks::register_status_callback(Arc::new(move |dest: &[u8], status: u8, link: Option<LinkHandle>| {
+            match (status, link) {
+                (app_links::APP_LINK_ACTIVE, Some(handle)) => {
+                    sink(SyncEvent::LinkActive { peer: dest.to_vec(), link_id: handle.link_id() })
+                }
+                (app_links::APP_LINK_DISCONNECTED, _) => sink(SyncEvent::LinkDown { peer: dest.to_vec() }),
+                _ => {}
+            }
+        }));
 
         // Set link established callback
         let weak_link = Arc::downgrade(arc);
@@ -876,6 +971,9 @@ impl LxmfPropagationNode {
     }
 
     fn unpeer(&mut self, destination_hash: &[u8]) {
+        // A session in flight ends with the peer: its held link goes, and its
+        // callbacks find no peer and are dropped.
+        self.sync_io.close_link(destination_hash);
         self.peers.remove(destination_hash);
         log(
             format!("[lxmf.prop] unpeered {}", hexrep(destination_hash, false)),
@@ -1845,12 +1943,25 @@ impl LxmfPropagationNode {
         encode_value(Value::Array(response_messages))
     }
 
-    // ── Peer sync tick ───────────────────────────────────────────────────────
+    // ── Outbound peer sync ───────────────────────────────────────────────────
+    //
+    // The reference is LXMF 1.1.1 (the workspace .venv): LXMRouter.sync_peers
+    // chooses one peer per sync job, and LXMPeer.sync / offer_response /
+    // resource_concluded carry that peer's session to its end:
+    //
+    //   IDLE ─open link─▶ LINK_ESTABLISHING ─link up─▶ LINK_READY
+    //        ─identify + /offer─▶ REQUEST_SENT ─response─▶ RESPONSE_RECEIVED
+    //        ─Resource [time, [lxm, ...]]─▶ RESOURCE_TRANSFERRING
+    //        ─concluded─▶ IDLE (ids handled only when COMPLETE)
+    //
+    // Every step after the choice runs on an event — AppLinks reporting the
+    // link up or down, the offer's response or failure, the Resource
+    // concluding — delivered to one worker thread in arrival order
+    // (`handle_sync_event`). Nothing waits on a clock, and nothing is retried:
+    // a failed session leaves the peer IDLE with its ids unhandled, and the
+    // next choice starts a new one. The departures from the reference, each
+    // with its reason, are listed in SPEC.md §10 "Outbound peer sync".
 
-    /// Called from the main event loop.  Drives outbound peer sync sessions.
-    ///
-    /// Flow: select best candidate peer with unhandled messages → ensure
-    /// peering key is ready → initiate outbound link + OFFER request.
     /// Is the startup backlog still held back from peer sync?
     pub fn backlog_held(&self) -> bool {
         now() - self.started_at < STARTUP_BACKLOG_HOLD_SECS
@@ -1859,7 +1970,9 @@ impl LxmfPropagationNode {
     /// The ids this peer may be offered right now: during the backlog hold
     /// only messages received since start that it still lacks; afterwards
     /// everything it still lacks. Cheap during the hold because it walks the
-    /// fresh list, not the peer's (possibly 150k-entry) queue.
+    /// fresh list, not the peer's (possibly 150k-entry) queue. Sync itself
+    /// calls `sync_pool_for`, holding a borrow of the peer.
+    #[cfg(test)]
     pub fn sync_pool(&self, peer: &PropPeer) -> Vec<Vec<u8>> {
         Self::sync_pool_for(self.backlog_held(), &self.fresh_since_start, peer)
     }
@@ -1874,6 +1987,16 @@ impl LxmfPropagationNode {
                 .collect()
         } else {
             peer.unhandled_ids.to_vec()
+        }
+    }
+
+    /// `!sync_pool_for(..).is_empty()` without building the pool: this runs
+    /// for every peer on every sync tick.
+    pub fn has_sync_candidates(backlog_held: bool, fresh_since_start: &[Vec<u8>], peer: &PropPeer) -> bool {
+        if backlog_held {
+            fresh_since_start.iter().any(|tid| peer.unhandled_ids.contains(tid))
+        } else {
+            !peer.unhandled_ids.is_empty()
         }
     }
 
@@ -1899,131 +2022,227 @@ impl LxmfPropagationNode {
         }
     }
 
-    /// May this tick start an outbound peer sync? False once the per-minute
-    /// budget is spent. Logs the hold once and the release once, so the log
-    /// tells the story without repeating it every 6 s.
-    pub fn outbound_sync_allowed(&mut self) -> bool {
-        let t = now();
+    // ── The per-minute outbound budget ───────────────────────────────────
+
+    /// Start a new accounting minute once the current one is over.
+    fn roll_outbound_window(&mut self, t: f64) {
         if t - self.outbound_sync_window_start >= 60.0 {
             self.outbound_sync_window_start = t;
             self.outbound_sync_window_count = 0;
         }
-        let held = if self.outbound_sync_window_count >= self.outbound_sync_msgs_per_min {
-            Some(format!(
-                "budget spent, {}/{} messages this minute",
-                self.outbound_sync_window_count, self.outbound_sync_msgs_per_min
-            ))
+    }
+
+    /// Messages that may still be offered this minute: the budget, less what
+    /// was sent this minute, less what the offers still awaiting a response
+    /// could send (a peer in REQUEST_SENT reserves its whole offer). The
+    /// response releases the reservation and `charge_outbound` counts what
+    /// the peer wanted, never more than it reserved. So
+    /// `sent + reserved <= budget` holds after every step, and no minute
+    /// sends more than the budget however many syncs run at once. Until
+    /// 2026-09-28 the budget was checked once before a 500-message send, and
+    /// 1000 went out in a 600-message minute (57 times in one staging run).
+    pub fn outbound_allowance(&mut self) -> u64 {
+        self.roll_outbound_window(now());
+        let reserved: u64 = self.peers.values()
+            .filter(|peer| peer.state == PropPeer::REQUEST_SENT)
+            .map(|peer| peer.last_offer.len() as u64)
+            .sum();
+        self.outbound_sync_msgs_per_min
+            .saturating_sub(self.outbound_sync_window_count.saturating_add(reserved))
+    }
+
+    /// Count `messages` leaving in a sync Resource against this minute.
+    fn charge_outbound(&mut self, messages: u64) {
+        self.roll_outbound_window(now());
+        self.outbound_sync_window_count += messages;
+    }
+
+    /// May this tick start an outbound peer sync? False while nothing is
+    /// left of this minute's budget. Logs the hold once and the release once,
+    /// so the log tells the story without repeating it every tick.
+    pub fn outbound_sync_allowed(&mut self) -> bool {
+        let allowance = self.outbound_allowance();
+        if allowance == 0 {
+            if !self.outbound_sync_hold_logged {
+                log(
+                    format!(
+                        "[lxmf.prop] outbound peer sync held: budget spent, {}/{} messages this minute",
+                        self.outbound_sync_window_count, self.outbound_sync_msgs_per_min
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                self.outbound_sync_hold_logged = true;
+            }
+            false
         } else {
-            None
-        };
-        match held {
-            Some(reason) => {
-                if !self.outbound_sync_hold_logged {
-                    log(format!("[lxmf.prop] outbound peer sync held: {reason}"), LOG_NOTICE, false, false);
-                    self.outbound_sync_hold_logged = true;
-                }
-                false
+            if self.outbound_sync_hold_logged {
+                log("[lxmf.prop] outbound peer sync resumed", LOG_NOTICE, false, false);
+                self.outbound_sync_hold_logged = false;
             }
-            None => {
-                if self.outbound_sync_hold_logged {
-                    log("[lxmf.prop] outbound peer sync resumed", LOG_NOTICE, false, false);
-                    self.outbound_sync_hold_logged = false;
-                }
-                true
-            }
+            true
         }
     }
 
+    // ── Choosing a peer (LXMRouter.sync_peers) ───────────────────────────
+
+    /// Called from the main event loop. Every PEER_SYNC_INTERVAL_SECS: cull
+    /// long-unreachable peers, start peering-key generation where it is
+    /// missing, and — while the minute's budget lasts — choose one peer and
+    /// hand it to the sync worker. Sessions already running continue on their
+    /// own events, so several peers sync at once, as in the reference.
     pub fn tick_sync(arc: &Arc<Mutex<Self>>) {
-        let mut guard = match arc.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-
-        if now() - guard.last_sync_tick < PEER_SYNC_INTERVAL_SECS {
-            return;
-        }
-        guard.last_sync_tick = now();
-        guard.note_backlog_hold();
-        if !guard.outbound_sync_allowed() {
-            return;
-        }
-
-        // Cull non-static peers we haven't heard from in MAX_UNREACHABLE_SECS.
-        // Static peers are never culled — they're operator-configured.
-        let culled: Vec<Vec<u8>> = guard.peers.iter()
-            .filter(|(hash, peer)| {
-                now() > peer.last_heard + MAX_UNREACHABLE_SECS
-                    && !guard.static_peers.contains(hash)
-            })
-            .map(|(hash, _)| hash.clone())
-            .collect();
-        for hash in culled {
-            guard.unpeer(&hash);
-        }
-
-        // Find the first IDLE peer with unhandled messages, alive, and past
-        // its backoff timer.  Only one sync session at a time.
-        let sync_candidate: Option<Vec<u8>> = guard.peers.iter()
-            .filter(|(_, peer)| {
-                peer.state == PropPeer::IDLE
-                    && !peer.unhandled_ids.is_empty()
-                    && peer.alive
-                    && now() >= peer.next_sync_attempt
-                    && !guard.sync_pool(peer).is_empty()
-            })
-            .map(|(hash, _)| hash.clone())
-            .next();
-
-        // Debug: log peer states
-        for (hash, peer) in &guard.peers {
-            if !peer.unhandled_ids.is_empty() || !peer.alive {
-                log(
-                    format!("[lxmf.prop] tick_sync peer {} alive={} state={} unhandled={} stamp_cost={:?} peer_cost={:?} peering_key_ready={}",
-                        hexrep(hash, false), peer.alive, peer.state, peer.unhandled_ids.len(),
-                        peer.propagation_stamp_cost, peer.peering_cost, peer.peering_key_ready()),
-                    LOG_DEBUG, false, false,
-                );
-            }
-        }
-
-        if let Some(peer_hash) = sync_candidate {
-            log(
-                format!("[lxmf.prop] tick_sync: found sync candidate {}", hexrep(&peer_hash, false)),
-                LOG_NOTICE, false, false,
-            );
-            // Check if peer needs a peering key — spawn background generation
-            let identity_clone = guard.identity.clone();
-            let sync_ready = guard.peers.get(&peer_hash).map(|p| p.sync_ready()).unwrap_or(true);
-            if !sync_ready {
-                // Must drop guard before spawn_peering_key_gen, which re-acquires the lock
-                drop(guard);
-                Self::spawn_peering_key_gen(arc, &peer_hash, &identity_clone);
+        let (needs_keys, identity) = {
+            let Some(mut guard) = lock_node(arc, "tick_sync") else { return };
+            let t = now();
+            if t - guard.last_sync_tick < PEER_SYNC_INTERVAL_SECS {
                 return;
             }
+            guard.last_sync_tick = t;
+            guard.note_backlog_hold();
 
-            // Initiate sync — drop the guard before the expensive offer building
-            // to avoid blocking client links.  initiate_sync re-acquires the lock
-            // internally for each peer access.
-            drop(guard);
-            Self::initiate_sync_locked(arc, &peer_hash);
-            return;
-        }
+            // Cull non-static peers we haven't heard from in MAX_UNREACHABLE_SECS.
+            // Static peers are never culled — they're operator-configured.
+            let culled: Vec<Vec<u8>> = guard.peers.iter()
+                .filter(|(hash, peer)| {
+                    t > peer.last_heard + MAX_UNREACHABLE_SECS
+                        && !guard.static_peers.contains(hash)
+                })
+                .map(|(hash, _)| hash.clone())
+                .collect();
+            for hash in culled {
+                log(
+                    format!("[lxmf.prop] removing peer {} due to excessive unreachability", hexrep(&hash, false)),
+                    LOG_WARNING, false, false,
+                );
+                guard.unpeer(&hash);
+            }
 
-        // Also check for peers that need peering keys generated — spawn background
-        let needs_keys: Vec<Vec<u8>> = guard.peers.iter()
-            .filter(|(_, peer)| {
-                peer.alive && peer.peering_cost.is_some() && !peer.peering_key_ready()
-            })
-            .map(|(hash, _)| hash.clone())
-            .collect();
+            for (hash, peer) in &guard.peers {
+                if !peer.unhandled_ids.is_empty() || !peer.alive {
+                    log(
+                        format!("[lxmf.prop] tick_sync peer {} alive={} state={} unhandled={} stamp_cost={:?} peer_cost={:?} peering_key_ready={}",
+                            hexrep(hash, false), peer.alive, PropPeer::state_name(peer.state), peer.unhandled_ids.len(),
+                            peer.propagation_stamp_cost, peer.peering_cost, peer.peering_key_ready()),
+                        LOG_DEBUG, false, false,
+                    );
+                }
+            }
 
-        let identity_clone = guard.identity.clone();
-        // Must drop guard before spawn_peering_key_gen, which re-acquires the lock
-        drop(guard);
+            // Keys are ground in the background, and a peer without one is
+            // simply not a candidate below: it can never hold up the others.
+            let needs_keys: Vec<Vec<u8>> = guard.peers.iter()
+                .filter(|(_, peer)| {
+                    peer.alive && peer.peering_cost.is_some() && !peer.peering_key_ready()
+                })
+                .map(|(hash, _)| hash.clone())
+                .collect();
+
+            if guard.outbound_sync_allowed() {
+                let mut rng = rand::thread_rng();
+                if let Some(peer_hash) = guard.select_sync_peer(t, &mut |n| rng.gen_range(0..n)) {
+                    log(
+                        format!("[lxmf.prop] tick_sync: selected peer {} to sync", hexrep(&peer_hash, false)),
+                        LOG_DEBUG, false, false,
+                    );
+                    (guard.event_sink())(SyncEvent::Start { peer: peer_hash });
+                }
+            }
+            (needs_keys, guard.identity.clone())
+        };
+
+        // spawn_peering_key_gen takes the lock itself.
         for hash in &needs_keys {
-            Self::spawn_peering_key_gen(arc, hash, &identity_clone);
+            Self::spawn_peering_key_gen(arc, hash, &identity);
         }
+    }
+
+    /// LXMRouter.sync_peers: choose the peer to start a sync with.
+    ///
+    /// Candidates are IDLE peers with something to offer. Alive ones are
+    /// "waiting"; the choice is random among the FASTEST_N_RANDOM_POOL
+    /// fastest of them plus as many of unknown speed. Only when none is
+    /// waiting is the choice random among the unresponsive peers whose
+    /// backoff has run out. `pick(n)` returns an index below `n`.
+    ///
+    /// Two departures, both so that no peer can hold up the rest:
+    ///   * a peer whose stamp costs are unknown or whose peering key is not
+    ///     ready is not a candidate. The reference chooses it, and its
+    ///     `sync()` only postpones and starts the key — a wasted choice.
+    ///     rfed chose the FIRST idle peer every tick, so one peer grinding
+    ///     its key blocked every other peer for 3.5 minutes (staging,
+    ///     2026-09-27);
+    ///   * an alive peer still in backoff is marked not alive here, which is
+    ///     what the reference's `sync()` does when it chooses one, without
+    ///     spending the choice on it.
+    pub fn select_sync_peer(&mut self, t: f64, pick: &mut dyn FnMut(usize) -> usize) -> Option<Vec<u8>> {
+        let backlog_held = self.backlog_held();
+        let fresh = &self.fresh_since_start;
+        let mut waiting: Vec<(Vec<u8>, f64)> = Vec::new();
+        let mut unresponsive: Vec<Vec<u8>> = Vec::new();
+        let mut not_ready = 0usize;
+        for (hash, peer) in self.peers.iter_mut() {
+            if peer.state != PropPeer::IDLE || !Self::has_sync_candidates(backlog_held, fresh, peer) {
+                continue;
+            }
+            if !peer.sync_ready() {
+                not_ready += 1;
+                continue;
+            }
+            if peer.alive {
+                if t <= peer.next_sync_attempt {
+                    peer.alive = false;
+                    log(
+                        format!(
+                            "[lxmf.prop] postponing sync with peer {} for {:.0}s due to previous failures",
+                            hexrep(hash, false), peer.next_sync_attempt - t,
+                        ),
+                        LOG_DEBUG, false, false,
+                    );
+                    continue;
+                }
+                waiting.push((hash.clone(), peer.sync_transfer_rate));
+            } else if t > peer.next_sync_attempt {
+                unresponsive.push(hash.clone());
+            }
+        }
+        if not_ready > 0 {
+            log(
+                format!("[lxmf.prop] {not_ready} peer(s) with messages to sync are waiting for stamp costs or a peering key"),
+                LOG_DEBUG, false, false,
+            );
+        }
+
+        let pool: Vec<Vec<u8>> = if !waiting.is_empty() {
+            let mut fastest = waiting.clone();
+            fastest.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            fastest.truncate(FASTEST_N_RANDOM_POOL.min(waiting.len()));
+            let fastest_count = fastest.len();
+            let mut pool: Vec<Vec<u8>> = fastest.into_iter().map(|(hash, _)| hash).collect();
+            pool.extend(
+                waiting.iter()
+                    .filter(|(_, rate)| *rate == 0.0)
+                    .take(fastest_count)
+                    .map(|(hash, _)| hash.clone()),
+            );
+            log(
+                format!("[lxmf.prop] selecting peer to sync from {} waiting peers", waiting.len()),
+                LOG_DEBUG, false, false,
+            );
+            pool
+        } else if !unresponsive.is_empty() {
+            log(
+                format!(
+                    "[lxmf.prop] no active peers available, randomly selecting peer to sync from {} unresponsive peers",
+                    unresponsive.len(),
+                ),
+                LOG_DEBUG, false, false,
+            );
+            unresponsive
+        } else {
+            return None;
+        };
+        let index = pick(pool.len()).min(pool.len() - 1);
+        Some(pool[index].clone())
     }
 
     /// Spawn a background thread to generate a peering key for `peer_hash`
@@ -2036,8 +2255,9 @@ impl LxmfPropagationNode {
                 Err(_) => return,
             };
             // Dedup: skip if a generation thread is already running for this peer.
-            // tick_sync runs every ~6 s; cost-N PoW takes seconds. Without this
-            // guard, concurrent generations stack up and pin the CPU.
+            // tick_sync runs every PEER_SYNC_INTERVAL_SECS; cost-N PoW takes
+            // seconds to minutes. Without this guard, concurrent generations
+            // stack up and pin the CPU.
             // // NEVER REMOVE EVER
             if guard.in_flight_keys.contains(peer_hash) {
                 return;
@@ -2107,528 +2327,912 @@ impl LxmfPropagationNode {
                                 );
                             }
                         }
+                    } else {
+                        log(
+                            format!(
+                                "[lxmf.prop] peering key generation for {} reached value {} of the {} required; it is tried again on a later tick",
+                                hexrep(&dest_hash, false), value, peering_cost,
+                            ),
+                            LOG_WARNING, false, false,
+                        );
                     }
                 }
             }
         });
     }
 
-    /// Initiate an outbound sync session with a peer (lock-free wrapper).
-    ///
-    /// Re-acquires the lock for each peer access to avoid blocking client
-    /// links during the expensive offer building.
-    fn initiate_sync_locked(arc: &Arc<Mutex<Self>>, peer_hash: &[u8]) {
-        log(
-            format!("[lxmf.prop] initiate_sync starting for {}", hexrep(peer_hash, false)),
-            LOG_DEBUG, false, false,
-        );
+    // ── The sync worker ──────────────────────────────────────────────────
 
-        // Phase 1: Collect peer data we need (short lock)
-        let (unhandled_ids, peering_key_ready) = {
-            let guard = match arc.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            let peer = match guard.peers.get(peer_hash) {
-                Some(p) => p,
-                None => { log("[lxmf.prop] sync: peer not found", LOG_DEBUG, false, false); return; }
-            };
-            if peer.state != PropPeer::IDLE {
-                log(format!("[lxmf.prop] sync: peer state={} not IDLE", peer.state), LOG_DEBUG, false, false);
-                return;
+    /// Start the one thread that runs every sync event, and return the sink
+    /// the network callbacks deliver to. Events are handled in the order they
+    /// arrive, so a session's steps can never overtake one another.
+    fn start_sync_worker(arc: &Arc<Mutex<Self>>, node: &mut Self) -> SyncEventSink {
+        let (tx, rx) = std::sync::mpsc::channel::<SyncEvent>();
+        let weak = Arc::downgrade(arc);
+        let spawned = std::thread::Builder::new()
+            .name("lxmf-prop-sync".into())
+            .spawn(move || {
+                for event in rx {
+                    let Some(arc) = weak.upgrade() else { break };
+                    Self::handle_sync_event(&arc, event);
+                }
+            });
+        if let Err(e) = spawned {
+            log(format!("[lxmf.prop] could not start the peer sync worker: {e}; outbound peer sync is OFF"), LOG_ERROR, false, false);
+        }
+        let sink: SyncEventSink = Arc::new(move |event: SyncEvent| {
+            let described = event.describe();
+            if tx.send(event).is_err() {
+                log(format!("[lxmf.prop] sync event dropped, the sync worker has stopped: {described}"), LOG_WARNING, false, false);
             }
-            (guard.sync_pool(peer), peer.peering_key.is_some())
-        };
-
-        if !peering_key_ready {
-            return;
-        }
-
-        // Phase 2: Build offer WITHOUT holding the lock (expensive operation)
-        let mut entries_with_weight: Vec<(Vec<u8>, f64, u64)> = Vec::new();
-        {
-            let guard = match arc.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            for tid in &unhandled_ids {
-                if let Some(entry) = guard.entries.get(tid) {
-                    let age = ((now() - entry.received) / 86400.0 / 4.0).max(1.0);
-                    let weight = age * entry.size as f64;
-                    entries_with_weight.push((tid.clone(), weight, entry.size as u64));
-                }
-            }
-        }
-
-        entries_with_weight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let per_message_overhead = 16.0;
-        let mut cumulative_size = 24.0;
-        let mut offer_ids = Vec::new();
-
-        {
-            let mut guard = match arc.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            let peer = match guard.peers.get_mut(peer_hash) {
-                Some(p) => p,
-                None => return,
-            };
-
-            for (tid, _, size) in &entries_with_weight {
-                if offer_ids.len() >= MAX_OFFER_IDS {
-                    break;
-                }
-                let msg_size = *size as f64 + per_message_overhead;
-                let next_size = cumulative_size + msg_size;
-
-                if let Some(limit) = peer.propagation_transfer_limit {
-                    if msg_size > limit * 1000.0 {
-                        peer.mark_handled(tid);
-                        continue;
-                    }
-                }
-
-                if let Some(sync_limit) = peer.propagation_sync_limit {
-                    if next_size >= sync_limit * 1000.0 {
-                        continue;
-                    }
-                }
-
-                cumulative_size += msg_size;
-                offer_ids.push(tid.clone());
-            }
-        }
-
-        if offer_ids.is_empty() {
-            return;
-        }
-
-        // Phase 3: Send offer (short lock)
-        let mut guard = match arc.lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
-
-        if let Some(handle) = AppLinks::get_handle(peer_hash)
-            .filter(|link| link.status() == reticulum_rust::link::STATE_ACTIVE)
-        {
-            log(
-                format!(
-                    "[lxmf.prop] reusing AppLinks persistent link for {}",
-                    hexrep(peer_hash, false),
-                ),
-                LOG_DEBUG,
-                false,
-                false,
-            );
-            guard.send_offer_on_link(&handle, peer_hash, &offer_ids);
-            return;
-        }
-
-        AppLinks::open_persistent(peer_hash, LXMF_APP, &[PROP_ASPECT]);
+        });
+        node.sync_event_sink = Some(Arc::clone(&sink));
+        sink
     }
 
-    /// Initiate an outbound sync session with a peer.
-    ///
-    /// Builds an OFFER payload containing unhandled transient_ids (sorted by
-    /// weight = age × size, lightest first) and runs the OFFER request over
-    /// the shared AppLinks-owned persistent `lxmf.propagation` link once it is
-    /// active.
-    fn initiate_sync(&mut self, peer_hash: &[u8]) {
-        log(
-            format!("[lxmf.prop] initiate_sync starting for {}", hexrep(peer_hash, false)),
-            LOG_DEBUG, false, false,
-        );
-        let backlog_held = self.backlog_held();
-        let fresh_since_start = if backlog_held { self.fresh_since_start.clone() } else { Vec::new() };
-        let peer = match self.peers.get_mut(peer_hash) {
-            Some(p) => p,
-            None => { log("[lxmf.prop] sync: peer not found", LOG_DEBUG, false, false); return; }
-        };
-
-        peer.last_sync_attempt = now();
-
-        if peer.state != PropPeer::IDLE {
-            log(format!("[lxmf.prop] sync: peer state={} not IDLE", peer.state), LOG_DEBUG, false, false);
-            return;
-        }
-
-        // Build offer candidates from the current peer state.
-        match &peer.peering_key {
-            Some(_) => {}
-            None => return,
-        };
-
-        // Gather unhandled IDs, sorted by weight (age × size, lightest first).
-        // This ensures small/recent messages are offered first, and oversized
-        // messages that exceed the peer's transfer limit are auto-handled.
-        let mut entries_with_weight: Vec<(Vec<u8>, f64, u64)> = Vec::new();
-        let pool = Self::sync_pool_for(backlog_held, &fresh_since_start, peer);
-        for tid in pool.iter() {
-            if let Some(entry) = self.entries.get(tid) {
-                let age = ((now() - entry.received) / 86400.0 / 4.0).max(1.0);
-                let weight = age * entry.size as f64;
-                entries_with_weight.push((tid.clone(), weight, entry.size as u64));
-            }
-        }
-        entries_with_weight.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
-        let per_message_overhead = 16.0;
-        let mut cumulative_size = 24.0;
-        let mut offer_ids = Vec::new();
-
-        for (tid, _, size) in &entries_with_weight {
-            // Cap the number of offered IDs to stay within the 5-second send
-            // budget.  With 197k+ messages the sort+filter alone takes >5s.
-            if offer_ids.len() >= MAX_OFFER_IDS {
-                break;
-            }
-            let msg_size = *size as f64 + per_message_overhead;
-            let next_size = cumulative_size + msg_size;
-
-            if let Some(limit) = peer.propagation_transfer_limit {
-                if msg_size > limit * 1000.0 {
-                    // Message too big for this peer, mark handled
-                    peer.mark_handled(tid);
-                    continue;
-                }
-            }
-
-            if let Some(sync_limit) = peer.propagation_sync_limit {
-                if next_size >= sync_limit * 1000.0 {
-                    continue;
-                }
-            }
-
-            cumulative_size += msg_size;
-            offer_ids.push(tid.clone());
-        }
-
-        if offer_ids.is_empty() {
-            return;
-        }
-
-        if let Some(handle) = AppLinks::get_handle(peer_hash)
-            .filter(|link| link.status() == reticulum_rust::link::STATE_ACTIVE)
-        {
-            log(
-                format!(
-                    "[lxmf.prop] reusing AppLinks persistent link for {}",
-                    hexrep(peer_hash, false),
-                ),
-                LOG_DEBUG,
-                false,
-                false,
-            );
-            self.send_offer_on_link(&handle, peer_hash, &offer_ids);
-            return;
-        }
-
-        AppLinks::open_persistent(peer_hash, LXMF_APP, &[PROP_ASPECT]);
-        log(
-            format!(
-                "[lxmf.prop] requested AppLinks persistent open for {}",
-                hexrep(peer_hash, false),
-            ),
-            LOG_DEBUG,
-            false,
-            false,
-        );
-    }
-
-    /// Send the OFFER request on an already-established link.
-    ///
-    /// Sets up response/failure callbacks that drive the rest of the sync
-    /// session (handle_offer_response → send_messages_to_peer).
-    fn send_offer_on_link(&mut self, link: &LinkHandle, peer_hash: &[u8], offer_ids: &[Vec<u8>]) {
-        let peer = match self.peers.get_mut(peer_hash) {
-            Some(p) => p,
-            None => return,
-        };
-
-        peer.link = Some(link.clone());
-        peer.last_offer = offer_ids.to_vec();
-        peer.state = PropPeer::LINK_READY;
-        peer.alive = true;
-        peer.last_heard = now();
-        peer.sync_backoff = 0.0;
-
-        let current_link_id = link.link_id();
-        let already_identified = peer
-            .identified_link_id
-            .as_ref()
-            .map(|id| id == &current_link_id)
-            .unwrap_or(false);
-
-        if !already_identified {
-            if let Err(e) = link.identify(&self.identity) {
+    /// Where this node's network callbacks deliver sync events.
+    fn event_sink(&self) -> SyncEventSink {
+        match &self.sync_event_sink {
+            Some(sink) => Arc::clone(sink),
+            None => Arc::new(|event: SyncEvent| {
                 log(
-                    format!("[lxmf.prop] identify before offer failed: {e}"),
-                    LOG_WARNING,
-                    false,
-                    false,
+                    format!("[lxmf.prop] sync event dropped, no sync worker is running: {}", event.describe()),
+                    LOG_WARNING, false, false,
                 );
-                link.teardown();
-                peer.state = PropPeer::IDLE;
-                peer.link = None;
-                peer.identified_link_id = None;
+            }),
+        }
+    }
+
+    /// The sync worker's dispatcher.
+    pub(crate) fn handle_sync_event(arc: &Arc<Mutex<Self>>, event: SyncEvent) {
+        match event {
+            SyncEvent::Start { peer } => Self::sync_peer(arc, &peer),
+            SyncEvent::LinkActive { peer, link_id } => Self::on_link_active(arc, &peer, link_id),
+            SyncEvent::LinkDown { peer } => Self::on_link_down(arc, &peer),
+            SyncEvent::OfferResponse { peer, session, response } => {
+                Self::on_offer_response(arc, &peer, session, response)
+            }
+            SyncEvent::OfferFailed { peer, session } => Self::on_offer_failed(arc, &peer, session),
+            SyncEvent::ResourceConcluded { peer, session, outcome } => {
+                Self::on_resource_concluded(arc, &peer, session, outcome)
+            }
+        }
+    }
+
+    /// End `peer_hash`'s session: release its held link (AppLinks::close, the
+    /// reference's `link.teardown()`) and return it to IDLE. Its unhandled
+    /// ids are untouched, and every callback still in flight for the session
+    /// is made stale.
+    fn end_sync(&mut self, peer_hash: &[u8]) {
+        self.sync_io.close_link(peer_hash);
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            peer.state = PropPeer::IDLE;
+            peer.link_id = None;
+            peer.identified_link_id = None;
+            peer.reidentified = false;
+            peer.transferring = None;
+            peer.current_sync_transfer_started = None;
+            peer.last_offer.clear();
+            peer.sync_session += 1;
+        }
+    }
+
+    /// Mark `ids` handled for `peer_hash`, for the ids still in the store
+    /// (LXMPeer.add_handled_message only records stored ids).
+    fn mark_handled_for(&mut self, peer_hash: &[u8], ids: &[Vec<u8>]) {
+        let entries = &self.entries;
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            for tid in ids {
+                if entries.contains_key(tid) {
+                    peer.mark_handled(tid);
+                } else {
+                    peer.unhandled_ids.remove(tid);
+                }
+            }
+        }
+    }
+
+    // ── A session's steps (LXMPeer) ──────────────────────────────────────
+
+    /// LXMPeer.sync(): advance `peer_hash`'s session one step — from IDLE,
+    /// open the sync link (or take the one already held); once the link is
+    /// ready, send the offer. The offer's candidates are sorted with the node
+    /// released: a peer's queue can hold 150k ids.
+    fn sync_peer(arc: &Arc<Mutex<Self>>, peer_hash: &[u8]) {
+        let prepared = {
+            let Some(mut node) = lock_node(arc, "peer sync") else { return };
+            node.prepare_sync(peer_hash)
+        };
+        let Some(prepared) = prepared else { return };
+        let plan = plan_offer(
+            prepared.candidates,
+            prepared.transfer_limit_kb,
+            prepared.sync_limit_kb,
+            MAX_OFFER_IDS,
+        );
+        let Some(mut node) = lock_node(arc, "peer sync (offer)") else { return };
+        node.send_offer(peer_hash, prepared.session, plan);
+    }
+
+    /// The part of LXMPeer.sync() that needs the node: the readiness checks,
+    /// opening the link from IDLE, and, once LINK_READY, the offer's
+    /// candidates. `Some` only when an offer is to be planned.
+    fn prepare_sync(&mut self, peer_hash: &[u8]) -> Option<PreparedOffer> {
+        let t = now();
+        let backlog_held = self.backlog_held();
+        let io = Arc::clone(&self.sync_io);
+        let peer_str = hexrep(peer_hash, false);
+
+        enum Gate { Postpone(String), NothingToSync, Busy, Proceed }
+        let (gate, state) = {
+            let fresh = &self.fresh_since_start;
+            let Some(peer) = self.peers.get_mut(peer_hash) else {
+                log(format!("[lxmf.prop] sync requested for {peer_str}, which is not a peer"), LOG_DEBUG, false, false);
+                return None;
+            };
+            // The reference calls sync() only on an IDLE peer (sync_peers) or
+            // a LINK_READY one (link_established); a session already past
+            // that is left to its own events.
+            if peer.state != PropPeer::IDLE && peer.state != PropPeer::LINK_READY {
+                log(
+                    format!(
+                        "[lxmf.prop] sync requested for peer {peer_str} in state {}; its session is already running",
+                        PropPeer::state_name(peer.state),
+                    ),
+                    LOG_DEBUG, false, false,
+                );
+                return None;
+            }
+            peer.last_sync_attempt = t;
+            let gate = if t <= peer.next_sync_attempt {
+                if peer.last_sync_attempt > peer.last_heard {
+                    peer.alive = false;
+                }
+                Gate::Postpone(format!("for {:.0}s due to previous failures", peer.next_sync_attempt - t))
+            } else if peer.propagation_stamp_cost.is_none()
+                || peer.propagation_stamp_flexibility.is_none()
+                || peer.peering_cost.is_none()
+            {
+                Gate::Postpone("since its required stamp costs are not yet known".to_string())
+            } else if !peer.peering_key_ready() {
+                Gate::Postpone("since a peering key has not been generated yet".to_string())
+            } else if !Self::has_sync_candidates(backlog_held, fresh, peer) {
+                Gate::NothingToSync
+            } else if peer.transferring.is_some() {
+                Gate::Busy
+            } else {
+                Gate::Proceed
+            };
+            (gate, peer.state)
+        };
+
+        match gate {
+            Gate::Proceed => {}
+            Gate::Postpone(reason) => {
+                log(format!("[lxmf.prop] postponing sync with peer {peer_str} {reason}"), LOG_DEBUG, false, false);
+                // A session never waits in LINK_READY: that would hold the
+                // link open with nothing coming.
+                if state == PropPeer::LINK_READY {
+                    self.end_sync(peer_hash);
+                }
+                return None;
+            }
+            Gate::NothingToSync => {
+                log(
+                    format!("[lxmf.prop] sync requested for peer {peer_str}, but no unhandled messages exist for it. Sync complete."),
+                    LOG_DEBUG, false, false,
+                );
+                if state == PropPeer::LINK_READY {
+                    self.end_sync(peer_hash);
+                }
+                return None;
+            }
+            Gate::Busy => {
+                log(
+                    format!("[lxmf.prop] sync requested for peer {peer_str}, but its current message transfer was not clear. Not starting another."),
+                    LOG_ERROR, false, false,
+                );
+                return None;
+            }
+        }
+
+        match state {
+            PropPeer::IDLE => {
+                let held = io.active_link(peer_hash);
+                let peer = self.peers.get_mut(peer_hash)?;
+                match held {
+                    Some(link_id) => {
+                        // A link to the peer is already held (the previous
+                        // session's, still up): take it, as if just established.
+                        log(
+                            format!("[lxmf.prop] sync with peer {peer_str} reuses the held link {}", hexrep(&link_id, false)),
+                            LOG_DEBUG, false, false,
+                        );
+                        peer.sync_session += 1;
+                        peer.link_id = Some(link_id);
+                        peer.identified_link_id = None;
+                        peer.reidentified = false;
+                        peer.next_sync_attempt = 0.0;
+                        peer.state = PropPeer::LINK_READY;
+                    }
+                    None => {
+                        peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
+                        peer.next_sync_attempt = t + peer.sync_backoff;
+                        peer.sync_session += 1;
+                        peer.link_id = None;
+                        peer.identified_link_id = None;
+                        peer.reidentified = false;
+                        peer.state = PropPeer::LINK_ESTABLISHING;
+                        log(
+                            format!(
+                                "[lxmf.prop] establishing link for sync to peer {peer_str} ({} unhandled)",
+                                peer.unhandled_ids.len(),
+                            ),
+                            LOG_NOTICE, false, false,
+                        );
+                        // The outcome arrives as LinkActive or LinkDown.
+                        io.open_link(peer_hash);
+                        return None;
+                    }
+                }
+            }
+            _ => {} // LINK_READY; other states returned above.
+        }
+
+        // LINK_READY: gather the offer's candidates.
+        let fresh = &self.fresh_since_start;
+        let entries = &self.entries;
+        let peer = self.peers.get_mut(peer_hash)?;
+        peer.alive = true;
+        peer.last_heard = t;
+        peer.sync_backoff = 0.0;
+        let min_accepted_cost = peer.propagation_stamp_cost.unwrap_or(0)
+            .saturating_sub(peer.propagation_stamp_flexibility.unwrap_or(0));
+
+        let mut candidates = Vec::new();
+        let mut purged = Vec::new();
+        let mut low_value = Vec::new();
+        for tid in Self::sync_pool_for(backlog_held, fresh, peer) {
+            match entries.get(&tid) {
+                None => purged.push(tid),
+                Some(entry) if entry.stamp_value < min_accepted_cost => low_value.push(tid),
+                Some(entry) => {
+                    // LXMRouter.get_weight: age in 4-day units (at least 1) × size.
+                    let age_weight = ((t - entry.received) / 86400.0 / 4.0).max(1.0);
+                    candidates.push(OfferCandidate {
+                        weight: age_weight * entry.size as f64,
+                        size: entry.size,
+                        tid,
+                    });
+                }
+            }
+        }
+        for tid in purged.iter().chain(low_value.iter()) {
+            peer.unhandled_ids.remove(tid);
+        }
+        if !purged.is_empty() {
+            log(
+                format!(
+                    "[lxmf.prop] dropped {} unhandled message(s) for peer {peer_str} since they no longer exist in the message store",
+                    purged.len(),
+                ),
+                LOG_DEBUG, false, false,
+            );
+        }
+        if !low_value.is_empty() {
+            log(
+                format!(
+                    "[lxmf.prop] dropped {} unhandled message(s) for peer {peer_str} since their stamp value is lower than the peer's requirement of {min_accepted_cost}",
+                    low_value.len(),
+                ),
+                LOG_NOTICE, false, false,
+            );
+        }
+        log(
+            format!("[lxmf.prop] synchronisation link to peer {peer_str} established, preparing sync offer..."),
+            LOG_DEBUG, false, false,
+        );
+        Some(PreparedOffer {
+            session: peer.sync_session,
+            candidates,
+            transfer_limit_kb: peer.propagation_transfer_limit,
+            sync_limit_kb: peer.propagation_sync_limit,
+        })
+    }
+
+    /// Send the planned offer: mark what the peer can never take handled,
+    /// size the offer to this minute's allowance, identify the link if it
+    /// has not been, and request `/offer` on it.
+    fn send_offer(&mut self, peer_hash: &[u8], prepared_session: u64, plan: OfferPlan) {
+        let peer_str = hexrep(peer_hash, false);
+        let transfer_limit_kb = match self.peers.get(peer_hash) {
+            Some(peer) if peer.state == PropPeer::LINK_READY && peer.sync_session == prepared_session => {
+                peer.propagation_transfer_limit
+            }
+            _ => {
+                log(
+                    format!("[lxmf.prop] sync with peer {peer_str} moved on while its offer was prepared; offer dropped"),
+                    LOG_DEBUG, false, false,
+                );
                 return;
             }
+        };
 
-            peer.identified_link_id = Some(current_link_id);
-            peer.state = PropPeer::IDLE;
+        // LXMPeer.sync: a message over the peer's per-message transfer limit
+        // is marked handled and never sent.
+        if !plan.too_big.is_empty() {
+            self.mark_handled_for(peer_hash, &plan.too_big);
+            log(
+                format!(
+                    "[lxmf.prop] {} message(s) over peer {peer_str}'s per-message transfer limit of {} KB marked handled without sending",
+                    plan.too_big.len(),
+                    transfer_limit_kb.map(|l| format!("{l}")).unwrap_or_else(|| "?".into()),
+                ),
+                LOG_WARNING, false, false,
+            );
+        }
+        // rfed departure: a message no single sync Resource can carry.
+        if !plan.over_resource.is_empty() {
+            self.mark_handled_for(peer_hash, &plan.over_resource);
+            log(
+                format!(
+                    "[lxmf.prop] {} message(s) larger than one sync Resource ({} B) marked handled for peer {peer_str} without sending",
+                    plan.over_resource.len(), MAX_SYNC_RESOURCE_BYTES,
+                ),
+                LOG_WARNING, false, false,
+            );
+        }
+
+        let allowance = self.outbound_allowance() as usize;
+        let mut offer: Vec<Vec<u8>> = {
+            let entries = &self.entries;
+            let Some(peer) = self.peers.get(peer_hash) else { return };
+            plan.offer.into_iter()
+                .filter(|tid| entries.contains_key(tid) && peer.unhandled_ids.contains(tid))
+                .collect()
+        };
+        if offer.len() > allowance {
+            log(
+                format!(
+                    "[lxmf.prop] offer to peer {peer_str} cut from {} to {allowance} message(s) by this minute's outbound budget",
+                    offer.len(),
+                ),
+                LOG_DEBUG, false, false,
+            );
+            offer.truncate(allowance);
+        }
+        if offer.is_empty() {
+            let reason = if allowance == 0 {
+                "this minute's outbound budget is spent"
+            } else {
+                "no unhandled messages fit the peer's limits"
+            };
+            log(
+                format!("[lxmf.prop] sync requested for peer {peer_str}, but nothing can be offered: {reason}. Sync complete."),
+                LOG_DEBUG, false, false,
+            );
+            self.end_sync(peer_hash);
             return;
         }
 
-        let (peering_key, _) = match &peer.peering_key {
-            Some(pk) => pk.clone(),
+        let io = Arc::clone(&self.sync_io);
+        let sink = self.event_sink();
+        let identity = self.identity.clone();
+        let (link_id, peering_key, identified_link_id) = match self.peers.get(peer_hash) {
+            Some(peer) => (
+                peer.link_id.clone(),
+                peer.peering_key.clone().map(|(key, _)| key),
+                peer.identified_link_id.clone(),
+            ),
             None => return,
         };
+        let (Some(link_id), Some(peering_key)) = (link_id, peering_key) else {
+            log(
+                format!("[lxmf.prop] sync with peer {peer_str} is LINK_READY without a link or a peering key; ending it"),
+                LOG_ERROR, false, false,
+            );
+            self.end_sync(peer_hash);
+            return;
+        };
+        let needs_identify = identified_link_id.as_ref() != Some(&link_id);
 
-        let offer = Value::Array(vec![
+        // Identify, then offer, back to back on the same link: the link
+        // actor sends them in this order (LXMPeer.link_established identifies
+        // and calls sync() at once). Once per link.
+        if needs_identify {
+            if let Err(e) = io.identify(peer_hash, &link_id, &identity) {
+                log(format!("[lxmf.prop] identify on the sync link to peer {peer_str} failed: {e}; sync ended"), LOG_WARNING, false, false);
+                self.end_sync(peer_hash);
+                return;
+            }
+        }
+
+        let session = {
+            let Some(peer) = self.peers.get_mut(peer_hash) else { return };
+            if needs_identify {
+                peer.identified_link_id = Some(link_id.clone());
+            }
+            peer.sync_session += 1;
+            peer.last_offer = offer.clone();
+            peer.state = PropPeer::REQUEST_SENT;
+            peer.sync_session
+        };
+
+        let offer_data = encode_value(Value::Array(vec![
             Value::Binary(peering_key),
-            Value::Array(offer_ids.iter().map(|id| Value::Binary(id.clone())).collect()),
-        ]);
-        let mut offer_data = Vec::new();
-        let _ = write_value(&mut offer_data, &offer);
-
-        // Set up response callback
-        let weak = self.self_handle.clone();
-        let peer_hash_clone = peer_hash.to_vec();
+            Value::Array(offer.iter().map(|id| Value::Binary(id.clone())).collect()),
+        ]));
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        let offer_sent_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
-        let response_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>> = Some(Arc::new({
-            let weak = weak.clone();
-            let ph = peer_hash_clone.clone();
-            move |receipt: RequestReceipt| {
+        let offer_sent_at = now();
+        let on_response: Arc<dyn Fn(Option<Vec<u8>>) + Send + Sync> = {
+            let sink = Arc::clone(&sink);
+            let peer = peer_hash.to_vec();
+            Arc::new(move |response: Option<Vec<u8>>| {
                 // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
                 reticulum_rust::send_assertion::assert_send_completed_in_time(
                     "lxmf.propagation.offer", offer_sent_at,
                 );
-                if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                    if let Ok(mut node) = arc.lock() {
-                        node.handle_offer_response(&ph, receipt);
-                    }
-                }
-            }
-        }));
-
-        let failed_cb: Option<Arc<dyn Fn(RequestReceipt) + Send + Sync>> = Some(Arc::new({
-            let weak = weak.clone();
-            let ph = peer_hash_clone.clone();
-            let link = link.clone();
-            move |_receipt: RequestReceipt| {
-                link.teardown();
-                if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                    if let Ok(mut node) = arc.lock() {
-                        if let Some(peer) = node.peers.get_mut(&ph) {
-                            peer.state = PropPeer::IDLE;
-                            peer.link = None;
-                            peer.identified_link_id = None;
-                        }
-                    }
-                }
-            }
-        }));
-
-        match link.request(
-            OFFER_PATH.to_string(),
-            offer_data,
-            response_cb,
-            failed_cb,
-            None,
-        ) {
-            Ok(_) => {
-                peer.state = PropPeer::REQUEST_SENT;
-            }
-            Err(e) => {
-                log(format!("[lxmf.prop] offer request failed: {e}"), LOG_WARNING, false, false);
-                link.teardown();
-                peer.state = PropPeer::IDLE;
-                peer.link = None;
-            }
+                sink(SyncEvent::OfferResponse { peer: peer.clone(), session, response });
+            })
+        };
+        let on_failed: Arc<dyn Fn() + Send + Sync> = {
+            let peer = peer_hash.to_vec();
+            Arc::new(move || sink(SyncEvent::OfferFailed { peer: peer.clone(), session }))
+        };
+        log(
+            format!("[lxmf.prop] offering {} message(s) to peer {peer_str}", offer.len()),
+            LOG_NOTICE, false, false,
+        );
+        if let Err(e) = io.request_offer(peer_hash, &link_id, offer_data, on_response, on_failed) {
+            log(format!("[lxmf.prop] offer request to peer {peer_str} could not be sent: {e}; sync ended"), LOG_WARNING, false, false);
+            self.end_sync(peer_hash);
         }
     }
 
-    /// Process the peer's response to our OFFER.
-    ///
-    /// The response is one of:
-    ///   - `false` (“have all”) — mark all offered IDs as handled.
-    ///   - `true`  (“want all”) — send every offered message.
-    ///   - `[id, ...]` (“want some”) — send only listed IDs; mark rest handled.
-    ///   - Integer error code — diagnose and possibly unpeer.
-    fn handle_offer_response(&mut self, peer_hash: &[u8], receipt: RequestReceipt) {
-        let response = match receipt.response {
-            Some(data) => read_value(&mut Cursor::new(data)).ok(),
-            None => None,
+    /// LXMPeer.offer_response.
+    fn on_offer_response(arc: &Arc<Mutex<Self>>, peer_hash: &[u8], session: u64, response: Option<Vec<u8>>) {
+        let next = {
+            let Some(mut node) = lock_node(arc, "offer response") else { return };
+            node.apply_offer_response(peer_hash, session, response)
         };
-
-        let peer = match self.peers.get_mut(peer_hash) {
-            Some(p) => p,
-            None => return,
-        };
-
-        peer.state = PropPeer::RESPONSE_RECEIVED;
-
-        // Check for error codes from the remote peer.
-        // 0xF0 = no identity (transient, retry); 0xF1 = access denied (unpeer);
-        // 0xF3 = invalid peering key (regenerate).
-        if let Some(Value::Integer(code)) = response.as_ref() {
-            let code = code.as_i64().unwrap_or(0) as u8;
-            match code {
-                0xF0 => {
-                    log("[lxmf.prop] remote: no identity, retrying...", LOG_WARNING, false, false);
-                    peer.identified_link_id = None;
-                    peer.state = PropPeer::IDLE;
-                    return;
-                }
-                0xF1 => {
-                    log("[lxmf.prop] remote: access denied, breaking peering", LOG_WARNING, false, false);
-                    let hash = peer_hash.to_vec();
-                    self.unpeer(&hash);
-                    return;
-                }
-                0xF3 => {
-                    log("[lxmf.prop] remote: invalid peering key, regenerating", LOG_WARNING, false, false);
-                    peer.peering_key = None;
-                    peer.identified_link_id = None;
-                    peer.state = PropPeer::IDLE;
-                    return;
-                }
-                _ => {}
-            }
+        match next {
+            OfferNext::Done => {}
+            OfferNext::Resync => Self::sync_peer(arc, peer_hash),
+            OfferNext::Send(files) => Self::send_sync_resource(arc, peer_hash, session, files),
         }
+    }
 
-        let last_offer = peer.last_offer.clone();
-
-        match response {
-            Some(Value::Boolean(false)) => {
-                // Peer has all messages — mark them handled
-                for tid in &last_offer {
-                    peer.mark_handled(tid);
-                }
-                log(
-                    format!("[lxmf.prop] peer {} has all {} offered messages", hexrep(peer_hash, false), last_offer.len()),
-                    LOG_DEBUG, false, false,
-                );
-            }
-            Some(Value::Boolean(true)) => {
-                // Peer wants all messages — send them via resource
-                log(
-                    format!("[lxmf.prop] peer {} wants all {} messages, sending...", hexrep(peer_hash, false), last_offer.len()),
-                    LOG_DEBUG, false, false,
-                );
-                self.send_messages_to_peer(peer_hash, &last_offer);
-            }
-            Some(Value::Array(list)) => {
-                // Peer wants specific messages
-                let wanted: Vec<Vec<u8>> = list.iter()
-                    .filter_map(|v| match v { Value::Binary(b) => Some(b.clone()), _ => None })
-                    .collect();
-
-                // Mark unwanted as handled
-                for tid in &last_offer {
-                    if !wanted.contains(tid) {
-                        if let Some(peer) = self.peers.get_mut(peer_hash) {
-                            peer.mark_handled(tid);
-                        }
-                    }
-                }
-
-                log(
-                    format!("[lxmf.prop] peer {} wants {}/{} messages", hexrep(peer_hash, false), wanted.len(), last_offer.len()),
-                    LOG_DEBUG, false, false,
-                );
-                self.send_messages_to_peer(peer_hash, &wanted);
+    /// The node side of LXMPeer.offer_response: reconcile the response with
+    /// the offer. Ids the peer already has are marked handled; the ones it
+    /// wants are NOT — they are returned, to be sent, and are marked handled
+    /// only when their Resource concludes COMPLETE.
+    fn apply_offer_response(&mut self, peer_hash: &[u8], session: u64, response: Option<Vec<u8>>) -> OfferNext {
+        let peer_str = hexrep(peer_hash, false);
+        let last_offer = match self.peers.get_mut(peer_hash) {
+            Some(peer) if peer.state == PropPeer::REQUEST_SENT && peer.sync_session == session => {
+                peer.state = PropPeer::RESPONSE_RECEIVED;
+                std::mem::take(&mut peer.last_offer)
             }
             _ => {
-                log("[lxmf.prop] unexpected offer response", LOG_WARNING, false, false);
+                log(format!("[lxmf.prop] offer response from peer {peer_str} belongs to an ended sync; ignored"), LOG_DEBUG, false, false);
+                return OfferNext::Done;
             }
+        };
+
+        let value = response.as_deref().and_then(|data| read_value(&mut Cursor::new(data)).ok());
+        let wanted: Vec<Vec<u8>> = match value {
+            Some(Value::Integer(code)) => {
+                let code = code.as_u64().unwrap_or(0) as u8;
+                match code {
+                    ERROR_NO_IDENTITY => {
+                        let Some(peer) = self.peers.get_mut(peer_hash) else { return OfferNext::Done };
+                        if !peer.reidentified {
+                            log(
+                                format!("[lxmf.prop] peer {peer_str} indicated that no identification was received; identifying again"),
+                                LOG_NOTICE, false, false,
+                            );
+                            peer.reidentified = true;
+                            peer.identified_link_id = None;
+                            peer.state = PropPeer::LINK_READY;
+                            return OfferNext::Resync;
+                        }
+                        log(
+                            format!("[lxmf.prop] peer {peer_str} still received no identification after a second identify; sync ended"),
+                            LOG_WARNING, false, false,
+                        );
+                        self.end_sync(peer_hash);
+                    }
+                    ERROR_NO_ACCESS => {
+                        log(format!("[lxmf.prop] peer {peer_str} indicated that access was denied, breaking peering"), LOG_WARNING, false, false);
+                        self.unpeer(peer_hash);
+                    }
+                    ERROR_THROTTLED => {
+                        log(
+                            format!("[lxmf.prop] peer {peer_str} indicated that we're throttled, postponing sync for {PN_STAMP_THROTTLE_SECS:.0}s"),
+                            LOG_NOTICE, false, false,
+                        );
+                        if let Some(peer) = self.peers.get_mut(peer_hash) {
+                            peer.next_sync_attempt = now() + PN_STAMP_THROTTLE_SECS;
+                        }
+                        self.end_sync(peer_hash);
+                    }
+                    ERROR_INVALID_KEY => {
+                        log(format!("[lxmf.prop] peer {peer_str} rejected our peering key; regenerating"), LOG_WARNING, false, false);
+                        if let Some(peer) = self.peers.get_mut(peer_hash) {
+                            peer.peering_key = None;
+                        }
+                        self.end_sync(peer_hash);
+                    }
+                    other => {
+                        log(
+                            format!("[lxmf.prop] peer {peer_str} refused the sync offer with error 0x{other:02x}; {} message(s) stay unhandled", last_offer.len()),
+                            LOG_WARNING, false, false,
+                        );
+                        self.end_sync(peer_hash);
+                    }
+                }
+                return OfferNext::Done;
+            }
+            Some(Value::Boolean(false)) => {
+                // The peer already has every offered message.
+                self.mark_handled_for(peer_hash, &last_offer);
+                Vec::new()
+            }
+            Some(Value::Boolean(true)) => last_offer.clone(),
+            Some(Value::Array(list)) => {
+                let listed: Vec<Vec<u8>> = list.into_iter()
+                    .filter_map(|v| match v { Value::Binary(b) => Some(b), _ => None })
+                    .collect();
+                // If the peer did not want a message, it already has it.
+                let unwanted: Vec<Vec<u8>> = last_offer.iter()
+                    .filter(|tid| !listed.contains(tid))
+                    .cloned()
+                    .collect();
+                self.mark_handled_for(peer_hash, &unwanted);
+                let wanted: Vec<Vec<u8>> = listed.iter().filter(|tid| last_offer.contains(tid)).cloned().collect();
+                if wanted.len() < listed.len() {
+                    log(
+                        format!(
+                            "[lxmf.prop] peer {peer_str} asked for {} message(s) that were not in the offer; not sent",
+                            listed.len() - wanted.len(),
+                        ),
+                        LOG_WARNING, false, false,
+                    );
+                }
+                wanted
+            }
+            other => {
+                log(
+                    format!(
+                        "[lxmf.prop] unreadable offer response from peer {peer_str} ({}); {} message(s) stay unhandled, sync ended",
+                        match other { None => "no response data".to_string(), Some(v) => format!("{v:?}") },
+                        last_offer.len(),
+                    ),
+                    LOG_WARNING, false, false,
+                );
+                self.end_sync(peer_hash);
+                return OfferNext::Done;
+            }
+        };
+
+        if wanted.is_empty() {
+            log(
+                format!("[lxmf.prop] peer {peer_str} did not request any of the {} offered messages, sync completed", last_offer.len()),
+                LOG_DEBUG, false, false,
+            );
+            self.end_sync(peer_hash);
+            return OfferNext::Done;
         }
 
-        // Reset peer state for next cycle
+        let mut files = Vec::with_capacity(wanted.len());
+        let mut gone = Vec::new();
+        for tid in wanted {
+            match self.entries.get(&tid) {
+                Some(entry) => files.push((tid, entry.filepath.clone())),
+                None => gone.push(tid),
+            }
+        }
         if let Some(peer) = self.peers.get_mut(peer_hash) {
-            peer.state = PropPeer::IDLE;
-            peer.link = None;
+            for tid in &gone {
+                peer.unhandled_ids.remove(tid);
+            }
+        }
+        if !gone.is_empty() {
+            log(
+                format!("[lxmf.prop] {} message(s) peer {peer_str} wanted left the message store before they could be sent", gone.len()),
+                LOG_NOTICE, false, false,
+            );
+        }
+        if files.is_empty() {
+            self.end_sync(peer_hash);
+            return OfferNext::Done;
+        }
+
+        log(
+            format!("[lxmf.prop] peer {peer_str} wanted {} of the {} offered messages", files.len(), last_offer.len()),
+            LOG_DEBUG, false, false,
+        );
+        // What the peer wants leaves in this minute; the offer's reservation
+        // ended with REQUEST_SENT above.
+        self.charge_outbound(files.len() as u64);
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            peer.state = PropPeer::RESOURCE_TRANSFERRING;
+        }
+        OfferNext::Send(files)
+    }
+
+    /// Send the wanted messages as one Resource of msgpack
+    /// `[time, [lxm, ...]]` — what LXMPeer.offer_response sends and what
+    /// LXMRouter.propagation_resource_concluded (and rfed's own
+    /// `ingest_propagation_batch`) ingest. Each lxm is the stored file:
+    /// the message with its propagation stamp. The files are read and the
+    /// Resource built with the node released.
+    fn send_sync_resource(arc: &Arc<Mutex<Self>>, peer_hash: &[u8], session: u64, files: Vec<(Vec<u8>, String)>) {
+        let peer_str = hexrep(peer_hash, false);
+        let mut ids = Vec::with_capacity(files.len());
+        let mut messages = Vec::with_capacity(files.len());
+        let mut unreadable = Vec::new();
+        for (tid, path) in files {
+            match fs::read(&path) {
+                Ok(data) => {
+                    ids.push(tid);
+                    messages.push(data);
+                }
+                Err(e) => unreadable.push((tid, path, e.to_string())),
+            }
+        }
+        for (tid, path, error) in &unreadable {
+            log(
+                format!("[lxmf.prop] cannot read message {} ({path}) for peer {peer_str}: {error}; it stays unhandled", hexrep(tid, false)),
+                LOG_WARNING, false, false,
+            );
+        }
+
+        let (io, sink, link_id) = {
+            let Some(mut node) = lock_node(arc, "sync resource") else { return };
+            let link_id = match node.peers.get(peer_hash) {
+                Some(peer) if peer.state == PropPeer::RESOURCE_TRANSFERRING && peer.sync_session == session => peer.link_id.clone(),
+                _ => {
+                    log(format!("[lxmf.prop] sync with peer {peer_str} ended before its Resource was built; not sent"), LOG_DEBUG, false, false);
+                    return;
+                }
+            };
+            let Some(link_id) = link_id else {
+                node.end_sync(peer_hash);
+                return;
+            };
+            if ids.is_empty() {
+                node.end_sync(peer_hash);
+                return;
+            }
+            if let Some(peer) = node.peers.get_mut(peer_hash) {
+                peer.transferring = Some(ids.clone());
+                peer.current_sync_transfer_started = Some(now());
+            }
+            (Arc::clone(&node.sync_io), node.event_sink(), link_id)
+        };
+
+        let count = messages.len();
+        let data = pack_sync_batch(now(), messages);
+        log(
+            format!("[lxmf.prop] sending {count} message(s) to peer {peer_str} as a Resource ({} B)", data.len()),
+            LOG_NOTICE, false, false,
+        );
+        let on_concluded: Arc<dyn Fn(ResourceOutcome) + Send + Sync> = {
+            let peer = peer_hash.to_vec();
+            Arc::new(move |outcome: ResourceOutcome| {
+                sink(SyncEvent::ResourceConcluded { peer: peer.clone(), session, outcome })
+            })
+        };
+        if let Err(e) = io.send_resource(peer_hash, &link_id, data, on_concluded) {
+            let Some(mut node) = lock_node(arc, "sync resource (failed)") else { return };
+            let current = node.peers.get(peer_hash)
+                .map(|peer| peer.state == PropPeer::RESOURCE_TRANSFERRING && peer.sync_session == session)
+                .unwrap_or(false);
+            if current {
+                log(
+                    format!("[lxmf.prop] could not start the sync Resource to peer {peer_str}: {e}; {count} message(s) stay unhandled"),
+                    LOG_WARNING, false, false,
+                );
+                node.end_sync(peer_hash);
+            }
         }
     }
 
-    /// Package and send requested messages to a peer over the established link.
-    ///
-    /// Messages are bundled as a msgpack array `[type_marker, [lxmf_data, ...]]`
-    /// matching the client PUT wire format, so the remote peer's
-    /// `on_propagation_packet` callback ingests them directly.
-    ///
-    /// Delivery is fire-and-forget — the IDs are marked handled optimistically
-    /// before the packet is sent.  If the packet is lost the peer will re-offer
-    /// those IDs on the next sync cycle.
-    fn send_messages_to_peer(&mut self, peer_hash: &[u8], transient_ids: &[Vec<u8>]) {
-        // Collect message data
-        let mut lxm_list = Vec::new();
-        for tid in transient_ids {
-            if let Some(entry) = self.entries.get(tid) {
-                if let Ok(data) = fs::read(&entry.filepath) {
-                    lxm_list.push(Value::Binary(data));
-                }
+    /// LXMPeer.resource_concluded.
+    fn on_resource_concluded(arc: &Arc<Mutex<Self>>, peer_hash: &[u8], session: u64, outcome: ResourceOutcome) {
+        let continue_sync = {
+            let Some(mut node) = lock_node(arc, "sync resource concluded") else { return };
+            node.apply_resource_outcome(peer_hash, session, &outcome)
+        };
+        if continue_sync {
+            Self::sync_peer(arc, peer_hash);
+        }
+    }
+
+    /// The node side of LXMPeer.resource_concluded. COMPLETE marks the
+    /// transferred ids handled; anything else leaves them unhandled. Returns
+    /// whether the session carries on at once (the reference's
+    /// STRATEGY_PERSISTENT: sync again while the peer still lacks messages).
+    fn apply_resource_outcome(&mut self, peer_hash: &[u8], session: u64, outcome: &ResourceOutcome) -> bool {
+        let t = now();
+        let peer_str = hexrep(peer_hash, false);
+        let (ids, started) = match self.peers.get_mut(peer_hash) {
+            Some(peer)
+                if peer.state == PropPeer::RESOURCE_TRANSFERRING
+                    && peer.sync_session == session
+                    && peer.transferring.is_some() =>
+            {
+                (peer.transferring.take().unwrap_or_default(), peer.current_sync_transfer_started.take())
             }
-        }
-
-        if lxm_list.is_empty() {
-            return;
-        }
-
-        let link = match self.peers.get(peer_hash).and_then(|p| p.link.clone()) {
-            Some(l) => l,
-            None => return,
+            _ => {
+                log(
+                    format!("[lxmf.prop] sync Resource to peer {peer_str} concluded ({}) for an ended sync; ignored", outcome.status),
+                    LOG_DEBUG, false, false,
+                );
+                return false;
+            }
         };
 
-        // Package as a msgpack array: [type_marker, [lxmf_data, ...]]
-        // This is the same format as client PUT packets, so the remote's
-        // on_propagation_packet callback will ingest the messages correctly.
-        let transfer = Value::Array(vec![
-            Value::Integer(0.into()), // type marker (same as client PUT)
-            Value::Array(lxm_list),
-        ]);
-        let mut transfer_data = Vec::new();
-        let _ = write_value(&mut transfer_data, &transfer);
-
-        let msg_count = transient_ids.len();
-        let peer_hash_str = hexrep(peer_hash, false);
-
-        // Mark IDs as handled before sending (optimistic delivery).
-        // If the packet is lost, the peer will re-offer those IDs on the next
-        // sync cycle and we will resend.
-        if let Some(peer) = self.peers.get_mut(peer_hash) {
-            for tid in transient_ids {
-                peer.mark_handled(tid);
-            }
+        if !outcome.complete {
+            log(
+                format!(
+                    "[lxmf.prop] resource transfer for LXMF peer sync to {peer_str} failed ({}); {} message(s) stay unhandled",
+                    outcome.status, ids.len(),
+                ),
+                LOG_WARNING, false, false,
+            );
+            self.end_sync(peer_hash);
+            return false;
         }
 
-        // Send as a raw link DATA packet.  This routes to the remote's
-        // callbacks.packet handler (on_propagation_packet), NOT to any request
-        // handler — which is what we need for the client PUT wire format.
-        match link.send_packet(&transfer_data) {
-            Ok(_) => {
-                self.outbound_sync_window_count += msg_count as u64;
+        self.mark_handled_for(peer_hash, &ids);
+        let backlog_held = self.backlog_held();
+        let held_link = self.sync_io.active_link(peer_hash);
+        let (more_to_sync, on_held_link) = {
+            let fresh = &self.fresh_since_start;
+            let Some(peer) = self.peers.get_mut(peer_hash) else { return false };
+            let mut rate_str = String::new();
+            if let Some(started) = started {
+                let elapsed = (t - started).max(1e-3);
+                peer.sync_transfer_rate = (outcome.transfer_size as f64 * 8.0) / elapsed;
+                rate_str = format!(" at {:.0} bit/s", peer.sync_transfer_rate);
+            }
+            peer.alive = true;
+            peer.last_heard = t;
+            log(
+                format!("[lxmf.prop] syncing {} messages to peer {peer_str} completed{rate_str}", ids.len()),
+                LOG_NOTICE, false, false,
+            );
+            (
+                Self::has_sync_candidates(backlog_held, fresh, peer),
+                held_link.is_some() && held_link == peer.link_id,
+            )
+        };
+
+        if !more_to_sync {
+            self.end_sync(peer_hash);
+            return false;
+        }
+        // The reference tears the link down and syncs again on a new one.
+        // While the held link is still up, the next offer goes on it instead.
+        if on_held_link {
+            if let Some(peer) = self.peers.get_mut(peer_hash) {
+                peer.state = PropPeer::LINK_READY;
+            }
+        } else {
+            self.end_sync(peer_hash);
+        }
+        true
+    }
+
+    /// LXMPeer.request_failed: the offer got no response.
+    fn on_offer_failed(arc: &Arc<Mutex<Self>>, peer_hash: &[u8], session: u64) {
+        let Some(mut node) = lock_node(arc, "offer failed") else { return };
+        let peer_str = hexrep(peer_hash, false);
+        match node.peers.get(peer_hash) {
+            Some(peer) if peer.state == PropPeer::REQUEST_SENT && peer.sync_session == session => {
                 log(
-                    format!("[lxmf.prop] sent {} message(s) to peer {}", msg_count, peer_hash_str),
+                    format!("[lxmf.prop] sync request to peer {peer_str} failed; {} message(s) stay unhandled", peer.last_offer.len()),
+                    LOG_WARNING, false, false,
+                );
+                node.end_sync(peer_hash);
+            }
+            _ => log(format!("[lxmf.prop] offer failure from peer {peer_str} belongs to an ended sync; ignored"), LOG_DEBUG, false, false),
+        }
+    }
+
+    /// AppLinks reports the held link to `peer_hash` ACTIVE
+    /// (LXMPeer.link_established).
+    fn on_link_active(arc: &Arc<Mutex<Self>>, peer_hash: &[u8], link_id: Vec<u8>) {
+        let proceed = {
+            let Some(mut node) = lock_node(arc, "sync link up") else { return };
+            let peer_str = hexrep(peer_hash, false);
+            let Some(peer) = node.peers.get_mut(peer_hash) else { return };
+            match peer.state {
+                PropPeer::LINK_ESTABLISHING => {
+                    log(format!("[lxmf.prop] sync link to peer {peer_str} established"), LOG_DEBUG, false, false);
+                    peer.link_id = Some(link_id);
+                    peer.identified_link_id = None;
+                    peer.reidentified = false;
+                    peer.next_sync_attempt = 0.0;
+                    peer.state = PropPeer::LINK_READY;
+                    true
+                }
+                PropPeer::IDLE => {
+                    // AppLinks brought a link up on its own (a re-open after
+                    // a close, or an attempt that outlived its session):
+                    // nothing uses it.
+                    log(format!("[lxmf.prop] closing a link to peer {peer_str} that no sync is using"), LOG_DEBUG, false, false);
+                    node.sync_io.close_link(peer_hash);
+                    false
+                }
+                _ if peer.link_id.as_ref() == Some(&link_id) => false,
+                state => {
+                    log(
+                        format!(
+                            "[lxmf.prop] a new link to peer {peer_str} came up while its sync ({}) runs on another; closing it",
+                            PropPeer::state_name(state),
+                        ),
+                        LOG_DEBUG, false, false,
+                    );
+                    node.sync_io.close_link(peer_hash);
+                    false
+                }
+            }
+        };
+        if proceed {
+            Self::sync_peer(arc, peer_hash);
+        }
+    }
+
+    /// AppLinks reports the link to `peer_hash` down (LXMPeer.link_closed,
+    /// and a path request that went unanswered).
+    ///
+    /// AppLinks reports DISCONNECTED for any link to the destination closing,
+    /// including a previous session's, so the report counts only when this
+    /// session's link attempt or link is really gone. A session whose link
+    /// closed ends here even with a Resource in flight: a Resource that had
+    /// not been advertised yet when the link closed never concludes
+    /// (Reticulum-rust `advertise_shared` waits for the link forever), and
+    /// its ids must not wait with it. They stay unhandled; if the Resource
+    /// had in fact completed, the next offer finds the peer has them.
+    fn on_link_down(arc: &Arc<Mutex<Self>>, peer_hash: &[u8]) {
+        let Some(mut node) = lock_node(arc, "sync link down") else { return };
+        let peer_str = hexrep(peer_hash, false);
+        let Some(peer) = node.peers.get(peer_hash) else { return };
+        match peer.state {
+            PropPeer::IDLE => {}
+            PropPeer::LINK_ESTABLISHING => {
+                if node.sync_io.link_attempt_live(peer_hash) {
+                    log(format!("[lxmf.prop] link-down report for peer {peer_str} while its link attempt is still live; ignored"), LOG_DEBUG, false, false);
+                    return;
+                }
+                log(
+                    format!(
+                        "[lxmf.prop] could not establish a sync link to peer {peer_str}; next attempt in {:.0}s",
+                        (peer.next_sync_attempt - now()).max(0.0),
+                    ),
                     LOG_NOTICE, false, false,
                 );
+                node.end_sync(peer_hash);
             }
-            Err(e) => {
-                log(format!("[lxmf.prop] message send failed for {peer_hash_str}: {e}"),
-                    LOG_WARNING, false, false);
-                link.teardown();
+            state => {
+                let held = node.sync_io.active_link(peer_hash);
+                if held.is_some() && held == peer.link_id {
+                    log(format!("[lxmf.prop] link-down report for peer {peer_str} while its sync link is up; ignored"), LOG_DEBUG, false, false);
+                    return;
+                }
+                let pending = peer.transferring.as_ref().map(|t| t.len()).unwrap_or(peer.last_offer.len());
+                log(
+                    format!(
+                        "[lxmf.prop] sync link to peer {peer_str} closed in state {}; {pending} message(s) stay unhandled",
+                        PropPeer::state_name(state),
+                    ),
+                    LOG_WARNING, false, false,
+                );
+                node.end_sync(peer_hash);
             }
-        }
-
-        if let Some(peer) = self.peers.get_mut(peer_hash) {
-            peer.link = None;
         }
     }
 
@@ -2765,6 +3369,301 @@ impl LxmfPropagationNode {
     pub fn get_stats(&self) -> (u64, u64, usize, usize) {
         (self.messages_received, self.messages_served, self.entries.len(), self.peers.len())
     }
+}
+
+// ── Outbound peer sync: events, the network seam, offer planning ─────────────
+
+/// One step's trigger for an outbound peer sync session. Network callbacks
+/// and the sync tick produce these; the sync worker runs them in order.
+pub(crate) enum SyncEvent {
+    /// The tick chose this peer (LXMRouter.sync_peers → LXMPeer.sync).
+    Start { peer: Vec<u8> },
+    /// AppLinks reports the held link to the peer ACTIVE.
+    LinkActive { peer: Vec<u8>, link_id: Vec<u8> },
+    /// AppLinks reports a link to the peer DISCONNECTED (or the path race failed).
+    LinkDown { peer: Vec<u8> },
+    /// The `/offer` request's response (the msgpack-encoded value).
+    OfferResponse { peer: Vec<u8>, session: u64, response: Option<Vec<u8>> },
+    /// The `/offer` request failed (timed out, or its link closed).
+    OfferFailed { peer: Vec<u8>, session: u64 },
+    /// The sync Resource concluded, COMPLETE or not.
+    ResourceConcluded { peer: Vec<u8>, session: u64, outcome: ResourceOutcome },
+}
+
+impl SyncEvent {
+    fn describe(&self) -> String {
+        match self {
+            SyncEvent::Start { peer } => format!("start sync with {}", hexrep(peer, false)),
+            SyncEvent::LinkActive { peer, link_id } => {
+                format!("link {} to {} active", hexrep(link_id, false), hexrep(peer, false))
+            }
+            SyncEvent::LinkDown { peer } => format!("link to {} down", hexrep(peer, false)),
+            SyncEvent::OfferResponse { peer, session, .. } => {
+                format!("offer response from {} (session {session})", hexrep(peer, false))
+            }
+            SyncEvent::OfferFailed { peer, session } => {
+                format!("offer to {} failed (session {session})", hexrep(peer, false))
+            }
+            SyncEvent::ResourceConcluded { peer, session, outcome } => format!(
+                "sync Resource to {} concluded {} (session {session})",
+                hexrep(peer, false), outcome.status,
+            ),
+        }
+    }
+}
+
+/// Delivers a sync event to the sync worker.
+pub(crate) type SyncEventSink = Arc<dyn Fn(SyncEvent) + Send + Sync>;
+
+/// How a sync Resource concluded, as its callback reported it.
+#[derive(Clone, Debug)]
+pub(crate) struct ResourceOutcome {
+    pub complete: bool,
+    pub status: String,
+    /// Bytes on the wire (after compression), for the transfer rate.
+    pub transfer_size: usize,
+}
+
+/// Everything outbound peer sync does on the network. Each call returns at
+/// once; outcomes arrive through the callbacks (and AppLinks' status
+/// callback), never by waiting. `AppLinksSyncIo` is the only production
+/// implementation; the unit tests drive the sync state machine through a
+/// recording fake.
+pub(crate) trait PeerSyncIo: Send + Sync {
+    /// Id of the link held to `peer` when it is ACTIVE.
+    fn active_link(&self, peer: &[u8]) -> Option<Vec<u8>>;
+    /// Whether a link attempt to `peer` is in flight or its link is up.
+    fn link_attempt_live(&self, peer: &[u8]) -> bool;
+    /// Start establishing the held link to `peer`.
+    fn open_link(&self, peer: &[u8]);
+    /// Drop the held link to `peer` and forget it, with no re-open.
+    fn close_link(&self, peer: &[u8]);
+    /// Identify on the held link `link_id` to `peer`.
+    fn identify(&self, peer: &[u8], link_id: &[u8], identity: &Identity) -> Result<(), String>;
+    /// Request `/offer` with `data` on the held link `link_id` to `peer`.
+    fn request_offer(
+        &self,
+        peer: &[u8],
+        link_id: &[u8],
+        data: Vec<u8>,
+        on_response: Arc<dyn Fn(Option<Vec<u8>>) + Send + Sync>,
+        on_failed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String>;
+    /// Send `data` as a Resource on the held link `link_id` to `peer`.
+    fn send_resource(
+        &self,
+        peer: &[u8],
+        link_id: &[u8],
+        data: Vec<u8>,
+        on_concluded: Arc<dyn Fn(ResourceOutcome) + Send + Sync>,
+    ) -> Result<(), String>;
+}
+
+/// Peer sync over AppLinks-held `lxmf.propagation` links. AppLinks owns the
+/// link (path race, establishment, teardown — Reticulum-rust SUBSYSTEMS.md
+/// §1); a session opens it with `open_persistent`, and releases it with
+/// `close`, where the reference tears its per-sync link down. Every call on
+/// a link names the link id the session runs on, so nothing lands on a
+/// different link than the one the offer was identified and validated on.
+struct AppLinksSyncIo;
+
+impl AppLinksSyncIo {
+    fn held(peer: &[u8], link_id: &[u8]) -> Result<LinkHandle, String> {
+        AppLinks::get_handle(peer)
+            .filter(|handle| handle.status() == reticulum_rust::link::STATE_ACTIVE && handle.link_id() == link_id)
+            .ok_or_else(|| {
+                format!("the sync link {} to {} is no longer held and active", hexrep(link_id, false), hexrep(peer, false))
+            })
+    }
+}
+
+impl PeerSyncIo for AppLinksSyncIo {
+    fn active_link(&self, peer: &[u8]) -> Option<Vec<u8>> {
+        AppLinks::get_handle(peer)
+            .filter(|handle| handle.status() == reticulum_rust::link::STATE_ACTIVE)
+            .map(|handle| handle.link_id())
+    }
+
+    fn link_attempt_live(&self, peer: &[u8]) -> bool {
+        matches!(
+            AppLinks::status(peer),
+            app_links::APP_LINK_PATH_REQUESTED | app_links::APP_LINK_ESTABLISHING | app_links::APP_LINK_ACTIVE
+        )
+    }
+
+    fn open_link(&self, peer: &[u8]) {
+        AppLinks::open_persistent(peer, LXMF_APP, &[PROP_ASPECT]);
+    }
+
+    fn close_link(&self, peer: &[u8]) {
+        AppLinks::close(peer);
+    }
+
+    fn identify(&self, peer: &[u8], link_id: &[u8], identity: &Identity) -> Result<(), String> {
+        Self::held(peer, link_id)?
+            .identify(identity)
+            .map_err(|_| format!("the sync link to {} is gone", hexrep(peer, false)))
+    }
+
+    fn request_offer(
+        &self,
+        peer: &[u8],
+        link_id: &[u8],
+        data: Vec<u8>,
+        on_response: Arc<dyn Fn(Option<Vec<u8>>) + Send + Sync>,
+        on_failed: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), String> {
+        let link = Self::held(peer, link_id)?;
+        let response_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> =
+            Arc::new(move |receipt: RequestReceipt| on_response(receipt.response.clone()));
+        let failed_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> =
+            Arc::new(move |_receipt: RequestReceipt| on_failed());
+        link.request(OFFER_PATH.to_string(), data, Some(response_cb), Some(failed_cb), None)
+            .map(|_| ())
+            .map_err(|_| format!("the sync link to {} is gone", hexrep(peer, false)))
+    }
+
+    fn send_resource(
+        &self,
+        peer: &[u8],
+        link_id: &[u8],
+        data: Vec<u8>,
+        on_concluded: Arc<dyn Fn(ResourceOutcome) + Send + Sync>,
+    ) -> Result<(), String> {
+        use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
+        let link = Self::held(peer, link_id)?;
+        // The Resource's own RTT-scaled timeouts decide its outcome, and its
+        // callback fires once, COMPLETE or not (a closed link cancels it).
+        // It runs with the Resource locked: it only forwards the outcome.
+        let concluded: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource| {
+            let outcome = match resource.lock() {
+                Ok(r) => ResourceOutcome {
+                    complete: r.status == ResourceStatus::Complete,
+                    status: format!("{:?}", r.status),
+                    transfer_size: r.get_transfer_size(),
+                },
+                Err(_) => ResourceOutcome { complete: false, status: "poisoned".to_string(), transfer_size: 0 },
+            };
+            on_concluded(outcome);
+        });
+        let resource = Resource::new_internal(
+            Some(ResourceData::Bytes(data)),
+            link,
+            None,
+            false,
+            AutoCompressOption::Enabled,
+            Some(concluded),
+            None,
+            None,
+            1,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )?;
+        Resource::advertise_shared(Arc::new(Mutex::new(resource)));
+        Ok(())
+    }
+}
+
+/// A message that may go in an offer.
+pub(crate) struct OfferCandidate {
+    pub tid: Vec<u8>,
+    /// Stored size: the message with its stamp.
+    pub size: usize,
+    /// LXMRouter.get_weight; lighter goes first.
+    pub weight: f64,
+}
+
+/// What `plan_offer` decided.
+#[derive(Debug, Default)]
+pub(crate) struct OfferPlan {
+    /// To offer, lightest first.
+    pub offer: Vec<Vec<u8>>,
+    /// Over the peer's per-message transfer limit: marked handled, never sent
+    /// (the reference's rule).
+    pub too_big: Vec<Vec<u8>>,
+    /// Too large for any one sync Resource: marked handled, never sent (an
+    /// rfed departure, see MAX_SYNC_RESOURCE_BYTES).
+    pub over_resource: Vec<Vec<u8>>,
+    /// The reference's estimate of the batch size in bytes.
+    pub estimated_bytes: f64,
+}
+
+/// The offer-building part of LXMPeer.sync. Candidates go lightest first; a
+/// message over the peer's per-message transfer limit (KB) is set aside to be
+/// marked handled; the batch stays under the peer's sync limit (KB), counting
+/// each message's size plus 16 B and 24 B for the batch, as the reference
+/// estimates it. rfed also keeps the batch within one Resource segment and
+/// within `max_ids` messages. The per-minute budget is applied by the caller.
+pub(crate) fn plan_offer(
+    mut candidates: Vec<OfferCandidate>,
+    transfer_limit_kb: Option<f64>,
+    sync_limit_kb: Option<f64>,
+    max_ids: usize,
+) -> OfferPlan {
+    const PER_MESSAGE_OVERHEAD: f64 = 16.0;
+    const BATCH_OVERHEAD: f64 = 24.0;
+    let resource_limit = MAX_SYNC_RESOURCE_BYTES as f64;
+    candidates.sort_by(|a, b| a.weight.partial_cmp(&b.weight).unwrap_or(std::cmp::Ordering::Equal));
+    let mut plan = OfferPlan { estimated_bytes: BATCH_OVERHEAD, ..OfferPlan::default() };
+    for candidate in candidates {
+        let transfer_size = candidate.size as f64 + PER_MESSAGE_OVERHEAD;
+        if let Some(limit) = transfer_limit_kb {
+            if transfer_size > limit * 1000.0 {
+                plan.too_big.push(candidate.tid);
+                continue;
+            }
+        }
+        if BATCH_OVERHEAD + transfer_size > resource_limit {
+            plan.over_resource.push(candidate.tid);
+            continue;
+        }
+        if plan.offer.len() >= max_ids {
+            continue;
+        }
+        let next_size = plan.estimated_bytes + transfer_size;
+        if let Some(limit) = sync_limit_kb {
+            if next_size >= limit * 1000.0 {
+                continue;
+            }
+        }
+        if next_size > resource_limit {
+            continue;
+        }
+        plan.estimated_bytes = next_size;
+        plan.offer.push(candidate.tid);
+    }
+    plan
+}
+
+/// An offer's candidates, gathered under the node lock and planned without it.
+struct PreparedOffer {
+    session: u64,
+    candidates: Vec<OfferCandidate>,
+    transfer_limit_kb: Option<f64>,
+    sync_limit_kb: Option<f64>,
+}
+
+/// What follows an offer response.
+enum OfferNext {
+    /// The session ended, or went on without a transfer.
+    Done,
+    /// Identify again and re-offer on the same link (ERROR_NO_IDENTITY).
+    Resync,
+    /// Send these `(transient id, message file)` as the sync Resource.
+    Send(Vec<(Vec<u8>, String)>),
+}
+
+/// A sync batch in the propagation wire format, msgpack `[timebase, [lxm, ...]]`
+/// with native types (CHECK_THESE_THINGS_FIRST §11): a float and an array of
+/// bin, as LXMPeer.offer_response packs `[time.time(), lxm_list]`.
+fn pack_sync_batch(timebase: f64, messages: Vec<Vec<u8>>) -> Vec<u8> {
+    encode_value(Value::Array(vec![
+        Value::F64(timebase),
+        Value::Array(messages.into_iter().map(Value::Binary).collect()),
+    ]))
 }
 
 // ── Serialisable peer state ──────────────────────────────────────────────────
@@ -3198,30 +4097,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Outbound peer sync goes through AppLinks-held links only: the
+    /// production network seam opens them with `open_persistent`, uses the
+    /// held handle, releases them with `close`, and never builds a raw link
+    /// (Reticulum-rust SUBSYSTEMS.md §1: AppLinks owns link lifecycle).
     #[test]
-    fn initiate_sync_uses_persistent_app_links() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/lxmf_propagation.rs"
-        ))
-        .expect("read lxmf_propagation.rs");
-
+    fn peer_sync_uses_persistent_app_links() {
+        let source = include_str!("lxmf_propagation.rs");
         let start = source
-            .find("fn initiate_sync(&mut self, peer_hash: &[u8])")
-            .expect("initiate_sync present");
-        let end = source[start..]
-            .find("fn send_offer_on_link")
-            .map(|offset| start + offset)
-            .expect("send_offer_on_link present");
+            .find("impl PeerSyncIo for AppLinksSyncIo")
+            .expect("AppLinksSyncIo present");
+        let end = source[start..].find("\n}\n").map(|offset| start + offset).expect("end of impl");
         let fragment = &source[start..end];
 
         assert!(
-            fragment.contains("AppLinks::get_handle(peer_hash)"),
-            "RFed propagation peer sync must reuse the AppLinks-owned persistent handle"
+            fragment.contains("AppLinks::get_handle(peer)"),
+            "RFed propagation peer sync must use the AppLinks-held handle"
         );
         assert!(
-            fragment.contains("AppLinks::open_persistent(peer_hash, LXMF_APP, &[PROP_ASPECT]);"),
+            fragment.contains("AppLinks::open_persistent(peer, LXMF_APP, &[PROP_ASPECT]);"),
             "RFed propagation peer sync must request a persistent AppLinks propagation link"
+        );
+        assert!(
+            fragment.contains("AppLinks::close(peer);"),
+            "RFed propagation peer sync must release its link through AppLinks"
         );
         assert!(
             !fragment.contains("Link::new_outbound"),
@@ -3229,53 +4128,606 @@ mod tests {
         );
     }
 
-    #[test]
-    fn send_offer_identifies_link_before_request() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/lxmf_propagation.rs"
-        ))
-        .expect("read lxmf_propagation.rs");
+    /// Outbound peer sync (LXMPeer / LXMRouter.sync_peers), driven end to end
+    /// through a fake network: each test fires the callbacks the network
+    /// would, in the order it would, and runs the events as the sync worker
+    /// does.
+    mod peer_sync_tests {
+        use super::ingest_lock_scope_tests::test_node;
+        use super::super::*;
+        use std::collections::VecDeque;
 
-        let start = source
-            .find("fn send_offer_on_link(&mut self, link: &LinkHandle, peer_hash: &[u8], offer_ids: &[Vec<u8>])")
-            .expect("send_offer_on_link present");
-        let end = source[start..]
-            .find("fn handle_offer_response")
-            .map(|offset| start + offset)
-            .expect("handle_offer_response present");
-        let fragment = &source[start..end];
+        const LINK_1: [u8; 16] = [0xA1; 16];
+        const LINK_2: [u8; 16] = [0xA2; 16];
 
-        assert!(
-            fragment.contains("link.identify(&self.identity)"),
-            "RFed propagation peer sync must identify the AppLinks-owned link before sending OFFER"
-        );
-    }
+        type OnResponse = Arc<dyn Fn(Option<Vec<u8>>) + Send + Sync>;
+        type OnFailed = Arc<dyn Fn() + Send + Sync>;
+        type OnConcluded = Arc<dyn Fn(ResourceOutcome) + Send + Sync>;
 
-    #[test]
-    fn send_offer_defers_request_until_link_identified() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/lxmf_propagation.rs"
-        ))
-        .expect("read lxmf_propagation.rs");
+        /// The network as the sync state machine sees it. Records every call;
+        /// keeps the callbacks for the test to fire.
+        #[derive(Default)]
+        struct FakeIo {
+            calls: Mutex<Vec<String>>,
+            active: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+            offers: Mutex<VecDeque<(Vec<u8>, OnResponse, OnFailed)>>,
+            resources: Mutex<VecDeque<(Vec<u8>, OnConcluded)>>,
+        }
 
-        let start = source
-            .find("fn send_offer_on_link(&mut self, link: &LinkHandle, peer_hash: &[u8], offer_ids: &[Vec<u8>])")
-            .expect("send_offer_on_link present");
-        let end = source[start..]
-            .find("fn handle_offer_response")
-            .map(|offset| start + offset)
-            .expect("handle_offer_response present");
-        let fragment = &source[start..end];
+        impl FakeIo {
+            fn record(&self, call: String) {
+                self.calls.lock().unwrap().push(call);
+            }
+            fn calls(&self) -> Vec<String> {
+                self.calls.lock().unwrap().clone()
+            }
+            /// AppLinks now holds `link` to `peer`, ACTIVE.
+            fn link_up(&self, peer: &[u8], link: &[u8]) {
+                self.active.lock().unwrap().insert(peer.to_vec(), link.to_vec());
+            }
+            /// The held link to `peer` is gone.
+            fn link_gone(&self, peer: &[u8]) {
+                self.active.lock().unwrap().remove(peer);
+            }
+            fn offer_count(&self) -> usize {
+                self.offers.lock().unwrap().len()
+            }
+            fn take_offer(&self) -> (Vec<u8>, OnResponse, OnFailed) {
+                self.offers.lock().unwrap().pop_front().expect("an offer was requested")
+            }
+            fn take_resource(&self) -> (Vec<u8>, OnConcluded) {
+                self.resources.lock().unwrap().pop_front().expect("a Resource was sent")
+            }
+            fn resource_count(&self) -> usize {
+                self.resources.lock().unwrap().len()
+            }
+        }
 
-        assert!(
-            fragment.contains("identified_link_id") && fragment.contains("already_identified"),
-            "RFed propagation peer sync must track whether the current AppLinks link has been identified"
-        );
-        assert!(
-            fragment.contains("peer.state = PropPeer::IDLE;") && fragment.contains("return;"),
-            "RFed propagation peer sync must defer OFFER until after link identification has been sent"
-        );
+        impl PeerSyncIo for FakeIo {
+            fn active_link(&self, peer: &[u8]) -> Option<Vec<u8>> {
+                self.active.lock().unwrap().get(peer).cloned()
+            }
+            fn link_attempt_live(&self, peer: &[u8]) -> bool {
+                self.active_link(peer).is_some()
+            }
+            fn open_link(&self, peer: &[u8]) {
+                self.record(format!("open {}", hexrep(&peer[..1], false)));
+            }
+            fn close_link(&self, peer: &[u8]) {
+                self.link_gone(peer);
+                self.record(format!("close {}", hexrep(&peer[..1], false)));
+            }
+            fn identify(&self, _peer: &[u8], link_id: &[u8], _identity: &Identity) -> Result<(), String> {
+                self.record(format!("identify {}", hexrep(&link_id[..1], false)));
+                Ok(())
+            }
+            fn request_offer(
+                &self,
+                _peer: &[u8],
+                link_id: &[u8],
+                data: Vec<u8>,
+                on_response: OnResponse,
+                on_failed: OnFailed,
+            ) -> Result<(), String> {
+                self.record(format!("offer {}", hexrep(&link_id[..1], false)));
+                self.offers.lock().unwrap().push_back((data, on_response, on_failed));
+                Ok(())
+            }
+            fn send_resource(
+                &self,
+                _peer: &[u8],
+                link_id: &[u8],
+                data: Vec<u8>,
+                on_concluded: OnConcluded,
+            ) -> Result<(), String> {
+                self.record(format!("resource {}", hexrep(&link_id[..1], false)));
+                self.resources.lock().unwrap().push_back((data, on_concluded));
+                Ok(())
+            }
+        }
+
+        struct Harness {
+            node: Arc<Mutex<LxmfPropagationNode>>,
+            io: Arc<FakeIo>,
+            events: Arc<Mutex<VecDeque<SyncEvent>>>,
+            next_message: std::cell::Cell<u32>,
+        }
+
+        impl Harness {
+            fn new(tag: &str) -> Self {
+                let node = test_node(tag);
+                let io = Arc::new(FakeIo::default());
+                let events: Arc<Mutex<VecDeque<SyncEvent>>> = Arc::new(Mutex::new(VecDeque::new()));
+                {
+                    let mut g = node.lock().unwrap();
+                    g.sync_io = io.clone();
+                    let queue = events.clone();
+                    g.sync_event_sink = Some(Arc::new(move |event| queue.lock().unwrap().push_back(event)));
+                }
+                Harness { node, io, events, next_message: std::cell::Cell::new(0) }
+            }
+
+            /// Run every queued event in order, as the sync worker does.
+            fn pump(&self) {
+                loop {
+                    let next = self.events.lock().unwrap().pop_front();
+                    match next {
+                        Some(event) => LxmfPropagationNode::handle_sync_event(&self.node, event),
+                        None => break,
+                    }
+                }
+            }
+
+            fn event(&self, event: SyncEvent) {
+                self.events.lock().unwrap().push_back(event);
+                self.pump();
+            }
+
+            fn start(&self, peer: &[u8]) {
+                self.event(SyncEvent::Start { peer: peer.to_vec() });
+            }
+
+            /// AppLinks brings `link` to `peer` up and says so.
+            fn link_active(&self, peer: &[u8], link: &[u8]) {
+                self.io.link_up(peer, link);
+                self.event(SyncEvent::LinkActive { peer: peer.to_vec(), link_id: link.to_vec() });
+            }
+
+            /// A peer as an announce leaves it: alive, costs known, a
+            /// peering key ready when `key_ready`.
+            fn add_peer(&self, hash: &[u8], key_ready: bool) {
+                let mut peer = PropPeer::new(hash.to_vec());
+                peer.alive = true;
+                peer.last_heard = now();
+                peer.propagation_stamp_cost = Some(16);
+                peer.propagation_stamp_flexibility = Some(3);
+                peer.peering_cost = Some(18);
+                peer.propagation_transfer_limit = Some(256.0);
+                peer.propagation_sync_limit = Some(10240.0);
+                if key_ready {
+                    peer.peering_key = Some((vec![0x5A; 32], 18));
+                }
+                self.node.lock().unwrap().peers.insert(hash.to_vec(), peer);
+            }
+
+            /// Store `count` messages of `size` bytes (with their stamp);
+            /// every peer then lacks them.
+            fn store(&self, count: usize, size: usize) -> Vec<Vec<u8>> {
+                let mut g = self.node.lock().unwrap();
+                (0..count)
+                    .map(|_| {
+                        let n = self.next_message.get();
+                        self.next_message.set(n + 1);
+                        let mut lxmf = vec![0x77u8; size - lx_stamper::STAMP_SIZE];
+                        lxmf[16..20].copy_from_slice(&n.to_be_bytes());
+                        let stamp = vec![0x33u8; lx_stamper::STAMP_SIZE];
+                        g.store_message(&lxmf, 16, Some(&stamp), None).expect("stored")
+                    })
+                    .collect()
+            }
+
+            fn peer<R>(&self, hash: &[u8], f: impl FnOnce(&PropPeer) -> R) -> R {
+                f(self.node.lock().unwrap().peers.get(hash).expect("peer"))
+            }
+
+            fn state(&self, hash: &[u8]) -> u8 {
+                self.peer(hash, |p| p.state)
+            }
+
+            fn unhandled(&self, hash: &[u8]) -> usize {
+                self.peer(hash, |p| p.unhandled_ids.len())
+            }
+
+            fn handled(&self, hash: &[u8]) -> usize {
+                self.peer(hash, |p| p.handled_ids.len())
+            }
+        }
+
+        fn msgpack(value: Value) -> Option<Vec<u8>> {
+            Some(encode_value(value))
+        }
+
+        fn failed() -> ResourceOutcome {
+            ResourceOutcome { complete: false, status: "Failed".into(), transfer_size: 0 }
+        }
+
+        fn complete() -> ResourceOutcome {
+            ResourceOutcome { complete: true, status: "Complete".into(), transfer_size: 4096 }
+        }
+
+        /// The ids in an `/offer` request `[peering_key, [id, ...]]`.
+        fn offered_ids(data: &[u8]) -> Vec<Vec<u8>> {
+            match read_value(&mut Cursor::new(data)).expect("offer msgpack") {
+                Value::Array(items) => {
+                    assert!(matches!(items[0], Value::Binary(_)), "the peering key is bin");
+                    match &items[1] {
+                        Value::Array(ids) => ids.iter()
+                            .map(|v| match v { Value::Binary(b) => b.clone(), other => panic!("id not bin: {other:?}") })
+                            .collect(),
+                        other => panic!("offer ids not an array: {other:?}"),
+                    }
+                }
+                other => panic!("offer not an array: {other:?}"),
+            }
+        }
+
+        /// The staging defect (2026-09-27): ids were marked handled before the
+        /// batch left, so every batch the peer never stored was lost for it.
+        /// They are now handled only when the sync Resource concludes
+        /// COMPLETE; a Resource that fails leaves every one unhandled.
+        #[test]
+        fn wanted_messages_are_handled_only_when_their_resource_completes() {
+            let h = Harness::new("sync_handled_on_complete");
+            let peer = [0x11u8; 16];
+            h.add_peer(&peer, true);
+            let ids = h.store(3, 300);
+            assert_eq!(h.unhandled(&peer), 3);
+
+            // No link is held: the session opens one and waits for it.
+            h.start(&peer);
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING);
+            assert_eq!(h.io.calls(), vec!["open 11"]);
+            // A second choice of the same peer (a late tick) leaves the
+            // running session alone.
+            h.start(&peer);
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING);
+            assert!(h.peer(&peer, |p| p.alive), "not demoted by its own session's backoff");
+            assert_eq!(h.io.calls(), vec!["open 11"]);
+
+            // The link comes up: identify, then the offer of all three.
+            h.link_active(&peer, &LINK_1);
+            assert_eq!(h.io.calls()[1..], ["identify a1", "offer a1"]);
+            let (offer, respond, _) = h.io.take_offer();
+            let mut offered = offered_ids(&offer);
+            offered.sort();
+            let mut expected = ids.clone();
+            expected.sort();
+            assert_eq!(offered, expected);
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
+
+            // The peer wants them all: they leave as ONE Resource, not a link
+            // packet, and are not handled yet.
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::RESOURCE_TRANSFERRING);
+            let (payload, concluded) = h.io.take_resource();
+            match read_value(&mut Cursor::new(&payload)).expect("batch msgpack") {
+                Value::Array(items) => {
+                    assert_eq!(items.len(), 2);
+                    assert!(matches!(items[0], Value::F64(_)), "timebase is a float, as time.time()");
+                    assert!(matches!(&items[1], Value::Array(m) if m.len() == 3));
+                }
+                other => panic!("batch not an array: {other:?}"),
+            }
+            let messages = decode_propagation_batch(&payload).expect("rfed's own ingest reads the batch");
+            assert_eq!(messages.len(), 3);
+            assert!(messages.iter().all(|m| m.len() == 300), "each message goes with its stamp, as stored");
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (3, 0), "nothing is handled while the Resource is in flight");
+
+            // The Resource fails: all three stay unhandled, the link is released.
+            concluded(failed());
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (3, 0), "a failed transfer hands nothing");
+            assert_eq!(h.io.calls().last().unwrap(), "close 11");
+
+            // The next session gets them there.
+            h.start(&peer);
+            h.link_active(&peer, &LINK_2);
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (_, concluded) = h.io.take_resource();
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (3, 0));
+            concluded(complete());
+            h.pump();
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 3), "COMPLETE hands them");
+            assert_eq!(h.state(&peer), PropPeer::IDLE, "nothing left: the session ends");
+            assert!(h.peer(&peer, |p| p.sync_transfer_rate) > 0.0, "the transfer rate feeds the fastest-peer pool");
+        }
+
+        /// An offer that gets no response, and a link lost mid-transfer, end
+        /// the session with every id still unhandled; a callback of an ended
+        /// session cannot disturb the next one.
+        #[test]
+        fn an_offer_failure_or_a_lost_link_leaves_ids_unhandled() {
+            let h = Harness::new("sync_failures");
+            let peer = [0x12u8; 16];
+            h.add_peer(&peer, true);
+            h.store(2, 300);
+
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let (_, _, offer_failed) = h.io.take_offer();
+            offer_failed();
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (2, 0));
+
+            h.start(&peer);
+            h.link_active(&peer, &LINK_2);
+            // The first session's failure arrives again, late: the running
+            // session is not ended by it.
+            offer_failed();
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT, "a stale callback is ignored");
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (_, _concluded) = h.io.take_resource();
+
+            // The link closes with the Resource in flight.
+            h.io.link_gone(&peer);
+            h.event(SyncEvent::LinkDown { peer: peer.to_vec() });
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (2, 0), "a transfer lost with its link hands nothing");
+        }
+
+        /// The peer answers with the ids it lacks: the rest are handled (it
+        /// has them), the listed ones are sent and handled only on COMPLETE.
+        #[test]
+        fn a_partial_want_hands_only_the_unwanted_until_complete() {
+            let h = Harness::new("sync_partial");
+            let peer = [0x13u8; 16];
+            h.add_peer(&peer, true);
+            h.store(3, 300);
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let (offer, respond, _) = h.io.take_offer();
+            let offered = offered_ids(&offer);
+            respond(msgpack(Value::Array(vec![Value::Binary(offered[0].clone())])));
+            h.pump();
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (1, 2));
+            let (payload, concluded) = h.io.take_resource();
+            assert_eq!(decode_propagation_batch(&payload).unwrap().len(), 1);
+            concluded(complete());
+            h.pump();
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 3));
+        }
+
+        /// Identify goes out before the offer, on the same link, once per
+        /// link; the persistent strategy offers the next batch on the held
+        /// link without identifying again. A peer that reports no
+        /// identification gets one second identify on that link, not a loop.
+        #[test]
+        fn identify_precedes_the_offer_once_per_link() {
+            let h = Harness::new("sync_identify");
+            let peer = [0x14u8; 16];
+            h.add_peer(&peer, true);
+            // One message per batch: 24 + 316 + 316 > 500 B.
+            h.node.lock().unwrap().peers.get_mut(&peer[..]).unwrap().propagation_sync_limit = Some(0.5);
+            h.store(2, 300);
+
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let (first, respond, _) = h.io.take_offer();
+            assert_eq!(offered_ids(&first).len(), 1);
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (_, concluded) = h.io.take_resource();
+            concluded(complete());
+            h.pump();
+            assert_eq!(h.io.calls(), vec!["open 14", "identify a1", "offer a1", "resource a1", "offer a1"],
+                "the second batch goes on the same link, not identified twice");
+
+            // ERROR_NO_IDENTITY: identify once more and re-offer; a second
+            // one ends the session.
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Integer((ERROR_NO_IDENTITY as i64).into())));
+            h.pump();
+            assert_eq!(h.io.calls()[5..], ["identify a1", "offer a1"]);
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Integer((ERROR_NO_IDENTITY as i64).into())));
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            assert_eq!(h.io.offer_count(), 0);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (1, 1));
+        }
+
+        /// The staging defect (2026-09-27): the first IDLE peer was chosen
+        /// every tick, so one peer grinding its peering key blocked all the
+        /// others for 3.5 minutes. A peer whose key is not ready is not a
+        /// candidate; the others are served.
+        #[test]
+        fn a_peer_without_a_ready_key_is_skipped_and_the_others_are_served() {
+            let h = Harness::new("sync_skip_not_ready");
+            let grinding = [0x21u8; 16];
+            let ready = [0x22u8; 16];
+            h.add_peer(&grinding, false);
+            h.add_peer(&ready, true);
+            h.store(2, 300);
+
+            {
+                let mut g = h.node.lock().unwrap();
+                for i in 0..8usize {
+                    assert_eq!(g.select_sync_peer(now(), &mut |n| i % n), Some(ready.to_vec()));
+                }
+            }
+
+            {
+                let mut g = h.node.lock().unwrap();
+                g.last_sync_tick = 0.0;
+                // Its key is still being ground (the generation thread's marker).
+                g.in_flight_keys.insert(grinding.to_vec());
+            }
+            LxmfPropagationNode::tick_sync(&h.node);
+            h.pump();
+            assert_eq!(h.state(&ready), PropPeer::LINK_ESTABLISHING, "the ready peer is served");
+            assert_eq!(h.state(&grinding), PropPeer::IDLE);
+            assert_eq!(h.io.calls(), vec!["open 22"]);
+
+            // With the ready peer busy, nothing else is chosen — the peer
+            // without a key is still no candidate.
+            assert_eq!(h.node.lock().unwrap().select_sync_peer(now(), &mut |_| 0), None);
+        }
+
+        /// LXMRouter.sync_peers: random among the FASTEST_N_RANDOM_POOL
+        /// fastest waiting peers and as many of unknown speed; unresponsive
+        /// peers only when none is waiting, and only after their backoff.
+        #[test]
+        fn the_choice_is_random_among_the_fastest_waiting_peers() {
+            let h = Harness::new("sync_pool");
+            let peers: Vec<([u8; 16], f64)> =
+                vec![([0x31; 16], 9000.0), ([0x32; 16], 5000.0), ([0x33; 16], 100.0), ([0x34; 16], 0.0)];
+            for (hash, rate) in &peers {
+                h.add_peer(hash, true);
+                h.node.lock().unwrap().peers.get_mut(&hash[..]).unwrap().sync_transfer_rate = *rate;
+            }
+            h.store(1, 300);
+
+            let mut chosen = std::collections::HashSet::new();
+            {
+                let mut g = h.node.lock().unwrap();
+                for i in 0..12usize {
+                    chosen.insert(g.select_sync_peer(now(), &mut |n| i % n).unwrap()[0]);
+                }
+            }
+            assert_eq!(chosen, [0x31u8, 0x32, 0x34].into_iter().collect(), "the slow known peer waits its turn");
+
+            // No one alive: an unresponsive peer past its backoff is chosen;
+            // one still in backoff is not.
+            let mut g = h.node.lock().unwrap();
+            for (hash, _) in &peers {
+                let peer = g.peers.get_mut(&hash[..]).unwrap();
+                peer.alive = false;
+                peer.next_sync_attempt = now() + 600.0;
+            }
+            assert_eq!(g.select_sync_peer(now(), &mut |_| 0), None);
+            g.peers.get_mut(&[0x33u8; 16][..]).unwrap().next_sync_attempt = 0.0;
+            assert_eq!(g.select_sync_peer(now(), &mut |_| 0), Some(vec![0x33; 16]));
+
+            // An alive peer still in backoff is not chosen, and is marked not
+            // alive, as the reference's sync() does when it picks one.
+            let peer = g.peers.get_mut(&[0x31u8; 16][..]).unwrap();
+            peer.alive = true;
+            assert_eq!(g.select_sync_peer(now(), &mut |_| 0), Some(vec![0x33; 16]));
+            assert!(!g.peers[&[0x31u8; 16][..]].alive);
+        }
+
+        /// The staging defect (2026-09-27): the 600/min budget was checked
+        /// before each 500-message send, so 1000 left in a minute (57
+        /// times). Offers are now sized to what is left of the minute, and an
+        /// offer awaiting its response reserves its size, so concurrent syncs
+        /// cannot overshoot either.
+        #[test]
+        fn the_minute_budget_is_never_exceeded_by_concurrent_syncs() {
+            let h = Harness::new("sync_budget");
+            h.node.lock().unwrap().outbound_sync_msgs_per_min = 5;
+            let a = [0x41u8; 16];
+            let b = [0x42u8; 16];
+            h.add_peer(&a, true);
+            h.add_peer(&b, true);
+            h.store(8, 300);
+
+            // Both sessions reach LINK_READY before either offer is answered.
+            h.start(&a);
+            h.start(&b);
+            h.link_active(&a, &LINK_1);
+            h.link_active(&b, &LINK_2);
+            assert_eq!(h.io.offer_count(), 1, "the first offer reserved the whole minute");
+            assert_eq!(h.state(&b), PropPeer::IDLE, "the second ends with nothing to offer this minute");
+            let (offer, respond, _) = h.io.take_offer();
+            assert_eq!(offered_ids(&offer).len(), 5);
+            {
+                let mut g = h.node.lock().unwrap();
+                assert_eq!(g.outbound_allowance(), 0);
+                assert!(!g.outbound_sync_allowed(), "the tick starts nothing more this minute");
+            }
+
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (payload, concluded) = h.io.take_resource();
+            assert_eq!(decode_propagation_batch(&payload).unwrap().len(), 5);
+            assert_eq!(h.node.lock().unwrap().outbound_sync_window_count, 5);
+
+            // Completing does not make room: the persistent strategy's next
+            // offer finds the minute spent and ends the session.
+            concluded(complete());
+            h.pump();
+            assert_eq!(h.io.offer_count(), 0);
+            assert_eq!(h.state(&a), PropPeer::IDLE);
+            assert_eq!(h.node.lock().unwrap().outbound_sync_window_count, 5, "never more than the budget");
+
+            // A new minute with 3 already sent: the next offer is 2.
+            {
+                let mut g = h.node.lock().unwrap();
+                g.outbound_sync_window_start = now() - 61.0;
+                assert_eq!(g.outbound_allowance(), 5);
+                g.outbound_sync_window_count = 3;
+            }
+            h.start(&b);
+            h.link_active(&b, &LINK_2);
+            let (offer, _, _) = h.io.take_offer();
+            assert_eq!(offered_ids(&offer).len(), 2);
+            assert_eq!(h.io.resource_count(), 0);
+        }
+
+        fn id(n: usize) -> Vec<u8> {
+            let mut v = vec![0u8; 32];
+            v[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            v
+        }
+
+        fn candidate(n: usize, size: usize, weight: f64) -> OfferCandidate {
+            OfferCandidate { tid: id(n), size, weight }
+        }
+
+        /// A batch is sized as the reference sizes it — lightest first, the
+        /// peer's per-message transfer limit and sync limit (KB) — and, in
+        /// rfed, to one Resource segment and MAX_OFFER_IDS messages.
+        #[test]
+        fn batches_follow_the_peer_limits_and_one_resource_segment() {
+            // 1 KB limits: #3 (2016 B) is over the per-message limit; the
+            // batch takes #2 and #4 (24 + 416 + 416 = 856 B) and not #1.
+            let plan = plan_offer(
+                vec![candidate(1, 900, 3.0), candidate(2, 400, 1.0), candidate(3, 2000, 0.5), candidate(4, 400, 2.0)],
+                Some(1.0),
+                Some(1.0),
+                MAX_OFFER_IDS,
+            );
+            assert_eq!(plan.too_big, vec![id(3)]);
+            assert_eq!(plan.offer, vec![id(2), id(4)], "lightest first, within the sync limit");
+            assert!(plan.estimated_bytes < 1000.0);
+
+            // A later, lighter-fitting message still goes in after one that
+            // did not fit (the reference skips, it does not stop).
+            let plan = plan_offer(
+                vec![candidate(1, 500, 1.0), candidate(2, 600, 2.0), candidate(3, 300, 3.0)],
+                None,
+                Some(1.0),
+                MAX_OFFER_IDS,
+            );
+            assert_eq!(plan.offer, vec![id(1), id(3)]);
+
+            // Generous peer limits: 600 × 5 KB is cut to one Resource segment.
+            let many: Vec<OfferCandidate> = (0..600).map(|n| candidate(n, 5000, n as f64)).collect();
+            let plan = plan_offer(many, Some(256.0), Some(10240.0), 600);
+            assert_eq!(plan.offer.len(), (MAX_SYNC_RESOURCE_BYTES - 24) / 5016);
+            assert!(plan.estimated_bytes <= MAX_SYNC_RESOURCE_BYTES as f64);
+
+            // A message no one segment can carry is set aside.
+            let plan = plan_offer(vec![candidate(1, 2_000_000, 1.0)], Some(4000.0), Some(10240.0), MAX_OFFER_IDS);
+            assert_eq!((plan.over_resource, plan.offer.len()), (vec![id(1)], 0));
+
+            // The count cap.
+            let small: Vec<OfferCandidate> = (0..10).map(|n| candidate(n, 100, n as f64)).collect();
+            assert_eq!(plan_offer(small, None, None, 4).offer.len(), 4);
+        }
+
+        /// LXMPeer.sync: a message over the peer's per-message transfer limit
+        /// is marked handled and never sent — logged, since it is a drop.
+        #[test]
+        fn messages_over_the_peer_transfer_limit_are_handled_unsent() {
+            let h = Harness::new("sync_transfer_limit");
+            let peer = [0x51u8; 16];
+            h.add_peer(&peer, true);
+            h.node.lock().unwrap().peers.get_mut(&peer[..]).unwrap().propagation_transfer_limit = Some(0.2);
+            h.store(2, 300);
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            assert_eq!(h.io.offer_count(), 0);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
     }
 }
