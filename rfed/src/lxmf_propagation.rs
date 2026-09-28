@@ -4975,6 +4975,65 @@ mod tests {
             assert_eq!(h.peer(&peer, |p| (p.sync_backoff, p.next_sync_attempt, p.alive)), (0.0, 0.0, true));
         }
 
+        /// A callback of an ended session is recognised by its session number
+        /// and ignored. A stale COMPLETE applied to the next session would
+        /// hand that session's in-flight ids before their own Resource
+        /// concludes — the handled-before-delivered loss this sync exists to
+        /// prevent; a stale response or failure would drive or end a session
+        /// it does not belong to.
+        #[test]
+        fn callbacks_of_an_ended_session_cannot_touch_the_next_one() {
+            let h = Harness::new("sync_stale_callbacks");
+            let peer = [0x1Eu8; 16];
+            h.add_peer(&peer, true);
+            h.store(2, 300);
+            let lose_link = || {
+                h.io.link_gone(&peer);
+                h.event(SyncEvent::LinkDown { peer: peer.to_vec() });
+                assert_eq!(h.state(&peer), PropPeer::IDLE);
+            };
+
+            // Session 1 loses its link with its offer unanswered.
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let (_, old_respond, _) = h.io.take_offer();
+            lose_link();
+
+            // Session 2 has offered; session 1's response arrives now.
+            h.start(&peer);
+            h.link_active(&peer, &LINK_2);
+            old_respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT, "a stale response is ignored");
+            assert_eq!(h.io.resource_count(), 0, "and sends nothing");
+
+            // Session 2's Resource is in flight when its link goes.
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (_, old_concluded) = h.io.take_resource();
+            lose_link();
+
+            // Session 3's Resource is in flight; session 2's concludes now.
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (_, concluded) = h.io.take_resource();
+            old_concluded(complete());
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::RESOURCE_TRANSFERRING, "a stale COMPLETE is ignored");
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (2, 0), "and hands nothing");
+            old_concluded(failed());
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::RESOURCE_TRANSFERRING, "a stale failure does not end it");
+
+            concluded(complete());
+            h.pump();
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2), "its own COMPLETE hands them");
+        }
+
         /// AppLinks reports DISCONNECTED for any link to the destination,
         /// a previous session's included, and a report can arrive after the
         /// state it described has moved on. One that does not describe the
