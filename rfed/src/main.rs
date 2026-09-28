@@ -169,7 +169,7 @@ fn write_status_file(
             "      {{\"peer\": \"{}\", \"alive\": {}, \"state\": \"{}\", \"unhandled\": {}, \"handled\": {}, \"next_sync_in_secs\": {:.0}, \"sync_transfer_rate\": {:.1}}}",
             hexrep(hash, false), peer.alive, lxmf_propagation::PropPeer::state_name(peer.state),
             peer.unhandled_ids.len(), peer.handled_ids.len(),
-            (peer.next_sync_attempt - now_secs).max(0.0), peer.sync_transfer_rate,
+            (peer.next_sync_attempt.max(peer.throttled_until) - now_secs).max(0.0), peer.sync_transfer_rate,
         )).collect::<Vec<_>>().join(",\n");
         format!(
             "{{\n    \"messagestore\": {},\n    \"fresh_since_start\": {},\n    \"outbound_sync\": {{\"sent_this_minute\": {}, \"budget_per_minute\": {}, \"backlog_hold_left_secs\": {:.0}}},\n    \"peers\": [\n{}\n    ]\n  }}",

@@ -234,6 +234,11 @@ pub struct PropPeer {
     pub sync_backoff: f64,
     /// Earliest Unix timestamp when the next sync attempt is allowed.
     pub next_sync_attempt: f64,
+    /// Until when the peer holds us off with ERROR_THROTTLED (0xF6). Kept
+    /// apart from `next_sync_attempt`: a throttle is an answer, not a
+    /// failure, so it never marks the peer unresponsive (see
+    /// `select_sync_peer`).
+    pub throttled_until: f64,
     /// Unix timestamp of the most recent sync attempt (success or failure).
     pub last_sync_attempt: f64,
     /// Bits per second of the last completed sync Resource
@@ -307,6 +312,7 @@ impl PropPeer {
             peering_key: None,
             sync_backoff: 0.0,
             next_sync_attempt: 0.0,
+            throttled_until: 0.0,
             last_sync_attempt: 0.0,
             sync_transfer_rate: 0.0,
             handled_ids: IdQueue::default(),
@@ -2224,9 +2230,16 @@ impl LxmfPropagationNode {
     ///     rfed chose the FIRST idle peer every tick, so one peer grinding
     ///     its key blocked every other peer for 3.5 minutes (staging,
     ///     2026-09-27);
-    ///   * an alive peer still in backoff is marked not alive here, which is
-    ///     what the reference's `sync()` does when it chooses one, without
-    ///     spending the choice on it.
+    ///   * an alive peer still in link-attempt backoff is marked not alive
+    ///     here, which is what the reference's `sync()` does when it chooses
+    ///     one, without spending the choice on it.
+    ///
+    /// A peer that throttled us (0xF6) is skipped until the throttle is over
+    /// and is NOT marked unresponsive: the reference holds it on its link in
+    /// RESPONSE_RECEIVED, where sync_peers never chooses it and sync() never
+    /// demotes it, and it is alive and waiting again once its link closes.
+    /// rfed ends that session at once, and marking the peer unresponsive
+    /// then left it behind every alive peer until its next announce.
     pub fn select_sync_peer(&mut self, t: f64, pick: &mut dyn FnMut(usize) -> usize) -> Option<Vec<u8>> {
         let backlog_held = self.backlog_held();
         let fresh = &self.fresh_since_start;
@@ -2239,6 +2252,16 @@ impl LxmfPropagationNode {
             }
             if !peer.sync_ready() {
                 not_ready += 1;
+                continue;
+            }
+            if t <= peer.throttled_until {
+                log(
+                    format!(
+                        "[lxmf.prop] not syncing with peer {} for {:.0}s more: it throttled us",
+                        hexrep(hash, false), peer.throttled_until - t,
+                    ),
+                    LOG_DEBUG, false, false,
+                );
                 continue;
             }
             if peer.alive {
@@ -2542,6 +2565,9 @@ impl LxmfPropagationNode {
                     peer.alive = false;
                 }
                 Gate::Postpone(format!("for {:.0}s due to previous failures", peer.next_sync_attempt - t))
+            } else if t <= peer.throttled_until {
+                // Not a failure: the peer stays alive (see select_sync_peer).
+                Gate::Postpone(format!("for {:.0}s since it throttled us", peer.throttled_until - t))
             } else if peer.propagation_stamp_cost.is_none()
                 || peer.propagation_stamp_flexibility.is_none()
                 || peer.peering_cost.is_none()
@@ -2904,8 +2930,9 @@ impl LxmfPropagationNode {
                             format!("[lxmf.prop] peer {peer_str} indicated that we're throttled, postponing sync for {PN_STAMP_THROTTLE_SECS:.0}s"),
                             LOG_NOTICE, false, false,
                         );
+                        // Held, but not as a failure: see `throttled_until`.
                         if let Some(peer) = self.peers.get_mut(peer_hash) {
-                            peer.next_sync_attempt = now() + PN_STAMP_THROTTLE_SECS;
+                            peer.throttled_until = now() + PN_STAMP_THROTTLE_SECS;
                         }
                         self.end_sync(peer_hash);
                     }
@@ -4781,6 +4808,39 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// ERROR_THROTTLED holds the peer PN_STAMP_THROTTLE_SECS, as an answer,
+        /// not a failure. The reference keeps a throttled peer on its link,
+        /// where it is neither chosen nor demoted, and alive when the link
+        /// closes. rfed ends the session at once, and the next tick marked the
+        /// peer unresponsive for the hold, so it waited behind every alive
+        /// peer until its next announce (hours) — and a 1.1.1 PN throttles any
+        /// offer that lands while it validates a batch.
+        #[test]
+        fn a_throttled_peer_is_held_but_stays_alive_and_waiting() {
+            let h = Harness::new("sync_throttled");
+            let peer = [0x15u8; 16];
+            h.add_peer(&peer, true);
+            h.store(2, 300);
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Integer((ERROR_THROTTLED as i64).into())));
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (2, 0), "nothing handled");
+            assert_eq!(h.io.calls().last().unwrap(), "close 15");
+            let until = h.peer(&peer, |p| p.throttled_until);
+            assert!((until - now() - PN_STAMP_THROTTLE_SECS).abs() < 5.0, "held for the throttle");
+
+            let mut g = h.node.lock().unwrap();
+            // A tick inside the hold: not chosen, and not demoted either.
+            assert_eq!(g.select_sync_peer(now(), &mut |_| 0), None);
+            assert!(g.peers[&peer[..]].alive, "a throttle is not a failure: the peer stays alive");
+            // Once the hold is over it is a waiting (alive) peer again.
+            assert_eq!(g.select_sync_peer(until + 1.0, &mut |_| 0), Some(peer.to_vec()));
+            assert!(g.peers[&peer[..]].alive);
         }
 
         /// LXMRouter.propagation_resource_concluded: a batch from a peer is

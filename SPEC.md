@@ -1118,8 +1118,8 @@ Departures from the reference, each for a reason:
   in the background. The reference chooses such a peer and only postpones,
   and rfed used to choose the first IDLE peer every tick, so one peer grinding
   its key held up every peer (3.5 min, staging 2026-09-27). An alive peer
-  still in backoff is marked unresponsive when found, as the reference's
-  `sync()` does when it chooses one.
+  still in link-attempt backoff is marked unresponsive when found, as the
+  reference's `sync()` does when it chooses one.
 - **Per-minute outbound budget** (`DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN`, 600).
   Each offer is cut to what is left of the minute, and an offer awaiting its
   response reserves its size, so no minute sends more than the budget however
@@ -1132,8 +1132,13 @@ Departures from the reference, each for a reason:
 - **`0xF0` (no identity)** is answered with one more identify per link, not
   one per answer, so a peer that never records the identity cannot loop the
   session. **`0xF6` (throttled)** ends the session at once (the reference
-  leaves it waiting for its link to close). **`0xF3`** discards and
-  regenerates the peering key.
+  leaves it waiting for its link to close) and holds the peer for 180 s
+  (`throttled_until`) WITHOUT marking it unresponsive: the reference never
+  chooses or demotes a peer it holds on its link, and that peer is alive and
+  waiting again when the link closes. A 1.1.1 PN throttles any offer that
+  arrives while it validates a batch, so this is routine; demoted, the peer
+  waited behind every alive peer until its next announce. **`0xF3`**
+  discards and regenerates the peering key.
 - **A lost link ends the session at once**, even with a Resource in flight:
   a Resource not yet advertised when its link closed never concludes in
   Reticulum-rust. Its ids stay unhandled; if it had in fact completed, the
