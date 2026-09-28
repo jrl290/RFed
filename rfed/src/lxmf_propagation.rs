@@ -4975,6 +4975,58 @@ mod tests {
             assert_eq!(h.peer(&peer, |p| (p.sync_backoff, p.next_sync_attempt, p.alive)), (0.0, 0.0, true));
         }
 
+        /// Every answer to an offer ends the session as LXMPeer.offer_response
+        /// and SPEC §10 say, and releases the link: 0xF1 unpeers (the one
+        /// answer that discards a peer's queues), 0xF3 discards the key, 0xF6
+        /// holds the peer without demoting it, `false` hands every offered
+        /// id, and any other code, nil, no data or bytes that are not msgpack
+        /// leave every id unhandled.
+        #[test]
+        fn every_offer_answer_ends_the_session_as_the_reference_does() {
+            #[derive(Debug)]
+            enum Ends { Unpeered, KeyDiscarded, Throttled, AllUnhandled, AllHandled }
+            let code = |c: u8| msgpack(Value::Integer((c as i64).into()));
+            let cases: Vec<(&str, Option<Vec<u8>>, Ends)> = vec![
+                ("0xF1 no access", code(ERROR_NO_ACCESS), Ends::Unpeered),
+                ("0xF3 invalid key", code(ERROR_INVALID_KEY), Ends::KeyDiscarded),
+                ("0xF6 throttled", code(ERROR_THROTTLED), Ends::Throttled),
+                ("0xF4, another error", code(0xF4), Ends::AllUnhandled),
+                ("nil", msgpack(Value::Nil), Ends::AllUnhandled),
+                ("no response data", None, Ends::AllUnhandled),
+                ("not msgpack", Some(vec![0xC1]), Ends::AllUnhandled),
+                ("false", msgpack(Value::Boolean(false)), Ends::AllHandled),
+            ];
+            for (i, (answer, response, ends)) in cases.into_iter().enumerate() {
+                let h = Harness::new(&format!("sync_answer_{i}"));
+                let peer = [0x60 + i as u8; 16];
+                h.add_peer(&peer, true);
+                h.store(2, 300);
+                h.start(&peer);
+                h.link_active(&peer, &LINK_1);
+                let (_, respond, _) = h.io.take_offer();
+                respond(response);
+                h.pump();
+                assert_eq!(h.io.calls().last().unwrap(), &format!("close {:02x}", peer[0]), "{answer}: the link is released");
+                if let Ends::Unpeered = ends {
+                    assert!(!h.node.lock().unwrap().peers.contains_key(&peer[..]), "{answer}: unpeered");
+                    continue;
+                }
+                assert_eq!(h.state(&peer), PropPeer::IDLE, "{answer}");
+                let (key, throttled_until, alive) = h.peer(&peer, |p| (p.peering_key.is_some(), p.throttled_until, p.alive));
+                let counts = (h.unhandled(&peer), h.handled(&peer));
+                match ends {
+                    Ends::KeyDiscarded => assert_eq!((key, counts), (false, (2, 0)), "{answer}"),
+                    Ends::Throttled => {
+                        assert!(throttled_until > now() + PN_STAMP_THROTTLE_SECS - 5.0, "{answer}: held");
+                        assert_eq!((key, alive, counts), (true, true, (2, 0)), "{answer}");
+                    }
+                    Ends::AllUnhandled => assert_eq!((key, throttled_until, counts), (true, 0.0, (2, 0)), "{answer}"),
+                    Ends::AllHandled => assert_eq!(counts, (0, 2), "{answer}"),
+                    Ends::Unpeered => unreachable!(),
+                }
+            }
+        }
+
         /// A callback of an ended session is recognised by its session number
         /// and ignored. A stale COMPLETE applied to the next session would
         /// hand that session's in-flight ids before their own Resource
