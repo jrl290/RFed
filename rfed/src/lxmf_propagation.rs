@@ -3308,8 +3308,31 @@ impl LxmfPropagationNode {
                 node.sync_io.close_link(peer_hash);
                 return;
             }
+            // The link AppLinks holds for the peer now. A report of a link it
+            // no longer holds is stale: the link was closed (a stray closed
+            // at a session's start, whose report was still queued) or
+            // replaced, and a session must not take it up or end on it.
+            let held_now = node.sync_io.active_link(peer_hash);
             let Some(peer) = node.peers.get_mut(peer_hash) else { return };
             match peer.state {
+                PropPeer::IDLE => {
+                    // AppLinks brought a link up on its own (a re-open after
+                    // a close, or an attempt that outlived its session):
+                    // nothing uses it.
+                    log(format!("[lxmf.prop] closing a link to peer {peer_str} that no sync is using"), LOG_DEBUG, false, false);
+                    node.sync_io.close_link(peer_hash);
+                    false
+                }
+                _ if held_now.as_ref() != Some(&link_id) => {
+                    log(
+                        format!(
+                            "[lxmf.prop] link {} to peer {peer_str} reported up, but AppLinks no longer holds it; report ignored",
+                            hexrep(&link_id, false),
+                        ),
+                        LOG_DEBUG, false, false,
+                    );
+                    false
+                }
                 PropPeer::LINK_ESTABLISHING => {
                     log(format!("[lxmf.prop] sync link to peer {peer_str} established"), LOG_DEBUG, false, false);
                     peer.link_id = Some(link_id);
@@ -3318,14 +3341,6 @@ impl LxmfPropagationNode {
                     peer.next_sync_attempt = 0.0;
                     peer.state = PropPeer::LINK_READY;
                     true
-                }
-                PropPeer::IDLE => {
-                    // AppLinks brought a link up on its own (a re-open after
-                    // a close, or an attempt that outlived its session):
-                    // nothing uses it.
-                    log(format!("[lxmf.prop] closing a link to peer {peer_str} that no sync is using"), LOG_DEBUG, false, false);
-                    node.sync_io.close_link(peer_hash);
-                    false
                 }
                 _ if peer.link_id.as_ref() == Some(&link_id) => false,
                 state => {
@@ -5258,6 +5273,10 @@ mod tests {
             h.start(&peer);
             assert_eq!(h.io.calls()[1..], ["close 17", "open 17"]);
             assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING);
+            // The closed link's own report, still queued, comes now: stale.
+            h.event(SyncEvent::LinkActive { peer: peer.to_vec(), link_id: LINK_1.to_vec() });
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING, "a link AppLinks no longer holds is not taken up");
+            assert_eq!(h.io.calls().len(), 3);
 
             // A second link comes up while the session runs on the first. It
             // replaced the session's link in AppLinks, and closing it drops
@@ -5267,6 +5286,8 @@ mod tests {
             h.link_active(&peer, &LINK_1);
             assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
             let (_, respond, _) = h.io.take_offer();
+            h.event(SyncEvent::LinkActive { peer: peer.to_vec(), link_id: LINK_2.to_vec() });
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT, "a stale report does not end the session");
             h.link_active(&peer, &LINK_2);
             assert_eq!(h.io.calls()[3..], ["identify a1", "offer a1", "close 17"]);
             assert_eq!(h.state(&peer), PropPeer::IDLE);

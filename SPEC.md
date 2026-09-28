@@ -1118,7 +1118,8 @@ Departures from the reference, each for a reason:
   held when a session starts from IDLE, one that comes up for an IDLE peer or
   for a destination that is no longer a peer, are closed; a second link that
   comes up mid-session (it replaced the session's link in AppLinks) is closed
-  and the session ends with its ids unhandled.
+  and the session ends with its ids unhandled. A report of a link AppLinks no
+  longer holds (one already closed) is stale and ignored.
 - **Not-ready peers are never chosen.** A peer whose stamp costs are unknown
   or whose peering key is still being generated is skipped; keys are ground
   in the background. The reference chooses such a peer and only postpones,
