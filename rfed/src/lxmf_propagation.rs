@@ -1225,9 +1225,10 @@ impl LxmfPropagationNode {
             let weak = weak.clone();
             move |data, packet| {
                 // NOT under the node lock — see `ingest_propagation_batch`.
+                // A client PUT: no sending peer, as LXMRouter.propagation_packet.
                 let _ = packet;
                 if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                    LxmfPropagationNode::ingest_propagation_batch(&arc, data);
+                    LxmfPropagationNode::ingest_propagation_batch(&arc, data, None);
                 }
             }
         })));
@@ -1251,21 +1252,25 @@ impl LxmfPropagationNode {
             })),
             None,
             Some(Arc::new(move |resource| {
-                let data: Vec<u8> = match resource.lock() {
+                let (data, link): (Vec<u8>, LinkHandle) = match resource.lock() {
                     Ok(r) => {
                         if r.status != reticulum_rust::resource::ResourceStatus::Complete {
                             return;
                         }
                         match r.data.clone() {
-                            Some(d) => d,
+                            Some(d) => (d, r.link.clone()),
                             None => return,
                         }
                     }
                     Err(_) => return,
                 };
+                // The sender is the identity it proved on this link, as
+                // LXMRouter.propagation_resource_concluded takes it; asked
+                // with the Resource released.
+                let sender = link.remote_identity().ok().flatten();
                 // NOT under the node lock — see `ingest_propagation_batch`.
                 if let Some(arc) = weak_concluded.as_ref().and_then(|w| w.upgrade()) {
-                    LxmfPropagationNode::ingest_propagation_batch(&arc, &data);
+                    LxmfPropagationNode::ingest_propagation_batch(&arc, &data, sender.as_ref());
                 }
             })),
         );
@@ -1298,15 +1303,28 @@ impl LxmfPropagationNode {
     /// wait. Same class as the FedNode fan-out wedge of 2026-08-17: a lock held
     /// across work whose duration the holder does not control.
     /// `ingest_lock_scope_tests` holds this in place.
-    pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8]) {
+    ///
+    /// `sender` is the identity the sender proved on its link, for a sync
+    /// Resource. When its `lxmf.propagation` destination is one of our peers,
+    /// every message in the batch is handled for that peer — it has them —
+    /// and new ones are queued for the other peers only, as
+    /// LXMRouter.propagation_resource_concluded does (`from_peer=peer`, then
+    /// `peer.queue_handled_message` for every validated message, a duplicate
+    /// included). Until 2026-09-28 rfed queued each one back to its sender,
+    /// and outbound sync offered every inbound batch straight back.
+    pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8], sender: Option<&Identity>) {
         let Some(messages) = decode_propagation_batch(data) else { return };
         if messages.is_empty() {
             return;
         }
 
-        let (min_cost, delivery) = {
+        let (min_cost, delivery, from_peer) = {
             let Some(node) = lock_node(arc, "ingest (setup)") else { return };
-            (node.stamp_cost.saturating_sub(node.stamp_flexibility), node.delivery_handles())
+            (
+                node.stamp_cost.saturating_sub(node.stamp_flexibility),
+                node.delivery_handles(),
+                node.sending_peer(sender),
+            )
         };
 
         // Validate PN (Propagation Node) stamps on all messages. Stamps below
@@ -1317,7 +1335,7 @@ impl LxmfPropagationNode {
         let mut streamed = 0usize;
         let mut notified = 0usize;
 
-        for (_transient_id, lxmf_data, stamp_value, stamp_raw) in &validated {
+        for (transient_id, lxmf_data, stamp_value, stamp_raw) in &validated {
             let dest_hash = if lxmf_data.len() >= DESTINATION_LENGTH {
                 &lxmf_data[..DESTINATION_LENGTH]
             } else {
@@ -1346,7 +1364,15 @@ impl LxmfPropagationNode {
             // The only step that needs the node. One message per acquisition,
             // so a waiting request handler gets in between any two of them.
             let was_stored = match lock_node(arc, "ingest (store)") {
-                Some(mut node) => node.store_message(lxmf_data, *stamp_value, Some(stamp_raw), None).is_some(),
+                Some(mut node) => {
+                    let stored = node
+                        .store_message(lxmf_data, *stamp_value, Some(stamp_raw), from_peer.as_deref())
+                        .is_some();
+                    if let Some(peer) = &from_peer {
+                        node.mark_handled_for(peer, std::slice::from_ref(transient_id));
+                    }
+                    stored
+                }
                 None => return,
             };
             if was_stored {
@@ -1369,6 +1395,18 @@ impl LxmfPropagationNode {
             ),
             LOG_NOTICE, false, false,
         );
+    }
+
+    /// The peer a sync batch came from: the `lxmf.propagation` destination of
+    /// the identity its sender proved on the link, when that is one of our
+    /// peers (LXMRouter.propagation_resource_concluded: `remote_hash in
+    /// self.peers`). `None` for a client, or a sender that is not a peer.
+    fn sending_peer(&self, sender: Option<&Identity>) -> Option<Vec<u8>> {
+        let hash = Destination::hash_from_name_and_identity(
+            &format!("{}.{}", LXMF_APP, PROP_ASPECT),
+            Some(sender?),
+        );
+        self.peers.contains_key(&hash).then_some(hash)
     }
 
     /// The shared handles delivery works through. Cloning them out is the only
@@ -3854,7 +3892,7 @@ mod tests {
             let ingest_flag = ingesting.clone();
             let ingest = std::thread::spawn(move || {
                 let started = Instant::now();
-                LxmfPropagationNode::ingest_propagation_batch(&ingest_node, &batch(64));
+                LxmfPropagationNode::ingest_propagation_batch(&ingest_node, &batch(64), None);
                 ingest_flag.store(false, Ordering::SeqCst);
                 started.elapsed()
             });
@@ -4743,6 +4781,62 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// LXMRouter.propagation_resource_concluded: a batch from a peer is
+        /// handled for that peer — it has every message in it, one we already
+        /// held included — and what is new is queued for the other peers only.
+        /// rfed queued each message back to its sender, so every inbound batch
+        /// was offered straight back. A client's batch (no peer) still goes to
+        /// every peer.
+        #[test]
+        fn a_batch_from_a_peer_is_handled_for_it_and_queued_for_the_others() {
+            let h = Harness::new("sync_from_peer");
+            {
+                // Any stamp meets cost 0; the test is about who gets what.
+                let mut g = h.node.lock().unwrap();
+                g.stamp_cost = 0;
+                g.stamp_flexibility = 0;
+            }
+            let sender_identity = Identity::new(true);
+            let sender = Destination::hash_from_name_and_identity("lxmf.propagation", Some(&sender_identity));
+            let other = [0x72u8; 16];
+            h.add_peer(&sender, true);
+            h.add_peer(&other, true);
+            // A message rfed already holds and had queued for both peers.
+            let held = h.store(1, 300).remove(0);
+            let held_file = {
+                let g = h.node.lock().unwrap();
+                fs::read(&g.entries[&held].filepath).expect("stored file")
+            };
+            let message = |fill: u8| {
+                let mut lxmf = vec![fill; 300 - lx_stamper::STAMP_SIZE];
+                lxmf[..16].copy_from_slice(&[0x5E; 16]);
+                let id = reticulum_rust::identity::full_hash(&lxmf);
+                ([lxmf, vec![0x33u8; lx_stamper::STAMP_SIZE]].concat(), id)
+            };
+            let (fresh, fresh_id) = message(0x78);
+            let batch = |messages: Vec<Vec<u8>>| encode_value(Value::Array(vec![
+                Value::F64(0.0),
+                Value::Array(messages.into_iter().map(Value::Binary).collect()),
+            ]));
+
+            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(vec![fresh, held_file]), Some(&sender_identity));
+            assert!(h.node.lock().unwrap().entries.contains_key(&fresh_id), "the new message is stored");
+            h.peer(&sender, |p| {
+                assert!(!p.unhandled_ids.contains(&fresh_id), "not queued back to the peer that sent it");
+                assert!(!p.unhandled_ids.contains(&held), "a duplicate it sent is no longer queued for it either");
+                assert!(p.handled_ids.contains(&fresh_id) && p.handled_ids.contains(&held), "both handled for it");
+            });
+            h.peer(&other, |p| {
+                assert!(p.unhandled_ids.contains(&fresh_id) && p.unhandled_ids.contains(&held), "the others still get both");
+            });
+
+            // A client PUT: no sending peer, so every peer gets it.
+            let (client, client_id) = message(0x79);
+            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(vec![client]), None);
+            assert!(h.peer(&sender, |p| p.unhandled_ids.contains(&client_id)));
+            assert!(h.peer(&other, |p| p.unhandled_ids.contains(&client_id)));
         }
 
         /// The wire defect (2026-09-28): rfed announced its limits as MB where

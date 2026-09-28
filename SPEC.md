@@ -1058,7 +1058,12 @@ notify-only shim.
 2. rfed validates the propagation-node stamp against the configured
   cost/flexibility.
 3. rfed stores the LXMF message on disk, indexes it, and queues it for
-  eligible propagation peers.
+  eligible propagation peers. A sync Resource from a peer (the sender's
+  identity on the link maps to a peer's `lxmf.propagation` hash) is handled
+  for that peer, every message in it including ones rfed already held, and is
+  queued for the other peers only (LXMF 1.1.1
+  `propagation_resource_concluded`, `from_peer`). A client's PUT goes to
+  every peer.
 4. Recipients retrieve stored messages with the standard LXMF `GET` path, and
   peers exchange OFFER / GET sync with LXMF-rust `lxmd` instances and other
   rfed nodes.
