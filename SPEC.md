@@ -1113,7 +1113,12 @@ Departures from the reference, each for a reason:
   request and 7.5 s sleep; its DISCONNECTED report is the failure event. The
   held link is released (`AppLinks::close`) wherever the reference tears its
   link down, except that the persistent strategy's next batch goes on the
-  still-up link instead of a new one.
+  still-up link instead of a new one. A session runs only on a link it opened
+  with `open_persistent`, so that AppLinks reports its loss: a link already
+  held when a session starts from IDLE, one that comes up for an IDLE peer or
+  for a destination that is no longer a peer, are closed; a second link that
+  comes up mid-session (it replaced the session's link in AppLinks) is closed
+  and the session ends with its ids unhandled.
 - **Not-ready peers are never chosen.** A peer whose stamp costs are unknown
   or whose peering key is still being generated is skipped; keys are ground
   in the background. The reference chooses such a peer and only postpones,

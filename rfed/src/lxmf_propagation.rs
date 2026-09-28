@@ -3329,14 +3329,21 @@ impl LxmfPropagationNode {
                 }
                 _ if peer.link_id.as_ref() == Some(&link_id) => false,
                 state => {
+                    // AppLinks reports ACTIVE only for the link it tracks, so
+                    // this one replaced the session's (two attempts overlapped),
+                    // and closing it drops the destination's registration as
+                    // well: AppLinks would report the loss of neither. A
+                    // session never runs on a link whose loss goes unreported;
+                    // it ends, with its ids unhandled.
+                    let pending = peer.transferring.as_ref().map(|t| t.len()).unwrap_or(peer.last_offer.len());
                     log(
                         format!(
-                            "[lxmf.prop] a new link to peer {peer_str} came up while its sync ({}) runs on another; closing it",
+                            "[lxmf.prop] a new link to peer {peer_str} came up while its sync ({}) runs on another; closing it and ending the sync, {pending} message(s) stay unhandled",
                             PropPeer::state_name(state),
                         ),
-                        LOG_DEBUG, false, false,
+                        LOG_WARNING, false, false,
                     );
-                    node.sync_io.close_link(peer_hash);
+                    node.end_sync(peer_hash);
                     false
                 }
             }
@@ -5247,15 +5254,21 @@ mod tests {
             assert_eq!(h.io.calls()[1..], ["close 17", "open 17"]);
             assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING);
 
-            // A second link comes up while the session runs on the first:
-            // closed, and the session carries on where it was.
+            // A second link comes up while the session runs on the first. It
+            // replaced the session's link in AppLinks, and closing it drops
+            // the registration: AppLinks would report the loss of neither, so
+            // the session ends rather than run on unreported, ids unhandled;
+            // the first link's late response is then stale.
             h.link_active(&peer, &LINK_1);
             assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
+            let (_, respond, _) = h.io.take_offer();
             h.link_active(&peer, &LINK_2);
             assert_eq!(h.io.calls()[3..], ["identify a1", "offer a1", "close 17"]);
-            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
-            assert_eq!(h.peer(&peer, |p| p.link_id.clone()), Some(LINK_1.to_vec()));
-            assert_eq!(h.io.offer_count(), 1, "no second offer");
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            assert_eq!((h.io.resource_count(), h.unhandled(&peer), h.handled(&peer)), (0, 2, 0));
 
             // A link comes up for a destination that is no longer a peer (it
             // was unpeered while the attempt was in flight): closed, too.
