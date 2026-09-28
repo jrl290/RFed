@@ -3095,12 +3095,14 @@ impl LxmfPropagationNode {
         let mut ids = Vec::with_capacity(files.len());
         let mut messages = Vec::with_capacity(files.len());
         let mut unreadable = Vec::new();
+        let mut missing = Vec::new();
         for (tid, path) in files {
             match fs::read(&path) {
                 Ok(data) => {
                     ids.push(tid);
                     messages.push(data);
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => missing.push((tid, path)),
                 Err(e) => unreadable.push((tid, path, e.to_string())),
             }
         }
@@ -3113,6 +3115,7 @@ impl LxmfPropagationNode {
 
         let (io, sink, link_id) = {
             let Some(mut node) = lock_node(arc, "sync resource") else { return };
+            node.forget_missing_messages(&missing);
             let link_id = match node.peers.get(peer_hash) {
                 Some(peer) if peer.state == PropPeer::RESOURCE_TRANSFERRING && peer.sync_session == session => peer.link_id.clone(),
                 _ => {
@@ -3159,6 +3162,30 @@ impl LxmfPropagationNode {
                 );
                 node.end_sync(peer_hash);
             }
+        }
+    }
+
+    /// Drop messages whose file is gone (NotFound) from the store index and,
+    /// as `evict_expired` does, from every peer's queues: nothing can ever be
+    /// sent or served from them. The reference skips a missing file and marks
+    /// it handled for that peer on COMPLETE; left in the index, rfed offered
+    /// it again, and opened a link for it, to every peer lacking it until it
+    /// expired (7 days). Only the entry the file belonged to goes: a message
+    /// stored again since has a file of its own.
+    fn forget_missing_messages(&mut self, missing: &[(Vec<u8>, String)]) {
+        for (tid, path) in missing {
+            if !self.entries.get(tid).map(|entry| &entry.filepath == path).unwrap_or(false) {
+                continue;
+            }
+            self.entries.remove(tid);
+            for peer in self.peers.values_mut() {
+                peer.handled_ids.remove(tid);
+                peer.unhandled_ids.remove(tid);
+            }
+            log(
+                format!("[lxmf.prop] message {} has no file ({path}); dropped from the message store and every peer's queue", hexrep(tid, false)),
+                LOG_WARNING, false, false,
+            );
         }
     }
 
@@ -4884,6 +4911,50 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// A message whose file is gone from disk leaves the store and every
+        /// peer's queue. Left unhandled, it was offered again — a link, an
+        /// identify, an offer and a response for nothing — to every peer
+        /// lacking it, every time it was chosen, until the message expired.
+        #[test]
+        fn a_message_whose_file_is_gone_leaves_the_store() {
+            let h = Harness::new("sync_file_gone");
+            let peer = [0x1Au8; 16];
+            let other = [0x1Bu8; 16];
+            h.add_peer(&peer, true);
+            h.add_peer(&other, true);
+            let ids = h.store(2, 300);
+            let path_of = |tid: &Vec<u8>| h.node.lock().unwrap().entries[tid].filepath.clone();
+
+            // One of two wanted files is gone: the other is sent.
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let (_, respond, _) = h.io.take_offer();
+            fs::remove_file(path_of(&ids[0])).expect("remove the file");
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (payload, concluded) = h.io.take_resource();
+            assert_eq!(decode_propagation_batch(&payload).unwrap().len(), 1, "the readable one is sent");
+            assert!(!h.node.lock().unwrap().entries.contains_key(&ids[0]), "the one without a file leaves the store");
+            assert!(!h.peer(&other, |p| p.unhandled_ids.contains(&ids[0])), "and every peer's queue");
+            concluded(complete());
+            h.pump();
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 1));
+            assert_eq!(h.state(&peer), PropPeer::IDLE, "nothing is left for it");
+
+            // The only file wanted is gone: the session ends with nothing left.
+            h.start(&other);
+            h.link_active(&other, &LINK_2);
+            let (offer, respond, _) = h.io.take_offer();
+            assert_eq!(offered_ids(&offer), vec![ids[1].clone()]);
+            fs::remove_file(path_of(&ids[1])).expect("remove the file");
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            assert_eq!(h.io.resource_count(), 0);
+            assert_eq!(h.state(&other), PropPeer::IDLE);
+            assert_eq!(h.unhandled(&other), 0, "not offered again");
+            assert_eq!(h.node.lock().unwrap().select_sync_peer(now(), &mut |_| 0), None);
         }
 
         /// ERROR_INVALID_KEY (0xF3): the key is ground again once per announced

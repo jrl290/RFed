@@ -1153,8 +1153,14 @@ Departures from the reference, each for a reason:
   Reticulum-rust. Its ids stay unhandled; if it had in fact completed, the
   next offer finds the peer has them. Callbacks of an ended session are
   recognised by a session number and ignored.
-- **Unreadable message files** stay unhandled, with a warning (the reference
-  skips them silently and marks them handled on COMPLETE).
+- **Message files that cannot be read.** A file that is gone (`NotFound`)
+  takes its message out of the store index and out of every peer's queues,
+  with a warning: nothing can be sent or served from it again, and left
+  queued it was offered, with a link opened for it, to every peer lacking it
+  until it expired (7 days). The reference skips a missing file silently and
+  marks it handled for that peer on COMPLETE. Any other read error (a
+  permission problem, EIO) leaves the id unhandled, with a warning, as the
+  reference's failed `open()` does.
 - **Backoff is not reset by announces**, and the **startup backlog** (messages
   stored before start) is held back from sync for an hour; both predate this.
 - **No 5-second assertion on the Resource** (DESIGN_PRINCIPLES §1): its
