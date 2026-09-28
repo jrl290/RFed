@@ -1095,7 +1095,8 @@ sync".
    the peer's sync limit (KB, estimated as size + 16 B per message + 24 B).
 4. **Response.** `false`: all offered ids handled. `true` / `[ids]`: the
    unwanted ones handled, the wanted ones sent. Errors: `0xF0` identify again,
-   `0xF1` unpeer, `0xF3` regenerate the peering key, `0xF6` no sync for 180 s.
+   `0xF1` unpeer, `0xF3` regenerate the peering key once per announced cost,
+   `0xF6` no sync for 180 s (the peer stays alive).
 5. **Transfer.** The wanted messages (each stored file: message + stamp) go as
    ONE `RNS.Resource` of msgpack `[time, [lxm, ...]]` (float, array of bin) —
    the format the reference and rfed's own inbound path ingest. They are
@@ -1137,8 +1138,16 @@ Departures from the reference, each for a reason:
   chooses or demotes a peer it holds on its link, and that peer is alive and
   waiting again when the link closes. A 1.1.1 PN throttles any offer that
   arrives while it validates a batch, so this is routine; demoted, the peer
-  waited behind every alive peer until its next announce. **`0xF3`**
-  discards and regenerates the peering key.
+  waited behind every alive peer until its next announce. **`0xF3`
+  (invalid key)** discards the peering key and grinds a new one at the
+  announced cost, once per announced cost: that repairs a key ground under
+  another rfed identity or persisted from an older stamper. If the peer
+  refuses that key too, it validates against a cost rfed has not heard yet,
+  and another key at the same cost cannot fare better, so the peer is not
+  chosen again until it announces a different peering cost. (The reference
+  has no `0xF3` branch: it ends the session with the key kept and offers
+  again at every choice. rfed used to regrind at the same cost after every
+  refusal: a full PoW grind, a link and an offer per cycle.)
 - **A lost link ends the session at once**, even with a Resource in flight:
   a Resource not yet advertised when its link closed never concludes in
   Reticulum-rust. Its ids stay unhandled; if it had in fact completed, the

@@ -229,6 +229,13 @@ pub struct PropPeer {
     /// Generated in a background thread via `spawn_peering_key_gen()` to avoid
     /// blocking the main loop during the expensive Hashcash grind.
     pub peering_key: Option<(Vec<u8>, u32)>,
+    /// The peering cost at which the key was discarded and ground once more
+    /// after the peer answered ERROR_INVALID_KEY (0xF3).
+    pub key_reground_at_cost: Option<u32>,
+    /// The peering cost at which that second key was refused as well. A key
+    /// ground at the same cost cannot fare better, so the peer is not synced
+    /// until it announces another peering cost (see `sync_ready`).
+    pub key_refused_at_cost: Option<u32>,
     /// Backoff in seconds: SYNC_BACKOFF_STEP_SECS more with each sync link
     /// attempt, cleared once a link is established (LXMPeer.sync_backoff).
     pub sync_backoff: f64,
@@ -310,6 +317,8 @@ impl PropPeer {
             propagation_sync_limit: None,
             metadata: None,
             peering_key: None,
+            key_reground_at_cost: None,
+            key_refused_at_cost: None,
             sync_backoff: 0.0,
             next_sync_attempt: 0.0,
             throttled_until: 0.0,
@@ -330,12 +339,20 @@ impl PropPeer {
 
     /// Check whether peer has all parameters needed to initiate sync:
     /// stamp costs populated from announce AND a valid (sufficiently strong)
-    /// peering key already ground.
+    /// peering key already ground, which the peer has not refused twice at
+    /// its announced cost.
     pub fn sync_ready(&self) -> bool {
         self.propagation_stamp_cost.is_some()
             && self.propagation_stamp_flexibility.is_some()
             && self.peering_cost.is_some()
             && self.peering_key_ready()
+            && !self.peering_key_refused()
+    }
+
+    /// Did the peer refuse a key ground again at its announced cost (see
+    /// `key_refused_at_cost`)?
+    pub fn peering_key_refused(&self) -> bool {
+        self.key_refused_at_cost.is_some() && self.key_refused_at_cost == self.peering_cost
     }
 
     /// A peering key is "ready" when its achieved PoW value meets or exceeds
@@ -954,6 +971,11 @@ impl LxmfPropagationNode {
                 peer.peering_timebase = timebase;
                 peer.propagation_stamp_cost = Some(stamp_cost);
                 peer.propagation_stamp_flexibility = Some(stamp_flex);
+                if peer.peering_cost != Some(peer_cost) {
+                    // A new cost: a refusal at the old one says nothing about it.
+                    peer.key_reground_at_cost = None;
+                    peer.key_refused_at_cost = None;
+                }
                 peer.peering_cost = Some(peer_cost);
                 peer.propagation_transfer_limit = Some(transfer_limit);
                 peer.propagation_sync_limit = sync_limit.or(Some(transfer_limit));
@@ -2577,6 +2599,8 @@ impl LxmfPropagationNode {
                 Gate::Postpone("since its required stamp costs are not yet known".to_string())
             } else if !peer.peering_key_ready() {
                 Gate::Postpone("since a peering key has not been generated yet".to_string())
+            } else if peer.peering_key_refused() {
+                Gate::Postpone("until it announces another peering cost, since it refused our key at this one twice".to_string())
             } else if !Self::has_sync_candidates(backlog_held, fresh, peer) {
                 Gate::NothingToSync
             } else if peer.transferring.is_some() {
@@ -2928,9 +2952,37 @@ impl LxmfPropagationNode {
                         self.end_sync(peer_hash);
                     }
                     ERROR_INVALID_KEY => {
-                        log(format!("[lxmf.prop] peer {peer_str} rejected our peering key; regenerating"), LOG_WARNING, false, false);
                         if let Some(peer) = self.peers.get_mut(peer_hash) {
-                            peer.peering_key = None;
+                            let cost = peer.peering_cost;
+                            if cost.is_some() && peer.key_reground_at_cost == cost {
+                                // Ground again at this cost and refused again:
+                                // a third key at the same cost cannot fare
+                                // better. The peer validates against another
+                                // cost than it announced, and its newer
+                                // announce has not reached us.
+                                peer.key_refused_at_cost = cost;
+                                log(
+                                    format!(
+                                        "[lxmf.prop] peer {peer_str} refused a peering key ground again at its announced cost {}: its peering cost must differ from its announce; no sync with it until it announces another",
+                                        cost.unwrap_or(0),
+                                    ),
+                                    LOG_WARNING, false, false,
+                                );
+                            } else {
+                                // Once per announced cost: this repairs a key
+                                // that is bad for another reason (ground under
+                                // another rfed identity, or persisted from an
+                                // older stamper).
+                                peer.peering_key = None;
+                                peer.key_reground_at_cost = cost;
+                                log(
+                                    format!(
+                                        "[lxmf.prop] peer {peer_str} rejected our peering key; generating a new one at cost {}, once",
+                                        cost.unwrap_or(0),
+                                    ),
+                                    LOG_WARNING, false, false,
+                                );
+                            }
                         }
                         self.end_sync(peer_hash);
                     }
@@ -4832,6 +4884,54 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// ERROR_INVALID_KEY (0xF3): the key is ground again once per announced
+        /// peering cost. Refused again, the peer validates against a cost rfed
+        /// has not heard yet, and a key at the same cost cannot fare better:
+        /// it waits for an announce with another cost. Regenerating at the
+        /// same cost after every refusal was a full PoW grind plus a link and
+        /// an offer per cycle for as long as rfed's copy of the cost was stale.
+        #[test]
+        fn a_refused_peering_key_is_ground_again_once_per_announced_cost() {
+            let h = Harness::new("sync_invalid_key");
+            let peer = [0x19u8; 16];
+            h.add_peer(&peer, true);
+            h.store(2, 300);
+            let refuse = |h: &Harness| {
+                h.start(&peer);
+                h.link_active(&peer, &LINK_1);
+                let (_, respond, _) = h.io.take_offer();
+                respond(msgpack(Value::Integer((ERROR_INVALID_KEY as i64).into())));
+                h.pump();
+                assert_eq!(h.state(&peer), PropPeer::IDLE);
+                assert_eq!((h.unhandled(&peer), h.handled(&peer)), (2, 0), "a refused offer hands nothing");
+            };
+            let set_key = |h: &Harness, value: u32| {
+                h.node.lock().unwrap().peers.get_mut(&peer[..]).unwrap().peering_key = Some((vec![0x5B; 32], value));
+            };
+
+            refuse(&h);
+            assert!(h.peer(&peer, |p| p.peering_key.is_none()), "discarded, to be ground again");
+            // The background grind delivers a new key at the same cost 18.
+            set_key(&h, 18);
+            assert_eq!(h.node.lock().unwrap().select_sync_peer(now(), &mut |_| 0), Some(peer.to_vec()));
+
+            refuse(&h);
+            assert!(h.peer(&peer, |p| p.peering_key.is_some()), "kept: no second grind at the same cost");
+            assert!(!h.peer(&peer, |p| p.sync_ready()));
+            assert_eq!(h.node.lock().unwrap().select_sync_peer(now(), &mut |_| 0), None, "not chosen at this cost");
+
+            // The peer announces another cost: a key is ground for it and the
+            // peer syncs again.
+            h.node.lock().unwrap().peer(peer.to_vec(), 1.0, 256.0, Some(10240.0), 16, 3, 20, Vec::new());
+            assert!(!h.peer(&peer, |p| p.peering_key_ready()), "the old key does not meet the new cost");
+            set_key(&h, 20);
+            assert_eq!(h.node.lock().unwrap().select_sync_peer(now(), &mut |_| 0), Some(peer.to_vec()));
+            // A later announce back at 18 is a new cost too: the old refusal
+            // no longer holds (the cost-20 key meets 18).
+            h.node.lock().unwrap().peer(peer.to_vec(), 2.0, 256.0, Some(10240.0), 16, 3, 18, Vec::new());
+            assert_eq!(h.node.lock().unwrap().select_sync_peer(now(), &mut |_| 0), Some(peer.to_vec()));
         }
 
         /// AppLinks brings links up that no session asked for: its re-open of
