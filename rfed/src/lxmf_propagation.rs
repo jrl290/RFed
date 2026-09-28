@@ -2843,17 +2843,7 @@ impl LxmfPropagationNode {
         ]));
         // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
         let offer_sent_at = now();
-        let on_response: Arc<dyn Fn(Option<Vec<u8>>) + Send + Sync> = {
-            let sink = Arc::clone(&sink);
-            let peer = peer_hash.to_vec();
-            Arc::new(move |response: Option<Vec<u8>>| {
-                // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-                reticulum_rust::send_assertion::assert_send_completed_in_time(
-                    "lxmf.propagation.offer", offer_sent_at,
-                );
-                sink(SyncEvent::OfferResponse { peer: peer.clone(), session, response });
-            })
-        };
+        let on_response = offer_response_callback(Arc::clone(&sink), peer_hash.to_vec(), session, offer_sent_at);
         let on_failed: Arc<dyn Fn() + Send + Sync> = {
             let peer = peer_hash.to_vec();
             Arc::new(move || sink(SyncEvent::OfferFailed { peer: peer.clone(), session }))
@@ -3734,6 +3724,29 @@ enum OfferNext {
     Resync,
     /// Send these `(transient id, message file)` as the sync Resource.
     Send(Vec<(Vec<u8>, String)>),
+}
+
+/// The `/offer` request's response callback: hand the response to the sync
+/// worker, THEN hold the round trip to DESIGN_PRINCIPLES §1.
+///
+/// In a debug build a response more than 5 s after `offer_sent_at` panics in
+/// the assertion, on the thread the link runs its response callbacks on. The
+/// assertion used to come first, so that panic also lost the response: it had
+/// already claimed the pending request, so no failure or timeout followed,
+/// and the peer sat in REQUEST_SENT for good with its offer still reserving
+/// the minute's budget — two such peers and outbound sync stopped. Forwarded
+/// first, the violation is still loud and the session still concludes.
+fn offer_response_callback(
+    sink: SyncEventSink,
+    peer: Vec<u8>,
+    session: u64,
+    offer_sent_at: f64,
+) -> Arc<dyn Fn(Option<Vec<u8>>) + Send + Sync> {
+    Arc::new(move |response: Option<Vec<u8>>| {
+        sink(SyncEvent::OfferResponse { peer: peer.clone(), session, response });
+        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
+        reticulum_rust::send_assertion::assert_send_completed_in_time("lxmf.propagation.offer", offer_sent_at);
+    })
 }
 
 /// A sync batch in the propagation wire format, msgpack `[timebase, [lxm, ...]]`
@@ -4808,6 +4821,37 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// DESIGN_PRINCIPLES §1 panics in a debug build when an offer's
+        /// response comes more than 5 s after it was sent. The callback
+        /// asserted first and forwarded the response after, so the panic lost
+        /// it: the peer stayed REQUEST_SENT for good and its offer kept its
+        /// reservation of the minute's budget. The response goes first now.
+        #[test]
+        fn a_late_offer_response_is_forwarded_before_the_5_second_assertion() {
+            let h = Harness::new("sync_late_response");
+            let peer = [0x16u8; 16];
+            h.add_peer(&peer, true);
+            h.store(3, 300);
+            h.start(&peer);
+            h.link_active(&peer, &LINK_1);
+            let _ = h.io.take_offer();
+            let (session, sink) = {
+                let mut g = h.node.lock().unwrap();
+                assert_eq!(g.outbound_allowance(), g.outbound_sync_msgs_per_min - 3, "the offer reserves its size");
+                (g.peers[&peer[..]].sync_session, g.event_sink())
+            };
+
+            // The response callback of an offer sent 10 s ago.
+            let late = offer_response_callback(sink, peer.to_vec(), session, now() - 10.0);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| late(msgpack(Value::Boolean(false)))));
+            assert_eq!(outcome.is_err(), cfg!(debug_assertions), "the §1 assertion still trips in a debug build");
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::IDLE, "the response was not lost with the panic");
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 3));
+            let mut g = h.node.lock().unwrap();
+            assert_eq!(g.outbound_allowance(), g.outbound_sync_msgs_per_min, "the reservation is released");
         }
 
         /// ERROR_THROTTLED holds the peer PN_STAMP_THROTTLE_SECS, as an answer,
