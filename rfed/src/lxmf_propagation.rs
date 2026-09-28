@@ -702,8 +702,10 @@ impl LxmfPropagationNode {
         // Outbound peer sync: one worker thread takes every sync event in
         // arrival order — the offer responses, the Resources concluding, and
         // AppLinks' status for the peers' held links, subscribed here.
-        // Events for destinations that are not propagation peers (rfed.node
-        // links, for one) are dropped by the worker.
+        // Only persistent AppLinks report ACTIVE with a link, and rfed opens
+        // those only for sync; rfed.node's ephemeral links report ACTIVE
+        // without one and are not forwarded. A DISCONNECTED for a destination
+        // that is not a propagation peer is dropped by the worker.
         let sink = Self::start_sync_worker(arc, &mut guard);
         AppLinks::register_status_callback(Arc::new(move |dest: &[u8], status: u8, link: Option<LinkHandle>| {
             match (status, link) {
@@ -2511,7 +2513,7 @@ impl LxmfPropagationNode {
     // ── A session's steps (LXMPeer) ──────────────────────────────────────
 
     /// LXMPeer.sync(): advance `peer_hash`'s session one step — from IDLE,
-    /// open the sync link (or take the one already held); once the link is
+    /// open the sync link (never one it did not open); once the link is
     /// ready, send the offer. The offer's candidates are sorted with the node
     /// released: a peer's queue can hold 150k ids.
     fn sync_peer(arc: &Arc<Mutex<Self>>, peer_hash: &[u8]) {
@@ -2617,43 +2619,42 @@ impl LxmfPropagationNode {
 
         match state {
             PropPeer::IDLE => {
-                let held = io.active_link(peer_hash);
-                let peer = self.peers.get_mut(peer_hash)?;
-                match held {
-                    Some(link_id) => {
-                        // A link to the peer is already held (the previous
-                        // session's, still up): take it, as if just established.
-                        log(
-                            format!("[lxmf.prop] sync with peer {peer_str} reuses the held link {}", hexrep(&link_id, false)),
-                            LOG_DEBUG, false, false,
-                        );
-                        peer.sync_session += 1;
-                        peer.link_id = Some(link_id);
-                        peer.identified_link_id = None;
-                        peer.reidentified = false;
-                        peer.next_sync_attempt = 0.0;
-                        peer.state = PropPeer::LINK_READY;
-                    }
-                    None => {
-                        peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
-                        peer.next_sync_attempt = t + peer.sync_backoff;
-                        peer.sync_session += 1;
-                        peer.link_id = None;
-                        peer.identified_link_id = None;
-                        peer.reidentified = false;
-                        peer.state = PropPeer::LINK_ESTABLISHING;
-                        log(
-                            format!(
-                                "[lxmf.prop] establishing link for sync to peer {peer_str} ({} unhandled)",
-                                peer.unhandled_ids.len(),
-                            ),
-                            LOG_NOTICE, false, false,
-                        );
-                        // The outcome arrives as LinkActive or LinkDown.
-                        io.open_link(peer_hash);
-                        return None;
-                    }
+                // LXMPeer.sync builds a new link from IDLE, and so does every
+                // session here: open_persistent registers the destination,
+                // so AppLinks reports the link's loss. A link already held now
+                // is not one a session opened — end_sync closes each
+                // session's — but one AppLinks brought up on its own after
+                // close() forgot the destination (its re-open of a link the
+                // peer closed). Adopted, its loss went unreported and a
+                // session could wait on it for good; it is closed instead.
+                if let Some(stray) = io.active_link(peer_hash) {
+                    log(
+                        format!(
+                            "[lxmf.prop] closing link {} to peer {peer_str}, which no sync opened, before the sync opens its own",
+                            hexrep(&stray, false),
+                        ),
+                        LOG_DEBUG, false, false,
+                    );
+                    io.close_link(peer_hash);
                 }
+                let peer = self.peers.get_mut(peer_hash)?;
+                peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
+                peer.next_sync_attempt = t + peer.sync_backoff;
+                peer.sync_session += 1;
+                peer.link_id = None;
+                peer.identified_link_id = None;
+                peer.reidentified = false;
+                peer.state = PropPeer::LINK_ESTABLISHING;
+                log(
+                    format!(
+                        "[lxmf.prop] establishing link for sync to peer {peer_str} ({} unhandled)",
+                        peer.unhandled_ids.len(),
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                // The outcome arrives as LinkActive or LinkDown.
+                io.open_link(peer_hash);
+                return None;
             }
             _ => {} // LINK_READY; other states returned above.
         }
@@ -3218,6 +3219,16 @@ impl LxmfPropagationNode {
         let proceed = {
             let Some(mut node) = lock_node(arc, "sync link up") else { return };
             let peer_str = hexrep(peer_hash, false);
+            if !node.peers.contains_key(peer_hash) {
+                // Only the sync links rfed opens report ACTIVE with a link
+                // (rfed.node's AppLinks are ephemeral, reported without one).
+                // This one's peer was removed while its attempt was in flight:
+                // unpeer's close came first, so AppLinks no longer tracks the
+                // destination and would neither close the link nor report it.
+                log(format!("[lxmf.prop] closing a sync link to {peer_str}, which is no longer a peer"), LOG_NOTICE, false, false);
+                node.sync_io.close_link(peer_hash);
+                return;
+            }
             let Some(peer) = node.peers.get_mut(peer_hash) else { return };
             match peer.state {
                 PropPeer::LINK_ESTABLISHING => {
@@ -4821,6 +4832,46 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// AppLinks brings links up that no session asked for: its re-open of
+        /// a link the peer closed, or an attempt that outlived its session or
+        /// its peer. Each is closed — none is adopted, none left held.
+        #[test]
+        fn links_no_session_opened_are_closed_never_adopted() {
+            let h = Harness::new("sync_stray_links");
+            let peer = [0x17u8; 16];
+            h.add_peer(&peer, true);
+            h.store(2, 300);
+
+            // A link comes up for an IDLE peer: nothing uses it.
+            h.link_active(&peer, &LINK_1);
+            assert_eq!(h.io.calls(), vec!["close 17"]);
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+
+            // A link is already held when the peer is chosen: it is closed,
+            // and the session opens its own, which AppLinks will report on.
+            h.io.link_up(&peer, &LINK_1);
+            h.start(&peer);
+            assert_eq!(h.io.calls()[1..], ["close 17", "open 17"]);
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING);
+
+            // A second link comes up while the session runs on the first:
+            // closed, and the session carries on where it was.
+            h.link_active(&peer, &LINK_1);
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
+            h.link_active(&peer, &LINK_2);
+            assert_eq!(h.io.calls()[3..], ["identify a1", "offer a1", "close 17"]);
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
+            assert_eq!(h.peer(&peer, |p| p.link_id.clone()), Some(LINK_1.to_vec()));
+            assert_eq!(h.io.offer_count(), 1, "no second offer");
+
+            // A link comes up for a destination that is no longer a peer (it
+            // was unpeered while the attempt was in flight): closed, too.
+            let gone = [0x18u8; 16];
+            h.link_active(&gone, &LINK_2);
+            assert_eq!(h.io.calls().last().unwrap(), "close 18");
+            assert!(h.io.active_link(&gone).is_none());
         }
 
         /// DESIGN_PRINCIPLES §1 panics in a debug build when an offer's
