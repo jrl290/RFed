@@ -4329,10 +4329,17 @@ mod tests {
 
         /// The network as the sync state machine sees it. Records every call;
         /// keeps the callbacks for the test to fire.
+        ///
+        /// Like AppLinks, it knows a link attempt that is in flight with no
+        /// link up yet (`attempting`, from `open_link` until the link comes
+        /// up, the attempt fails, or `close_link`): `link_attempt_live` is
+        /// true for it, as `AppLinks::status` reports PATH_REQUESTED or
+        /// ESTABLISHING.
         #[derive(Default)]
         struct FakeIo {
             calls: Mutex<Vec<String>>,
             active: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+            attempting: Mutex<HashSet<Vec<u8>>>,
             offers: Mutex<VecDeque<(Vec<u8>, OnResponse, OnFailed)>>,
             resources: Mutex<VecDeque<(Vec<u8>, OnConcluded)>>,
         }
@@ -4346,11 +4353,17 @@ mod tests {
             }
             /// AppLinks now holds `link` to `peer`, ACTIVE.
             fn link_up(&self, peer: &[u8], link: &[u8]) {
+                self.attempting.lock().unwrap().remove(peer);
                 self.active.lock().unwrap().insert(peer.to_vec(), link.to_vec());
             }
             /// The held link to `peer` is gone.
             fn link_gone(&self, peer: &[u8]) {
                 self.active.lock().unwrap().remove(peer);
+            }
+            /// The link attempt to `peer` failed (path race lost, or the link
+            /// closed before it came up).
+            fn attempt_failed(&self, peer: &[u8]) {
+                self.attempting.lock().unwrap().remove(peer);
             }
             fn offer_count(&self) -> usize {
                 self.offers.lock().unwrap().len()
@@ -4371,12 +4384,14 @@ mod tests {
                 self.active.lock().unwrap().get(peer).cloned()
             }
             fn link_attempt_live(&self, peer: &[u8]) -> bool {
-                self.active_link(peer).is_some()
+                self.attempting.lock().unwrap().contains(peer) || self.active_link(peer).is_some()
             }
             fn open_link(&self, peer: &[u8]) {
+                self.attempting.lock().unwrap().insert(peer.to_vec());
                 self.record(format!("open {}", hexrep(&peer[..1], false)));
             }
             fn close_link(&self, peer: &[u8]) {
+                self.attempt_failed(peer);
                 self.link_gone(peer);
                 self.record(format!("close {}", hexrep(&peer[..1], false)));
             }
@@ -4911,6 +4926,100 @@ mod tests {
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 2));
             assert_eq!(h.state(&peer), PropPeer::IDLE);
+        }
+
+        /// LXMPeer.sync: each link attempt adds SYNC_BACKOFF_STEP_SECS to the
+        /// peer's backoff; a failed attempt ends the session with every id
+        /// unhandled, and the peer is not chosen again until the backoff has
+        /// run out (it is marked unresponsive when found in it); an
+        /// established link clears it. Without the backoff an unreachable
+        /// peer is chosen again at every tick, crowding out the rest.
+        #[test]
+        fn a_failed_link_attempt_backs_the_peer_off_until_a_link_is_established() {
+            let h = Harness::new("sync_backoff");
+            let peer = [0x1Cu8; 16];
+            h.add_peer(&peer, true);
+            h.store(2, 300);
+
+            let t0 = now();
+            h.start(&peer);
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING);
+            let (backoff, next) = h.peer(&peer, |p| (p.sync_backoff, p.next_sync_attempt));
+            assert_eq!(backoff, SYNC_BACKOFF_STEP_SECS);
+            assert!((next - t0 - SYNC_BACKOFF_STEP_SECS).abs() < 5.0, "the next attempt waits out the backoff");
+
+            // The attempt fails: AppLinks reports the destination down with
+            // no attempt left in flight.
+            h.io.attempt_failed(&peer);
+            h.event(SyncEvent::LinkDown { peer: peer.to_vec() });
+            assert_eq!(h.state(&peer), PropPeer::IDLE);
+            assert_eq!(h.io.calls(), vec!["open 1c", "close 1c"]);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (2, 0), "a failed attempt hands nothing");
+
+            {
+                let mut g = h.node.lock().unwrap();
+                assert_eq!(g.select_sync_peer(now(), &mut |_| 0), None, "not chosen during the backoff");
+                assert!(!g.peers[&peer[..]].alive, "and marked unresponsive for it");
+                assert_eq!(g.select_sync_peer(next + 1.0, &mut |_| 0), Some(peer.to_vec()), "chosen once it has run out");
+                // Time passes: the backoff is over.
+                g.peers.get_mut(&peer[..]).unwrap().next_sync_attempt = now() - 1.0;
+            }
+
+            // A second attempt: the backoff grows by another step.
+            h.start(&peer);
+            assert_eq!(h.peer(&peer, |p| p.sync_backoff), 2.0 * SYNC_BACKOFF_STEP_SECS);
+
+            // The link comes up: backoff and next attempt cleared, alive again.
+            h.link_active(&peer, &LINK_1);
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
+            assert_eq!(h.peer(&peer, |p| (p.sync_backoff, p.next_sync_attempt, p.alive)), (0.0, 0.0, true));
+        }
+
+        /// AppLinks reports DISCONNECTED for any link to the destination,
+        /// a previous session's included, and a report can arrive after the
+        /// state it described has moved on. One that does not describe the
+        /// running session's own attempt or link is ignored.
+        #[test]
+        fn a_stale_link_down_report_leaves_the_running_session_alone() {
+            let h = Harness::new("sync_stale_link_down");
+            let peer = [0x1Du8; 16];
+            h.add_peer(&peer, true);
+            // One message per batch, so a COMPLETE carries on.
+            h.node.lock().unwrap().peers.get_mut(&peer[..]).unwrap().propagation_sync_limit = Some(0.5);
+            h.store(2, 300);
+            let link_down = || h.event(SyncEvent::LinkDown { peer: peer.to_vec() });
+
+            // While the attempt is in flight.
+            h.start(&peer);
+            link_down();
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING, "the attempt is still live");
+            assert_eq!(h.io.calls(), vec!["open 1d"]);
+
+            // While the session's own link is up: REQUEST_SENT, then
+            // RESOURCE_TRANSFERRING.
+            h.link_active(&peer, &LINK_1);
+            link_down();
+            assert_eq!(h.state(&peer), PropPeer::REQUEST_SENT);
+            let (_, respond, _) = h.io.take_offer();
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            link_down();
+            assert_eq!(h.state(&peer), PropPeer::RESOURCE_TRANSFERRING);
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (2, 0));
+            assert!(!h.io.calls().contains(&"close 1d".to_string()), "nothing closed");
+
+            // The link goes before the COMPLETE is handled: the next batch
+            // opens a new link, and the old link's report, arriving now,
+            // leaves that attempt alone.
+            let (_, concluded) = h.io.take_resource();
+            h.io.link_gone(&peer);
+            concluded(complete());
+            h.pump();
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING);
+            assert_eq!(h.io.calls()[4..], ["close 1d", "open 1d"]);
+            link_down();
+            assert_eq!(h.state(&peer), PropPeer::LINK_ESTABLISHING, "the new attempt survives the old link's report");
+            assert_eq!((h.unhandled(&peer), h.handled(&peer)), (1, 1));
         }
 
         /// A message whose file is gone from disk leaves the store and every
