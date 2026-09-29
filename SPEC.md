@@ -1090,7 +1090,9 @@ sync".
    alive peers (by the rate of their last completed sync) plus as many of
    unknown speed; only when no alive peer waits, at random among unresponsive
    peers whose backoff has run out. Sessions already running continue on
-   their own events, so several peers sync at once.
+   their own events, so several peers sync at once. (While the outbound
+   budget binds, the choice is the least recently served: see "Sharing the
+   budget" below.)
 2. **Link.** The session opens a held link to the peer's `lxmf.propagation`
    destination through AppLinks. Each attempt adds 12 min to the peer's
    backoff; an established link clears it.
@@ -1109,7 +1111,8 @@ sync".
    offer, a failed Resource or a lost link returns the peer to IDLE with every
    id still unhandled.
 6. **Persistent strategy.** After a COMPLETE the session carries on with the
-   next batch while the peer still lacks messages.
+   next batch while the peer still lacks messages (unless the outbound budget
+   binds and other ready peers wait: see "Sharing the budget").
 
 Departures from the reference, each for a reason:
 
@@ -1152,6 +1155,33 @@ Departures from the reference, each for a reason:
   fixed minute started lazily and reset by a restart: 1200 left in 26 s in
   one process and 1200 in 58 s across a restart, staging.) Offers are also
   capped at 500 ids.
+- **Sharing the budget.** The budget is rfed's own departure, and the
+  reference's choice was never made to share one: its persistent strategy
+  keeps a session going while the peer lacks messages, and its pool favours
+  the fastest peers. Under the budget that starved peers (staging
+  2026-09-28): one session took the whole 600 (500 on the offer, 100 more on
+  the held link), so one peer was served per ~73 s, and the pool chose the
+  same fast peers again (one peer 7 sessions in a phase) while 7 of 20 got
+  nothing in 30 minutes. So while the budget **binds** — the ready waiting
+  peers (the ones step 1 could choose now), each counted up to one offer,
+  want more than is left of it — three rules apply, and none otherwise:
+  - a batch is cut to a **fair share**: the budget divided by the ready
+    waiting peers (this one included), but never less than one tick's worth
+    of it (budget × 24 s / 60 s, 240 of 600). A new session starts only on a
+    tick, so at most 2.5 start in a minute; a smaller share would leave the
+    budget unspent and serve no peer sooner. No batch takes the whole
+    budget while another ready peer waits;
+  - a session whose batch completed does **not** carry on to its next batch
+    on the held link while other ready peers wait: it ends (the link is
+    released) and waits for its turn like them;
+  - the choice (step 1) is the ready waiting peer whose last turn
+    (`last_sync_attempt`) is **oldest**, at random among equals, instead of
+    the fastest-peer pool.
+
+  With 20 ready peers each lacking many messages, one peer is served per
+  tick, all 20 within ceil(20 / 2.5) = 8 minutes, in batches of 240 / 240 /
+  120 per 72 s (the budget spent, never exceeded): test
+  `every_ready_peer_gets_a_turn_while_the_budget_binds`.
 - **One Resource segment per batch** (`MAX_SYNC_RESOURCE_BYTES`, ~1 MiB).
   Reticulum-rust sends an in-memory Resource as one segment of any size, and
   receivers refuse a segment over ~3 MiB; the rest goes in the next batch. A
