@@ -1133,9 +1133,25 @@ Departures from the reference, each for a reason:
   still in link-attempt backoff is marked unresponsive when found, as the
   reference's `sync()` does when it chooses one.
 - **Per-minute outbound budget** (`DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN`, 600).
-  Each offer is cut to what is left of the minute, and an offer awaiting its
-  response reserves its size, so no minute sends more than the budget however
-  many sessions run. Offers are also capped at 500 ids.
+  Guarantee: for every moment t, the messages in sync Resources handed to a
+  link in (t − 60 s, t] number at most the budget, all peers together,
+  across a restart too. A message counts from the moment its Resource is
+  handed to the link (just before the `sending N message(s) to peer X as a
+  Resource` log line), whether or not the Resource then completes; spans are
+  measured on a monotonic clock. The window rolls — it is not a calendar
+  minute: an offer may take only the budget less what was handed over in the
+  last 60 s, less what running sessions reserve (a session reserves its whole
+  offer until the answer, then the wanted ids until their Resource is handed
+  over, when the reservation becomes the send). Restart: the send record is
+  not persisted; instead nothing is offered for the first 60 s after start,
+  as if the last run had spent the whole budget the moment this one started.
+  The last run's final send came before it stopped, so no second budget
+  opens within 60 s of it. That holds after a crash or a kill, which a record
+  written at shutdown would not, puts no disk write in the send path, and
+  never compares two runs' wall clocks. (Until 2026-09-28 the budget was a
+  fixed minute started lazily and reset by a restart: 1200 left in 26 s in
+  one process and 1200 in 58 s across a restart, staging.) Offers are also
+  capped at 500 ids.
 - **One Resource segment per batch** (`MAX_SYNC_RESOURCE_BYTES`, ~1 MiB).
   Reticulum-rust sends an in-memory Resource as one segment of any size, and
   receivers refuse a segment over ~3 MiB; the rest goes in the next batch. A

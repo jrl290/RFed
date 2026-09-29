@@ -172,9 +172,9 @@ fn write_status_file(
             (peer.next_sync_attempt.max(peer.throttled_until) - now_secs).max(0.0), peer.sync_transfer_rate,
         )).collect::<Vec<_>>().join(",\n");
         format!(
-            "{{\n    \"messagestore\": {},\n    \"fresh_since_start\": {},\n    \"outbound_sync\": {{\"sent_this_minute\": {}, \"budget_per_minute\": {}, \"backlog_hold_left_secs\": {:.0}}},\n    \"peers\": [\n{}\n    ]\n  }}",
+            "{{\n    \"messagestore\": {},\n    \"fresh_since_start\": {},\n    \"outbound_sync\": {{\"sent_last_60s\": {}, \"budget_per_minute\": {}, \"startup_hold_left_secs\": {:.0}, \"backlog_hold_left_secs\": {:.0}}},\n    \"peers\": [\n{}\n    ]\n  }}",
             g.entries.len(), g.fresh_since_start.len(),
-            g.outbound_sync_window_count, g.outbound_sync_msgs_per_min,
+            g.outbound_sent_in_window(), g.outbound_sync_msgs_per_min, g.outbound_startup_hold_left(),
             (lxmf_propagation::STARTUP_BACKLOG_HOLD_SECS - (now_secs - g.started_at)).max(0.0),
             peers_json,
         )

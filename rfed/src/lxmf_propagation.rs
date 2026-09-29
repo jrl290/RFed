@@ -45,12 +45,12 @@
 //! concurrently, each on its own events. See "Outbound peer sync" below and
 //! SPEC.md §10.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_links::AppLinks;
 use rand::Rng;
@@ -140,8 +140,12 @@ pub const STARTUP_BACKLOG_HOLD_SECS: f64 = 3600.0;
 /// which with 20 peers and a 264k-message store meant ~2000 messages/min for
 /// hours after every restart (2026-09-23). The budget caps the aggregate:
 /// every offer is sized to what is left of it (`outbound_allowance`), so no
-/// minute sends more than this.
+/// span of OUTBOUND_BUDGET_WINDOW_SECS carries more than this.
 pub const DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN: u64 = 600;
+/// The span the outbound budget is counted over. It rolls: at every moment
+/// the sends of the last this-many seconds count, so no span of this length,
+/// wherever it starts, carries more than the budget.
+pub const OUTBOUND_BUDGET_WINDOW_SECS: f64 = 60.0;
 /// Max time a peer is unreachable before removal (14 days).
 pub const MAX_UNREACHABLE_SECS: f64 = 14.0 * 24.0 * 3600.0;
 /// Peer OFFER request path.
@@ -160,6 +164,15 @@ fn now() -> f64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64())
         .unwrap_or(0.0)
+        + test_clock::offset()
+}
+
+/// Seconds on a monotonic clock (since this process first asked). The
+/// outbound budget counts spans on it, so a wall-clock step cannot stretch or
+/// shrink one. (Both clocks add `test_clock::offset()`, 0 outside tests.)
+fn monotonic_now() -> f64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    BASE.get_or_init(Instant::now).elapsed().as_secs_f64() + test_clock::offset()
 }
 
 /// The per-transfer and per-sync limits rfed announces, in the reference's
@@ -264,9 +277,13 @@ pub struct PropPeer {
     pub transferring: Option<Vec<Vec<u8>>>,
     /// When the in-flight sync Resource was started, for the transfer rate.
     pub current_sync_transfer_started: Option<f64>,
-    /// The last set of IDs we offered — used to reconcile the response. While
-    /// the peer is REQUEST_SENT these reserve outbound budget.
+    /// The last set of IDs we offered — used to reconcile the response.
     pub last_offer: Vec<Vec<u8>>,
+    /// Messages of the outbound budget this session holds: the whole offer
+    /// while it awaits its answer, then the ids the peer wanted until their
+    /// Resource is handed to the link (`record_outbound_send`), which counts
+    /// them as sent. Zero at every other step (`end_sync` clears it).
+    pub budget_reserved: u64,
     /// Id of the AppLinks-held link this sync session runs on.
     pub link_id: Option<Vec<u8>>,
     /// Link id of the currently identified AppLinks-owned sync link.
@@ -329,6 +346,7 @@ impl PropPeer {
             transferring: None,
             current_sync_transfer_started: None,
             last_offer: Vec::new(),
+            budget_reserved: 0,
             link_id: None,
             identified_link_id: None,
             reidentified: false,
@@ -552,13 +570,17 @@ pub struct LxmfPropagationNode {
     /// backlog hold these are the only ids offered to peers.
     pub fresh_since_start: Vec<Vec<u8>>,
     pub backlog_hold_logged: bool,
-    /// Outbound sync budget window: start (unix seconds) and messages sent
-    /// to peers within it.
-    pub outbound_sync_window_start: f64,
-    pub outbound_sync_window_count: u64,
+    /// The outbound budget's send record: every sync Resource handed to a
+    /// link in the last OUTBOUND_BUDGET_WINDOW_SECS, as (monotonic time,
+    /// messages), oldest first. See `outbound_allowance`.
+    pub outbound_sends: VecDeque<(f64, u64)>,
+    /// Monotonic time the send record starts: when this node was built. What
+    /// the previous run sent before it stopped is not known, so nothing is
+    /// sent until a whole window has passed since (`outbound_allowance`).
+    pub outbound_record_start: f64,
     pub outbound_sync_msgs_per_min: u64,
-    /// Set while the budget or the grace holds sync, so the hold is logged
-    /// once per episode rather than every tick.
+    /// Set while the budget or the startup hold holds sync, so the hold is
+    /// logged once per episode rather than every tick.
     pub outbound_sync_hold_logged: bool,
 
     // ── Outbound peer sync plumbing ───────────────────────────────────
@@ -639,8 +661,8 @@ impl LxmfPropagationNode {
             started_at: now(),
             fresh_since_start: Vec::new(),
             backlog_hold_logged: false,
-            outbound_sync_window_start: now(),
-            outbound_sync_window_count: 0,
+            outbound_sends: VecDeque::new(),
+            outbound_record_start: monotonic_now(),
             outbound_sync_msgs_per_min: DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN,
             outbound_sync_hold_logged: false,
             sync_io: Arc::new(AppLinksSyncIo),
@@ -2168,54 +2190,112 @@ impl LxmfPropagationNode {
     }
 
     // ── The per-minute outbound budget ───────────────────────────────────
+    //
+    // What is guaranteed: for every moment t, the messages in sync Resources
+    // handed to a link in (t - 60 s, t] number at most
+    // `outbound_sync_msgs_per_min`, all peers together, including across a
+    // restart. A message counts once its Resource is handed to the link
+    // (`record_outbound_send`, just before the "sending N message(s)" log
+    // line), whether or not that Resource then completes.
 
-    /// Start a new accounting minute once the current one is over.
-    fn roll_outbound_window(&mut self, t: f64) {
-        if t - self.outbound_sync_window_start >= 60.0 {
-            self.outbound_sync_window_start = t;
-            self.outbound_sync_window_count = 0;
+    /// Drop the sends that are out of the window ending at `t`.
+    fn prune_outbound_sends(&mut self, t: f64) {
+        while let Some(&(at, _)) = self.outbound_sends.front() {
+            if t - at >= OUTBOUND_BUDGET_WINDOW_SECS {
+                self.outbound_sends.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
-    /// Messages that may still be offered this minute: the budget, less what
-    /// was sent this minute, less what the offers still awaiting a response
-    /// could send (a peer in REQUEST_SENT reserves its whole offer). The
-    /// response releases the reservation and `charge_outbound` counts what
-    /// the peer wanted, never more than it reserved. So
-    /// `sent + reserved <= budget` holds after every step, and no minute
-    /// sends more than the budget however many syncs run at once. Until
-    /// 2026-09-28 the budget was checked once before a 500-message send, and
-    /// 1000 went out in a 600-message minute (57 times in one staging run).
+    /// Messages handed to links in the budget window ending now.
+    pub fn outbound_sent_in_window(&self) -> u64 {
+        let t = monotonic_now();
+        self.outbound_sends.iter()
+            .filter(|(at, _)| t - at < OUTBOUND_BUDGET_WINDOW_SECS)
+            .map(|(_, messages)| messages)
+            .sum()
+    }
+
+    /// Messages the running sessions hold of the budget (`budget_reserved`).
+    fn outbound_reserved(&self) -> u64 {
+        self.peers.values().map(|peer| peer.budget_reserved).sum()
+    }
+
+    /// Seconds left of the startup hold: no outbound sync until a whole
+    /// window has passed since this node was built.
+    pub fn outbound_startup_hold_left(&self) -> f64 {
+        (self.outbound_record_start + OUTBOUND_BUDGET_WINDOW_SECS - monotonic_now()).max(0.0)
+    }
+
+    /// Messages an offer may still reserve: the budget, less what was handed
+    /// to links in the last 60 s (a rolling window, not a calendar minute),
+    /// less what the running sessions reserve — a session holds its whole
+    /// offer until the answer, then the wanted ids until their Resource is
+    /// handed to the link, where `record_outbound_send` turns the reservation
+    /// into a send. So `sent in the last 60 s + reserved <= budget` holds
+    /// after every step, and since the sent part only ever leaves the window
+    /// by ageing out, no 60-second span sends more than the budget however
+    /// many sessions run.
+    ///
+    /// Across a restart: the previous run's sends are not known, so nothing
+    /// may be reserved until 60 s after this node was built — as if that run
+    /// had spent the whole budget the moment this one started. Its last send
+    /// came before it stopped, so a restart cannot open a second full budget
+    /// within 60 s of it. Chosen over persisting the send record: that holds
+    /// only when the record was written after the last send, which a crash
+    /// or a kill does not do (and writing it on every send puts a disk write
+    /// in the send path), and it would compare this run's clock with the
+    /// last one's across whatever step the wall clock took in between.
+    ///
+    /// Until 2026-09-28 the window was a fixed minute started lazily by the
+    /// first query after the last one ended, and reset by a restart: 1200
+    /// went out in 26 s in one process and 1200 in 58 s across a restart
+    /// (staging). Before that the budget was checked once before a
+    /// 500-message send, and 1000 went out in a 600-message minute.
     pub fn outbound_allowance(&mut self) -> u64 {
-        self.roll_outbound_window(now());
-        let reserved: u64 = self.peers.values()
-            .filter(|peer| peer.state == PropPeer::REQUEST_SENT)
-            .map(|peer| peer.last_offer.len() as u64)
-            .sum();
+        let t = monotonic_now();
+        if t - self.outbound_record_start < OUTBOUND_BUDGET_WINDOW_SECS {
+            return 0;
+        }
+        self.prune_outbound_sends(t);
+        let sent: u64 = self.outbound_sends.iter().map(|(_, messages)| messages).sum();
         self.outbound_sync_msgs_per_min
-            .saturating_sub(self.outbound_sync_window_count.saturating_add(reserved))
+            .saturating_sub(sent.saturating_add(self.outbound_reserved()))
     }
 
-    /// Count `messages` leaving in a sync Resource against this minute.
-    fn charge_outbound(&mut self, messages: u64) {
-        self.roll_outbound_window(now());
-        self.outbound_sync_window_count += messages;
+    /// `peer_hash`'s sync Resource of `messages` is being handed to its link:
+    /// record the send and release the session's reservation.
+    fn record_outbound_send(&mut self, peer_hash: &[u8], messages: u64) {
+        let t = monotonic_now();
+        self.prune_outbound_sends(t);
+        self.outbound_sends.push_back((t, messages));
+        if let Some(peer) = self.peers.get_mut(peer_hash) {
+            peer.budget_reserved = 0;
+        }
     }
 
-    /// May this tick start an outbound peer sync? False while nothing is
-    /// left of this minute's budget. Logs the hold once and the release once,
-    /// so the log tells the story without repeating it every tick.
+    /// May this tick start an outbound peer sync? False during the startup
+    /// hold and while nothing is left of the budget. Logs the hold once and
+    /// the release once, so the log tells the story without repeating it
+    /// every tick.
     pub fn outbound_sync_allowed(&mut self) -> bool {
         let allowance = self.outbound_allowance();
         if allowance == 0 {
             if !self.outbound_sync_hold_logged {
-                log(
+                let startup_left = self.outbound_startup_hold_left();
+                let message = if startup_left > 0.0 {
                     format!(
-                        "[lxmf.prop] outbound peer sync held: budget spent, {}/{} messages this minute",
-                        self.outbound_sync_window_count, self.outbound_sync_msgs_per_min
-                    ),
-                    LOG_NOTICE, false, false,
-                );
+                        "[lxmf.prop] outbound peer sync held for {startup_left:.0}s more after start: what the last run sent in its final {OUTBOUND_BUDGET_WINDOW_SECS:.0}s is not known",
+                    )
+                } else {
+                    format!(
+                        "[lxmf.prop] outbound peer sync held: budget spent, {} sent in the last {OUTBOUND_BUDGET_WINDOW_SECS:.0}s and {} reserved of {}",
+                        self.outbound_sent_in_window(), self.outbound_reserved(), self.outbound_sync_msgs_per_min,
+                    )
+                };
+                log(message, LOG_NOTICE, false, false);
                 self.outbound_sync_hold_logged = true;
             }
             false
@@ -2232,7 +2312,7 @@ impl LxmfPropagationNode {
 
     /// Called from the main event loop. Every PEER_SYNC_INTERVAL_SECS: cull
     /// long-unreachable peers, start peering-key generation where it is
-    /// missing, and — while the minute's budget lasts — choose one peer and
+    /// missing, and — while the outbound budget lasts — choose one peer and
     /// hand it to the sync worker. Sessions already running continue on their
     /// own events, so several peers sync at once, as in the reference.
     pub fn tick_sync(arc: &Arc<Mutex<Self>>) {
@@ -2575,6 +2655,7 @@ impl LxmfPropagationNode {
             peer.transferring = None;
             peer.current_sync_transfer_started = None;
             peer.last_offer.clear();
+            peer.budget_reserved = 0;
             peer.sync_session += 1;
         }
     }
@@ -2807,7 +2888,7 @@ impl LxmfPropagationNode {
     }
 
     /// Send the planned offer: mark what the peer can never take handled,
-    /// size the offer to this minute's allowance, identify the link if it
+    /// size the offer to the outbound budget's allowance, identify the link if it
     /// has not been, and request `/offer` on it.
     fn send_offer(&mut self, peer_hash: &[u8], prepared_session: u64, plan: OfferPlan) {
         let peer_str = hexrep(peer_hash, false);
@@ -2860,7 +2941,7 @@ impl LxmfPropagationNode {
         if offer.len() > allowance {
             log(
                 format!(
-                    "[lxmf.prop] offer to peer {peer_str} cut from {} to {allowance} message(s) by this minute's outbound budget",
+                    "[lxmf.prop] offer to peer {peer_str} cut from {} to {allowance} message(s) by the outbound budget",
                     offer.len(),
                 ),
                 LOG_DEBUG, false, false,
@@ -2869,7 +2950,7 @@ impl LxmfPropagationNode {
         }
         if offer.is_empty() {
             let reason = if allowance == 0 {
-                "this minute's outbound budget is spent"
+                "the outbound budget is spent"
             } else {
                 "no unhandled messages fit the peer's limits"
             };
@@ -2920,6 +3001,8 @@ impl LxmfPropagationNode {
             }
             peer.sync_session += 1;
             peer.last_offer = offer.clone();
+            // The whole offer is held of the budget until the answer.
+            peer.budget_reserved = offer.len() as u64;
             peer.state = PropPeer::REQUEST_SENT;
             peer.sync_session
         };
@@ -2989,6 +3072,8 @@ impl LxmfPropagationNode {
                             );
                             peer.reidentified = true;
                             peer.identified_link_id = None;
+                            // The re-offer is sized afresh.
+                            peer.budget_reserved = 0;
                             peer.state = PropPeer::LINK_READY;
                             return OfferNext::Resync;
                         }
@@ -3137,10 +3222,10 @@ impl LxmfPropagationNode {
             format!("[lxmf.prop] peer {peer_str} wanted {} of the {} offered messages", files.len(), last_offer.len()),
             LOG_DEBUG, false, false,
         );
-        // What the peer wants leaves in this minute; the offer's reservation
-        // ended with REQUEST_SENT above.
-        self.charge_outbound(files.len() as u64);
+        // The session now holds only what the peer wants, until the Resource
+        // is handed to the link (`send_sync_resource`).
         if let Some(peer) = self.peers.get_mut(peer_hash) {
+            peer.budget_reserved = files.len() as u64;
             peer.state = PropPeer::RESOURCE_TRANSFERRING;
         }
         OfferNext::Send(files)
@@ -3175,6 +3260,11 @@ impl LxmfPropagationNode {
             );
         }
 
+        // Packed before the node is taken: it is only a copy, and the send
+        // below is recorded against the budget the moment it is logged.
+        let count = messages.len();
+        let data = pack_sync_batch(now(), messages);
+
         let (io, sink, link_id) = {
             let Some(mut node) = lock_node(arc, "sync resource") else { return };
             node.forget_missing_messages(&missing);
@@ -3197,15 +3287,18 @@ impl LxmfPropagationNode {
                 peer.transferring = Some(ids.clone());
                 peer.current_sync_transfer_started = Some(now());
             }
+            // These messages leave now: counted against the budget from this
+            // moment, the reservation released. A Resource that then fails
+            // to start still counts; the budget is a ceiling, never exceeded
+            // by over-counting.
+            node.record_outbound_send(peer_hash, count as u64);
+            log(
+                format!("[lxmf.prop] sending {count} message(s) to peer {peer_str} as a Resource ({} B)", data.len()),
+                LOG_NOTICE, false, false,
+            );
             (Arc::clone(&node.sync_io), node.event_sink(), link_id)
         };
 
-        let count = messages.len();
-        let data = pack_sync_batch(now(), messages);
-        log(
-            format!("[lxmf.prop] sending {count} message(s) to peer {peer_str} as a Resource ({} B)", data.len()),
-            LOG_NOTICE, false, false,
-        );
         let on_concluded: Arc<dyn Fn(ResourceOutcome) + Send + Sync> = {
             let peer = peer_hash.to_vec();
             Arc::new(move |outcome: ResourceOutcome| {
@@ -3980,6 +4073,24 @@ pub(crate) fn encode_error(code: u8) -> Vec<u8> {
     encode_value(Value::Integer((code as i64).into()))
 }
 
+// ── Simulated time for the unit tests ────────────────────────────────────────
+
+/// An offset, per test thread, that `now()` and `monotonic_now()` add. The
+/// peer sync tests run every event on the test's own thread, so advancing it
+/// moves the whole state machine's time. Always 0 outside tests.
+#[cfg(not(test))]
+mod test_clock {
+    #[inline(always)]
+    pub(crate) fn offset() -> f64 { 0.0 }
+}
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use std::cell::Cell;
+    thread_local! { static OFFSET: Cell<f64> = const { Cell::new(0.0) }; }
+    pub(crate) fn offset() -> f64 { OFFSET.with(|o| o.get()) }
+    pub(crate) fn advance(secs: f64) { OFFSET.with(|o| o.set(o.get() + secs)); }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -4027,23 +4138,61 @@ mod tests {
         #[test]
         fn outbound_sync_is_not_gated_by_the_backlog_hold() {
             let node = test_node("fresh_allowed");
+            test_clock::advance(OUTBOUND_BUDGET_WINDOW_SECS);
             let mut g = node.lock().unwrap();
             assert!(g.backlog_held());
-            assert!(g.outbound_sync_allowed(), "the budget alone gates the tick; fresh messages need no wait");
+            assert!(g.outbound_sync_allowed(), "past the startup hold the budget alone gates the tick; fresh messages need no wait");
         }
 
+        /// The budget rolls: a send counts for exactly 60 s from the moment
+        /// it was handed over, not until a calendar-like minute ends.
         #[test]
-        fn sync_is_held_once_the_minute_budget_is_spent_and_resets_next_minute() {
+        fn sync_is_held_while_the_budget_is_spent_and_resumes_as_sends_age_out() {
             let node = test_node("budget");
+            test_clock::advance(OUTBOUND_BUDGET_WINDOW_SECS);
             let mut g = node.lock().unwrap();
-            g.outbound_sync_window_count = g.outbound_sync_msgs_per_min;
+            let budget = g.outbound_sync_msgs_per_min;
+            g.record_outbound_send(&[0x99; 16], budget);
             assert!(!g.outbound_sync_allowed(), "budget spent holds sync");
             assert!(g.outbound_sync_hold_logged, "the hold is logged once");
-            assert!(!g.outbound_sync_allowed(), "still held within the window");
-            g.outbound_sync_window_start = now() - 61.0;
-            assert!(g.outbound_sync_allowed(), "a new minute resets the budget");
-            assert_eq!(g.outbound_sync_window_count, 0);
+            test_clock::advance(OUTBOUND_BUDGET_WINDOW_SECS - 0.5);
+            assert!(!g.outbound_sync_allowed(), "still held: the send is under 60 s old");
+            test_clock::advance(0.5);
+            assert!(g.outbound_sync_allowed(), "60 s after the send its messages no longer count");
+            assert_eq!(g.outbound_allowance(), budget);
             assert!(!g.outbound_sync_hold_logged, "the release clears the hold flag");
+        }
+
+        /// A restart must not open a second full budget within 60 s of the
+        /// last run's sends (staging 2026-09-28: 1200 in 58 s across one).
+        /// The send record is not persisted; a node sends nothing until a
+        /// whole window has passed since it was built.
+        #[test]
+        fn a_restart_sends_nothing_until_a_whole_window_has_passed() {
+            // The last run spent its budget, then stopped at once.
+            let before = test_node("restart_before");
+            test_clock::advance(OUTBOUND_BUDGET_WINDOW_SECS);
+            let last_send = monotonic_now();
+            {
+                let mut g = before.lock().unwrap();
+                let budget = g.outbound_sync_msgs_per_min;
+                g.record_outbound_send(&[0x99; 16], budget);
+            }
+            drop(before);
+
+            // The next run, built the moment the last one stopped.
+            let node = test_node("restart_after");
+            let mut g = node.lock().unwrap();
+            let budget = g.outbound_sync_msgs_per_min;
+            assert_eq!(g.outbound_allowance(), 0, "nothing may be offered at start");
+            assert!(!g.outbound_sync_allowed());
+            assert!(g.outbound_sync_hold_logged, "the startup hold is logged");
+            test_clock::advance(OUTBOUND_BUDGET_WINDOW_SECS - 0.5);
+            assert_eq!(g.outbound_allowance(), 0, "nor 59.5 s later");
+            test_clock::advance(0.5);
+            assert!(monotonic_now() - last_send >= OUTBOUND_BUDGET_WINDOW_SECS);
+            assert_eq!(g.outbound_allowance(), budget, "a whole window after the last send, the whole budget");
+            assert!(g.outbound_sync_allowed());
         }
     }
 
@@ -4431,6 +4580,8 @@ mod tests {
             attempting: Mutex<HashSet<Vec<u8>>>,
             offers: Mutex<VecDeque<(Vec<u8>, OnResponse, OnFailed)>>,
             resources: Mutex<VecDeque<(Vec<u8>, OnConcluded)>>,
+            /// Every sync Resource handed over: (monotonic time, peer, messages).
+            sent: Mutex<Vec<(f64, Vec<u8>, u64)>>,
         }
 
         impl FakeIo {
@@ -4466,6 +4617,25 @@ mod tests {
             fn resource_count(&self) -> usize {
                 self.resources.lock().unwrap().len()
             }
+            fn sent(&self) -> Vec<(f64, Vec<u8>, u64)> {
+                self.sent.lock().unwrap().clone()
+            }
+        }
+
+        /// The most messages handed over in any span of
+        /// OUTBOUND_BUDGET_WINDOW_SECS: every such span that holds a send
+        /// ends at one, so checking the span ending at each send covers them
+        /// all.
+        fn most_in_any_window(sent: &[(f64, Vec<u8>, u64)]) -> u64 {
+            sent.iter()
+                .map(|(end, _, _)| {
+                    sent.iter()
+                        .filter(|(at, _, _)| at <= end && end - at < OUTBOUND_BUDGET_WINDOW_SECS)
+                        .map(|(_, _, messages)| messages)
+                        .sum::<u64>()
+                })
+                .max()
+                .unwrap_or(0)
         }
 
         impl PeerSyncIo for FakeIo {
@@ -4502,12 +4672,14 @@ mod tests {
             }
             fn send_resource(
                 &self,
-                _peer: &[u8],
+                peer: &[u8],
                 link_id: &[u8],
                 data: Vec<u8>,
                 on_concluded: OnConcluded,
             ) -> Result<(), String> {
                 self.record(format!("resource {}", hexrep(&link_id[..1], false)));
+                let messages = decode_propagation_batch(&data).map(|m| m.len()).unwrap_or(0) as u64;
+                self.sent.lock().unwrap().push((monotonic_now(), peer.to_vec(), messages));
                 self.resources.lock().unwrap().push_back((data, on_concluded));
                 Ok(())
             }
@@ -4530,6 +4702,9 @@ mod tests {
                     g.sync_io = io.clone();
                     let queue = events.clone();
                     g.sync_event_sink = Some(Arc::new(move |event| queue.lock().unwrap().push_back(event)));
+                    // As if the node had been up a whole budget window: the
+                    // startup hold has its own test.
+                    g.outbound_record_start = monotonic_now() - OUTBOUND_BUDGET_WINDOW_SECS;
                 }
                 Harness { node, io, events, next_message: std::cell::Cell::new(0) }
             }
@@ -4925,29 +5100,77 @@ mod tests {
             h.pump();
             let (payload, concluded) = h.io.take_resource();
             assert_eq!(decode_propagation_batch(&payload).unwrap().len(), 5);
-            assert_eq!(h.node.lock().unwrap().outbound_sync_window_count, 5);
+            assert_eq!(h.node.lock().unwrap().outbound_sent_in_window(), 5);
 
             // Completing does not make room: the persistent strategy's next
-            // offer finds the minute spent and ends the session.
+            // offer finds the budget spent and ends the session.
             concluded(complete());
             h.pump();
             assert_eq!(h.io.offer_count(), 0);
             assert_eq!(h.state(&a), PropPeer::IDLE);
-            assert_eq!(h.node.lock().unwrap().outbound_sync_window_count, 5, "never more than the budget");
+            assert_eq!(h.node.lock().unwrap().outbound_sent_in_window(), 5, "never more than the budget");
 
-            // A new minute with 3 already sent: the next offer is 2.
-            {
-                let mut g = h.node.lock().unwrap();
-                g.outbound_sync_window_start = now() - 61.0;
-                assert_eq!(g.outbound_allowance(), 5);
-                g.outbound_sync_window_count = 3;
-            }
+            // 30 s on, 3 more leave; 60 s after the first 5 only those 3
+            // count, so the next offer is 2.
+            test_clock::advance(30.0);
+            h.node.lock().unwrap().record_outbound_send(&[0x99; 16], 3);
+            test_clock::advance(OUTBOUND_BUDGET_WINDOW_SECS - 30.0);
+            assert_eq!(h.node.lock().unwrap().outbound_allowance(), 2);
             h.start(&b);
             h.link_active(&b, &LINK_2);
             let (offer, _, _) = h.io.take_offer();
             assert_eq!(offered_ids(&offer).len(), 2);
             assert_eq!(h.io.resource_count(), 0);
         }
+
+        /// The staging defect (2026-09-28): the budget was a fixed minute,
+        /// started by the first check after the last one ended, so the
+        /// sends at the end of one minute and the start of the next added
+        /// up: 1200 left in 26 s against a budget of 600. It rolls now: the
+        /// span ending at any moment holds at most the budget.
+        #[test]
+        fn no_60_second_span_carries_more_than_the_budget() {
+            let h = Harness::new("sync_budget_rolls");
+            h.node.lock().unwrap().outbound_sync_msgs_per_min = 10;
+            // One peer, so the budget alone sizes each batch.
+            let peer = [0x43u8; 16];
+            h.add_peer(&peer, true);
+
+            // A session that takes all the peer lacks, until the budget stops it.
+            let session = || {
+                h.start(&peer);
+                h.link_active(&peer, &LINK_1);
+                while h.io.offer_count() > 0 {
+                    let (_, respond, _) = h.io.take_offer();
+                    respond(msgpack(Value::Boolean(true)));
+                    h.pump();
+                    let (_, concluded) = h.io.take_resource();
+                    concluded(complete());
+                    h.pump();
+                }
+                assert_eq!(h.state(&peer), PropPeer::IDLE);
+            };
+
+            // t = 0: 4 go, all the peer lacks.
+            h.store(4, 300);
+            session();
+            // t = 40: it lacks 20 more and gets the 6 that are left.
+            test_clock::advance(40.0);
+            h.store(20, 300);
+            session();
+            assert_eq!(h.node.lock().unwrap().outbound_allowance(), 0);
+            // t = 60: the 4 have aged out, the 6 still count: 4 more.
+            test_clock::advance(20.0);
+            session();
+            // t = 100: the 6 have aged out: 6 more.
+            test_clock::advance(40.0);
+            session();
+
+            let sent: Vec<u64> = h.io.sent().iter().map(|(_, _, messages)| *messages).collect();
+            assert_eq!(sent, vec![4, 6, 4, 6], "each batch gets what the last 60 s left over");
+            assert_eq!(most_in_any_window(&h.io.sent()), 10, "no 60 s span carries more than the budget");
+        }
+
 
         fn id(n: usize) -> Vec<u8> {
             let mut v = vec![0u8; 32];
