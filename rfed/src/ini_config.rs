@@ -262,8 +262,14 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
 [storage]
 
   # limit_mb          = 2000
-  # transfer_limit_mb = 500
-  # sync_limit_mb     = 1000
+  # transfer_limit_mb and sync_limit_mb: leave unset to announce LXMF's own
+  # propagation defaults, 256 KB per message and 10240 KB per sync, which
+  # these whole-MB keys cannot express. Set, they are announced in KB of
+  # 1000 B (MB x 1024^2 / 1000) and rfed refuses inbound sync Resources over
+  # the sync limit; 1 / 10 announce 1048 KB / 10485 KB. They also cap
+  # rfed.node channel sync (/rfed/get: bytes per response, per hour).
+  # transfer_limit_mb = 1
+  # sync_limit_mb     = 10
 
 
 [peering]
@@ -309,3 +315,35 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
   # subscribers = aabbccddaabbccddaabbccddaabbccdd, 11223344112233441122334411223344
 "#;
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped templates leave `[storage] transfer_limit_mb` /
+    /// `sync_limit_mb` unset, so an rfed started from one announces LXMF
+    /// 1.1.1's own propagation limits. With 929a079 announcing the real
+    /// limits, the old 100 / 1000 told every peer 100 MB per message and
+    /// ~1 GB per sync (~410x and ~100x the reference).
+    #[test]
+    fn the_config_templates_announce_the_reference_propagation_limits() {
+        let templates = [
+            ("config.txt.example", include_str!("../../config.txt.example")),
+            ("rfed-nas.config", include_str!("../../rfed-nas.config")),
+            ("SAMPLE_CONFIG", SAMPLE_CONFIG),
+        ];
+        for (name, text) in templates {
+            let cfg = IniConfig::parse(text).unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
+            assert_eq!(
+                (cfg.storage.transfer_limit_mb, cfg.storage.sync_limit_mb), (None, None),
+                "{name} sets a propagation limit",
+            );
+            let bytes = |mb: Option<u64>| mb.map(|m| m * 1024 * 1024);
+            assert_eq!(
+                crate::lxmf_propagation::propagation_limits_kb(bytes(cfg.storage.transfer_limit_mb), bytes(cfg.storage.sync_limit_mb)),
+                (256.0, 10240.0),
+                "{name}: LXMRouter.PROPAGATION_LIMIT and SYNC_LIMIT",
+            );
+        }
+    }
+}

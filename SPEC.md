@@ -1275,7 +1275,11 @@ announce; unset they are 256 and 10240 (LXMF's `PROPAGATION_LIMIT` and
 `LXMRouter.__init__`. Until 2026-09-28 rfed announced MB here, truncated, so a
 default rfed announced `0` and `10`: every peer, Python or rfed, read a 0 KB
 per-message limit and marked every message for rfed handled without sending
-it.
+it. The shipped templates (`config.txt.example`, `rfed-nas.config`, the
+first-run sample) leave both keys unset: their old 100 / 1000, announced for
+real, said 100 MB per message and ~1 GB per sync, ~410× and ~100× the
+reference; whole MB cannot express 256 KB. (The keys also cap `rfed.node`
+channel sync, §4.)
 
 rfed holds senders to what it announces, as LXMF 1.1.1
 `LXMRouter.propagation_resource_advertised` does: a propagation Resource
@@ -1385,8 +1389,8 @@ lxmf_propagation_autopeer    = no
 
 [storage]
 limit_mb          = 2000
-transfer_limit_mb = 500
-sync_limit_mb     = 1000
+# transfer_limit_mb = 1     # unset: LXMF's 256 KB per message (§10)
+# sync_limit_mb     = 10    # unset: LXMF's 10240 KB per sync (§10)
 
 [peering]
 static_peers         = aabbccdd...

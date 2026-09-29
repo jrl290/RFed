@@ -51,8 +51,20 @@
 [storage]
 
   limit_mb          = 2000
-  transfer_limit_mb = 100
-  sync_limit_mb     = 1000
+
+  # transfer_limit_mb and sync_limit_mb are left unset on purpose: unset, the
+  # lxmf.propagation node announces LXMF's own defaults, 256 KB per message
+  # and 10240 KB per sync (LXMRouter PROPAGATION_LIMIT / SYNC_LIMIT), which
+  # these whole-MB keys cannot express. Set, rfed announces them in the
+  # reference's KB of 1000 B (MB x 1024^2 / 1000), peers size what they send
+  # to them, and rfed refuses an inbound sync Resource over the sync limit.
+  # The old 100 / 1000 announced 100 MB per message and ~1 GB per sync,
+  # ~410x and ~100x the reference. The smallest whole-MB values, 1 / 10,
+  # announce 1048 KB / 10485 KB. The same keys also cap rfed.node channel
+  # sync (/rfed/get: bytes per response, and per hour for all peers); unset,
+  # that is not capped.
+  # transfer_limit_mb = 1
+  # sync_limit_mb     = 10
 
 
 [peering]
