@@ -3786,11 +3786,13 @@ impl LxmfPropagationNode {
     /// AppLinks reports DISCONNECTED for any link to the destination closing,
     /// including a previous session's, so the report counts only when this
     /// session's link attempt or link is really gone. A session whose link
-    /// closed ends here even with a Resource in flight: a Resource that had
-    /// not been advertised yet when the link closed never concludes
-    /// (Reticulum-rust `advertise_shared` waits for the link forever), and
-    /// its ids must not wait with it. They stay unhandled; if the Resource
-    /// had in fact completed, the next offer finds the peer has them.
+    /// closed ends here even with a Resource in flight, as the reference's
+    /// `LXMPeer.link_closed` returns to IDLE. The Resource concludes FAILED
+    /// on its own within one 0.25 s wait step of the close (Reticulum-rust
+    /// 6e53dea), and that callback, of an ended session, is ignored by its
+    /// session number (`apply_resource_outcome`). The ids stay unhandled; if
+    /// the Resource had in fact completed, the next offer finds the peer has
+    /// them.
     fn on_link_down(arc: &Arc<Mutex<Self>>, peer_hash: &[u8]) {
         let Some(mut node) = lock_node(arc, "sync link down") else { return };
         let peer_str = hexrep(peer_hash, false);
@@ -4127,12 +4129,12 @@ impl PeerSyncIo for AppLinksSyncIo {
         use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceData, ResourceStatus};
         let link = Self::held(peer, link_id)?;
         // The Resource's own RTT-scaled timeouts decide its outcome, and its
-        // callback fires once, COMPLETE or not, for a Resource that has been
-        // advertised (a closed link cancels those). One whose link closes
-        // before it is advertised never concludes: Reticulum-rust's
-        // `advertise_shared` thread waits on the dead link for good, holding
-        // the batch (SPEC.md §10). The session does not wait on it: the link's
-        // DISCONNECTED ends it (`on_link_down`).
+        // callback fires once, COMPLETE or not: a closed link cancels one in
+        // flight, and one whose link closes before it is advertised fails at
+        // its next 0.25 s wait step (Reticulum-rust 6e53dea). A link that has
+        // already closed cannot encrypt the batch, so no Resource is built
+        // and the error comes back from here. The session does not wait on
+        // the callback: the link's DISCONNECTED ends it (`on_link_down`).
         // It runs with the Resource locked: it only forwards the outcome.
         let concluded: Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync> = Arc::new(move |resource| {
             let outcome = match resource.lock() {

@@ -1237,11 +1237,17 @@ Departures from the reference, each for a reason:
   has no `0xF3` branch: it ends the session with the key kept and offers
   again at every choice. rfed used to regrind at the same cost after every
   refusal: a full PoW grind, a link and an offer per cycle.)
-- **A lost link ends the session at once**, even with a Resource in flight:
-  a Resource not yet advertised when its link closed never concludes in
-  Reticulum-rust. Its ids stay unhandled; if it had in fact completed, the
-  next offer finds the peer has them. Callbacks of an ended session are
-  recognised by a session number and ignored.
+- **A lost link ends the session at once**, even with a Resource in flight,
+  as the reference's `LXMPeer.link_closed` does (the peer goes back to
+  IDLE). The Resource concludes FAILED on its own: the close cancels one in
+  flight, one still waiting to be advertised fails at its next 0.25 s wait
+  step (Reticulum-rust 6e53dea, `PARITY-AUDIT-1.5.2.md` A31), and one built
+  after the close is refused, so `send_resource` returns the error (A32).
+  Its ids stay unhandled; if it had in fact completed, the next offer finds
+  the peer has them. The departure is the late callback: it belongs to an
+  ended session, is recognised by its session number and is ignored, where
+  the reference's `resource_concluded` tears down the link and clears the
+  transfer of whatever session the peer is in by then.
 - **Message files that cannot be read.** A file that is gone (`NotFound`)
   takes its message out of the store index and out of every peer's queues,
   with a warning: nothing can be sent or served from it again, and left
@@ -1256,7 +1262,7 @@ Departures from the reference, each for a reason:
   completion scales with size and RTT (as for app-links' Resources). The
   offer's round trip keeps its assertion.
 
-Known departures not yet fixed, both outside rfed:
+Known departure not yet fixed, outside rfed:
 
 - **AppLinks re-opens a lost sync link once** (Reticulum-rust `SUBSYSTEMS.md`
   §1: "one automatic re-open attempt"). `open_persistent` is the only
@@ -1273,14 +1279,13 @@ Known departures not yet fixed, both outside rfed:
   it). The fix belongs in AppLinks: a held-link mode without the
   close-triggered re-open, and a per-registration generation that `close`
   bumps and an attempt checks before it registers its link.
-- **A sync Resource whose link closes before it is advertised is leaked.**
-  Reticulum-rust's `Resource::advertise_shared` thread waits on
-  `ready_for_new_resource`, which is false for ever once the link's actor
-  has exited, so it spins every 250 ms for the life of the process, holding
-  the batch (up to ~1 MiB) and its callback, and never concludes. RNS 1.5.2
-  cancels such a Resource (`ensure_link`), which concludes it FAILED. rfed's
-  session does not wait on it (the DISCONNECTED ends it, ids unhandled); the
-  leaked thread and buffer are Reticulum-rust's to fix.
+
+Fixed outside rfed: until Reticulum-rust 6e53dea (2026-09-28, A31) a sync
+Resource whose link closed before it was advertised never concluded, its
+advertise thread spinning every 250 ms for the life of the process with the
+batch (up to ~1 MiB) held. A running rfed has the fix only if it was built
+against 6e53dea or later: `rfed --build` prints the sibling commits it was
+built from.
 
 ### Announce Metadata
 
