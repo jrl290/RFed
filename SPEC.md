@@ -1258,9 +1258,13 @@ Departures from the reference, each for a reason:
   reference's failed `open()` does.
 - **Backoff is not reset by announces**, and the **startup backlog** (messages
   stored before start) is held back from sync for an hour; both predate this.
-- **No 5-second assertion on the Resource** (DESIGN_PRINCIPLES §1): its
-  completion scales with size and RTT (as for app-links' Resources). The
-  offer's round trip keeps its assertion.
+- **No 5-second assertion on the Resource or on the offer's round trip**
+  (DESIGN_PRINCIPLES §1). The Resource's completion scales with size and RTT
+  (as for app-links' Resources). The offer's round trip includes the remote
+  peer choosing which offered ids it wants, over however many hops it sits
+  (6-14 s to distant production peers, 2026-09-29), which rfed does not
+  control; James removed that assertion on 2026-09-29. rfed logs each offer's
+  round trip at NOTICE instead ("offer to peer X: answered after N s").
 
 Known departure not yet fixed, outside rfed:
 

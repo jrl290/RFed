@@ -4265,15 +4265,15 @@ enum OfferNext {
 }
 
 /// The `/offer` request's response callback: hand the response to the sync
-/// worker, THEN hold the round trip to DESIGN_PRINCIPLES §1.
+/// worker, then log how long the round trip took.
 ///
-/// In a debug build a response more than 5 s after `offer_sent_at` panics in
-/// the assertion, on the thread the link runs its response callbacks on. The
-/// assertion used to come first, so that panic also lost the response: it had
-/// already claimed the pending request, so no failure or timeout followed,
-/// and the peer sat in REQUEST_SENT for good with its offer still reserving
-/// the minute's budget — two such peers and outbound sync stopped. Forwarded
-/// first, the violation is still loud and the session still concludes.
+/// No DESIGN_PRINCIPLES §1 assertion on this round trip (James, 2026-09-29).
+/// It includes the remote peer working out which of up to MAX_OFFER_IDS ids it
+/// wants, across however many hops it sits: 6-14 s to distant production
+/// peers on 2026-09-29, time rfed does not control. The request itself still
+/// goes out at once, and a missing answer still ends the session through the
+/// request's own failure. The assertion was removed on James's word; do not
+/// restore it for this round trip without his.
 fn offer_response_callback(
     sink: SyncEventSink,
     peer: Vec<u8>,
@@ -4281,9 +4281,18 @@ fn offer_response_callback(
     offer_sent_at: f64,
 ) -> Arc<dyn Fn(Option<Vec<u8>>) + Send + Sync> {
     Arc::new(move |response: Option<Vec<u8>>| {
+        let elapsed = now() - offer_sent_at;
+        let answered = response.is_some();
         sink(SyncEvent::OfferResponse { peer: peer.clone(), session, response });
-        // NEVER REMOVE EVER — see DESIGN_PRINCIPLES.md §1
-        reticulum_rust::send_assertion::assert_send_completed_in_time("lxmf.propagation.offer", offer_sent_at);
+        log(
+            format!(
+                "[lxmf.prop] offer to peer {}: {} after {:.2}s",
+                hexrep(&peer, false),
+                if answered { "answered" } else { "no answer" },
+                elapsed,
+            ),
+            LOG_NOTICE, false, false,
+        );
     })
 }
 
@@ -6232,13 +6241,14 @@ mod tests {
             assert!(h.io.active_link(&gone).is_none());
         }
 
-        /// DESIGN_PRINCIPLES §1 panics in a debug build when an offer's
-        /// response comes more than 5 s after it was sent. The callback
-        /// asserted first and forwarded the response after, so the panic lost
-        /// it: the peer stayed REQUEST_SENT for good and its offer kept its
-        /// reservation of the minute's budget. The response goes first now.
+        /// A response that comes long after the offer is still delivered and
+        /// concludes the session, in every build. The callback once asserted
+        /// DESIGN_PRINCIPLES §1 first, and in a debug build the panic lost the
+        /// response: the peer stayed REQUEST_SENT for good and its offer kept
+        /// its reservation of the minute's budget. The round trip is the
+        /// remote peer's time, so it carries no assertion (James, 2026-09-29).
         #[test]
-        fn a_late_offer_response_is_forwarded_before_the_5_second_assertion() {
+        fn a_late_offer_response_is_forwarded_and_concludes_the_session() {
             let h = Harness::new("sync_late_response");
             let peer = [0x16u8; 16];
             h.add_peer(&peer, true);
@@ -6255,9 +6265,9 @@ mod tests {
             // The response callback of an offer sent 10 s ago.
             let late = offer_response_callback(sink, peer.to_vec(), session, now() - 10.0);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| late(msgpack(Value::Boolean(false)))));
-            assert_eq!(outcome.is_err(), cfg!(debug_assertions), "the §1 assertion still trips in a debug build");
+            assert!(outcome.is_ok(), "a late answer does not panic in any build");
             h.pump();
-            assert_eq!(h.state(&peer), PropPeer::IDLE, "the response was not lost with the panic");
+            assert_eq!(h.state(&peer), PropPeer::IDLE, "the late response concluded the session");
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 3));
             let mut g = h.node.lock().unwrap();
             assert_eq!(g.outbound_allowance(), g.outbound_sync_msgs_per_min, "the reservation is released");
