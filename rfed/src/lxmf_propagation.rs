@@ -286,6 +286,11 @@ pub struct PropPeer {
     /// Resource is handed to the link (`record_outbound_send`), which counts
     /// them as sent. Zero at every other step (`end_sync` clears it).
     pub budget_reserved: u64,
+    /// Messages this session has handed to its link (`record_outbound_send`),
+    /// counted from its start. While the outbound budget binds, a session's
+    /// turn is a fair share of messages sent, not one batch (see "Sharing
+    /// the budget"). Zero at IDLE.
+    pub turn_sent: u64,
     /// Id of the AppLinks-held link this sync session runs on.
     pub link_id: Option<Vec<u8>>,
     /// Link id of the currently identified AppLinks-owned sync link.
@@ -349,6 +354,7 @@ impl PropPeer {
             current_sync_transfer_started: None,
             last_offer: Vec::new(),
             budget_reserved: 0,
+            turn_sent: 0,
             link_id: None,
             identified_link_id: None,
             reidentified: false,
@@ -2307,13 +2313,15 @@ impl LxmfPropagationNode {
     }
 
     /// `peer_hash`'s sync Resource of `messages` is being handed to its link:
-    /// record the send and release the session's reservation.
+    /// record the send, release the session's reservation and count the
+    /// messages to its turn.
     fn record_outbound_send(&mut self, peer_hash: &[u8], messages: u64) {
         let t = monotonic_now();
         self.prune_outbound_sends(t);
         self.outbound_sends.push_back((t, messages));
         if let Some(peer) = self.peers.get_mut(peer_hash) {
             peer.budget_reserved = 0;
+            peer.turn_sent += messages;
         }
     }
 
@@ -2360,9 +2368,15 @@ impl LxmfPropagationNode {
     // ~73 s, and the same fast peers won the next choice — 7 of 20 peers got
     // nothing in 30 minutes. So while the budget binds — the ready waiting
     // peers want more than is left of it — rfed shares it:
-    //   * a batch is cut to a fair share (`fair_share`);
-    //   * a session does not carry on to its next batch while other ready
-    //     peers wait (`apply_resource_outcome`), it yields;
+    //   * a session's turn is a fair share (`fair_share`) of messages SENT
+    //     (`turn_sent`): each offer is cut to what is left of it, and the
+    //     session takes its next batch on the held link until the share is
+    //     sent (`apply_resource_outcome`), then yields while other ready
+    //     peers wait. A turn of one batch left most of the budget unspent
+    //     whenever a batch was smaller than the share: a byte-limited batch
+    //     (52 messages of 20 KB in a ~1 MiB Resource), or a peer that wanted
+    //     only part of an offer (review of bcc38cb: 22% and 10% of the
+    //     budget spent);
     //   * the tick chooses the ready peer whose last turn is oldest
     //     (`select_sync_peer`), so every one gets a turn.
     // While the budget does not bind, the reference's choice and persistent
@@ -2412,12 +2426,14 @@ impl LxmfPropagationNode {
         contention
     }
 
-    /// The most one batch may take while the budget binds and `contenders`
-    /// ready peers (the one being sized included) want it: an equal share of
-    /// the budget, but never less than one tick's worth of it (the budget ×
-    /// PEER_SYNC_INTERVAL_SECS / 60 s, 240 of 600). A new session starts only
-    /// on a tick, so at most 2.5 start in a minute: a smaller share would
-    /// leave the budget unspent and serve no peer sooner.
+    /// The most one session may send in its turn (`turn_sent`) while the
+    /// budget binds and `contenders` ready peers (its own included) want it:
+    /// an equal share of the budget, but never less than one tick's worth of
+    /// it (the budget × PEER_SYNC_INTERVAL_SECS / 60 s, 240 of 600). A new
+    /// session starts only on a tick, so at most 2.5 start in a minute: a
+    /// smaller share would leave the budget unspent and serve no peer
+    /// sooner. That holds only because a turn runs until its share is SENT,
+    /// over as many batches as it takes, not for one batch.
     pub fn fair_share(&self, contenders: usize) -> u64 {
         let budget = self.outbound_sync_msgs_per_min as f64;
         let equal = budget / contenders.max(1) as f64;
@@ -2811,6 +2827,7 @@ impl LxmfPropagationNode {
             peer.current_sync_transfer_started = None;
             peer.last_offer.clear();
             peer.budget_reserved = 0;
+            peer.turn_sent = 0;
             peer.sync_session += 1;
         }
     }
@@ -2963,6 +2980,8 @@ impl LxmfPropagationNode {
                 peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
                 peer.next_sync_attempt = t + peer.sync_backoff;
                 peer.sync_session += 1;
+                // A new turn.
+                peer.turn_sent = 0;
                 peer.link_id = None;
                 peer.identified_link_id = None;
                 peer.reidentified = false;
@@ -3094,15 +3113,23 @@ impl LxmfPropagationNode {
                 .collect()
         };
         // What is left of the budget, or, while it binds with other ready
-        // peers waiting, this peer's fair share of it (see "Sharing the
-        // budget").
+        // peers waiting, what is left of this session's fair share of it:
+        // its turn is the share SENT, over as many batches as it takes (see
+        // "Sharing the budget").
         let wanted = offer.len() as u64;
+        let turn_sent = self.peers.get(peer_hash).map(|peer| peer.turn_sent).unwrap_or(0);
         let contention = self.budget_contention(now(), peer_hash, allowance.saturating_sub(wanted));
+        let mut share_used = false;
         let (cap, by) = if contention.waiting > 0 && wanted + contention.demand > allowance {
             let share = self.fair_share(contention.waiting + 1);
+            let left_of_share = share.saturating_sub(turn_sent);
+            share_used = left_of_share == 0;
             (
-                allowance.min(share),
-                format!("its fair share of the outbound budget ({share}; {allowance} left, {} other peer(s) waiting)", contention.waiting),
+                allowance.min(left_of_share),
+                format!(
+                    "what is left of its fair share of the outbound budget ({left_of_share} of {share}, {turn_sent} sent this turn; {allowance} left, {} other peer(s) waiting)",
+                    contention.waiting,
+                ),
             )
         } else {
             (allowance, "the outbound budget".to_string())
@@ -3117,6 +3144,8 @@ impl LxmfPropagationNode {
         if offer.is_empty() {
             let reason = if allowance == 0 {
                 "the outbound budget is spent"
+            } else if share_used {
+                "its fair share of the outbound budget is sent and other peers wait"
             } else {
                 "no unhandled messages fit the peer's limits"
             };
@@ -3585,25 +3614,51 @@ impl LxmfPropagationNode {
             self.end_sync(peer_hash);
             return false;
         }
-        // rfed departure (see "Sharing the budget"): while the budget binds,
-        // a session does not take the next batch from under ready peers that
-        // are waiting; it ends, and waits its turn like them.
-        let own = {
+        // rfed departure (see "Sharing the budget"): while the budget binds
+        // and ready peers wait, a session's turn is its fair share of
+        // messages sent. Until it has sent that, it takes its next batch on
+        // the held link (sized to what is left of the share, `send_offer`);
+        // then it ends and waits its turn like them. A turn of one batch
+        // left most of the budget unspent when batches were byte-limited or
+        // peers wanted part of an offer.
+        let (own, turn_sent) = {
             let Some(peer) = self.peers.get(peer_hash) else { return false };
-            Self::next_batch_demand(backlog_held, &self.fresh_since_start, peer, MAX_OFFER_IDS as u64)
+            (
+                Self::next_batch_demand(backlog_held, &self.fresh_since_start, peer, MAX_OFFER_IDS as u64),
+                peer.turn_sent,
+            )
         };
         let allowance = self.outbound_allowance();
         let contention = self.budget_contention(t, peer_hash, allowance.saturating_sub(own));
         if contention.waiting > 0 && own + contention.demand > allowance {
+            let share = self.fair_share(contention.waiting + 1);
+            let why = if turn_sent >= share {
+                Some(format!("its turn sent {turn_sent} message(s), its fair share of {share}"))
+            } else if allowance == 0 {
+                Some(format!("the budget is spent ({turn_sent} of its fair share of {share} sent this turn)"))
+            } else if !on_held_link {
+                // Its next batch would need a new link: that is a new turn.
+                Some(format!("its sync link is gone ({turn_sent} of its fair share of {share} sent this turn)"))
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                log(
+                    format!(
+                        "[lxmf.prop] sync with peer {peer_str} yields to {} waiting peer(s) while the outbound budget binds ({allowance} left): {why}",
+                        contention.waiting,
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                self.end_sync(peer_hash);
+                return false;
+            }
             log(
                 format!(
-                    "[lxmf.prop] sync with peer {peer_str} yields to {} waiting peer(s): the outbound budget binds ({allowance} left)",
-                    contention.waiting,
+                    "[lxmf.prop] sync with peer {peer_str} takes its next batch on the held link: {turn_sent} of its fair share of {share} sent this turn",
                 ),
-                LOG_NOTICE, false, false,
+                LOG_DEBUG, false, false,
             );
-            self.end_sync(peer_hash);
-            return false;
         }
         // The reference tears the link down and syncs again on a new one.
         // While the held link is still up, the next offer goes on it instead.
@@ -5369,6 +5424,11 @@ mod tests {
         /// being attempted, answer every offer "want all", conclude every
         /// Resource COMPLETE. Each step costs no simulated time.
         fn serve_everything(h: &Harness) {
+            serve_answering(h, &|_| Value::Boolean(true));
+        }
+
+        /// `serve_everything`, answering each offer with `answer(offered ids)`.
+        fn serve_answering(h: &Harness, answer: &dyn Fn(&[Vec<u8>]) -> Value) {
             loop {
                 let attempting: Vec<Vec<u8>> = h.io.attempting.lock().unwrap().iter().cloned().collect();
                 let mut progressed = !attempting.is_empty();
@@ -5376,8 +5436,8 @@ mod tests {
                     h.link_active(&peer, &[peer[0] ^ 0xFF; 16]);
                 }
                 while h.io.offer_count() > 0 {
-                    let (_, respond, _) = h.io.take_offer();
-                    respond(msgpack(Value::Boolean(true)));
+                    let (offer, respond, _) = h.io.take_offer();
+                    respond(msgpack(answer(&offered_ids(&offer))));
                     h.pump();
                     progressed = true;
                 }
@@ -5484,47 +5544,153 @@ mod tests {
         }
 
         /// The persistent strategy (next batch on the held link) stands while
-        /// the budget does not bind; while it binds and other ready peers
-        /// wait, the session ends after its batch and the next goes to them.
+        /// the budget does not bind. While it binds and other ready peers
+        /// wait, a session's turn is its fair share of messages SENT: it
+        /// takes its next batch on the held link until it has sent that,
+        /// then ends and the next turn goes to them. (It used to end after
+        /// its first batch however little that carried.)
         #[test]
-        fn a_session_yields_its_link_while_the_budget_binds_and_others_wait() {
+        fn a_session_yields_its_link_once_its_share_is_sent_while_the_budget_binds() {
             let h = Harness::new("sync_yield");
             let a = [0x61u8; 16];
             let b = [0x62u8; 16];
             h.add_peer(&a, true);
-            h.add_peer(&b, true);
-            // One message per batch: 24 + 316 + 316 > 500 B.
+            // No peering key yet: b cannot be chosen, so nothing binds.
+            h.add_peer(&b, false);
+            // A budget of 10: with a and b ready, a turn is fair_share(2) = 5.
+            h.node.lock().unwrap().outbound_sync_msgs_per_min = 10;
+            // One message per batch for a: 24 + 316 + 316 > 500 B.
             h.node.lock().unwrap().peers.get_mut(&a[..]).unwrap().propagation_sync_limit = Some(0.5);
-            h.store(3, 300);
+            h.store(12, 300);
+            let batch = || {
+                let (offer, respond, _) = h.io.take_offer();
+                assert_eq!(offered_ids(&offer).len(), 1);
+                respond(msgpack(Value::Boolean(true)));
+                h.pump();
+                let (_, concluded) = h.io.take_resource();
+                concluded(complete());
+                h.pump();
+            };
 
-            // Budget 600, 3 wanted each: a carries on on its held link.
             h.start(&a);
             h.link_active(&a, &LINK_1);
-            let (_, respond, _) = h.io.take_offer();
-            respond(msgpack(Value::Boolean(true)));
-            h.pump();
-            let (_, concluded) = h.io.take_resource();
-            concluded(complete());
-            h.pump();
+            batch();
+            batch();
             assert_eq!(h.state(&a), PropPeer::REQUEST_SENT, "persistent strategy: the next offer on the held link");
-            let (_, respond, _) = h.io.take_offer();
-            respond(msgpack(Value::Boolean(true)));
-            h.pump();
+            assert_eq!(h.peer(&a, |p| p.turn_sent), 2);
 
-            // Now the budget binds: 2 left, a wants 1 more and b 3.
-            {
-                let mut g = h.node.lock().unwrap();
-                let spent = g.outbound_sync_msgs_per_min - g.outbound_sent_in_window() - 2;
-                g.record_outbound_send(&[0x99; 16], spent);
-                g.peers.get_mut(&a[..]).unwrap().budget_reserved = 0;
-            }
-            let (_, concluded) = h.io.take_resource();
-            concluded(complete());
-            h.pump();
-            assert_eq!(h.state(&a), PropPeer::IDLE, "a yields");
+            // b's key is ready: a and b want more than is left, it binds.
+            h.node.lock().unwrap().peers.get_mut(&b[..]).unwrap().peering_key = Some((vec![0x5A; 32], 18));
+            assert_eq!(h.node.lock().unwrap().fair_share(2), 5);
+            batch();
+            assert_eq!(h.state(&a), PropPeer::REQUEST_SENT, "3 of its share of 5 sent: a carries on on the held link");
+            batch();
+            assert_eq!(h.state(&a), PropPeer::REQUEST_SENT, "4 of 5 sent: a carries on");
+            batch();
+            assert_eq!(h.state(&a), PropPeer::IDLE, "its share sent, a yields");
             assert_eq!(h.io.offer_count(), 0);
-            assert_eq!(h.unhandled(&a), 1, "what a still lacks waits for its next turn");
+            assert_eq!(h.io.sent().iter().map(|(_, _, m)| m).sum::<u64>(), 5, "a's turn: its share, in five batches");
+            assert_eq!(h.unhandled(&a), 7, "what a still lacks waits for its next turn");
             assert_eq!(h.io.calls().last().unwrap(), "close 61", "the held link is released");
+            assert_eq!(h.peer(&a, |p| p.turn_sent), 0, "the next session is a new turn");
+        }
+
+        /// Simulated time in steps of a second for `secs`, the tick choosing
+        /// whenever it is due, as the main loop calls it, the network served
+        /// as `serve_answering` does.
+        fn run_for(h: &Harness, secs: f64, answer: &dyn Fn(&[Vec<u8>]) -> Value) {
+            let start = monotonic_now();
+            while monotonic_now() - start < secs {
+                LxmfPropagationNode::tick_sync(&h.node);
+                h.pump();
+                serve_answering(h, answer);
+                test_clock::advance(1.0);
+            }
+        }
+
+        /// What each turn (a session, from its link attempt to its end) sent,
+        /// in order: a session starts with an "open", and the i-th Resource
+        /// handed over is `sent[i]`.
+        fn turns(h: &Harness) -> Vec<u64> {
+            let sent = h.io.sent();
+            let mut resources = sent.iter();
+            let mut running: HashMap<String, usize> = HashMap::new();
+            let mut turns: Vec<u64> = Vec::new();
+            for call in h.io.calls() {
+                if let Some(peer) = call.strip_prefix("open ") {
+                    running.insert(peer.to_string(), turns.len());
+                    turns.push(0);
+                } else if call.starts_with("resource ") {
+                    let (_, to, messages) = resources.next().expect("a Resource for each call");
+                    let index = *running.get(&hexrep(&to[..1], false)).expect("a Resource inside a session");
+                    turns[index] += messages;
+                }
+            }
+            turns
+        }
+
+        /// 20 peers, each lacking plenty, for 8 simulated minutes: the budget
+        /// binds throughout. Past the startup backlog hold, as production is
+        /// most of the time (the hold has its own tests).
+        fn fair_run(tag: &str, count: usize, size: usize, answer: &dyn Fn(&[Vec<u8>]) -> Value) -> (Harness, f64) {
+            let h = Harness::new(tag);
+            h.node.lock().unwrap().started_at = now() - STARTUP_BACKLOG_HOLD_SECS - 1.0;
+            for i in 0..20u8 {
+                h.add_peer(&[0x80 + i; 16], true);
+            }
+            h.store(count, size);
+            let minutes = 8.0;
+            run_for(&h, minutes * 60.0, answer);
+            (h, minutes)
+        }
+
+        /// Review of bcc38cb: a turn was one batch, whatever that carried of
+        /// the share. With messages of 20 KB a batch is ~52 (one ~1 MiB
+        /// Resource), and 20 turns in 8 minutes sent 1040 of a budget of
+        /// 4800. A turn is now the share sent, in as many batches on the held
+        /// link as it takes: the budget is spent, never exceeded, and no turn
+        /// sends more than its share.
+        #[test]
+        fn the_budget_is_spent_while_it_binds_when_batches_are_byte_limited() {
+            let (h, minutes) = fair_run("sync_fair_bytes", 1000, 20_000, &|_| Value::Boolean(true));
+            let (budget, share) = {
+                let g = h.node.lock().unwrap();
+                (g.outbound_sync_msgs_per_min, g.fair_share(20))
+            };
+            let sent = h.io.sent();
+            let largest = sent.iter().map(|(_, _, messages)| *messages).max().unwrap_or(0);
+            assert!(largest < 60, "a batch is limited by bytes, far under the share (largest {largest})");
+            assert!(most_in_any_window(&sent) <= budget, "no 60 s span carries more than the budget");
+            let most = turns(&h).into_iter().max().unwrap_or(0);
+            assert!(most <= share, "no turn sends more than its share of {share} (most {most})");
+            let total: u64 = sent.iter().map(|(_, _, messages)| messages).sum();
+            assert!(
+                total as f64 >= 0.75 * budget as f64 * minutes,
+                "the budget is spent while it binds: {total} sent in {minutes} minutes",
+            );
+        }
+
+        /// Review of bcc38cb: each peer already holds 9 in 10 of what it is
+        /// offered (from other propagation nodes, normal in a mesh), so a
+        /// turn of one batch sent a tenth of the share: 480 of a budget of
+        /// 4800 in 8 minutes. The turn now carries on until the share is
+        /// sent.
+        #[test]
+        fn the_budget_is_spent_while_it_binds_when_peers_want_part_of_each_offer() {
+            let one_in_ten = |offered: &[Vec<u8>]| {
+                Value::Array(
+                    offered.iter().filter(|id| id[0] % 10 == 0).map(|id| Value::Binary(id.clone())).collect(),
+                )
+            };
+            let (h, minutes) = fair_run("sync_fair_partial", 3000, 300, &one_in_ten);
+            let budget = h.node.lock().unwrap().outbound_sync_msgs_per_min;
+            let sent = h.io.sent();
+            assert!(most_in_any_window(&sent) <= budget, "no 60 s span carries more than the budget");
+            let total: u64 = sent.iter().map(|(_, _, messages)| messages).sum();
+            assert!(
+                total as f64 >= 0.75 * budget as f64 * minutes,
+                "the budget is spent while it binds: {total} sent in {minutes} minutes",
+            );
         }
 
         fn id(n: usize) -> Vec<u8> {

@@ -1111,8 +1111,9 @@ sync".
    offer, a failed Resource or a lost link returns the peer to IDLE with every
    id still unhandled.
 6. **Persistent strategy.** After a COMPLETE the session carries on with the
-   next batch while the peer still lacks messages (unless the outbound budget
-   binds and other ready peers wait: see "Sharing the budget").
+   next batch while the peer still lacks messages (while the outbound budget
+   binds and other ready peers wait, only until it has sent its fair share:
+   see "Sharing the budget").
 
 Departures from the reference, each for a reason:
 
@@ -1165,21 +1166,31 @@ Departures from the reference, each for a reason:
   nothing in 30 minutes. So while the budget **binds** — the ready waiting
   peers (the ones step 1 could choose now), each counted up to one offer,
   want more than is left of it — three rules apply, and none otherwise:
-  - a batch is cut to a **fair share**: the budget divided by the ready
-    waiting peers (this one included), but never less than one tick's worth
-    of it (budget × 24 s / 60 s, 240 of 600). A new session starts only on a
-    tick, so at most 2.5 start in a minute; a smaller share would leave the
-    budget unspent and serve no peer sooner. No batch takes the whole
-    budget while another ready peer waits;
-  - a session whose batch completed does **not** carry on to its next batch
-    on the held link while other ready peers wait: it ends (the link is
-    released) and waits for its turn like them;
+  - a session's **turn** is a **fair share** of messages **sent**: the
+    budget divided by the ready waiting peers (this one included), but never
+    less than one tick's worth of it (budget × 24 s / 60 s, 240 of 600). A
+    new session starts only on a tick, so at most 2.5 start in a minute; a
+    smaller share would leave the budget unspent and serve no peer sooner.
+    Each offer is cut to what is left of the share (and of the budget), so
+    no turn sends more than its share and no batch takes the whole budget
+    while another ready peer waits;
+  - until its share is sent the session takes its next batch on the held
+    link; once it is sent (or the budget is spent, or the link is gone) the
+    session ends (the link is released) while other ready peers wait, and
+    waits for its turn like them. A turn used to be one batch, and a batch
+    is often far smaller than the share: ~52 messages of 20 KB fill a
+    Resource, and a peer that already holds most of an offer (normal in a
+    mesh) wants only part of it. With 20 peers for 8 minutes, turns of one
+    batch sent 1040 and 480 of a budget of 4800 (review, 2026-09-28); turns
+    of a share send 4080 and 3996 (tests
+    `the_budget_is_spent_while_it_binds_when_batches_are_byte_limited`,
+    `..._when_peers_want_part_of_each_offer`);
   - the choice (step 1) is the ready waiting peer whose last turn
     (`last_sync_attempt`) is **oldest**, at random among equals, instead of
     the fastest-peer pool.
 
   With 20 ready peers each lacking many messages, one peer is served per
-  tick, all 20 within ceil(20 / 2.5) = 8 minutes, in batches of 240 / 240 /
+  tick, all 20 within ceil(20 / 2.5) = 8 minutes, in turns of 240 / 240 /
   120 per 72 s (the budget spent, never exceeded): test
   `every_ready_peer_gets_a_turn_while_the_budget_binds`.
 - **One Resource segment per batch** (`MAX_SYNC_RESOURCE_BYTES`, ~1 MiB).
