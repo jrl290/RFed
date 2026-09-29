@@ -242,6 +242,17 @@ This mirrors Reticulum's own `Identity` hash derivation: the hash is
 computed over the 64-byte public key bundle, then truncated to the first
 16 bytes (`TRUNCATED_HASHLENGTH / 8`).
 
+It is the channel's **identity** hash, not the `lxmf.delivery`
+destination hash of the channel identity. The identity hash is what goes
+in the first 16 bytes of every post, what RFed stores and fans out under,
+and what clients send in subscribe, pull, stream-filter and notify
+requests. RFed never derives it; it only compares the 16 bytes it is
+given. The `lxmf.delivery` destination hash of the channel identity is
+used for one thing only: the inner LXMF message is addressed to it and
+signed over it. The sender drops it, and the receiver re-derives it to
+rebuild the signed bytes (step 7 of the receive path). It is never on the
+wire.
+
 ### Rust Implementation
 
 ```rust

@@ -165,11 +165,15 @@ impl ChannelKeypair {
         bundle
     }
 
-    /// The 16-byte truncated destination hash for this channel.
+    /// The channel hash: the 16-byte **identity** hash of the channel's
+    /// keypair (SPEC.md §1).
     ///
-    /// Clients embed this in the first 16 bytes of every SEND packet.
+    /// Clients embed this in the first 16 bytes of every SEND packet, and RFed
+    /// keys stored posts, fan-out and subscriptions by it. It is not the
+    /// `lxmf.delivery` destination hash of the channel identity, which only
+    /// addresses and signs the inner LXMF message and is never on the wire.
     pub fn hash(&self) -> Vec<u8> {
-        // Reticulum destination hash: SHA-256 over the full public key bundle,
+        // Reticulum identity hash: SHA-256 over the full public key bundle,
         // truncated to the first 16 bytes (TRUNCATED_HASHLENGTH / 8).
         let bundle = self.public_key_bundle();
         let full = Sha256::digest(&bundle);
