@@ -790,8 +790,17 @@ impl LxmfPropagationNode {
 
     // ── Announce ──────────────────────────────────────────────────────────────
 
+    /// The per-transfer and per-sync limits as announced: whole KB of 1000 B
+    /// (`build_app_data`). An inbound sync Resource is held to the announced
+    /// per-sync limit (`inbound_resource_callbacks`), so what rfed accepts is
+    /// exactly what it tells its peers.
+    pub fn announced_limits_kb(&self) -> (i64, i64) {
+        (self.transfer_limit_kb as i64, self.sync_limit_kb as i64)
+    }
+
     pub fn build_app_data(&self) -> Vec<u8> {
         let ts = now() as i64;
+        let (transfer_limit_kb, sync_limit_kb) = self.announced_limits_kb();
         let stamp_costs = Value::Array(vec![
             Value::Integer((self.stamp_cost as i64).into()),
             Value::Integer((self.stamp_flexibility as i64).into()),
@@ -811,8 +820,8 @@ impl LxmfPropagationNode {
             Value::Boolean(false),
             Value::Integer(ts.into()),
             Value::Boolean(true),
-            Value::Integer((self.transfer_limit_kb as i64).into()),
-            Value::Integer((self.sync_limit_kb as i64).into()),
+            Value::Integer(transfer_limit_kb.into()),
+            Value::Integer(sync_limit_kb.into()),
             stamp_costs,
             metadata,
         ]);
@@ -1293,15 +1302,29 @@ impl LxmfPropagationNode {
         // so the concluded callback dispatches into the same ingest helper.
         link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
-        let (advertised, concluded) = Self::inbound_resource_callbacks(self.self_handle.clone());
+        let (_, sync_limit_kb) = self.announced_limits_kb();
+        let (advertised, concluded) = Self::inbound_resource_callbacks(self.self_handle.clone(), sync_limit_kb);
         link.set_resource_callbacks(Some(advertised), None, Some(concluded));
     }
 
-    /// The Resource callbacks of an inbound link. Resource-advertised: accepts
-    /// every advertisement (its return value is the ACCEPT_APP verdict,
-    /// RNS/Link.py:1108). Resource-concluded: invoked once the multi-segment
-    /// transfer is fully assembled; decodes and ingests the same way as
-    /// single-packet inbound propagation data.
+    /// The Resource callbacks of an inbound link. Resource-advertised: the
+    /// ACCEPT_APP verdict (RNS/Link.py:1108), which refuses a Resource whose
+    /// data is larger than our announced per-sync limit — `sync_limit_kb`, in
+    /// the reference's KB of 1000 B — and accepts the rest, as LXMF 1.1.1
+    /// `LXMRouter.propagation_resource_advertised` does (`size >
+    /// propagation_per_sync_limit*1000`, on the advertisement's data size).
+    /// Resource-concluded: invoked once the multi-segment transfer is fully
+    /// assembled; decodes and ingests the same way as single-packet inbound
+    /// propagation data.
+    ///
+    /// The reference has no per-message size limit on what it receives: the
+    /// per-transfer limit it announces is applied by the SENDER
+    /// (`LXMPeer.sync`, rfed's `plan_offer`). Its one per-message check on
+    /// receipt is `LXStamper.validate_pn_stamp`'s — a message no longer than
+    /// LXMF_OVERHEAD + STAMP_SIZE, or with a stamp under the cost, is dropped —
+    /// which rfed applies with the same code (`lx_stamper::validate_pn_stamps`
+    /// in `ingest_propagation_batch`), and counts in its per-batch
+    /// "bad-stamp" figure.
     ///
     /// The two share the identity the sender proved on the link, which says
     /// whose batch it is (`ingest_propagation_batch`). It is recorded when the
@@ -1325,6 +1348,7 @@ impl LxmfPropagationNode {
     /// spawns it and moves on, so nothing orders it before the conclusion.
     fn inbound_resource_callbacks(
         weak: Option<Weak<Mutex<Self>>>,
+        sync_limit_kb: i64,
     ) -> (
         reticulum_rust::link::ResourceAcceptCallback,
         Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync>,
@@ -1332,7 +1356,22 @@ impl LxmfPropagationNode {
         let sender: Arc<Mutex<Option<Identity>>> = Arc::new(Mutex::new(None));
 
         let recorded = sender.clone();
+        let limit_bytes = sync_limit_kb.max(0) as u64 * 1000;
         let advertised = Arc::new(move |advertisement: &reticulum_rust::resource::ResourceAdvertisement| -> bool {
+            // Until 929a079 rfed announced MB where peers read KB, so none
+            // could offer more than a few MB; announcing its real limits, it
+            // must hold senders to them.
+            let size = advertisement.get_data_size() as u64;
+            if size > limit_bytes {
+                log(
+                    format!(
+                        "[lxmf.prop] rejecting a {size} B propagation Resource on link {}: over our per-sync limit of {limit_bytes} B ({sync_limit_kb} KB announced)",
+                        advertisement.link.as_ref().map(|link| hexrep(&link.link_id(), false)).unwrap_or_else(|| "?".into()),
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                return false;
+            }
             if let Some(link) = &advertisement.link {
                 match link.remote_identity() {
                     Ok(Some(identity)) => {
@@ -1351,7 +1390,7 @@ impl LxmfPropagationNode {
                     ),
                 }
             }
-            // Accept all advertised propagation resources.
+            // Within the limit: accepted.
             true
         });
 
@@ -6060,8 +6099,11 @@ mod tests {
             let link = LinkHandle::spawn(link);
 
             // The callbacks link_established installs on that link.
-            let weak = h.node.lock().unwrap().self_handle.clone();
-            let (advertised, concluded) = LxmfPropagationNode::inbound_resource_callbacks(weak);
+            let (weak, sync_limit_kb) = {
+                let g = h.node.lock().unwrap();
+                (g.self_handle.clone(), g.announced_limits_kb().1)
+            };
+            let (advertised, concluded) = LxmfPropagationNode::inbound_resource_callbacks(weak, sync_limit_kb);
 
             // The sender advertises its batch; rfed accepts it.
             let advertisement = ResourceAdvertisement {
@@ -6069,7 +6111,7 @@ mod tests {
                 q: None, f: 0, m: Vec::new(), e: true, c: false, s: false, u: false, p: false, x: false,
                 link: Some(link.clone()),
             };
-            assert!(advertised(&advertisement), "every propagation Resource is accepted");
+            assert!(advertised(&advertisement), "a propagation Resource within the limit is accepted");
 
             // The proof has gone out and the sender has closed the link: its
             // actor is gone before the concluded callback runs.
@@ -6096,6 +6138,41 @@ mod tests {
                 assert!(p.handled_ids.contains(&id), "handled for it");
             });
             h.peer(&other, |p| assert!(p.unhandled_ids.contains(&id), "queued for the other peer"));
+        }
+
+        /// LXMF 1.1.1 LXMRouter.propagation_resource_advertised: a propagation
+        /// Resource whose data is larger than the per-sync limit we announce
+        /// (KB of 1000 B) is refused at its advertisement. Since 929a079 rfed
+        /// announces its real limits (10240 KB unset; ~1 GB with the old
+        /// NAS template), and nothing held a sender to them.
+        #[test]
+        fn a_propagation_resource_over_our_announced_sync_limit_is_refused() {
+            use reticulum_rust::resource::ResourceAdvertisement;
+            let advertisement = |size: u64| ResourceAdvertisement {
+                t: size, d: size, n: 1, h: vec![0xAD; 32], r: vec![0; 4], o: vec![0xAD; 32], i: 1, l: 1,
+                q: None, f: 0, m: Vec::new(), e: true, c: false, s: false, u: false, p: false, x: false,
+                link: None,
+            };
+            for (tag, sync_limit_bytes) in [("limit_default", None), ("limit_configured", Some(3 * 1024 * 1024))] {
+                let h = Harness::new(tag);
+                let (weak, announced_kb) = {
+                    let mut g = h.node.lock().unwrap();
+                    if let Some(bytes) = sync_limit_bytes {
+                        g.sync_limit_kb = propagation_limits_kb(None, Some(bytes)).1;
+                    }
+                    let announced = match read_value(&mut Cursor::new(&g.build_app_data())).expect("announce") {
+                        Value::Array(items) => items[4].as_i64().expect("sync limit"),
+                        other => panic!("announce not an array: {other:?}"),
+                    };
+                    (g.self_handle.clone(), announced)
+                };
+                assert_eq!(announced_kb, h.node.lock().unwrap().announced_limits_kb().1);
+                let (advertised, _) = LxmfPropagationNode::inbound_resource_callbacks(weak, announced_kb);
+                let limit = announced_kb as u64 * 1000;
+                assert!(advertised(&advertisement(limit)), "{tag}: exactly the announced limit is accepted");
+                assert!(!advertised(&advertisement(limit + 1)), "{tag}: one byte over it is refused");
+                assert!(advertised(&advertisement(300)), "{tag}: a small batch is accepted");
+            }
         }
 
         /// The wire defect (2026-09-28): rfed announced its limits as MB where

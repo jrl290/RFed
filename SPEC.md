@@ -1277,6 +1277,18 @@ default rfed announced `0` and `10`: every peer, Python or rfed, read a 0 KB
 per-message limit and marked every message for rfed handled without sending
 it.
 
+rfed holds senders to what it announces, as LXMF 1.1.1
+`LXMRouter.propagation_resource_advertised` does: a propagation Resource
+whose data size (the advertisement's `d`) is larger than the announced
+per-sync limit × 1000 B is refused at its advertisement, with a log line
+naming the size, the limit and the link. As in the reference there is no
+per-message size limit on receipt — the per-transfer limit is the sender's
+to apply (`LXMPeer.sync`, rfed's `plan_offer`); the reference's one
+per-message check on receipt, `LXStamper.validate_pn_stamp` (a message no
+longer than LXMF_OVERHEAD + STAMP_SIZE, or with a stamp under the cost, is
+dropped), runs in rfed through the same stamper, and each batch's log line
+counts those drops as `bad-stamp`.
+
 ---
 
 ## 11. Backup Failover
