@@ -2366,8 +2366,9 @@ impl LxmfPropagationNode {
     // session took the whole 600 (500, then 100 more on its held link), the
     // budget was spent until its sends aged out, so one peer was served per
     // ~73 s, and the same fast peers won the next choice — 7 of 20 peers got
-    // nothing in 30 minutes. So while the budget binds — the ready waiting
-    // peers want more than is left of it — rfed shares it:
+    // nothing in 30 minutes. So while the budget binds — the ready peers the
+    // tick could choose (`contends_for_sync`) want more than is left of it —
+    // rfed shares it:
     //   * a session's turn is a fair share (`fair_share`) of messages SENT
     //     (`turn_sent`): each offer is cut to what is left of it, and the
     //     session takes its next batch on the held link until the share is
@@ -2378,17 +2379,22 @@ impl LxmfPropagationNode {
     //     only part of an offer (review of bcc38cb: 22% and 10% of the
     //     budget spent);
     //   * the tick chooses the ready peer whose last turn is oldest
-    //     (`select_sync_peer`), so every one gets a turn.
+    //     (`select_sync_peer`), so every one gets a turn — unresponsive
+    //     peers whose backoff has run out included. The reference chooses
+    //     those only when no alive peer waits, which while the budget binds
+    //     is never: one failed link attempt left a peer with nothing until
+    //     its next announce (lxmd: every 6 h; review of bcc38cb).
     // While the budget does not bind, the reference's choice and persistent
     // strategy stand unchanged.
 
-    /// Is `peer` one the tick could choose now, "waiting" as
-    /// `select_sync_peer` counts it: IDLE, ready to sync, alive, out of
-    /// backoff and throttle, lacking something it may be offered.
-    fn waiting_for_sync(peer: &PropPeer, t: f64, backlog_held: bool, fresh: &[Vec<u8>]) -> bool {
+    /// Is `peer` one the tick could choose now, and so a contender for the
+    /// budget: IDLE, ready to sync, out of backoff and throttle, lacking
+    /// something it may be offered. Alive ("waiting" in the reference) or
+    /// not ("unresponsive", its backoff run out): while the budget binds,
+    /// both take their turn (see "Sharing the budget").
+    fn contends_for_sync(peer: &PropPeer, t: f64, backlog_held: bool, fresh: &[Vec<u8>]) -> bool {
         peer.state == PropPeer::IDLE
             && peer.sync_ready()
-            && peer.alive
             && t > peer.throttled_until
             && t > peer.next_sync_attempt
             && Self::has_sync_candidates(backlog_held, fresh, peer)
@@ -2406,15 +2412,16 @@ impl LxmfPropagationNode {
         lacking as u64
     }
 
-    /// The ready waiting peers other than `except`, and what they want of the
-    /// budget, each up to one offer. The demand is counted only until it
-    /// passes `enough`: past that the budget binds whatever the rest want.
+    /// The peers other than `except` the tick could choose now (alive or
+    /// unresponsive, `contends_for_sync`), and what they want of the budget,
+    /// each up to one offer. The demand is counted only until it passes
+    /// `enough`: past that the budget binds whatever the rest want.
     fn budget_contention(&self, t: f64, except: &[u8], enough: u64) -> BudgetContention {
         let backlog_held = self.backlog_held();
         let fresh = &self.fresh_since_start;
         let mut contention = BudgetContention { waiting: 0, demand: 0 };
         for (hash, peer) in &self.peers {
-            if hash.as_slice() == except || !Self::waiting_for_sync(peer, t, backlog_held, fresh) {
+            if hash.as_slice() == except || !Self::contends_for_sync(peer, t, backlog_held, fresh) {
                 continue;
             }
             contention.waiting += 1;
@@ -2541,11 +2548,15 @@ impl LxmfPropagationNode {
     /// then left it behind every alive peer until its next announce.
     ///
     /// And one departure for the budget (see "Sharing the budget"): while it
-    /// binds — the waiting peers want more than is left of it, each counted
-    /// up to one offer — the choice is the waiting peer whose last turn
-    /// (`last_sync_attempt`) is oldest, at random among equals, so every
-    /// ready peer is served in turn. The fastest-peer pool served the same
-    /// fast peers again and again while the others got nothing.
+    /// binds — the peers the tick could choose, alive or unresponsive, want
+    /// more than is left of it, each counted up to one offer — the choice is
+    /// the one of them whose last turn (`last_sync_attempt`) is oldest, at
+    /// random among equals, so every ready peer is served in turn. The
+    /// fastest-peer pool served the same fast peers again and again while
+    /// the others got nothing; and unresponsive peers, chosen only when no
+    /// alive peer waits, were never chosen while the budget bound, so one
+    /// failed link attempt left a peer without sync until it announced
+    /// again.
     pub fn select_sync_peer(&mut self, t: f64, pick: &mut dyn FnMut(usize) -> usize) -> Option<Vec<u8>> {
         let allowance = self.outbound_allowance();
         let backlog_held = self.backlog_held();
@@ -2595,15 +2606,17 @@ impl LxmfPropagationNode {
             );
         }
 
-        // Does the budget bind? The demand is counted only as far as needed
-        // to tell.
-        let binds = !waiting.is_empty() && {
+        // Does the budget bind? Every peer the tick could choose counts,
+        // alive or unresponsive (`contends_for_sync`); the demand is counted
+        // only as far as needed to tell.
+        let contenders: Vec<&Vec<u8>> = waiting.iter().map(|(hash, _)| hash).chain(unresponsive.iter()).collect();
+        let binds = {
             let mut demand = 0u64;
-            for (hash, _) in &waiting {
+            for hash in &contenders {
                 if demand > allowance {
                     break;
                 }
-                if let Some(peer) = self.peers.get(hash) {
+                if let Some(peer) = self.peers.get(*hash) {
                     demand += Self::next_batch_demand(backlog_held, fresh, peer, allowance - demand + 1);
                 }
             }
@@ -2611,16 +2624,19 @@ impl LxmfPropagationNode {
         };
 
         let pool: Vec<Vec<u8>> = if binds {
+            // Unresponsive peers past their backoff take their turn too: the
+            // reference's "only when no alive peer waits" never comes while
+            // the budget binds.
             let last_turn = |hash: &Vec<u8>| self.peers.get(hash).map(|peer| peer.last_sync_attempt).unwrap_or(0.0);
-            let oldest = waiting.iter().map(|(hash, _)| last_turn(hash)).fold(f64::INFINITY, f64::min);
-            let pool: Vec<Vec<u8>> = waiting.iter()
-                .filter(|(hash, _)| last_turn(hash) == oldest)
-                .map(|(hash, _)| hash.clone())
+            let oldest = contenders.iter().map(|hash| last_turn(hash)).fold(f64::INFINITY, f64::min);
+            let pool: Vec<Vec<u8>> = contenders.iter()
+                .filter(|hash| last_turn(hash) == oldest)
+                .map(|hash| (*hash).clone())
                 .collect();
             log(
                 format!(
-                    "[lxmf.prop] the outbound budget binds ({allowance} left): selecting the least recently served of {} waiting peers",
-                    waiting.len(),
+                    "[lxmf.prop] the outbound budget binds ({allowance} left): selecting the least recently served of {} waiting and {} unresponsive peers",
+                    waiting.len(), unresponsive.len(),
                 ),
                 LOG_DEBUG, false, false,
             );
@@ -4221,8 +4237,8 @@ pub(crate) fn plan_offer(
     plan
 }
 
-/// The ready waiting peers besides one, and what they want of the outbound
-/// budget (see `budget_contention`).
+/// The ready peers besides one the tick could choose, alive or unresponsive,
+/// and what they want of the outbound budget (see `budget_contention`).
 struct BudgetContention {
     waiting: usize,
     demand: u64,
@@ -5642,6 +5658,108 @@ mod tests {
             let minutes = 8.0;
             run_for(&h, minutes * 60.0, answer);
             (h, minutes)
+        }
+
+        /// Review of bcc38cb: the rotation covered alive peers only, and the
+        /// reference chooses an unresponsive peer only when no alive peer
+        /// waits — never, while the budget binds. One failed link attempt
+        /// makes a peer unresponsive (backoff, then the next tick demotes
+        /// it), and it got nothing until its next announce (lxmd: every
+        /// 6 h). While the budget binds it now takes its turn in the same
+        /// rotation once its backoff has run out: its last turn is the
+        /// oldest, so it is chosen within a tick or two of that.
+        #[test]
+        fn an_unresponsive_peer_takes_its_turn_while_the_budget_binds() {
+            let h = Harness::new("sync_fair_unresponsive");
+            h.node.lock().unwrap().started_at = now() - STARTUP_BACKLOG_HOLD_SECS - 1.0;
+            let budget = h.node.lock().unwrap().outbound_sync_msgs_per_min;
+            let peers: Vec<[u8; 16]> = (0..20u8).map(|i| [0x80 + i; 16]).collect();
+            for hash in &peers {
+                h.add_peer(hash, true);
+            }
+            let x = [0x70u8; 16];
+            h.add_peer(&x, true);
+            h.store(3000, 300);
+
+            // x's link attempt fails: it backs off, and the first tick finds
+            // it in backoff and marks it unresponsive.
+            h.start(&x);
+            h.io.attempt_failed(&x);
+            h.event(SyncEvent::LinkDown { peer: x.to_vec() });
+            assert_eq!(h.state(&x), PropPeer::IDLE);
+            let failed_at = monotonic_now();
+            LxmfPropagationNode::tick_sync(&h.node);
+            h.pump();
+            assert!(!h.peer(&x, |p| p.alive), "one failed attempt: unresponsive");
+            serve_everything(&h);
+            test_clock::advance(1.0);
+
+            // Its backoff, then as long again as the 21 contenders take to
+            // go round once (2.5 turns a minute).
+            let sessions_per_minute = 60.0 / PEER_SYNC_INTERVAL_SECS;
+            let bound = SYNC_BACKOFF_STEP_SECS + ((peers.len() + 1) as f64 / sessions_per_minute).ceil() * 60.0;
+            run_for(&h, bound, &|_| Value::Boolean(true));
+
+            let sent = h.io.sent();
+            let first = sent.iter().find(|(_, to, _)| to == &x).map(|(at, _, _)| at - failed_at);
+            assert!(
+                first.is_some_and(|at| at <= bound),
+                "the unresponsive peer first served at {first:?} s, not within {bound} s",
+            );
+            assert!(h.peer(&x, |p| p.alive), "its link came up: alive again");
+            assert!(most_in_any_window(&sent) <= budget, "no 60 s span carries more than the budget");
+        }
+
+        /// While the budget binds, an unresponsive peer past its backoff is a
+        /// contender like an alive one: chosen when its turn is the oldest,
+        /// though an alive peer waits, and counted in the share, so a
+        /// running session yields to it once its share is sent.
+        #[test]
+        fn an_unresponsive_peer_past_its_backoff_contends_for_the_budget() {
+            let h = Harness::new("sync_unresponsive_contends");
+            h.node.lock().unwrap().started_at = now() - STARTUP_BACKLOG_HOLD_SECS - 1.0;
+            let a = [0x91u8; 16];
+            let x = [0x92u8; 16];
+            h.add_peer(&a, true);
+            h.add_peer(&x, true);
+            {
+                let mut g = h.node.lock().unwrap();
+                let peer = g.peers.get_mut(&a[..]).unwrap();
+                peer.last_sync_attempt = now() - 10.0;
+                // x failed a link attempt 13 minutes ago; its 12-minute
+                // backoff is over.
+                let peer = g.peers.get_mut(&x[..]).unwrap();
+                peer.alive = false;
+                peer.sync_backoff = SYNC_BACKOFF_STEP_SECS;
+                peer.last_sync_attempt = now() - 780.0;
+                peer.next_sync_attempt = now() - 60.0;
+            }
+            h.store(2000, 300);
+
+            // 500 + 500 wanted of 600: it binds, and x's turn is the oldest.
+            {
+                let mut g = h.node.lock().unwrap();
+                for i in 0..4usize {
+                    assert_eq!(g.select_sync_peer(now(), &mut |n| i % n), Some(x.to_vec()));
+                }
+                assert!(!g.peers[&x[..]].alive, "still unresponsive: chosen for its turn, not revived");
+            }
+
+            // a's session: with x contending, a's turn is fair_share(2) =
+            // 300, not the 500 of a whole offer, and it yields once that is
+            // sent.
+            let share = h.node.lock().unwrap().fair_share(2);
+            h.start(&a);
+            h.link_active(&a, &LINK_1);
+            let (offer, respond, _) = h.io.take_offer();
+            assert_eq!(offered_ids(&offer).len() as u64, share, "the offer is cut to a's share");
+            respond(msgpack(Value::Boolean(true)));
+            h.pump();
+            let (_, concluded) = h.io.take_resource();
+            concluded(complete());
+            h.pump();
+            assert_eq!(h.state(&a), PropPeer::IDLE, "its share sent, a yields to x");
+            assert_eq!(h.io.offer_count(), 0);
         }
 
         /// Review of bcc38cb: a turn was one batch, whatever that carried of

@@ -1091,8 +1091,8 @@ sync".
    unknown speed; only when no alive peer waits, at random among unresponsive
    peers whose backoff has run out. Sessions already running continue on
    their own events, so several peers sync at once. (While the outbound
-   budget binds, the choice is the least recently served: see "Sharing the
-   budget" below.)
+   budget binds, the choice is the least recently served, alive or
+   unresponsive: see "Sharing the budget" below.)
 2. **Link.** The session opens a held link to the peer's `lxmf.propagation`
    destination through AppLinks. Each attempt adds 12 min to the peer's
    backoff; an established link clears it.
@@ -1163,11 +1163,12 @@ Departures from the reference, each for a reason:
   2026-09-28): one session took the whole 600 (500 on the offer, 100 more on
   the held link), so one peer was served per ~73 s, and the pool chose the
   same fast peers again (one peer 7 sessions in a phase) while 7 of 20 got
-  nothing in 30 minutes. So while the budget **binds** — the ready waiting
-  peers (the ones step 1 could choose now), each counted up to one offer,
-  want more than is left of it — three rules apply, and none otherwise:
+  nothing in 30 minutes. So while the budget **binds** — the ready peers
+  step 1 could choose now, alive (waiting) or unresponsive with their
+  backoff run out, each counted up to one offer, want more than is left of
+  it — three rules apply, and none otherwise:
   - a session's **turn** is a **fair share** of messages **sent**: the
-    budget divided by the ready waiting peers (this one included), but never
+    budget divided by those ready peers (this one included), but never
     less than one tick's worth of it (budget × 24 s / 60 s, 240 of 600). A
     new session starts only on a tick, so at most 2.5 start in a minute; a
     smaller share would leave the budget unspent and serve no peer sooner.
@@ -1185,9 +1186,20 @@ Departures from the reference, each for a reason:
     of a share send 4080 and 3996 (tests
     `the_budget_is_spent_while_it_binds_when_batches_are_byte_limited`,
     `..._when_peers_want_part_of_each_offer`);
-  - the choice (step 1) is the ready waiting peer whose last turn
+  - the choice (step 1) is the ready peer whose last turn
     (`last_sync_attempt`) is **oldest**, at random among equals, instead of
-    the fastest-peer pool.
+    the fastest-peer pool — unresponsive peers past their backoff included,
+    and they count in the share and make a running session yield like
+    alive ones. The reference chooses an unresponsive peer only when no
+    alive peer waits, which relies on the waiting set draining quickly;
+    under the budget it does not, so one failed link attempt (12 min of
+    backoff, then the next tick marks the peer unresponsive) left a peer
+    with nothing until its next announce, every 6 h from lxmd by default
+    (review, 2026-09-28: 0 of 3000 in 30 minutes). Now its last turn is
+    the oldest once its backoff has run out, and it is chosen within a tick
+    or two (test `an_unresponsive_peer_takes_its_turn_while_the_budget_binds`).
+    An unreachable peer costs one link attempt per turn, and its backoff
+    grows by 12 min with each.
 
   With 20 ready peers each lacking many messages, one peer is served per
   tick, all 20 within ceil(20 / 2.5) = 8 minutes, in turns of 240 / 240 /
