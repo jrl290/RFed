@@ -494,6 +494,8 @@ fn main() -> Result<(), String> {
 
     let transfer_limit_mb: Option<u64> = cfg.storage.transfer_limit_mb;
     let sync_limit_mb: Option<u64>     = cfg.storage.sync_limit_mb;
+    // rfed.node channel sync (/rfed/get) has caps of its own, always set.
+    let (channel_transfer_limit_bytes, channel_sync_limit_bytes) = cfg.storage.channel_sync_limits_bytes();
 
     // Collect --static-peer CLI flags (repeatable), then fall back to config.
     let mut static_peers: Vec<Vec<u8>> = Vec::new();
@@ -704,6 +706,8 @@ fn main() -> Result<(), String> {
         storage_limit_bytes: storage_limit_mb * 1024 * 1024,
         transfer_limit_bytes: transfer_limit_mb.map(|m| m * 1024 * 1024),
         sync_limit_bytes: sync_limit_mb.map(|m| m * 1024 * 1024),
+        channel_transfer_limit_bytes,
+        channel_sync_limit_bytes,
         static_peers,
         from_static_only,
         trusted_backup_peers,

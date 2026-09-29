@@ -822,12 +822,11 @@ impl FedNode {
         fed_sync.from_static_only = config.from_static_only;
         fed_sync.static_peers = config.static_peers.clone();
         fed_sync.peer_state_file = Some(config.peer_state_file());
-        if let Some(lim) = config.transfer_limit_bytes {
-            fed_sync.transfer_limit_bytes = Some(lim as f64);
-        }
-        if let Some(lim) = config.sync_limit_bytes {
-            fed_sync.sync_limit_bytes = Some(lim as f64);
-        }
+        // Channel sync's own caps, never the propagation node's announced
+        // limits (`transfer_limit_bytes` / `sync_limit_bytes`): see sync.rs
+        // "Channel sync caps".
+        fed_sync.transfer_limit_bytes = config.channel_transfer_limit_bytes;
+        fed_sync.sync_limit_bytes = config.channel_sync_limit_bytes;
         let sync = Arc::new(Mutex::new(fed_sync));
 
         // ── RNS destinations ────────────────────────────────────────
@@ -2000,6 +1999,8 @@ mod backup_chain_tests {
             storage_limit_bytes: 1 << 20,
             transfer_limit_bytes: None,
             sync_limit_bytes: None,
+            channel_transfer_limit_bytes: crate::sync::DEFAULT_CHANNEL_TRANSFER_LIMIT_BYTES,
+            channel_sync_limit_bytes: crate::sync::DEFAULT_CHANNEL_SYNC_LIMIT_BYTES,
             static_peers: Vec::new(),
             from_static_only: false,
             trusted_backup_peers: Vec::new(),
@@ -5262,6 +5263,8 @@ mod announce_order_tests {
             storage_limit_bytes: 1 << 20,
             transfer_limit_bytes: None,
             sync_limit_bytes: None,
+            channel_transfer_limit_bytes: crate::sync::DEFAULT_CHANNEL_TRANSFER_LIMIT_BYTES,
+            channel_sync_limit_bytes: crate::sync::DEFAULT_CHANNEL_SYNC_LIMIT_BYTES,
             static_peers: Vec::new(),
             from_static_only: false,
             trusted_backup_peers: Vec::new(),
@@ -5457,5 +5460,21 @@ mod announce_order_tests {
         assert_eq!(expected.len(), ANNOUNCE_ORDER.len() - 1);
         assert_eq!(node.publish_destinations(), expected);
         assert_eq!(node.announce(), expected);
+    }
+
+    /// The /rfed/get responder takes the channel sync caps, never the
+    /// propagation node's announced limits. It used to take those, which the
+    /// templates leave unset (LXMF's defaults), and was then uncapped.
+    #[test]
+    fn channel_sync_takes_the_channel_caps_not_the_propagation_limits() {
+        let _guard = transport_guard();
+        let mut config = config("channel_caps", false);
+        config.transfer_limit_bytes = Some(1024 * 1024);
+        config.sync_limit_bytes = Some(10 * 1024 * 1024);
+        config.channel_transfer_limit_bytes = 7 * 1024 * 1024;
+        config.channel_sync_limit_bytes = 70 * 1024 * 1024;
+        let node = FedNode::new(Identity::new(true), config).expect("node");
+        let sync = node.sync.lock().unwrap();
+        assert_eq!((sync.transfer_limit_bytes, sync.sync_limit_bytes), (7 * 1024 * 1024, 70 * 1024 * 1024));
     }
 }

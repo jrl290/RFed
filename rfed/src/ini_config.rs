@@ -26,8 +26,27 @@ pub struct IniNode {
 
 pub struct IniStorage {
     pub limit_mb: Option<u64>,
+    /// The lxmf.propagation node's announced per-message and per-sync
+    /// limits (SPEC §10). Unset: LXMF's own defaults.
     pub transfer_limit_mb: Option<u64>,
     pub sync_limit_mb: Option<u64>,
+    /// rfed.node channel sync (`/rfed/get`): the most per response, and to
+    /// all peers per hour. Unset: `sync::DEFAULT_CHANNEL_*` — never uncapped.
+    pub channel_transfer_limit_mb: Option<u64>,
+    pub channel_sync_limit_mb: Option<u64>,
+}
+
+impl IniStorage {
+    /// The rfed.node channel sync caps in bytes, `(per response, per hour)`:
+    /// the configured ones, else the defaults. Never uncapped (see sync.rs
+    /// "Channel sync caps").
+    pub fn channel_sync_limits_bytes(&self) -> (u64, u64) {
+        let bytes = |mb: u64| mb.saturating_mul(1024 * 1024);
+        (
+            bytes(self.channel_transfer_limit_mb.unwrap_or(crate::sync::DEFAULT_CHANNEL_TRANSFER_LIMIT_MB)),
+            bytes(self.channel_sync_limit_mb.unwrap_or(crate::sync::DEFAULT_CHANNEL_SYNC_LIMIT_MB)),
+        )
+    }
 }
 
 pub struct IniPeering {
@@ -102,6 +121,8 @@ impl IniConfig {
             limit_mb:          flat_uint(s, "limit_mb")?,
             transfer_limit_mb: flat_uint(s, "transfer_limit_mb")?,
             sync_limit_mb:     flat_uint(s, "sync_limit_mb")?,
+            channel_transfer_limit_mb: flat_uint(s, "channel_transfer_limit_mb")?,
+            channel_sync_limit_mb:     flat_uint(s, "channel_sync_limit_mb")?,
         };
 
         // ── [peering] ─────────────────────────────────────────────────
@@ -138,6 +159,7 @@ impl IniConfig {
             },
             storage: IniStorage {
                 limit_mb: None, transfer_limit_mb: None, sync_limit_mb: None,
+                channel_transfer_limit_mb: None, channel_sync_limit_mb: None,
             },
             peering: IniPeering {
                 static_peers: vec![], from_static_only: None, peering_cost: None,
@@ -266,10 +288,16 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
   # propagation defaults, 256 KB per message and 10240 KB per sync, which
   # these whole-MB keys cannot express. Set, they are announced in KB of
   # 1000 B (MB x 1024^2 / 1000) and rfed refuses inbound sync Resources over
-  # the sync limit; 1 / 10 announce 1048 KB / 10485 KB. They also cap
-  # rfed.node channel sync (/rfed/get: bytes per response, per hour).
+  # the sync limit; 1 / 10 announce 1048 KB / 10485 KB. They do not touch
+  # rfed.node channel sync, which has its own caps below.
   # transfer_limit_mb = 1
   # sync_limit_mb     = 10
+
+  # channel_transfer_limit_mb and channel_sync_limit_mb cap rfed.node channel
+  # sync (/rfed/get): MB per response, and per hour for all peers. Unset they
+  # are 100 / 1000; there is never no cap.
+  # channel_transfer_limit_mb = 100
+  # channel_sync_limit_mb     = 1000
 
 
 [peering]
@@ -345,5 +373,40 @@ mod tests {
                 "{name}: LXMRouter.PROPAGATION_LIMIT and SYNC_LIMIT",
             );
         }
+    }
+
+    /// rfed.node channel sync (`/rfed/get`) is always capped. Its caps were
+    /// `transfer_limit_mb` / `sync_limit_mb`, the propagation announce's
+    /// keys, so 5bdce60 leaving those unset in the templates left the
+    /// MESSAGE_GET responder with no cap: a whole gap, any size, read from
+    /// disk into one response under the FedSync and BlobStore locks. It has
+    /// keys of its own now: the templates set the old 100 / 1000 MB, unset
+    /// they are the same, and the propagation keys do not touch them.
+    #[test]
+    fn the_config_templates_cap_channel_sync() {
+        let caps = (100 * 1024 * 1024, 1000 * 1024 * 1024);
+        for (name, text) in [
+            ("config.txt.example", include_str!("../../config.txt.example")),
+            ("rfed-nas.config", include_str!("../../rfed-nas.config")),
+        ] {
+            let cfg = IniConfig::parse(text).unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
+            assert_eq!(
+                (cfg.storage.channel_transfer_limit_mb, cfg.storage.channel_sync_limit_mb), (Some(100), Some(1000)),
+                "{name} sets the channel sync caps",
+            );
+            assert_eq!(cfg.storage.channel_sync_limits_bytes(), caps, "{name}");
+        }
+        let unset = [
+            ("SAMPLE_CONFIG", SAMPLE_CONFIG),
+            ("no [storage]", "[node]\n  name = x\n"),
+            ("propagation limits only", "[storage]\n  transfer_limit_mb = 1\n  sync_limit_mb = 10\n"),
+        ];
+        for (name, text) in unset {
+            let cfg = IniConfig::parse(text).unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
+            assert_eq!(cfg.storage.channel_sync_limits_bytes(), caps, "{name}: capped by the defaults");
+        }
+        assert_eq!(IniConfig::empty().storage.channel_sync_limits_bytes(), caps, "no config file: capped");
+        let set = IniConfig::parse("[storage]\n  channel_transfer_limit_mb = 5\n  channel_sync_limit_mb = 50\n").unwrap();
+        assert_eq!(set.storage.channel_sync_limits_bytes(), (5 * 1024 * 1024, 50 * 1024 * 1024));
     }
 }

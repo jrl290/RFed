@@ -4482,6 +4482,8 @@ mod tests {
                 storage_limit_bytes: 0,
                 transfer_limit_bytes: None,
                 sync_limit_bytes: None,
+                channel_transfer_limit_bytes: crate::sync::DEFAULT_CHANNEL_TRANSFER_LIMIT_BYTES,
+                channel_sync_limit_bytes: crate::sync::DEFAULT_CHANNEL_SYNC_LIMIT_BYTES,
                 static_peers: Vec::new(),
                 from_static_only: false,
                 trusted_backup_peers: Vec::new(),

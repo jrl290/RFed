@@ -150,10 +150,19 @@ pub struct NodeConfig {
     // ── Storage limits ────────────────────────────────────────────────
     /// Maximum total bytes of stored inner blobs
     pub storage_limit_bytes: u64,
-    /// Maximum bytes transferred to a peer in a single sync session
+    /// The lxmf.propagation node's per-message limit, announced to its peers
+    /// (`[storage] transfer_limit_mb`; SPEC §10). None: LXMF's 256 KB.
     pub transfer_limit_bytes: Option<u64>,
-    /// Maximum bytes transferred to a peer across all sessions per period
+    /// The lxmf.propagation node's per-sync limit, announced and held to on
+    /// inbound sync Resources (`[storage] sync_limit_mb`). None: 10240 KB.
     pub sync_limit_bytes: Option<u64>,
+    /// rfed.node channel sync: the most one `/rfed/get` response carries
+    /// (`[storage] channel_transfer_limit_mb`, default
+    /// `sync::DEFAULT_CHANNEL_TRANSFER_LIMIT_MB`). Always a cap.
+    pub channel_transfer_limit_bytes: u64,
+    /// rfed.node channel sync: the most `/rfed/get` responses carry to all
+    /// peers per hour (`[storage] channel_sync_limit_mb`). Always a cap.
+    pub channel_sync_limit_bytes: u64,
 
     // ── Peering ───────────────────────────────────────────────────────
     /// Explicitly configured peer destination hashes (16-byte truncated)
@@ -262,6 +271,8 @@ mod tests {
             storage_limit_bytes: 0,
             transfer_limit_bytes: None,
             sync_limit_bytes: None,
+            channel_transfer_limit_bytes: crate::sync::DEFAULT_CHANNEL_TRANSFER_LIMIT_BYTES,
+            channel_sync_limit_bytes: crate::sync::DEFAULT_CHANNEL_SYNC_LIMIT_BYTES,
             static_peers: Vec::new(),
             from_static_only: false,
             trusted_backup_peers: Vec::new(),

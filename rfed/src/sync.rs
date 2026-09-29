@@ -67,6 +67,26 @@ pub const BACKUP_PUSH_PATH: &str = "/rfed/backup/push";
 const SYNC_BACKOFF_MIN: f64 = 10.0;
 const SYNC_BACKOFF_MAX: f64 = 3600.0;
 
+// ── Channel sync caps (MESSAGE_GET responder) ────────────────────────────────
+//
+// `handle_message_get` builds one response for a peer's whole gap while the
+// FedSync and BlobStore mutexes are held, reading every blob from disk, so it
+// is never left uncapped. `[storage] channel_transfer_limit_mb` /
+// `channel_sync_limit_mb` set the caps; these are the defaults, the values
+// the shipped templates always set. (Until 2026-09-28 the caps were
+// `transfer_limit_mb` / `sync_limit_mb`, which are also the lxmf.propagation
+// node's announced limits; leaving those unset for the propagation announce
+// left /rfed/get with no cap at all.)
+
+/// The most one MESSAGE_GET response carries, in MB of 1024².
+pub const DEFAULT_CHANNEL_TRANSFER_LIMIT_MB: u64 = 100;
+/// The most MESSAGE_GET responses carry to all peers together per hour, MB.
+pub const DEFAULT_CHANNEL_SYNC_LIMIT_MB: u64 = 1000;
+/// `DEFAULT_CHANNEL_TRANSFER_LIMIT_MB` in bytes.
+pub const DEFAULT_CHANNEL_TRANSFER_LIMIT_BYTES: u64 = DEFAULT_CHANNEL_TRANSFER_LIMIT_MB * 1024 * 1024;
+/// `DEFAULT_CHANNEL_SYNC_LIMIT_MB` in bytes.
+pub const DEFAULT_CHANNEL_SYNC_LIMIT_BYTES: u64 = DEFAULT_CHANNEL_SYNC_LIMIT_MB * 1024 * 1024;
+
 // ── FedPeer ──────────────────────────────────────────────────────────────────
 
 /// State maintained for a known rfed peer node.
@@ -139,8 +159,11 @@ pub struct FedSync {
     /// Checked during manifest filtering and post-ingest fanout dispatch.
     pub distro_table: Arc<Mutex<DistroTable>>,
     pub max_peering_cost: u32,
-    pub transfer_limit_bytes: Option<f64>,
-    pub sync_limit_bytes: Option<f64>,
+    /// The most one MESSAGE_GET response carries, bytes. Always a cap (see
+    /// "Channel sync caps").
+    pub transfer_limit_bytes: u64,
+    /// The most MESSAGE_GET responses carry to all peers per hour, bytes.
+    pub sync_limit_bytes: u64,
     /// Local node's rfed.node destination hash. Used to ignore self-announces.
     pub local_node_hash: Option<Vec<u8>>,
     pub from_static_only: bool,
@@ -165,8 +188,8 @@ impl FedSync {
             subscription_table,
             distro_table,
             max_peering_cost: 26,
-            transfer_limit_bytes: None,
-            sync_limit_bytes: None,
+            transfer_limit_bytes: DEFAULT_CHANNEL_TRANSFER_LIMIT_BYTES,
+            sync_limit_bytes: DEFAULT_CHANNEL_SYNC_LIMIT_BYTES,
             local_node_hash: None,
             from_static_only: false,
             static_peers: Vec::new(),
@@ -445,27 +468,23 @@ impl FedSync {
                 Some(m) => m,
                 None => continue,
             };
-            // Enforce per-session transfer cap before reading the blob.
-            if let Some(limit) = self.transfer_limit_bytes {
-                if total_sent + meta.size as u64 > limit as u64 {
-                    log(
-                        format!("[sync] transfer limit reached ({}/{}B) — truncating response",
-                            total_sent, limit as u64),
-                        LOG_NOTICE, false, false,
-                    );
-                    break;
-                }
+            // Enforce the per-response transfer cap before reading the blob.
+            if total_sent + meta.size as u64 > self.transfer_limit_bytes {
+                log(
+                    format!("[sync] transfer limit reached ({}/{}B) — truncating response",
+                        total_sent, self.transfer_limit_bytes),
+                    LOG_NOTICE, false, false,
+                );
+                break;
             }
             // Enforce aggregate sync limit across all peers.
-            if let Some(limit) = self.sync_limit_bytes {
-                if self.sync_bytes_sent + meta.size as u64 > limit as u64 {
-                    log(
-                        format!("[sync] sync limit reached ({}/{}B) — refusing until next period",
-                            self.sync_bytes_sent, limit as u64),
-                        LOG_NOTICE, false, false,
-                    );
-                    break;
-                }
+            if self.sync_bytes_sent + meta.size as u64 > self.sync_limit_bytes {
+                log(
+                    format!("[sync] sync limit reached ({}/{}B) — refusing until next period",
+                        self.sync_bytes_sent, self.sync_limit_bytes),
+                    LOG_NOTICE, false, false,
+                );
+                break;
             }
             let blob = match store.get(id) {
                 Some(b) => b,
@@ -564,6 +583,52 @@ mod tests {
             .expect("system time")
             .as_nanos();
         std::env::temp_dir().join(format!("rfed_sync_{label}_{unique}"))
+    }
+
+    /// The MESSAGE_GET responder is never uncapped ("Channel sync caps"): a
+    /// FedSync starts at the default caps, and a response stops at the
+    /// per-response cap and at what is left of the hour's. With the caps
+    /// optional, a config without them served a peer's whole gap, any size,
+    /// in one response built under the FedSync and BlobStore locks.
+    #[test]
+    fn message_get_responses_are_always_capped() {
+        let base = temp_path("get_caps");
+        std::fs::create_dir_all(&base).expect("create temp dir");
+        let blob_store = Arc::new(Mutex::new(BlobStore::open(base.join("blobs"), 1024 * 1024)));
+        let subscription_table = Arc::new(Mutex::new(SubscriptionTable::load(base.join("subscriptions.rmp"))));
+        let distro_table = Arc::new(Mutex::new(DistroTable::load(base.join("distro.rmp"))));
+        let mut sync = FedSync::new(Arc::clone(&blob_store), subscription_table, distro_table);
+        assert_eq!(
+            (sync.transfer_limit_bytes, sync.sync_limit_bytes),
+            (100 * 1024 * 1024, 1000 * 1024 * 1024),
+            "capped before any config is applied",
+        );
+
+        let channel = vec![0x11; 16];
+        let ids: Vec<Vec<u8>> = (0..6u8)
+            .map(|i| blob_store.lock().unwrap().store(&channel, &[i; 100]).expect("store blob"))
+            .collect();
+        // Blobs in a response: channel(16) | id(16) | len(4) | blob.
+        let served = |response: Vec<u8>| -> usize {
+            let raw: Vec<u8> = rmp_serde::from_slice(&response).expect("bin payload");
+            let (mut at, mut count) = (0usize, 0usize);
+            while at + 36 <= raw.len() {
+                let len = u32::from_be_bytes(raw[at + 32..at + 36].try_into().unwrap()) as usize;
+                at += 36 + len;
+                count += 1;
+            }
+            count
+        };
+
+        // 250 B per response, 500 B an hour, blobs of 100 B.
+        sync.transfer_limit_bytes = 250;
+        sync.sync_limit_bytes = 500;
+        assert_eq!(served(sync.handle_message_get(&ids)), 2, "the per-response cap");
+        assert_eq!(served(sync.handle_message_get(&ids[2..])), 2);
+        assert_eq!(served(sync.handle_message_get(&ids[4..])), 1, "what is left of the hour's cap");
+        assert_eq!(served(sync.handle_message_get(&ids[5..])), 0, "the hour's cap is spent");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

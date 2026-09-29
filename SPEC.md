@@ -624,9 +624,18 @@ A → B: /rfed/get  payload = msgpack [wanted_id₁, wanted_id₂, ...]
 B → A: response   payload = binary blob stream (see §3)
 ```
 
-The response is subject to two limits:
-- **transfer_limit_bytes**: caps a single session (per-peer)
-- **sync_limit_bytes**: rolling 1-hour aggregate across all peers
+The response is subject to two caps, always set:
+- **`channel_transfer_limit_mb`** (`[storage]`, default 100): the most one
+  response carries (per peer request)
+- **`channel_sync_limit_mb`** (`[storage]`, default 1000): the most sent to
+  all peers together per hour
+
+B builds the response for A's whole gap while holding the FedSync and
+BlobStore locks and reading every blob from disk, so it is never uncapped.
+What a response leaves out is in the gap of A's next sync. Until 2026-09-28
+the caps were `transfer_limit_mb` / `sync_limit_mb`, which are also the
+`lxmf.propagation` node's announced limits (§10); left unset for that
+announce (the shipped templates since then), channel sync had no cap at all.
 
 ### Step 4: Ingest & Fanout
 
@@ -1301,8 +1310,8 @@ per-message limit and marked every message for rfed handled without sending
 it. The shipped templates (`config.txt.example`, `rfed-nas.config`, the
 first-run sample) leave both keys unset: their old 100 / 1000, announced for
 real, said 100 MB per message and ~1 GB per sync, ~410× and ~100× the
-reference; whole MB cannot express 256 KB. (The keys also cap `rfed.node`
-channel sync, §4.)
+reference; whole MB cannot express 256 KB. (`rfed.node` channel sync has
+caps of its own, `channel_transfer_limit_mb` / `channel_sync_limit_mb`, §4.)
 
 rfed holds senders to what it announces, as LXMF 1.1.1
 `LXMRouter.propagation_resource_advertised` does: a propagation Resource
@@ -1414,6 +1423,8 @@ lxmf_propagation_autopeer    = no
 limit_mb          = 2000
 # transfer_limit_mb = 1     # unset: LXMF's 256 KB per message (§10)
 # sync_limit_mb     = 10    # unset: LXMF's 10240 KB per sync (§10)
+channel_transfer_limit_mb = 100   # /rfed/get per response (§4); unset: 100
+channel_sync_limit_mb     = 1000  # /rfed/get per hour, all peers; unset: 1000
 
 [peering]
 static_peers         = aabbccdd...

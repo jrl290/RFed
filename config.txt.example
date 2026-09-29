@@ -60,11 +60,16 @@
   # to them, and rfed refuses an inbound sync Resource over the sync limit.
   # The old 100 / 1000 announced 100 MB per message and ~1 GB per sync,
   # ~410x and ~100x the reference. The smallest whole-MB values, 1 / 10,
-  # announce 1048 KB / 10485 KB. The same keys also cap rfed.node channel
-  # sync (/rfed/get: bytes per response, and per hour for all peers); unset,
-  # that is not capped.
+  # announce 1048 KB / 10485 KB. They do not touch rfed.node channel sync,
+  # which has its own caps below.
   # transfer_limit_mb = 1
   # sync_limit_mb     = 10
+
+  # rfed.node channel sync (/rfed/get): the most one response carries, and
+  # the most sent to all peers per hour, in MB. Unset they are 100 / 1000;
+  # there is never no cap.
+  channel_transfer_limit_mb = 100
+  channel_sync_limit_mb     = 1000
 
 
 [peering]
