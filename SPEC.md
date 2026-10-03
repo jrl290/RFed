@@ -67,6 +67,11 @@ Layer 4 (innermost — application):
         source_hash         = the sender's lxmf.delivery DESTINATION hash
                             = truncated_hash( name_hash("lxmf.delivery") || identity_hash )
                               — NOT truncated_hash(sender_identity_pub).
+        sender              = the posting identity: the distro identity when
+                              the device holds one, otherwise the device
+                              identity (§17.12; RFed-spec/Channel.md
+                              "Distro holders"). Subscriptions stay the
+                              device's.
         msgpack_payload     = the LXMF payload; its fields map may carry the
                               Retichat field 0xD1 (FIELD_RETICHAT, a map) whose
                               key 0 is the poster's Channel Display Name (see
@@ -89,16 +94,21 @@ Layer 2 (RFed wire payload, what the sender PUTs to /rfed/send):
                    STAMP_EXPAND_ROUNDS = 16 (see PoW STAMP CONTRACT below).
 
 Layer 1 (Reticulum transport — first hop):
-    Reticulum DATA packet, DestinationType::Single, addressed to
-    rfed.send (the RFed node's send endpoint). RFed decrypts the outer
-    Reticulum envelope with its node identity, validates the stamp,
-    strips it, and stores `inner_blob` keyed by channel_hash.
+    A `/channel/publish` request on the RFed node's `rfed.link`
+    (RFed-spec/Link.md), or a Reticulum DATA packet,
+    DestinationType::Single, addressed to the node's legacy
+    `rfed.channel` / `rfed.channel.publish` destination. RFed decrypts the
+    outer envelope (the link, or the packet with its node identity),
+    validates the stamp, strips it, and stores `inner_blob` keyed by
+    channel_hash.
 
 Layer 1' (Reticulum transport — fanout hop, one per subscriber):
-    For every subscriber S of channel_hash, RFed sends a Reticulum
-    DATA packet, DestinationType::Single, addressed to S's
-    rfed.delivery endpoint, with payload:
+    For every subscriber S of channel_hash, RFed pushes
         [ channel_hash(16) | inner_blob ]
+    by the first live route of §7 that takes it (a `/delivery` request
+    on S's bound rfed.link, a DATA packet on S's legacy
+    rfed.channel.stream link, a DATA packet to S's rfed.delivery
+    destination), and otherwise queues it for S's pull (§7).
     (No stamp on the fanout hop — stamp was already validated at ingest.)
 ```
 
@@ -714,6 +724,46 @@ SQLite (`subscriptions.sqlite3`, one row per entry; see §13 Data Files).
 | `owner_node_hash` | `Option<[u8; 16]>` | Non-None = backup subscription |
 | `last_refreshed` | `f64` | Backup TTL tracking |
 
+The subscriber is a **device**: clients sign `/rfed/subscribe` with their
+device key, also when they post as a distro (§17.12). The node keeps one row
+per channel, one bound `rfed.link` (RFed-spec/Link.md), one deferred bucket
+(§7) and one wake address (§9) per subscriber hash, which is why devices
+never subscribe under a shared hash.
+
+### Channel and distro hashes
+
+Channel hashes (identity hashes, §1) and distro hashes (`lxmf.delivery`
+hashes, §17.5) are both 16-byte routing hashes in one namespace: the
+BlobStore, the sync manifest and the deferred queue key blobs by them alike.
+A node keeps the two apart for every distro registered at it, judged against
+its own DistroTable (`DistroTable::is_distro`) when the request or the blob
+arrives:
+
+- **Subscribe.** `/rfed/subscribe` (`/channel/subscribe` on `rfed.link`)
+  stores nothing and answers a bare msgpack `false`, as for any refused
+  subscription, when `channel_hash` is a registered distro's
+  `distro_lxmf_hash` (`subscribe_cb`).
+- **Sync ingest.** For a routing hash that is a registered distro, sync
+  ingest (§4 step 4, §17.7) runs the distro fan-out only, never the channel
+  fan-out. This stops delivery to a subscription row that exists anyway: one
+  made before the distro registered here, a backup row pushed by a peer, or
+  one stored before this rule.
+
+Without them anyone could subscribe to a user's distro address as a channel
+and be sent that distro's messages as this node pulled them from its peers:
+still encrypted to the distro key, but with their timing and size. Found by
+reading the code on 2026-10-03, not observed. Before this rule
+`subscribe_cb` checked only the length of the hash; where the rule stands in
+the code is in §17.12, "Implementation index".
+
+Not covered: a node knows only its own DistroTable. Where a distro is not
+registered, its hash can still be subscribed as a channel, and that node
+then pulls the distro's blobs from its peers for the subscriber (§4 step 2):
+the same ciphertext. A publish under a distro hash is not refused either. It
+reaches no channel subscriber where these rules hold, and what a peer's
+distro fan-out makes of it is a message to the distro, which anyone can
+already send through `lxmf.propagation`.
+
 ### Primary vs. Backup Subscriptions
 
 - **Primary** (`owner_node_hash = None`): Created via `/rfed/subscribe`.
@@ -796,9 +846,10 @@ key of `source + LXMF timestamp`, and a stored distro message by an id of
 source, timestamp and content (§17.11 rule 5); channel blobs by their own
 message identity.
 
-One deferred bucket holds everything for an identity, and one identity is
-often both a channel subscriber and a distro device. Each pull takes only its
-own kind: `/distro/pull` (and `/rfed/pull` on `rfed.distro.register`) returns
+One deferred bucket holds everything for an identity, and one identity, a
+device's, is often both a channel subscriber and a distro device (§6,
+§17.12). Each pull takes only its own kind: `/distro/pull` (and `/rfed/pull`
+on `rfed.distro.register`) returns
 only blobs for distros registered at this node, `/channel/pull` only the
 requested channel's, and `/rfed/pull` on `rfed.delivery` returns both, for
 the client to route by the leading hash.
@@ -835,24 +886,42 @@ When the global limit is reached, new entries are silently dropped.
 
 ### Fanout Process
 
-When a blob is ingested (via SEND or sync), `fanout_blob()` iterates over
-all subscribers for the channel:
+When a channel blob is ingested — a publish (a DATA packet to `rfed.channel`
+or `rfed.channel.publish`, a `/channel/publish` request or bare DATA or
+Resource on `rfed.link`) or a blob from peer sync (§4) — the node snapshots
+the channel's subscribers (`plan_channel_fanout`) and `fanout_blob()` takes
+each in turn:
 
-1. Skip backup subscriptions where the owner is still online.
-2. Look up the subscriber's identity and current path.
-3. Build an outbound Reticulum packet to the subscriber's `rfed.delivery`
-   destination, containing the inner blob as payload.
-4. Send the packet.
-5. If the subscriber is unreachable, add to the "missed" list for deferred
-   queuing.
+1. Skip a backup subscription whose owner is still online (§6, §11).
+2. Try the subscriber's live routes in the order of §7 "Live delivery and its
+   proof" — a `/delivery` request on its bound `rfed.link`, a DATA packet on
+   its legacy `rfed.channel.stream` link, a DATA packet to its
+   `rfed.delivery` destination — and stop at the first that takes the push.
+   The payload is `[ channel_hash(16) | inner_blob ]` on every route.
+3. When no route takes it, or the one that took it never confirms it, hand
+   the blob off once: queue it under the subscriber's identity hash and wake
+   the subscriber through its notify registrations (§7, §9).
+
+The poster is not left out. RFed cannot tell who posted (the source is inside
+the EC envelope), so a poster that is subscribed is sent its own post back,
+and so is every sibling device of its distro that subscribed; clients
+recognise their own posts and dedupe them (RFed-spec/Channel.md, "Distro
+holders").
+
+Distro blobs never take this path. Sync ingest runs the distro fan-out for
+them (§17.3, §17.7), and no channel fan-out for a routing hash that is a
+distro registered at this node (§6, "Channel and distro hashes"); the
+`lxmf.propagation` intercept and a channel publish each run only their own
+fan-out.
 
 ### Double Envelope
 
 ```
 ┌─── Outer Envelope (rfed → subscriber) ───────────────────────────┐
-│  Reticulum HEADER_1 packet                                       │
-│  Destination: subscriber's rfed.delivery (Single, encrypted)     │
-│  Payload: [ inner_blob ]                                         │
+│  The route of §7: a /delivery request on the subscriber's        │
+│  rfed.link, a DATA packet on its rfed.channel.stream link, or    │
+│  a Single packet to its rfed.delivery (all encrypted)            │
+│  Payload: [ channel_hash(16) | inner_blob ]                      │
 │                                                                  │
 │  ┌─── Inner Blob (sender → channel) ─────────────────────────┐  │
 │  │  Encrypted to channel X25519 pubkey                        │  │
@@ -1656,8 +1725,10 @@ Distro is a **double-wrap, server-blind** relay (same trust model as channels):
 Sender → LXMF message encrypted to distro identity
        → lxmf.propagation PUT (standard LXMF path)
        → RFed intercepts, stores in BlobStore (NOT messagestore)
-       → RFed fans out to each registered device via rfed.delivery
-       → Device receives on rfed.delivery, decrypts with shared distro key
+       → RFed fans out to each registered device (§17.3): /lxmf/delivery on
+         its rfed.link, else its rfed.propagation.stream, else queued for
+         /distro/pull with a notify wake — never an rfed.delivery packet
+       → Device decrypts with the shared distro key
 ```
 
 **Key differences from channels:**
@@ -1665,10 +1736,12 @@ Sender → LXMF message encrypted to distro identity
 | | Channel | Distro |
 |---|---|---|
 | Identity model | Derived from channel name | Standard LXMF identity, shared out-of-band |
-| Registration | Self-service (know name → join) | Owner-managed (distro key proves ownership) |
+| Registration | Self-service (know name → join); the subscriber is the device, signing with its own key | Owner-managed (distro key proves ownership); each device registers under the distro |
 | Sender experience | Must know channel name, derive keys | Sends normal LXMF to a normal address |
-| Reply identity | Each sender signs with own identity | All devices reply as the distro identity |
-| Ingress | `rfed.channel.publish` (DATA) | `lxmf.propagation` (intercepted) |
+| Reply identity | The poster's posting identity: the distro when the device holds one, otherwise the device (§17.12) | All devices reply as the distro identity |
+| Ingress | `/channel/publish` on `rfed.link`, or a DATA packet to the legacy `rfed.channel` / `rfed.channel.publish` | `lxmf.propagation` (intercepted) |
+| Membership across a distro's devices | Synced by the `rfed.distro.channel` message (§17.12); each device subscribes itself | Each device registers itself |
+| Routing hash | Channel identity hash (§1); a registered distro's hash is refused (§6) | The distro's `lxmf.delivery` hash |
 
 ### 17.2 Cross-Node Distribution
 
@@ -1763,9 +1836,10 @@ The FedSync engine treats channel and distro blobs uniformly:
   local subscribers AND distros with local devices.
 - **Gap filtering** (`gap_from_peer`): pulls blobs for subscribed channels
   OR registered distros that the node doesn't already hold.
-- **Post-ingest dispatch**: calls `fanout_blob()` for channel hashes and
-  `distro_fanout()` for distro hashes, then enqueues missed subscribers/devices
-  in the DeferredQueue.
+- **Post-ingest dispatch**: calls `distro_fanout()` for a hash that is a
+  distro registered at this node and `fanout_blob()` for any other hash,
+  never both (§6, "Channel and distro hashes"), then enqueues missed
+  subscribers/devices in the DeferredQueue.
 
 ### 17.8 Deferred PULL on distro.register
 
@@ -1847,8 +1921,10 @@ sending device.
 
 **No copy is sent for:** identity transfers (`"rfed.distro.transfer"`,
 §17.9), delivery notifications and ticket-only messages, group messages,
-channel messages, messages whose destination is D itself, or when the device
-holds no distro identity.
+channel messages, messages whose destination is D itself (the channel
+membership messages of §17.12 among them), or when the device holds no
+distro identity. A channel post needs no copy: every sibling subscribed to
+the channel receives the post itself (§17.12).
 
 **Receiving.** A device unwraps a fan-out blob with its distro key (§17.3).
 A message whose `fields[0xFB]` is `"rfed.distro.sent"` is a copy, and the
@@ -1923,6 +1999,276 @@ so only holders of the distro key can read it, and they are the user's own
 devices, which already know one another's addresses from
 `/rfed/distro/list` (§17.5). RFed and relays see only an ordinary distro
 blob.
+
+### 17.12 Channels and the distro
+
+Decided by James, 2026-10-03. RFed joins the two mechanisms nowhere: it never
+sees who signed a post (the source is inside the EC envelope), its channel
+fan-out reads only the subscription table (§8), and its distro fan-out
+carries only messages addressed to a distro (§17.3). This section is the
+contract for a device that holds a distro identity D and uses channels.
+Before it, every client signed its posts, subscribed, and kept its channel
+list as the device alone (Retichat-js 24d83e6, Retichat-ios 07f6d70,
+Retichat-android 47bdb0a), so a user's own post from another device showed
+as a stranger's, and each device had to join each channel itself.
+
+**Posting and subscribing.** Normative in RFed-spec/Channel.md, "Distro
+holders"; in short:
+
+- A post is signed by D: its `source_hash` is D's `lxmf.delivery` hash and
+  its RTID prelude carries D's public key. Without a distro, the device signs.
+- `/rfed/subscribe` and `/rfed/unsubscribe`, the stream-open signature, the
+  link's identify (and so every pull) and the channel notify registrations
+  stay the **device's**. RFed keeps one subscription row, one bound
+  `rfed.link`, one deferred bucket and one wake per subscriber hash (§6, §7,
+  §9). Devices subscribed under D would be one subscriber: the last to bind
+  would get every push, the first to pull would take what the others missed,
+  and every wake would go to D. They would steal each other's posts.
+- A received post is the user's own when its source is the device's
+  `lxmf.delivery` hash or D's. It is shown as outgoing, never notified, never
+  counted as a sender, and deduplicated by `(source, timestamp_ms)` against
+  what the client has stored, rfed's echo of the post included.
+- The Channel Display Name state is kept per channel and posting identity,
+  and learns from D's posts that reach the device, whichever device sent them
+  (LXMF-rust/DISPLAY_NAMES.md §4.2).
+
+**Membership sync.** Joining or leaving a channel on one device is applied on
+every other device of D. The change travels as a distro message through the
+existing fan-out, the way a sent copy does (§17.11); each sibling then
+subscribes or unsubscribes with its own device key. RFed needs no change.
+
+*Who sends it.* A device holding D whose channel list changes by the user's
+own action — the user joins a channel not in the list, or leaves one that is
+— sends one membership message C. Nothing else sends one: not a change made
+by applying a received C, not restoring or re-subscribing the list at start,
+not a stamp refresh, not a join of a channel already in the list, and not a
+device that holds no distro.
+
+| | Membership message C |
+|---|---|
+| Destination | D's `lxmf.delivery` |
+| Source / signature | D, signed with D's key (the "send as distro" path of §17.11) |
+| Title, content | Empty |
+| `fields[0x0C]` (FIELD_TICKET) | An empty bin. It is no ticket: it is there so that older clients take C for a delivery notification and drop it (below). Receivers neither read nor remember it |
+| `fields[0xFB]` (FIELD_CUSTOM_TYPE) | `"rfed.distro.channel"` |
+| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name, `<root>.<name>`, as UTF-8 str (receivers accept bin too). `at_ms` is an unsigned integer, the time of the user's action in milliseconds since the epoch (rule 5 below). Receivers ignore elements after the third |
+| `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
+| `fields[0xD1]` | None: C is a message to one's own devices and carries no Message Display Name (DISPLAY_NAMES.md §4.1) |
+| Method | PROPAGATED at once (D is a distro, §17.10); RFed intercepts it on `lxmf.propagation` and fans it out to every registered device of D, the sender included |
+
+The name is all a sibling needs to join. For a public channel it is
+`public.<name>`. For a private channel it is `<root>.<name>`, which is the
+invite and the key at once: the channel identity is derived from it (§1), and
+there is no other key material. C is encrypted to D, so only holders of D's
+key can read it; RFed, relays and peers see an ordinary distro blob.
+
+C is sent once per change and is fire-and-forget: its delivery state changes
+nothing on the sending device, which changed its own list when the user
+acted.
+
+*Receiving.* A device unwraps a fan-out blob with its distro key (§17.3). A
+message whose `fields[0xFB]` is `"rfed.distro.channel"` is a membership
+message, and the device applies these rules to it in order; the first rule
+that drops it ends the check.
+
+1. **Source.** If the unwrapped source is not D, it is ignored and logged.
+2. **Signature.** It MUST carry a valid LXMF signature by D's key, checked
+   exactly as §17.11 rule 2 checks a sent copy; one that fails is dropped
+   with a log line. D's public key is announced, so anyone can encrypt a
+   message to D that claims source D. Without this check a stranger could
+   make the user's devices join a channel of the stranger's choosing, or
+   leave a channel and delete its history.
+3. **Own echo.** If `fields[0xFD]` is this device's own `lxmf.delivery`
+   address, it is dropped silently and recorded as seen: this device made
+   the change when the user acted.
+4. **Form.** `op` must be `"join"` or `"leave"`, `name` must be a channel
+   name the client's own join accepts (the rules a typed name must pass), and
+   `at_ms` a non-negative integer. Anything else is dropped with a log line.
+5. **Order.** The device keeps, per channel hash, the last membership action
+   it made or applied, `(op, at_ms)`, persisted, and kept after a leave. A
+   message whose `at_ms` is older than the recorded one is stale and is
+   dropped (recorded as seen). At an equal time a leave replaces a join and a
+   join never replaces a leave, so every device ends in the same state in
+   whatever order the messages arrive. A user's action on this device is
+   recorded the same way, and the C it sends carries that record: its `at_ms`
+   is the current time, or one more than the `at_ms` already recorded for the
+   channel when that is later. The user's latest action is then the newest on
+   every device, even when this device's clock is behind a sibling's.
+6. **Apply,** with this device's own identity and its own configured RFed
+   node, as the user's own join or leave on this device would:
+   - `join` of a channel not in the list: the channel is added, then
+     subscribed with the device key. It is stored before it is subscribed,
+     so a subscription that cannot be made now is made by the client's own
+     subscription of stored channels when its RFed link is ready, never by
+     a retry (DESIGN_PRINCIPLES.md §3, §5);
+   - `join` of a channel already in the list: nothing but the record;
+   - `leave` of a channel in the list: unsubscribe with the device key,
+     remove the channel's push registration, its posts and its names;
+   - `leave` of a channel not in the list: nothing but the record.
+
+   Then `(op, at_ms)` is recorded. Applying C never sends a membership
+   message, so nothing loops. It asks nothing of the user: no notification,
+   no alert, no prompt; the channel list simply changes.
+
+*A device that is offline.* C is a distro blob like any other. A device with
+no live route has it handed off (§17.3): queued in its deferred bucket and
+woken through its LXMF notify registration, and it applies C when it next
+collects its backlog with `/distro/pull` (`/rfed/pull` on
+`rfed.distro.register`). A device registered at another RFed node gets C
+through FedSync (§17.2). Not covered: the queue keeps an entry for 7 days,
+and a device's bucket holds at most its per-subscriber limit (256 by default,
+§7 "Limits"), shared with its channel posts, the oldest evicted first. A
+device offline for longer, or whose bucket overflows, never learns the
+change, and neither does a device that imports D after it. Such a device
+keeps its own list until the next change of that channel; there the user
+joins by name, as before. No catch-up exchange is defined.
+
+*Older clients.* C has empty content, a ticket and no attachment, which every
+client that predates this section takes for a delivery notification and drops
+without showing anything:
+
+- Retichat-js up to 24d83e6: `_handleDistroBlob` finds no sent-copy marker,
+  `LXMF.isDeliveryNotification` is true, and an empty bin is no ticket of
+  the web's (`LXMF.webTicket`), so C is dropped with a console line and a
+  push of it is answered `false`;
+- Retichat-android up to 47bdb0a: `RfedDistroClient.handleBlob` returns on
+  the unwrap's `is_delivery_notification`;
+- Retichat-ios up to 07f6d70: `RfedDistroClient.unwrapAndDeliver` makes it
+  `.notification`, and the NSE's `NSEDistroPull.unwrapToShow` returns nil.
+
+Without the ticket, or with any content, each of them would store C as a
+message from the user's own distro address, and iOS and Android would notify.
+Checked on 2026-10-03 by running the shipped `lxmf_rust::distro::unwrap_blob`
+and Retichat-js's own `LXMessage.decodePayload` and `LXMF` helpers on C's
+bytes, and on the same bytes without `0x0C` or with content. `unwrap_blob`
+keeps reporting `is_delivery_notification` for C after this section, so an
+app built against a newer LXMF-rust that does not read the marker still drops
+it. An updated client reads the marker before its delivery-notification
+test. An older device follows none of its siblings' changes and sends none.
+
+*Privacy.* `fields[0xFD]` reveals which device acted, to holders of D only,
+as in §17.11. A private channel's name, its invite, sits encrypted to D in
+RFed's BlobStore and deferred queues, as every distro blob does.
+
+#### Implementation index
+
+Where each part lives or is to be made, by function (not line).
+
+| Part | Where | Status (2026-10-03) |
+|---|---|---|
+| Namespace guard (§6) | RFed-rust `subscribe_cb` and the sync-ingest dispatch in `rfed/src/destinations.rs` | being made in its own lane on 2026-10-03; record the commit here when it lands |
+| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | being made in its own lane on 2026-10-03; record the commits here when they land |
+| Shared Rust for the phones | LXMF-rust, below | not started |
+| iOS | Retichat-ios at 07f6d70, below | not started |
+| Android | Retichat-android at 47bdb0a, below | not started |
+
+**LXMF-rust** (shared by both phones).
+
+- `distro.rs`: a constant `DISTRO_CHANNEL_TYPE = "rfed.distro.channel"`.
+  `unwrap_blob` reports the marker as `DistroMessage.channel_sync`
+  (`op`, `name`, `at_ms`, and `by` from 0xFD), set whenever the type
+  matches, with an unusable value reported as absent so the client drops
+  and logs it, as `sent_by` does for §17.11. It applies the D-signature
+  check of §17.11 rule 2 to this type too, and it keeps
+  `is_delivery_notification` true for C. `DistroMessage::to_json` carries
+  it as `"channel_sync"` (an object, or null), so `retichat_distro_unwrap`
+  (iOS) and `nativeDistroUnwrap` (Android) pass it on unchanged.
+- One writer for C's fields, `distro::channel_sync_fields(op, name, at_ms,
+  device_hex)`, and a message setter for the bridges (C
+  `lxmf_message_set_distro_channel_sync`, JNI
+  `nativeMessageSetDistroChannelSync`): the generic setters
+  (`message_add_field_string` / `_bool`) write only str and bool, and 0xFC
+  is an array.
+- `name_ledger::is_own_devices_message`: `DISTRO_CHANNEL_TYPE` too
+  (DISPLAY_NAMES.md §4.1).
+- `channel::pack`: unchanged; it signs with the identity it is given.
+- Tests: C's shape unwraps as a delivery notification with the marker set
+  (mutation: drop 0x0C and the notification flag goes); a C claiming D
+  without D's signature is rejected; a marker from another source is
+  reported for rule 1.
+
+**Retichat-ios.**
+
+- Posting: `RfedChannelClient.trySend` packs with the handle from
+  `DistroManager.shared.sendingIdentity(deviceHash:deviceHandle:)`, not
+  `identityHandle`; the optimistic post's `senderHash` (`sendMessageAsync`)
+  and `canonicalId` in `trySend` take the posting hash, not `ownHashHex`.
+  `identityHandle` (set by `RetichatApp`'s `channelClient.configure`) stays
+  for `subscribeOnServer`, `leaveChannel`'s unsubscribe,
+  `buildChannelStreamPayload`, `pullDeferred` and the channel registrations
+  of `RfedNotifyRegistrar`.
+- Own posts: `RfedChannelClient.dispatchVerifiedLxmf` sets `isOutgoing`
+  when the sender is `ownHashHex` or `DistroManager.shared.deliveryHashHex`,
+  and then calls no `noteSender`, posts no notification, and feeds the post's
+  name to the §4.2 state. The NSE: `NSEChannelPull.run` drops the distro's
+  hash from what it shows, beside `ownHash`.
+- Name state: `channelPostName(for:)` and `recordPostName` keyed by channel
+  and posting identity (`ChannelEntity.nameLastDigestHex` /
+  `nameLastIncludedAt`, reset when the posting identity changes).
+- Sending C: the user's join and leave (`joinChannel(name:
+  rfedNodeIdentityHashHex:)`, `leaveChannel(channelHashHex:)` as the UI
+  calls them) call a new `ChatRepository.sendDistroChannelSync`, built as
+  `sendDistroSentCopy` is.
+- Receiving C: a `channelSync` case of `RfedDistroClient`'s `Inbound`,
+  chosen in `unwrapAndDeliver` before `.notification`; rules 1-5 in a pure
+  `DistroCodec.channelSyncDisposition` beside `sentCopyDisposition`; rule 6
+  in `RfedChannelClient`: a join stores the `ChannelEntity` and subscribes
+  through `resubscribePersistedChannels` (today `joinChannel` subscribes
+  before it stores), a leave runs `leaveChannel`'s clean-up without sending
+  C. The per-channel `(op, at_ms)` record is new storage, kept after a
+  leave.
+
+**Retichat-android.**
+
+- Posting: `RfedChannelClient.sendMessage` and `trySend` pack with
+  `DistroManager.sendingIdentity(selfDestHash, identityHandle)`; the
+  optimistic post's `sourceHashHex` and `canonicalMessageId` take the
+  posting hash, not `StackRuntime.selfDestHash`. `StackRuntime.identityHandle`
+  stays for `subscribeOnServer`, `leaveChannel`'s unsubscribe,
+  `sendChannelStreamConfig`, `pullDeferred` and
+  `RfedNotifyRegistrar.registerForChannel` / `deregisterForChannel`.
+- Own posts: `RfedChannelClient.dispatchBlob` sets `isOutbound` for
+  `DistroManager.deliveryHashHex` too, and then records no
+  `recordChannelSender`, posts no notification, and feeds the post's name to
+  the §4.2 state.
+- Name state: `channelPostName` and `recordPostName` keyed by channel and
+  posting identity (`ChannelNameStateEntity`, which needs a Room migration,
+  or is cleared when the posting identity changes).
+- Sending C: the user's join (`JoinChannelScreen` → `joinChannel`) and leave
+  (`ChatListViewModel`, `ConversationScreen` → `leaveChannel`) call a new
+  `ChatRepository.sendDistroChannelSync`, built as `sendDistroSentCopy` is.
+- Receiving C: `RfedDistroClient.handleBlob` reads `channel_sync` before
+  `if (isNotification) return`; rules 1-5 in a pure
+  `DistroCodec.classifyChannelSync` beside `classifySentCopy`; rule 6 in
+  `RfedChannelClient`: a join stores the `ChannelEntity` and subscribes
+  through `resubscribePersistedChannels` (today `joinChannel` subscribes
+  before it stores), a leave runs `leaveChannel`'s clean-up without sending
+  C. The per-channel `(op, at_ms)` record is a new table, kept after a
+  leave.
+
+**Retichat-js** (as of 24d83e6).
+
+- Posting: `RnsClient.sendChannelMessage` packs with
+  `this.sendingIdentity().identity`; the echo key and the optimistic
+  record's `srcHash` take `sendingIdentity().hash`, and the record's
+  `timestamp` the packed `tsMs` (today the echo key is the device's
+  `lxmf.delivery` hash, `srcHash` the device's identity hash, and
+  `timestamp` the time the record was made).
+- Own posts and dedupe: `_handleChannelPacket` stores a post from
+  `ownLxmfDestinationHash()` or `DistroManager.lxmfDeliveryHash` as
+  `dir: "out"`, with no `ContactStore.keep` and no
+  `ChannelPostNamesStore.noteSender`; `ChannelMsgStore.add` drops a post
+  whose `(srcHash, timestamp)` it already holds, the stored `timestamp`
+  being the post's own `tsMs` (today only the in-memory `_chanSeenIds`
+  dedupes).
+- Name state: `ChannelPostNames` (`lib/name_ledger.js`) per channel and
+  posting identity, learning from own posts.
+- Sending C: `joinChannel` and `leaveChannel` (user actions) call a new
+  `_sendDistroChannelSync`, built as `_sendDistroSentCopy` is.
+- Receiving C: `_handleDistroBlob` reads the marker (new
+  `LXMF.DISTRO_CHANNEL_TYPE`, `LXMF.distroChannelSyncFromFields`) before
+  `LXMF.isDeliveryNotification`, with the source and signature checks it
+  already makes for a sent copy.
 
 ### 17.9 Distro Identity Transfer
 
