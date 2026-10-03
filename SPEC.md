@@ -2105,7 +2105,7 @@ device that holds no distro.
 | Title, content | Empty |
 | `fields[0x0C]` (FIELD_TICKET) | An empty bin. It is no ticket: it is there so that older clients take C for a delivery notification and drop it (below; web builds before 2026-09-30 do not). Receivers neither read nor remember it |
 | `fields[0xFB]` (FIELD_CUSTOM_TYPE) | `"rfed.distro.channel"` |
-| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name as the sending device stores it, as UTF-8 str (receivers accept bin too): `<root>.<name>` for every channel joined since the name rules of 2026-09-27, and for a channel joined earlier the name it was joined with, which may break those rules (Retichat-js before b75e02e joined any trimmed name). `at_ms` is the time of the user's action in milliseconds since the epoch (rule 5 below): a msgpack integer from 0 to 2^53 − 1, in any integer encoding: the web writes int 64 (`0xd3`), rmpv and umsgpack write uint 64 (`0xcf`) ("`at_ms` on the wire" below). Receivers ignore elements after the third |
+| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name as the sending device stores it, as UTF-8 str (receivers accept bin too): `<root>.<name>` for every channel joined since the name rules of 2026-09-27, and for a channel joined earlier the name it was joined with, which may break those rules (Retichat-js before b75e02e joined any trimmed name). `at_ms` is the time of the user's action in milliseconds since the epoch (rule 5 below): a msgpack integer from 0 to 2^53 − 1, in any integer encoding: the web writes int 64 (`0xd3`), rmpv and umsgpack write uint 64 (`0xcf`) ("`at_ms` on the wire" below). A larger value is no `at_ms`, and rule 4 drops it. Receivers ignore elements after the third |
 | `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
 | `fields[0xD1]` | None: C is a message to one's own devices and carries no Message Display Name (DISPLAY_NAMES.md §4.1) |
 | Method | PROPAGATED at once (D is a distro, §17.10); RFed intercepts it on `lxmf.propagation` and fans it out to every registered device of D, the sender included |
@@ -2137,10 +2137,21 @@ value for `0xd3` exactly as for `0xcf`, and `None` for a negative integer or
 a float. Retichat-js reads it from the payload's bytes (`lib/channel_sync.js`
 `readChannelSync`, through `msgpack_raw.js` `readHead`), every integer
 encoding included. A float (`0xca`, `0xcb`), even an integral one, a negative
-integer, a str and a nil are no `at_ms`, and rule 4 drops them. A writer MUST
-NOT write a value above 2^53 − 1: the web holds `at_ms` in a JavaScript
-number, which is exact only up to there, and its writer refuses a larger one.
-A millisecond clock stays below that bound for about 285,000 years.
+integer, a str and a nil are no `at_ms`, and rule 4 drops them.
+
+The value is bounded at 2^53 − 1, on both sides. A writer MUST NOT write a
+larger one: the web holds `at_ms` in a JavaScript number, which is exact only
+up to there, and its writer refuses a larger one. A receiver MUST drop a
+larger one under rule 4, whatever its encoding, because the clients would
+otherwise order it differently. `readHead` turns a 64-bit integer into a
+JavaScript number, which rounds above 2^53 − 1 (2^53 + 1 reads as 2^53),
+while `as_u64()` keeps it exact. A join at 2^53 + 1 and a leave at 2^53 would
+then be equal times on the web, where rule 5 keeps the leave, and different
+times on a phone, where it keeps the join. So LXMF-rust takes `as_u64()` and
+then refuses a value above 2^53 − 1, and the web refuses a value that is not
+`Number.isSafeInteger` (every value read from 2^53 up rounds to 2^53 or
+more, which is not). A millisecond clock stays below the bound for about
+285,000 years, so no real C is dropped by it.
 
 The type does not affect rule 2. C's payload has four elements and no stamp (D
 asks none, §17.10), so every receiver checks D's signature over the payload
@@ -2157,31 +2168,57 @@ shipped `unwrap_blob` reports `signature_validated` and
 over rmpv's re-pack of the same payload. The web reads a `0xcf` `at_ms` as it
 reads its own.
 
-*On the sending device.* C is sent once per change. Its delivery state changes
+*On the sending device.* One C is made per change. Its delivery state changes
 nothing in the sending device's list, which changed when the user acted. The
 device still keeps C until the propagation node proves it has it:
 
 - C is packed and signed by D once, when the user acts, and written to
   persistent storage before anything can yield.
-- It is uploaded at once when the propagation link is up. Otherwise, and
-  after an upload that was not proved (the packet was reported lost, or the
-  link closed or the connection stopped first), it is uploaded when the
-  propagation link next comes up. Three events trigger an upload or end one:
-  the user's action, the link coming up, and the node's proof. There is no
-  timer and no retry loop (DESIGN_PRINCIPLES.md §3, §5). A proof that comes
-  after the upload was reported lost still settles it.
-- Every upload is the same LXMF message, packed once. A sibling that gets C
-  twice (the node had an upload whose proof never reached the sender) holds
-  the second as a repeat and applies C once.
+- It is uploaded at once when the propagation link is up, and otherwise when
+  the link next comes up. That wait is the ordering of DESIGN_PRINCIPLES.md
+  §5, not a retry: the link coming up is the readiness signal, and C has not
+  been sent before it. Three events start or end an upload: the user's
+  action, the link coming up, and the node's proof. There is no timer.
+- The node's proof settles C: it is owed no more and never goes again. A
+  proof that comes after the upload was reported lost settles it too.
+- An upload that is not proved (its packet was reported lost, or the link
+  closed or the connection stopped first) is a failure, and the device says
+  so: a log line, and an error the client can show the user.
+- **Sending C again after that failure is open for James.** A second upload
+  of a C whose upload failed is a message-send retry. DESIGN_PRINCIPLES.md §3
+  forbids those unless James makes an exception, as he did on 2026-10-03 for
+  the gateway's registration at a PHP relay, and he has made none for C.
+  Retichat-js at a448e98 does send it again: C stays owed, and the same
+  packed message is uploaded when the propagation link next comes up. It also
+  uploads C again on a new link that replaced the earlier one without closing
+  it, while the earlier upload is still neither proved nor reported lost.
+  Until James decides, this section does not require a second upload, and
+  the phones do not build one. The web's is recorded as made, not as the
+  rule. If he decides against it, an upload that is not proved loses C ("Not
+  covered" below), and the web's second upload is a departure to remove.
+- Every upload of C is the same LXMF message, packed once. A sibling that gets
+  C twice (the node had an upload whose proof never reached the sender, or the
+  sender uploaded it again) holds the second as a repeat ("Receiving") and
+  applies C once.
 - At most one C is owed per channel. A later join or leave of the same
-  channel replaces the C still owed, and a C replaced while its upload was
-  being built is not sent. Only the newest action goes, the one rule 5 would
-  keep anyway.
-- A C owed to a distro the device no longer holds is dropped with a log line.
-  It is never sent under another distro.
+  channel replaces the C still owed, and a replaced C is never sent, by this
+  device now or after a restart (in a browser, by a later page). That holds
+  when C was replaced while its upload was being built. It also holds when
+  storage refuses the C that replaces it: the device still takes the replaced
+  C out of storage, with a write no larger than what storage holds. Sending a
+  replaced C would be worse than losing it, because the siblings would make
+  the change the user undid. Only the newest action goes, the one rule 5
+  would keep anyway.
+- When the device gives up D (forgets it, or takes another distro), every C
+  owed to D is dropped then, with a log line. It is not kept in case D comes
+  back, and it is never sent under another distro. A kept C would go if D
+  came back, after changes the user made without D that no C reported (a
+  leave of the same channel, say), and the siblings would join a channel the
+  user had left.
 
-The losses that remain on the sending device are listed under "Not covered"
-below.
+Retichat-js at a448e98 departs from the last two points ("Retichat-js
+departures" in the Implementation index). The losses that remain on the
+sending device are listed under "Not covered" below.
 
 *Receiving.* A device unwraps a fan-out blob with its distro key (§17.3). A
 message whose `fields[0xFB]` is `"rfed.distro.channel"` is a membership
@@ -2204,7 +2241,8 @@ millisecond would share it, and one of the two actions would be lost.
    address, it is dropped silently and recorded as seen: this device made
    the change when the user acted.
 4. **Form.** `op` must be `"join"` or `"leave"`, `name` a non-empty str or
-   bin, and `at_ms` a non-negative integer. A `join`'s name must also be one
+   bin, and `at_ms` an integer from 0 to 2^53 − 1, in any integer encoding
+   ("`at_ms` on the wire"). A `join`'s name must also be one
    the client's own join accepts (the rules a typed name must pass). A
    `leave`'s name is not held to those rules. The channel it means is the one
    whose hash the name gives (§1, the derivation every client stores its
@@ -2255,20 +2293,28 @@ through FedSync (§17.2).
 *Not covered.* C can be lost before it leaves the sending device, and in
 RFed's queue.
 
-On the sending device, C is persisted until proved and sent on the next
+On the sending device, C is persisted until proved; sent on the next
 propagation-link establishment ("On the sending device" above). So none of
-these loses it: the device is offline, the link is not up yet, the
-propagation node's key is not known yet, a tab is taken over or closed, the
-connection restarts, or an upload's packet is lost. C goes when the link next
-comes up. It is lost only in these cases:
+these loses a C that has not been uploaded yet: the device is offline, the
+link is not up yet, the propagation node's key is not known yet, a tab is
+taken over or closed, or the connection restarts. C goes when the link next
+comes up. It is lost in these cases:
 
+- An upload of it is not proved (its packet was reported lost, or the link
+  closed or the connection stopped first), unless James allows a second
+  upload ("On the sending device", open). The failure is said, never silent.
+  Retichat-js at a448e98 uploads C again on the next link instead.
 - Storage refuses to keep it (in Retichat-js, a full `localStorage`). The
-  page then holds C and sends it while it stays open with the propagation
-  link up; a reload or a closed tab before that loses it. The refusal is
-  logged and raised as a Harness error, never silent. The C it replaced is
-  not sent either, from this page or a later one.
+  device then holds C in memory and sends it while it keeps running with the
+  propagation link up (in a browser, while the page stays open); a restart
+  before that (a reload, a closed tab) loses it. The refusal is logged and
+  raised as an error, never silent. The C it replaced is not sent either, now
+  or after the restart. Retichat-js at a448e98 can still send that one from a
+  later page ("Retichat-js departures").
 - The device gives up D, or takes another distro, before C is proved. C is
-  dropped with a log line and is not sent under the other distro.
+  dropped then, with a log line. It is not sent under the other distro, nor
+  under D if D comes back. Retichat-js at a448e98 keeps it while no distro is
+  held and sends it if D comes back ("Retichat-js departures").
 - The device's storage is cleared (site data cleared, app removed) before C
   is proved, or the device never brings its propagation link up again.
 
@@ -2339,7 +2385,7 @@ Where each part lives or is to be made, by function (not line).
 | Part | Where | Status (2026-10-03) |
 |---|---|---|
 | Namespace guard (§6) | RFed-rust `rfed/src/destinations.rs`: `subscribe` (behind `subscribe_cb`), `plan_sync_dispatch` / `run_sync_dispatch` (sync ingest), `plan_channel_fanout` (a publish), `backup_push_response`, `backup_delivery_tick` | made 2026-10-03, not pushed or deployed: 454dc59 (subscribe, sync ingest), 7b19a94 (backup tick, BACKUP_PUSH), 49001ad (publish, the distro's own key); takes effect with an rfed redeploy. The sync reads of §6 "Not covered" stay open for James |
-| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | made 2026-10-03 on branch `distro-channels-web` (main untouched at 24d83e6), not merged, pushed or deployed: 69ff01e (the section), 9f058e9 (review of 69ff01e: a post's record keeps its packed timestamp, a named device never learns a sibling's clear, a dropped C is judged again, the distro's uploads said sent only on the node's proof), 73a725d (C and the §17.11 sent copy kept until proved, "On the sending device"; a cut upload decided; DISPLAY_NAMES §4.2 learned at the post's time), a448e98 (a flush checks each owed entry again before and after its build; a write storage refuses). Staged on the private chain at 9f058e9; 73a725d and a448e98 are covered by unit tests, not yet by a stage |
+| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | made 2026-10-03 on branch `distro-channels-web` (main untouched at 24d83e6), not merged, pushed or deployed: 69ff01e (the section), 9f058e9 (review of 69ff01e: a post's record keeps its packed timestamp, a named device never learns a sibling's clear, a dropped C is judged again, the distro's uploads said sent only on the node's proof), 73a725d (C and the §17.11 sent copy kept until proved, "On the sending device"; a cut upload decided; DISPLAY_NAMES §4.2 learned at the post's time), a448e98 (a flush checks each owed entry again before and after its build; a write storage refuses). Staged on the private chain at 9f058e9; 73a725d and a448e98 are covered by unit tests, not yet by a stage. a448e98 departs from this section in three places and makes the second upload that waits on James ("Retichat-js departures" below); open for the web lane |
 | Shared Rust for the phones | LXMF-rust, below | not started |
 | iOS | Retichat-ios at 07f6d70, below | not started |
 | Android | Retichat-android at 47bdb0a, below | not started |
@@ -2351,8 +2397,9 @@ Where each part lives or is to be made, by function (not line).
   (`op`, `name`, `at_ms`, and `by` from 0xFD), set whenever the type
   matches, with an unusable value reported as absent so the client drops
   and logs it, as `sent_by` does for §17.11. `at_ms` is read with
-  `Value::as_u64()`, so the web's int 64 and rmpv's uint 64 both read, and a
-  float or negative value is unusable ("`at_ms` on the wire"). It applies
+  `Value::as_u64()` and must be at most 2^53 − 1, so the web's int 64 and
+  rmpv's uint 64 both read, and a float, a negative value or a larger value
+  is unusable ("`at_ms` on the wire"). It applies
   the D-signature check of §17.11 rule 2 to this type too, over the received
   bytes (`lxmf_signature_valid`, never a re-pack), and it keeps
   `is_delivery_notification` true for C. It also reports C's LXMF message
@@ -2378,7 +2425,9 @@ Where each part lives or is to be made, by function (not line).
   its value and the signature valid (mutations: reading `at_ms` only from a
   uint marker, or checking the signature over a re-pack, each drops the
   web's C). A uint 64 `at_ms` reads the same; a float 64 holding an integral
-  value, and a negative int 64, are reported unusable.
+  value, a negative int 64, and 2^53 as uint 64 or int 64 are reported
+  unusable, and 2^53 − 1 reads (mutation: `as_u64()` without the bound
+  reads 2^53).
 
 **Retichat-ios.**
 
@@ -2405,9 +2454,9 @@ Where each part lives or is to be made, by function (not line).
   rfedNodeIdentityHashHex:)`, `leaveChannel(channelHashHex:)` as the UI
   calls them) call a new `ChatRepository.sendDistroChannelSync`, built as
   `sendDistroSentCopy` is. C is kept until the propagation node proves it,
-  as "On the sending device" says. Whether the LXMF router's queue for a
-  PROPAGATED message gives that today (persisted, sent again only when the
-  propagation link comes up) is not checked here; the lane checks it first.
+  as "On the sending device" says, and is not uploaded a second time while
+  James has not decided that point. See "The LXMF-rust router and C" below
+  before sending C through the router.
 - Receiving C: a `channelSync` case of `RfedDistroClient`'s `Inbound`,
   chosen in `unwrapAndDeliver` before `.notification`, a repeat only by its
   LXMF message hash ("Receiving"); rules 1-5 in a pure
@@ -2440,8 +2489,9 @@ Where each part lives or is to be made, by function (not line).
   (`ChatListViewModel`, `ConversationScreen` → `leaveChannel`) call a new
   `ChatRepository.sendDistroChannelSync`, built as `sendDistroSentCopy` is.
   C is kept until the propagation node proves it, as "On the sending
-  device" says. Whether the LXMF router's queue for a PROPAGATED message
-  gives that today is not checked here; the lane checks it first.
+  device" says, and is not uploaded a second time while James has not
+  decided that point. See "The LXMF-rust router and C" below before sending
+  C through the router.
 - Receiving C: `RfedDistroClient.handleBlob` reads `channel_sync` before
   `if (isNotification) return`, a repeat only by its LXMF message hash
   ("Receiving"); rules 1-5 in a pure
@@ -2451,6 +2501,21 @@ Where each part lives or is to be made, by function (not line).
   before it stores), a leave runs `leaveChannel`'s clean-up without sending
   C. The per-channel `(op, at_ms)` record is a new table, kept after a
   leave.
+
+**The LXMF-rust router and C** (both phones). As built at 3e617aa,
+`lxm_router.rs` sends a PROPAGATED message a second time when the node does
+not prove it. When the packet's receipt times out or its Resource fails,
+`propagation_packet_timed_out_shared` puts the message back to OUTBOUND and
+the held propagation link is torn down, as the Python reference's
+`LXMessage.__link_packet_timed_out` does. The router sends it again once the
+link is open again. It opens that link for the message at most
+`MAX_DELIVERY_ATTEMPTS` (2) times, paced by `DELIVERY_RETRY_WAIT` (2 s) and
+`PATH_REQUEST_WAIT` (7 s), and then fails the message. That is the second
+upload "On the sending device" leaves open, and it is paced by a timer, so a
+C handed to the router as it is would not follow this section, whichever way
+James decides. Whether the router's queue outlives a restart, which "On the
+sending device" needs, is not checked here. The phone lanes check both
+before they send C through the router.
 
 **Retichat-js** (as made, branch `distro-channels-web` at a448e98).
 
@@ -2487,11 +2552,17 @@ Where each part lives or is to be made, by function (not line).
   build. `_uploadForDistro` and `DistroUploads` (`lib/distro_upload.js`)
   decide the upload: by the node's proof, by the exchange's loss report, or
   by `cut()` on a disconnect or the link's close. Only a proof settles the
-  entry. `RetichatTest.distroOwed()` lists the outbox for staging.
+  entry. An entry whose upload was not proved stays owed and goes again on
+  the next `"established"` or `"recovered"`: the second upload that waits on
+  James. The in-flight check (`_distroOutboxInFlight`) skips only an upload
+  on the same link, so an upload still undecided on a link that a new one
+  replaced goes again on the new one. A sibling applies it once.
+  `RetichatTest.distroOwed()` lists the outbox for staging.
 - Receiving C: `_handleDistroBlob` reads the marker with
   `LXMF.distroChannelSyncFromPayload` (`lib/channel_sync.js`
   `readChannelSync`, from the payload's bytes, so a float `at_ms` is refused
-  as rmpv refuses it), after the §17.11 copy and before
+  as rmpv refuses it; one above 2^53 − 1 is not refused yet, see
+  "Retichat-js departures"), after the §17.11 copy and before
   `LXMF.isDeliveryNotification`. Its repeat key (`DistroSeen`) adds the LXMF
   message hash to the source and timestamp. Rules 1 and 2 use the
   `signedByDistro` check shared with §17.11, over the received bytes
@@ -2504,6 +2575,59 @@ Where each part lives or is to be made, by function (not line).
   `_leaveChannelHere(ch, true)`: unsubscribe, the channel's posts,
   `ChannelSenderNamesStore.forget`, `ChannelPostNamesStore.forget` and the
   stream memo. No C is sent.
+
+**Retichat-js departures** (a448e98, found in review on 2026-10-03, open for
+the web lane). Each was shown by running a448e98's own code: its
+`DistroOutbox`, the harness of `distro_channels.test.mjs`, and
+`readChannelSync`. A scratch copy of a448e98 with the two changes named
+below (not committed) passes the first and third cases and the 120 tests of
+`distro_outbox`, `distro_channels`, `distro_upload`, `distro_sent_sync` and
+`lxmf_signature`, as a448e98 does.
+
+- *A replaced C can reach a later page.* After storage refuses a put,
+  `DistroOutbox.put` writes the entries this page holds, less the replaced
+  one. When the page already held the outbox (an earlier write was refused),
+  that write can be larger than what storage holds, so a full storage
+  refuses it too and keeps the replaced C. The next page then sends the
+  action the user undid. Case: owe a join (kept); storage fills; owe a
+  §17.11 sent copy (refused); owe a leave of the same channel (refused). A
+  new `DistroOutbox` on the same storage lists the join. To follow "On the
+  sending device", the write after a refusal takes the replaced entry out of
+  what storage holds (`storage.get`, filtered), which is never larger.
+- *A C owed when D is given up is kept, without a log line, and goes if D
+  comes back.* `_forgetDistro` leaves `DistroOutbox` as it is, and
+  `_sendDistroOutbox` returns at once when no distro is held.
+  `distro_channels.test.mjs` pins this ("With no distro held at all, nothing
+  goes and nothing is dropped"). Case: join with the link down, give up D,
+  leave the channel 60 s later, import D again, bring the link up: the join
+  goes, the sibling joins, and this device stays left. An entry owed to
+  another distro is dropped only when a flush finds it. So a device that
+  takes another distro and then D again, with no link up in between, sends
+  it too.
+- *No bound on `at_ms`.* `readChannelSync` takes any non-negative integer,
+  and `readHead` rounds a 64-bit one above 2^53 − 1 into a JavaScript
+  number, so such an `at_ms` is applied ("`at_ms` on the wire"). Refusing a
+  value that is not `Number.isSafeInteger` follows rule 4.
+- *The second upload* of a C that was not proved, which waits on James ("On
+  the sending device"). If he decides against it, the next
+  `"established"` or `"recovered"` sends nothing that already had an upload.
+
+**Tests every client makes for the sending device**, each with the mutation
+it must catch:
+
+- Storage that refuses a write larger than what it holds: owe a join (kept),
+  fill storage, owe a §17.11 sent copy (refused), then owe a leave of the
+  same channel (refused). What storage holds then does not hold the join.
+  Mutation: writing, after the refusal, what this device holds in memory
+  (Retichat-js a448e98) leaves the join for a later page.
+- Owe a join with the link down, give up D (a log line says what was
+  dropped), import D again and bring the link up: nothing is uploaded.
+  Mutation: keeping what is owed while no distro is held (Retichat-js
+  a448e98) uploads the join, and the sibling joins a channel this device
+  left.
+- An upload that is not proved is said (a log line and an error) and does
+  not settle C; a later proof of that upload does. The case for a second
+  upload waits on James.
 
 **Tests every client makes for rules 4 and 5 and the repeat key** (in its
 pure disposition function and the rule 6 code). Each case is listed with the mutation it must
@@ -2534,6 +2658,11 @@ catch:
   LXMF message hash ("Receiving") drops the second as a repeat. In
   Retichat-js at a448e98 that mutation fails "rule 5: a join and a leave at
   one time leave every device left, in either order".
+- An `at_ms` of 2^53 − 1 is read, as uint 64 and as int 64; 2^53 and
+  2^53 + 1 as uint 64, 2^53 as int 64, and 2^64 − 1 are unusable, and rule 4
+  drops them. Mutation: a reader without the bound takes them (Retichat-js
+  a448e98 rounds them; `as_u64()` alone keeps them exact), and the web and
+  the phones order a join at 2^53 + 1 and a leave at 2^53 differently.
 
 ### 17.9 Distro Identity Transfer
 
