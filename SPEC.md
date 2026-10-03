@@ -2027,9 +2027,13 @@ holders"; in short:
 - A received post is the user's own when its source is the device's
   `lxmf.delivery` hash or D's. It is shown as outgoing, never notified, never
   counted as a sender, and deduplicated by `(source, timestamp_ms)` against
-  what the client has stored, rfed's echo of the post included.
-- The Channel Display Name state is kept per channel and posting identity,
-  and learns from D's posts that reach the device, whichever device sent them
+  what the client has stored, rfed's echo of the post included. One stored
+  from RFed (a sibling's post) has state SENT, as §17.11 rule 5 gives a sent
+  copy. It came from RFed, so RFed has it. It is never DELIVERED, since a
+  channel post has no per-reader confirmation, and never sending or failed.
+- The Channel Display Name state is kept per channel and posting identity.
+  It learns from D's posts that reach the device, whichever device sent
+  them, but only a value equal to the one this device would send itself
   (LXMF-rust/DISPLAY_NAMES.md §4.2).
 
 **Membership sync.** Joining or leaving a channel on one device is applied on
@@ -2049,9 +2053,9 @@ device that holds no distro.
 | Destination | D's `lxmf.delivery` |
 | Source / signature | D, signed with D's key (the "send as distro" path of §17.11) |
 | Title, content | Empty |
-| `fields[0x0C]` (FIELD_TICKET) | An empty bin. It is no ticket: it is there so that older clients take C for a delivery notification and drop it (below). Receivers neither read nor remember it |
+| `fields[0x0C]` (FIELD_TICKET) | An empty bin. It is no ticket: it is there so that older clients take C for a delivery notification and drop it (below; web builds before 2026-09-30 do not). Receivers neither read nor remember it |
 | `fields[0xFB]` (FIELD_CUSTOM_TYPE) | `"rfed.distro.channel"` |
-| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name, `<root>.<name>`, as UTF-8 str (receivers accept bin too). `at_ms` is an unsigned integer, the time of the user's action in milliseconds since the epoch (rule 5 below). Receivers ignore elements after the third |
+| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name as the sending device stores it, as UTF-8 str (receivers accept bin too): `<root>.<name>` for every channel joined since the name rules of 2026-09-27, and for a channel joined earlier the name it was joined with, which may break those rules (Retichat-js before b75e02e joined any trimmed name). `at_ms` is an unsigned integer, the time of the user's action in milliseconds since the epoch (rule 5 below). Receivers ignore elements after the third |
 | `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
 | `fields[0xD1]` | None: C is a message to one's own devices and carries no Message Display Name (DISPLAY_NAMES.md §4.1) |
 | Method | PROPAGATED at once (D is a distro, §17.10); RFed intercepts it on `lxmf.propagation` and fans it out to every registered device of D, the sender included |
@@ -2081,9 +2085,14 @@ that drops it ends the check.
 3. **Own echo.** If `fields[0xFD]` is this device's own `lxmf.delivery`
    address, it is dropped silently and recorded as seen: this device made
    the change when the user acted.
-4. **Form.** `op` must be `"join"` or `"leave"`, `name` must be a channel
-   name the client's own join accepts (the rules a typed name must pass), and
-   `at_ms` a non-negative integer. Anything else is dropped with a log line.
+4. **Form.** `op` must be `"join"` or `"leave"`, `name` a non-empty str or
+   bin, and `at_ms` a non-negative integer. A `join`'s name must also be one
+   the client's own join accepts (the rules a typed name must pass). A
+   `leave`'s name is not held to those rules. The channel it means is the one
+   whose hash the name gives (§1, the derivation every client stores its
+   channels under), so a channel joined before the rules (for example
+   `public.Test`) can still be left on every device. Anything else is dropped
+   with a log line.
 5. **Order.** The device keeps, per channel hash, the last membership action
    it made or applied, `(op, at_ms)`, persisted, and kept after a leave. A
    message whose `at_ms` is older than the recorded one is stale and is
@@ -2092,8 +2101,16 @@ that drops it ends the check.
    whatever order the messages arrive. A user's action on this device is
    recorded the same way, and the C it sends carries that record: its `at_ms`
    is the current time, or one more than the `at_ms` already recorded for the
-   channel when that is later. The user's latest action is then the newest on
-   every device, even when this device's clock is behind a sibling's.
+   channel when that is later. So an action made after this device received
+   a sibling's record is newer than that record on every device, even when
+   this device's clock is behind the sibling's. The guarantee needs that
+   record to have arrived. Actions that two devices make before either has
+   the other's record (concurrent, or while one was offline) are ordered by
+   their clocks alone. The larger `at_ms` wins everywhere, so with a clock
+   behind, the action the user made later can lose. For example, A leaves at
+   12:00, and B, ten minutes slow and not yet holding A's leave, joins at
+   12:05 stamped 11:55: every device ends left. All devices still end in the
+   same state.
 6. **Apply,** with this device's own identity and its own configured RFed
    node, as the user's own join or leave on this device would:
    - `join` of a channel not in the list: the channel is added, then
@@ -2115,36 +2132,61 @@ no live route has it handed off (§17.3): queued in its deferred bucket and
 woken through its LXMF notify registration, and it applies C when it next
 collects its backlog with `/distro/pull` (`/rfed/pull` on
 `rfed.distro.register`). A device registered at another RFed node gets C
-through FedSync (§17.2). Not covered: the queue keeps an entry for 7 days,
-and a device's bucket holds at most its per-subscriber limit (256 by default,
-§7 "Limits"), shared with its channel posts, the oldest evicted first. A
-device offline for longer, or whose bucket overflows, never learns the
-change, and neither does a device that imports D after it. Such a device
-keeps its own list until the next change of that channel; there the user
-joins by name, as before. No catch-up exchange is defined.
+through FedSync (§17.2). Not covered: C can be lost in three ways (§7
+"Limits"):
 
-*Older clients.* C has empty content, a ticket and no attachment, which every
-client that predates this section takes for a delivery notification and drops
-without showing anything:
+- The queue keeps an entry for 7 days.
+- A device's bucket holds at most its per-subscriber limit (256 by default),
+  shared with its channel posts, and the oldest entry is evicted first.
+- The whole queue holds at most 4096 entries. When it is full, a new entry,
+  C included, is dropped without a word (`DeferredQueue::enqueue`, reached
+  from the hand-off in `handoff.rs`).
 
-- Retichat-js up to 24d83e6: `_handleDistroBlob` finds no sent-copy marker,
-  `LXMF.isDeliveryNotification` is true, and an empty bin is no ticket of
-  the web's (`LXMF.webTicket`), so C is dropped with a console line and a
-  push of it is answered `false`;
-- Retichat-android up to 47bdb0a: `RfedDistroClient.handleBlob` returns on
-  the unwrap's `is_delivery_notification`;
-- Retichat-ios up to 07f6d70: `RfedDistroClient.unwrapAndDeliver` makes it
-  `.notification`, and the NSE's `NSEDistroPull.unwrapToShow` returns nil.
+A device that is offline for longer than 7 days, whose bucket overflows, or
+whose C met a full queue never learns the change. Neither does a device that
+imports D after the change. Such a device keeps its own list until the next
+change of that channel; there the user joins by name, as before. No catch-up
+exchange is defined.
 
-Without the ticket, or with any content, each of them would store C as a
-message from the user's own distro address, and iOS and Android would notify.
-Checked on 2026-10-03 by running the shipped `lxmf_rust::distro::unwrap_blob`
-and Retichat-js's own `LXMessage.decodePayload` and `LXMF` helpers on C's
-bytes, and on the same bytes without `0x0C` or with content. `unwrap_blob`
-keeps reporting `is_delivery_notification` for C after this section, so an
-app built against a newer LXMF-rust that does not read the marker still drops
-it. An updated client reads the marker before its delivery-notification
-test. An older device follows none of its siblings' changes and sends none.
+*Older clients.* C has empty content, a ticket and no attachment. Most clients
+that predate this section take it for a delivery notification and drop it
+without showing anything, but not every one. Some web builds older than
+2026-09-30 show it:
+
+- Retichat-js from adee619 (2026-09-30) through 24d83e6 drops it.
+  `_handleDistroBlob` finds no sent-copy marker, `LXMF.isDeliveryNotification`
+  is true (0x0C is present and not nil), and an empty bin is no ticket of the
+  web's (`LXMF.webTicket`). So C is dropped with a console line, and a push of
+  it is answered `false`.
+- Retichat-js before adee619 **shows** it, as an empty incoming message from
+  D. From 8ea775c (2026-08-16) the reason is that `_ticketFromFields` reads an
+  empty bin as the empty string, which the test `ticket && !content` takes
+  for no ticket. Before 8ea775c (for example 132ece1, 2026-08-01) there is no
+  ticket test at all. Such a build still pulls from a current node. It lives
+  on in a tab not reloaded since 2026-09-30, or wherever an older `app.js` is
+  still served, and shows one such message per membership change until it is
+  updated.
+- Retichat-android from 076f310 (2026-09-23, its first build with a distro)
+  through 47bdb0a drops it: `RfedDistroClient.handleBlob` returns on the
+  unwrap's `is_delivery_notification`. Earlier builds hold no distro and
+  never receive C.
+- Retichat-ios from 24c64a4 (2026-08-16, its first distro client) through
+  07f6d70 drops it: `RfedDistroClient.unwrapAndDeliver` makes it
+  `.notification`. The NSE, which pulls distro messages from a6ac519
+  (2026-09-26), drops it too: `NSEDistroPull.unwrapToShow` returns nil.
+
+Without the ticket, or with any content, each build that drops C would store
+it instead, as a message from the user's own distro address, and iOS and
+Android would notify. Checked on 2026-10-03 by running the shipped
+`lxmf_rust::distro::unwrap_blob` on C's bytes, and on the same bytes without
+`0x0C` or with content. The web was checked the same way, with each build's
+own decoder and the ticket test read from that build's `_handleDistroBlob`
+(132ece1, 8ea775c, the commit before adee619, adee619 and 24d83e6).
+`unwrap_blob` keeps reporting `is_delivery_notification` for C after this
+section, so an app built against a newer LXMF-rust that does not read the
+marker still drops it. An updated client reads the marker before its
+delivery-notification test. An older device follows none of its siblings'
+changes and sends none.
 
 *Privacy.* `fields[0xFD]` reveals which device acted, to holders of D only,
 as in §17.11. A private channel's name, its invite, sits encrypted to D in
@@ -2199,9 +2241,12 @@ Where each part lives or is to be made, by function (not line).
   of `RfedNotifyRegistrar`.
 - Own posts: `RfedChannelClient.dispatchVerifiedLxmf` sets `isOutgoing`
   when the sender is `ownHashHex` or `DistroManager.shared.deliveryHashHex`,
-  and then calls no `noteSender`, posts no notification, and feeds the post's
-  name to the §4.2 state. The NSE: `NSEChannelPull.run` drops the distro's
-  hash from what it shows, beside `ownHash`.
+  and then calls no `noteSender` and posts no notification. It stores the post
+  with `deliveryState` sent (`verifiedChannelMessageDeliveryState` already
+  gives that for an outgoing post). It feeds the post's name to the §4.2 state
+  only when the name equals the device's own (DISPLAY_NAMES.md §4.2). The
+  NSE: `NSEChannelPull.run` drops the distro's hash from what it shows,
+  beside `ownHash`.
 - Name state: `channelPostName(for:)` and `recordPostName` keyed by channel
   and posting identity (`ChannelEntity.nameLastDigestHex` /
   `nameLastIncludedAt`, reset when the posting identity changes).
@@ -2229,8 +2274,10 @@ Where each part lives or is to be made, by function (not line).
   `RfedNotifyRegistrar.registerForChannel` / `deregisterForChannel`.
 - Own posts: `RfedChannelClient.dispatchBlob` sets `isOutbound` for
   `DistroManager.deliveryHashHex` too, and then records no
-  `recordChannelSender`, posts no notification, and feeds the post's name to
-  the §4.2 state.
+  `recordChannelSender` and posts no notification. The row keeps `sendState`
+  `SEND_STATE_SENT`, the entity's default. It feeds the post's name to the
+  §4.2 state only when the name equals the device's own (DISPLAY_NAMES.md
+  §4.2).
 - Name state: `channelPostName` and `recordPostName` keyed by channel and
   posting identity (`ChannelNameStateEntity`, which needs a Room migration,
   or is cleared when the posting identity changes).
@@ -2256,19 +2303,37 @@ Where each part lives or is to be made, by function (not line).
   `timestamp` the time the record was made).
 - Own posts and dedupe: `_handleChannelPacket` stores a post from
   `ownLxmfDestinationHash()` or `DistroManager.lxmfDeliveryHash` as
-  `dir: "out"`, with no `ContactStore.keep` and no
+  `dir: "out"`, `status: "sent"`, with no `ContactStore.keep` and no
   `ChannelPostNamesStore.noteSender`; `ChannelMsgStore.add` drops a post
   whose `(srcHash, timestamp)` it already holds, the stored `timestamp`
   being the post's own `tsMs` (today only the in-memory `_chanSeenIds`
   dedupes).
 - Name state: `ChannelPostNames` (`lib/name_ledger.js`) per channel and
-  posting identity, learning from own posts.
+  posting identity. It learns from own posts only a value equal to the
+  device's own (DISPLAY_NAMES.md §4.2).
 - Sending C: `joinChannel` and `leaveChannel` (user actions) call a new
   `_sendDistroChannelSync`, built as `_sendDistroSentCopy` is.
 - Receiving C: `_handleDistroBlob` reads the marker (new
   `LXMF.DISTRO_CHANNEL_TYPE`, `LXMF.distroChannelSyncFromFields`) before
   `LXMF.isDeliveryNotification`, with the source and signature checks it
   already makes for a sent copy.
+
+**Tests every client makes for rules 4 and 5** (in its pure disposition
+function and the rule 6 code). Each case is listed with the mutation it must
+catch:
+
+- A `leave` of a stored channel whose name today's join refuses (for example
+  `public.Test`) is applied, and a `join` of that name is dropped. Mutation:
+  holding the leave to the join rules keeps the channel.
+- A device that has received a sibling's leave, with its clock 10 minutes
+  behind, stamps a later join after that leave, and every device ends
+  joined. Mutation: stamping with the clock alone leaves the devices
+  disagreeing.
+- A join and a leave with one `at_ms`, delivered in either order, leave
+  every device left. Mutation: letting an equal time replace the record
+  makes the result depend on the order.
+- Concurrent actions end in one state on every device, the one with the
+  larger `at_ms`.
 
 ### 17.9 Distro Identity Transfer
 
