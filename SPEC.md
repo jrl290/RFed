@@ -728,7 +728,8 @@ The subscriber is a **device**: clients sign `/rfed/subscribe` with their
 device key, also when they post as a distro (§17.12). The node keeps one row
 per channel, one bound `rfed.link` (RFed-spec/Link.md), one deferred bucket
 (§7) and one wake address (§9) per subscriber hash, which is why devices
-never subscribe under a shared hash.
+never subscribe under a shared hash. A node refuses a subscription signed
+with the key of a distro registered at it (below).
 
 ### Channel and distro hashes
 
@@ -742,12 +743,23 @@ arrives:
 - **Subscribe.** `/rfed/subscribe` (`/channel/subscribe` on `rfed.link`)
   stores nothing and answers a bare msgpack `false`, as for any refused
   subscription, when `channel_hash` is a registered distro's
-  `distro_lxmf_hash` (`subscribe_cb`).
+  `distro_lxmf_hash`, and when the payload is signed with a registered
+  distro's key (the signer's `lxmf.delivery` hash is a `distro_lxmf_hash`):
+  a distro's devices subscribe with their own keys (above). The channel
+  hash is judged first. Each refusal has a log line of its own
+  (`subscribe`, `SubscribeRefusal`).
 - **Sync ingest.** For a routing hash that is a registered distro, sync
   ingest (§4 step 4, §17.7) runs the distro fan-out only, never the channel
   fan-out. This stops delivery to a subscription row that exists anyway: one
   made before the distro registered here, a backup row pushed by a peer, or
   one stored before this rule.
+- **Publish.** A publish under a registered distro's hash (§8) is stored and
+  is not refused, but reaches no channel subscriber: `plan_channel_fanout`
+  plans none for that hash, whatever rows it has.
+- **Backup.** `/rfed/backup/push` (§11) stores no pair under a registered
+  distro's hash, nor one whose subscriber is a registered distro; it stores
+  the rest of the batch and answers `true`. The backup tick delivers to no
+  backup row under a registered distro's hash.
 
 Without them anyone could subscribe to a user's distro address as a channel
 and be sent that distro's messages as this node pulled them from its peers:
@@ -756,13 +768,43 @@ reading the code on 2026-10-03, not observed. Before this rule
 `subscribe_cb` checked only the length of the hash; where the rule stands in
 the code is in §17.12, "Implementation index".
 
-Not covered: a node knows only its own DistroTable. Where a distro is not
-registered, its hash can still be subscribed as a channel, and that node
-then pulls the distro's blobs from its peers for the subscriber (§4 step 2):
-the same ciphertext. A publish under a distro hash is not refused either. It
-reaches no channel subscriber where these rules hold, and what a peer's
-distro fan-out makes of it is a message to the distro, which anyone can
-already send through `lxmf.propagation`.
+If the DistroTable cannot be read (its lock poisoned), each rule fails
+closed and logs at error level: subscribe and the backup push are refused,
+sync ingest and a publish fan out to no one (the blob stays stored), and
+the backup tick delivers to no row. A refused backup push makes its owner
+queue the whole batch and push it again at every backup tick
+(`requeue_backup_pairs`), an application-level retry older than this rule
+(DESIGN_PRINCIPLES §3; open).
+
+These rules stop a node *pushing* a distro's messages to a stranger and
+waking them for it. They do not stop anyone *reading* the stored
+ciphertext. Not covered:
+
+- **Sync reads.** OFFER answers any caller with the node's whole store
+  manifest (§4 step 1) and MESSAGE_GET with any blob by id. Both are
+  registered `ALLOW_ALL` and never look at the caller, on `rfed.node`
+  (`/rfed/offer`, `/rfed/get`) and on `rfed.link` (`/node/offer`,
+  `/node/get`), which every web client opens. So anyone can read every
+  distro message a node holds, the `rfed.distro.channel` membership
+  messages (§17.12) and the §17.11 sent copies included, without
+  subscribing to anything: the ciphertext, its size and id, and its timing
+  by polling. Peers need the distro blobs, so they cannot be left out of
+  sync; closing this needs peers to authenticate to OFFER and GET, which is
+  James's decision (open, 2026-10-03). Found in review on 2026-10-03 with a
+  probe test kept outside the repo; not observed in use.
+- **Other nodes.** A node knows only its own DistroTable. Where a distro is
+  not registered, its hash can still be subscribed as a channel (and its
+  key can subscribe), and that node then pulls the distro's blobs from its
+  peers for the subscriber (§4 step 2): the same ciphertext.
+- **A distro that leaves.** Once the last device of a distro unregisters at
+  a node, its hash is no longer a distro's there, while the BlobStore keeps
+  its messages until they expire (§5). A backup row then pushed under it
+  (any self-signed owner is accepted while `trusted_backup_peers` is empty,
+  §11) is handed all of them, with a wake, at the next backup tick: the
+  ciphertext the sync reads above already hand out.
+- **A publish, onward.** What a peer's distro fan-out makes of a publish
+  under a distro hash is a message to the distro, which anyone can already
+  send through `lxmf.propagation`.
 
 ### Primary vs. Backup Subscriptions
 
@@ -910,9 +952,10 @@ holders").
 
 Distro blobs never take this path. Sync ingest runs the distro fan-out for
 them (§17.3, §17.7), and no channel fan-out for a routing hash that is a
-distro registered at this node (§6, "Channel and distro hashes"); the
-`lxmf.propagation` intercept and a channel publish each run only their own
-fan-out.
+distro registered at this node (§6, "Channel and distro hashes"). The
+`lxmf.propagation` intercept runs only the distro fan-out, and a channel
+publish under such a hash is stored and fanned out to no one
+(`plan_channel_fanout`, §6).
 
 ### Double Envelope
 
@@ -1459,6 +1502,13 @@ owner_offline_secs = 90             # silence before failover activates
    delivery for adopted subscribers.
 5. Backup re-pushes adopted entries to **its own** backup (chain of custody).
 6. Entries not refreshed within `2 × owner_offline_secs` are pruned.
+
+A distro registered at the backup node is not a channel there (§6, "Channel
+and distro hashes"): the push stores no pair under its hash and none whose
+subscriber is the distro, and still answers `true` for the batch so that the
+owner does not push it again; the tick delivers to no backup row under its
+hash. The tick otherwise queues every blob the BlobStore holds under a row's
+hash for the row's subscriber.
 
 ### Backup Selection
 
@@ -2198,7 +2248,7 @@ Where each part lives or is to be made, by function (not line).
 
 | Part | Where | Status (2026-10-03) |
 |---|---|---|
-| Namespace guard (§6) | RFed-rust `subscribe_cb` and the sync-ingest dispatch in `rfed/src/destinations.rs` | being made in its own lane on 2026-10-03; record the commit here when it lands |
+| Namespace guard (§6) | RFed-rust `rfed/src/destinations.rs`: `subscribe` (behind `subscribe_cb`), `plan_sync_dispatch` / `run_sync_dispatch` (sync ingest), `plan_channel_fanout` (a publish), `backup_push_response`, `backup_delivery_tick` | made 2026-10-03, not pushed or deployed: 454dc59 (subscribe, sync ingest), 7b19a94 (backup tick, BACKUP_PUSH), 49001ad (publish, the distro's own key); takes effect with an rfed redeploy. The sync reads of §6 "Not covered" stay open for James |
 | Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | being made in its own lane on 2026-10-03; record the commits here when they land |
 | Shared Rust for the phones | LXMF-rust, below | not started |
 | iOS | Retichat-ios at 07f6d70, below | not started |
