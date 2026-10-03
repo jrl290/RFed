@@ -2105,7 +2105,7 @@ device that holds no distro.
 | Title, content | Empty |
 | `fields[0x0C]` (FIELD_TICKET) | An empty bin. It is no ticket: it is there so that older clients take C for a delivery notification and drop it (below; web builds before 2026-09-30 do not). Receivers neither read nor remember it |
 | `fields[0xFB]` (FIELD_CUSTOM_TYPE) | `"rfed.distro.channel"` |
-| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name as the sending device stores it, as UTF-8 str (receivers accept bin too): `<root>.<name>` for every channel joined since the name rules of 2026-09-27, and for a channel joined earlier the name it was joined with, which may break those rules (Retichat-js before b75e02e joined any trimmed name). `at_ms` is an unsigned integer, the time of the user's action in milliseconds since the epoch (rule 5 below). Receivers ignore elements after the third |
+| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name as the sending device stores it, as UTF-8 str (receivers accept bin too): `<root>.<name>` for every channel joined since the name rules of 2026-09-27, and for a channel joined earlier the name it was joined with, which may break those rules (Retichat-js before b75e02e joined any trimmed name). `at_ms` is the time of the user's action in milliseconds since the epoch (rule 5 below): a msgpack integer from 0 to 2^53 − 1, in any integer encoding: the web writes int 64 (`0xd3`), rmpv and umsgpack write uint 64 (`0xcf`) ("`at_ms` on the wire" below). Receivers ignore elements after the third |
 | `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
 | `fields[0xD1]` | None: C is a message to one's own devices and carries no Message Display Name (DISPLAY_NAMES.md §4.1) |
 | Method | PROPAGATED at once (D is a distro, §17.10); RFed intercepts it on `lxmf.propagation` and fans it out to every registered device of D, the sender included |
@@ -2116,14 +2116,82 @@ invite and the key at once: the channel identity is derived from it (§1), and
 there is no other key material. C is encrypted to D, so only holders of D's
 key can read it; RFed, relays and peers see an ordinary distro blob.
 
-C is sent once per change and is fire-and-forget: its delivery state changes
-nothing on the sending device, which changed its own list when the user
-acted.
+*`at_ms` on the wire.* msgpack has two 64-bit integer types, and the clients
+write different ones for the same value. Both are valid C, and the type
+carries no meaning:
+
+- Retichat-js writes **int 64** (`0xd3`, eight bytes, big-endian two's
+  complement). `channelSyncFields` passes `BigInt(atMs)`, and msgpackr writes
+  a BigInt below 2^63 that way; a plain JavaScript number above 2^32 would go
+  as a float 64, which is no `at_ms`. 2026-01-01 00:00 UTC is
+  `d3 00 00 01 9b 76 da a8 00`.
+- An rmpv writer (LXMF-rust, so iOS and Android) and the Python reference
+  (umsgpack) write the smallest encoding, which for any time after
+  1970-02-19 (2^32 ms) is **uint 64** (`0xcf`).
+
+A receiver MUST accept every msgpack integer encoding (positive fixint,
+uint 8 to 64, int 8 to 64) and judge the value, never the type byte.
+LXMF-rust reads it with `rmpv::Value::as_u64()`: rmpv 1.0.0 decodes an int 64
+holding a non-negative value as a positive integer, so `as_u64()` gives the
+value for `0xd3` exactly as for `0xcf`, and `None` for a negative integer or
+a float. Retichat-js reads it from the payload's bytes (`lib/channel_sync.js`
+`readChannelSync`, through `msgpack_raw.js` `readHead`), every integer
+encoding included. A float (`0xca`, `0xcb`), even an integral one, a negative
+integer, a str and a nil are no `at_ms`, and rule 4 drops them. A writer MUST
+NOT write a value above 2^53 − 1: the web holds `at_ms` in a JavaScript
+number, which is exact only up to there, and its writer refuses a larger one.
+A millisecond clock stays below that bound for about 285,000 years.
+
+The type does not affect rule 2. C's payload has four elements and no stamp (D
+asks none, §17.10), so every receiver checks D's signature over the payload
+bytes as received (§17.11 rule 2), as the reference does for an unstamped
+message. A receiver MUST NOT decode C's payload and re-pack it to check the
+signature: rmpv and umsgpack re-pack the web's `0xd3` as `0xcf`, the hash
+changes, and every C from the web would fail rule 2. In LXMF-rust,
+`distro::unwrap_blob` (its `lxmf_signature_valid`) hashes the received bytes
+and is the check to use. `LXMessage::unpack_from_bytes` re-packs every
+payload, stamped or not, so it is not. Checked on 2026-10-03 with a C built by
+Retichat-js a448e98's own `channelSyncFields` and `LXMessage.pack`: the
+shipped `unwrap_blob` reports `signature_validated` and
+`is_delivery_notification`, and `as_u64()` gives `at_ms`; D's signature fails
+over rmpv's re-pack of the same payload. The web reads a `0xcf` `at_ms` as it
+reads its own.
+
+*On the sending device.* C is sent once per change. Its delivery state changes
+nothing in the sending device's list, which changed when the user acted. The
+device still keeps C until the propagation node proves it has it:
+
+- C is packed and signed by D once, when the user acts, and written to
+  persistent storage before anything can yield.
+- It is uploaded at once when the propagation link is up. Otherwise, and
+  after an upload that was not proved (the packet was reported lost, or the
+  link closed or the connection stopped first), it is uploaded when the
+  propagation link next comes up. Three events trigger an upload or end one:
+  the user's action, the link coming up, and the node's proof. There is no
+  timer and no retry loop (DESIGN_PRINCIPLES.md §3, §5). A proof that comes
+  after the upload was reported lost still settles it.
+- Every upload is the same LXMF message, packed once. A sibling that gets C
+  twice (the node had an upload whose proof never reached the sender) holds
+  the second as a repeat and applies C once.
+- At most one C is owed per channel. A later join or leave of the same
+  channel replaces the C still owed, and a C replaced while its upload was
+  being built is not sent. Only the newest action goes, the one rule 5 would
+  keep anyway.
+- A C owed to a distro the device no longer holds is dropped with a log line.
+  It is never sent under another distro.
+
+The losses that remain on the sending device are listed under "Not covered"
+below.
 
 *Receiving.* A device unwraps a fan-out blob with its distro key (§17.3). A
 message whose `fields[0xFB]` is `"rfed.distro.channel"` is a membership
 message, and the device applies these rules to it in order; the first rule
-that drops it ends the check.
+that drops it ends the check. A membership message is a repeat (one copy from
+the live fan-out and one from a pull, or the second upload of one C) only when
+its LXMF message hash is one already seen. The id that §17.11 rule 5 gives
+other fan-out messages, from source, timestamp and content, is not enough:
+every C has source D and empty content, so two siblings' Cs made in the same
+millisecond would share it, and one of the two actions would be lost.
 
 1. **Source.** If the unwrapped source is not D, it is ignored and logged.
 2. **Signature.** It MUST carry a valid LXMF signature by D's key, checked
@@ -2182,8 +2250,29 @@ no live route has it handed off (§17.3): queued in its deferred bucket and
 woken through its LXMF notify registration, and it applies C when it next
 collects its backlog with `/distro/pull` (`/rfed/pull` on
 `rfed.distro.register`). A device registered at another RFed node gets C
-through FedSync (§17.2). Not covered: C can be lost in three ways (§7
-"Limits"):
+through FedSync (§17.2).
+
+*Not covered.* C can be lost before it leaves the sending device, and in
+RFed's queue.
+
+On the sending device, C is persisted until proved and sent on the next
+propagation-link establishment ("On the sending device" above). So none of
+these loses it: the device is offline, the link is not up yet, the
+propagation node's key is not known yet, a tab is taken over or closed, the
+connection restarts, or an upload's packet is lost. C goes when the link next
+comes up. It is lost only in these cases:
+
+- Storage refuses to keep it (in Retichat-js, a full `localStorage`). The
+  page then holds C and sends it while it stays open with the propagation
+  link up; a reload or a closed tab before that loses it. The refusal is
+  logged and raised as a Harness error, never silent. The C it replaced is
+  not sent either, from this page or a later one.
+- The device gives up D, or takes another distro, before C is proved. C is
+  dropped with a log line and is not sent under the other distro.
+- The device's storage is cleared (site data cleared, app removed) before C
+  is proved, or the device never brings its propagation link up again.
+
+In RFed's queue there are three ways (§7 "Limits"):
 
 - The queue keeps an entry for 7 days.
 - A device's bucket holds at most its per-subscriber limit (256 by default),
@@ -2192,11 +2281,12 @@ through FedSync (§17.2). Not covered: C can be lost in three ways (§7
   C included, is dropped without a word (`DeferredQueue::enqueue`, reached
   from the hand-off in `handoff.rs`).
 
-A device that is offline for longer than 7 days, whose bucket overflows, or
-whose C met a full queue never learns the change. Neither does a device that
-imports D after the change. Such a device keeps its own list until the next
-change of that channel; there the user joins by name, as before. No catch-up
-exchange is defined.
+When C is lost on the sending device, no sibling learns the change. A device
+that is offline for longer than 7 days, whose bucket overflows, or whose C met
+a full queue does not learn it either. Neither does a device that imports D
+after the change. Such a device keeps its own list until the next change of
+that channel; there the user joins by name, as before. No catch-up exchange
+is defined.
 
 *Older clients.* C has empty content, a ticket and no attachment. Most clients
 that predate this section take it for a delivery notification and drop it
@@ -2249,7 +2339,7 @@ Where each part lives or is to be made, by function (not line).
 | Part | Where | Status (2026-10-03) |
 |---|---|---|
 | Namespace guard (§6) | RFed-rust `rfed/src/destinations.rs`: `subscribe` (behind `subscribe_cb`), `plan_sync_dispatch` / `run_sync_dispatch` (sync ingest), `plan_channel_fanout` (a publish), `backup_push_response`, `backup_delivery_tick` | made 2026-10-03, not pushed or deployed: 454dc59 (subscribe, sync ingest), 7b19a94 (backup tick, BACKUP_PUSH), 49001ad (publish, the distro's own key); takes effect with an rfed redeploy. The sync reads of §6 "Not covered" stay open for James |
-| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | being made in its own lane on 2026-10-03; record the commits here when they land |
+| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | made 2026-10-03 on branch `distro-channels-web` (main untouched at 24d83e6), not merged, pushed or deployed: 69ff01e (the section), 9f058e9 (review of 69ff01e: a post's record keeps its packed timestamp, a named device never learns a sibling's clear, a dropped C is judged again, the distro's uploads said sent only on the node's proof), 73a725d (C and the §17.11 sent copy kept until proved, "On the sending device"; a cut upload decided; DISPLAY_NAMES §4.2 learned at the post's time), a448e98 (a flush checks each owed entry again before and after its build; a write storage refuses). Staged on the private chain at 9f058e9; 73a725d and a448e98 are covered by unit tests, not yet by a stage |
 | Shared Rust for the phones | LXMF-rust, below | not started |
 | iOS | Retichat-ios at 07f6d70, below | not started |
 | Android | Retichat-android at 47bdb0a, below | not started |
@@ -2260,24 +2350,35 @@ Where each part lives or is to be made, by function (not line).
   `unwrap_blob` reports the marker as `DistroMessage.channel_sync`
   (`op`, `name`, `at_ms`, and `by` from 0xFD), set whenever the type
   matches, with an unusable value reported as absent so the client drops
-  and logs it, as `sent_by` does for §17.11. It applies the D-signature
-  check of §17.11 rule 2 to this type too, and it keeps
-  `is_delivery_notification` true for C. `DistroMessage::to_json` carries
-  it as `"channel_sync"` (an object, or null), so `retichat_distro_unwrap`
-  (iOS) and `nativeDistroUnwrap` (Android) pass it on unchanged.
+  and logs it, as `sent_by` does for §17.11. `at_ms` is read with
+  `Value::as_u64()`, so the web's int 64 and rmpv's uint 64 both read, and a
+  float or negative value is unusable ("`at_ms` on the wire"). It applies
+  the D-signature check of §17.11 rule 2 to this type too, over the received
+  bytes (`lxmf_signature_valid`, never a re-pack), and it keeps
+  `is_delivery_notification` true for C. It also reports C's LXMF message
+  hash (SHA-256 of dest, src and the signed payload), the repeat key of
+  "Receiving". `DistroMessage::to_json` carries it as `"channel_sync"` (an
+  object, or null), so `retichat_distro_unwrap` (iOS) and
+  `nativeDistroUnwrap` (Android) pass it on unchanged.
 - One writer for C's fields, `distro::channel_sync_fields(op, name, at_ms,
   device_hex)`, and a message setter for the bridges (C
   `lxmf_message_set_distro_channel_sync`, JNI
   `nativeMessageSetDistroChannelSync`): the generic setters
   (`message_add_field_string` / `_bool`) write only str and bool, and 0xFC
-  is an array.
+  is an array. It writes `at_ms` as `Value::from(u64)`, which rmpv packs as
+  uint 64 (`0xcf`), and refuses a value above 2^53 − 1.
 - `name_ledger::is_own_devices_message`: `DISTRO_CHANNEL_TYPE` too
   (DISPLAY_NAMES.md §4.1).
 - `channel::pack`: unchanged; it signs with the identity it is given.
 - Tests: C's shape unwraps as a delivery notification with the marker set
   (mutation: drop 0x0C and the notification flag goes); a C claiming D
   without D's signature is rejected; a marker from another source is
-  reported for rule 1.
+  reported for rule 1. A C made by Retichat-js (`channelSyncFields` and
+  `LXMessage.pack`, `at_ms` as int 64) unwraps with the marker set, `at_ms`
+  its value and the signature valid (mutations: reading `at_ms` only from a
+  uint marker, or checking the signature over a re-pack, each drops the
+  web's C). A uint 64 `at_ms` reads the same; a float 64 holding an integral
+  value, and a negative int 64, are reported unusable.
 
 **Retichat-ios.**
 
@@ -2303,9 +2404,13 @@ Where each part lives or is to be made, by function (not line).
 - Sending C: the user's join and leave (`joinChannel(name:
   rfedNodeIdentityHashHex:)`, `leaveChannel(channelHashHex:)` as the UI
   calls them) call a new `ChatRepository.sendDistroChannelSync`, built as
-  `sendDistroSentCopy` is.
+  `sendDistroSentCopy` is. C is kept until the propagation node proves it,
+  as "On the sending device" says. Whether the LXMF router's queue for a
+  PROPAGATED message gives that today (persisted, sent again only when the
+  propagation link comes up) is not checked here; the lane checks it first.
 - Receiving C: a `channelSync` case of `RfedDistroClient`'s `Inbound`,
-  chosen in `unwrapAndDeliver` before `.notification`; rules 1-5 in a pure
+  chosen in `unwrapAndDeliver` before `.notification`, a repeat only by its
+  LXMF message hash ("Receiving"); rules 1-5 in a pure
   `DistroCodec.channelSyncDisposition` beside `sentCopyDisposition`; rule 6
   in `RfedChannelClient`: a join stores the `ChannelEntity` and subscribes
   through `resubscribePersistedChannels` (today `joinChannel` subscribes
@@ -2334,8 +2439,12 @@ Where each part lives or is to be made, by function (not line).
 - Sending C: the user's join (`JoinChannelScreen` → `joinChannel`) and leave
   (`ChatListViewModel`, `ConversationScreen` → `leaveChannel`) call a new
   `ChatRepository.sendDistroChannelSync`, built as `sendDistroSentCopy` is.
+  C is kept until the propagation node proves it, as "On the sending
+  device" says. Whether the LXMF router's queue for a PROPAGATED message
+  gives that today is not checked here; the lane checks it first.
 - Receiving C: `RfedDistroClient.handleBlob` reads `channel_sync` before
-  `if (isNotification) return`; rules 1-5 in a pure
+  `if (isNotification) return`, a repeat only by its LXMF message hash
+  ("Receiving"); rules 1-5 in a pure
   `DistroCodec.classifyChannelSync` beside `classifySentCopy`; rule 6 in
   `RfedChannelClient`: a join stores the `ChannelEntity` and subscribes
   through `resubscribePersistedChannels` (today `joinChannel` subscribes
@@ -2343,33 +2452,61 @@ Where each part lives or is to be made, by function (not line).
   C. The per-channel `(op, at_ms)` record is a new table, kept after a
   leave.
 
-**Retichat-js** (as of 24d83e6).
+**Retichat-js** (as made, branch `distro-channels-web` at a448e98).
 
-- Posting: `RnsClient.sendChannelMessage` packs with
-  `this.sendingIdentity().identity`; the echo key and the optimistic
-  record's `srcHash` take `sendingIdentity().hash`, and the record's
-  `timestamp` the packed `tsMs` (today the echo key is the device's
-  `lxmf.delivery` hash, `srcHash` the device's identity hash, and
-  `timestamp` the time the record was made).
-- Own posts and dedupe: `_handleChannelPacket` stores a post from
-  `ownLxmfDestinationHash()` or `DistroManager.lxmfDeliveryHash` as
-  `dir: "out"`, `status: "sent"`, with no `ContactStore.keep` and no
-  `ChannelPostNamesStore.noteSender`; `ChannelMsgStore.add` drops a post
-  whose `(srcHash, timestamp)` it already holds, the stored `timestamp`
-  being the post's own `tsMs` (today only the in-memory `_chanSeenIds`
-  dedupes).
-- Name state: `ChannelPostNames` (`lib/name_ledger.js`) per channel and
-  posting identity. It learns from own posts only a value equal to the
-  device's own (DISPLAY_NAMES.md §4.2).
-- Sending C: `joinChannel` and `leaveChannel` (user actions) call a new
-  `_sendDistroChannelSync`, built as `_sendDistroSentCopy` is.
-- Receiving C: `_handleDistroBlob` reads the marker (new
-  `LXMF.DISTRO_CHANNEL_TYPE`, `LXMF.distroChannelSyncFromFields`) before
-  `LXMF.isDeliveryNotification`, with the source and signature checks it
-  already makes for a sent copy.
+- Posting: `RnsClient.sendChannelMessage` decides the posting identity once,
+  `sendingIdentity()` (D when held, else the device), and packs with it
+  (`channelLxmPack`). The record's `srcHash`, the echo key and the §4.2 name
+  state take that identity's `lxmf.delivery` hash, and the record's
+  `timestamp` is the one the post is packed with, moved to the next free
+  millisecond when `ChannelMsgStore.held` already holds that
+  `(srcHash, timestamp)`. `_subscribeChannel`, `_unsubscribeChannel`, the
+  stream and the link's identify stay with `IdMgr.id`, the device.
+- Own posts and dedupe: `_handleChannelPacket` takes a post as the user's own
+  when its source is `ownLxmfDestinationHash()` or
+  `DistroManager.lxmfDeliveryHash`, and stores it `dir: "out"`,
+  `status: "sent"`, with no `ContactStore.keep`, no
+  `ChannelPostNamesStore.noteSender` and no notification.
+  `ChannelMsgStore.add` drops a post whose `(srcHash, timestamp)` it already
+  holds (`ChannelMsgStore.held`), so rfed's echo is dropped after a reload too.
+- Name state: `ChannelPostNames` (`lib/name_ledger.js`), per channel and
+  posting identity. `learn` records only the value this device would send
+  itself, at the post's time (DISPLAY_NAMES.md §4.2). 9f058e9 clamped that
+  time to this device's clock; 73a725d follows the spec text.
+- Sending C: `joinChannel` and `leaveChannel`, the user's actions, call
+  `_syncChannelMembership`. It stamps and records the action
+  (`ChannelMembership.stampLocal` in `lib/channel_sync.js`, stored under
+  `channel_membership_v1`), with or without a distro. With a distro it calls
+  `_sendDistroChannelSync`, which builds the fields with `channelSyncFields`
+  (`at_ms` as int 64) and packs and signs C with D once. `_oweDistro` then
+  writes C to `DistroOutbox` (`lib/distro_outbox.js`, one entry per channel,
+  id `channel:<channel hash>`, which also holds the §17.11 sent copies).
+  `_uploadOwed` uploads C at once when the propagation link is ACTIVE, and
+  `_sendDistroOutbox` uploads what is owed on the link's `"established"` and
+  `"recovered"`. `_stillOwed` checks each entry again before and after its
+  build. `_uploadForDistro` and `DistroUploads` (`lib/distro_upload.js`)
+  decide the upload: by the node's proof, by the exchange's loss report, or
+  by `cut()` on a disconnect or the link's close. Only a proof settles the
+  entry. `RetichatTest.distroOwed()` lists the outbox for staging.
+- Receiving C: `_handleDistroBlob` reads the marker with
+  `LXMF.distroChannelSyncFromPayload` (`lib/channel_sync.js`
+  `readChannelSync`, from the payload's bytes, so a float `at_ms` is refused
+  as rmpv refuses it), after the §17.11 copy and before
+  `LXMF.isDeliveryNotification`. Its repeat key (`DistroSeen`) adds the LXMF
+  message hash to the source and timestamp. Rules 1 and 2 use the
+  `signedByDistro` check shared with §17.11, over the received bytes
+  (`LXMessage.signedPayload`). `_handleDistroChannelSync` runs rules 1-5 in
+  `channelSyncDisposition` (`joinNameAccepted` for a join's name in rule 4,
+  `supersedes` for rule 5), and `_applyDistroChannelSync` runs rule 6. A join
+  goes through `ChannelStore.join` and is subscribed by
+  `_ensureChannelSubscribed` once `_initChannels` has re-subscribed the
+  stored channels, or by that re-subscription. A leave goes through
+  `_leaveChannelHere(ch, true)`: unsubscribe, the channel's posts,
+  `ChannelSenderNamesStore.forget`, `ChannelPostNamesStore.forget` and the
+  stream memo. No C is sent.
 
-**Tests every client makes for rules 4 and 5** (in its pure disposition
-function and the rule 6 code). Each case is listed with the mutation it must
+**Tests every client makes for rules 4 and 5 and the repeat key** (in its
+pure disposition function and the rule 6 code). Each case is listed with the mutation it must
 catch:
 
 - A `leave` of a stored channel whose name today's join refuses (for example
@@ -2384,6 +2521,19 @@ catch:
   makes the result depend on the order.
 - Concurrent actions end in one state on every device, the one with the
   larger `at_ms`.
+- A C whose `at_ms` is int 64 (`0xd3`, as the web writes it) and one whose
+  `at_ms` is uint 64 (`0xcf`, as rmpv writes it), holding one value, read as
+  the same action. Mutation: a reader that takes one of the two types only
+  drops the other client's C, and the devices disagree. Retichat-js at
+  a448e98 feeds `readChannelSync` its own int 64 and a positive fixint. Its
+  `readHead` reads `0xcf` (removing that case fails
+  `lxmf_signature.test.mjs`), but no `readChannelSync` test gives it a
+  `0xcf` `at_ms` yet.
+- Two Cs from two siblings with the same LXMF timestamp and different
+  actions are both judged by rule 5. Mutation: a repeat key without the
+  LXMF message hash ("Receiving") drops the second as a repeat. In
+  Retichat-js at a448e98 that mutation fails "rule 5: a join and a leave at
+  one time leave every device left, in either order".
 
 ### 17.9 Distro Identity Transfer
 
