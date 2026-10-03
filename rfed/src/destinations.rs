@@ -706,6 +706,74 @@ pub(crate) struct DistroFanoutCtx {
     pub config: NodeConfig,
 }
 
+/// The one fan-out sync ingest runs for a blob, chosen by
+/// `FedNode::plan_sync_dispatch` under the `FedNode` mutex and run by
+/// `run_sync_dispatch` after it is released. Each variant owns its snapshot.
+pub(crate) enum SyncDispatch {
+    /// A distro registered at this node: the devices registered for it.
+    Distro(Vec<crate::distro::DistroEntry>),
+    /// Any other routing hash is a channel's: its subscribers.
+    Channel(fanout::FanoutPlan),
+    /// The DistroTable could not be read, so the node cannot tell a distro
+    /// from a channel. Neither fan-out runs; the blob stays stored.
+    Unjudged,
+}
+
+/// Deliver one blob peer sync stored here, by the fan-out
+/// `FedNode::plan_sync_dispatch` chose.
+///
+/// Callers must not hold the `FedNode` mutex: both fan-outs do unbounded
+/// network work per recipient (see `FedNode::plan_channel_fanout`).
+fn run_sync_dispatch(routing_hash: &[u8], blob: &[u8], dispatch: SyncDispatch, ctx: &DistroFanoutCtx) {
+    match dispatch {
+        // ── Channel fanout ────────────
+        SyncDispatch::Channel(plan) => plan.run(routing_hash, blob),
+
+        // ── Distro fanout ────────────
+        SyncDispatch::Distro(devices) => {
+            // Every device the fan-out cannot confirm — unreachable,
+            // sent a packet nothing confirms, or pushed on rfed.link or
+            // a stream and never answered (Link.md) — is queued for
+            // /rfed/pull and woken. Until 2026-09-26 this caller woke by
+            // the device's identity hash, which no registration is
+            // stored under, so it woke no one.
+            let config = ctx.config.clone();
+            let on_unconfirmed = crate::handoff::defer_then_wake(
+                Arc::new(crate::notify::rns::LiveStack),
+                Arc::clone(&ctx.deferred_queue),
+                Arc::clone(&ctx.notify_registry),
+                Arc::new(move |device_id_hash: &[u8]| {
+                    config.policy_for(device_id_hash).deferred_queue_limit
+                }),
+                routing_hash,
+                blob,
+                None,
+            );
+            if let Ok(hooks) = ctx.hook_registry.lock() {
+                crate::distro::distro_fanout(
+                    routing_hash,
+                    blob,
+                    &devices,
+                    &hooks,
+                    Some(&ctx.propagation_streams),
+                    Some(&ctx.link_sessions),
+                    on_unconfirmed,
+                );
+            }
+        }
+
+        SyncDispatch::Unjudged => log(
+            format!(
+                "[sync] distro table lock poisoned: blob for {} stored, not fanned out — a distro cannot be told from a channel (SPEC §6)",
+                hexrep(routing_hash, false),
+            ),
+            LOG_ERROR,
+            false,
+            false,
+        ),
+    }
+}
+
 impl FedNode {
     /// The `Arc`s and config a distro fan-out needs after the guard is
     /// released. See `DistroFanoutCtx`.
@@ -753,6 +821,50 @@ impl FedNode {
             channel_streams: Arc::clone(&self.channel_streams),
             link_sessions: Arc::clone(&self.link_sessions),
         }
+    }
+
+    /// Choose the one fan-out a blob that peer sync stored here goes by
+    /// (SPEC §6, "Channel and distro hashes"; §17.7): the distro fan-out for
+    /// a routing hash that is a distro registered at this node, the channel
+    /// fan-out for any other. Never both.
+    ///
+    /// Until 2026-10-03 sync ingest ran the channel fan-out for every blob
+    /// and the distro fan-out as well for a distro's, so a channel
+    /// subscription row under a distro's hash was sent that distro's
+    /// messages. `subscribe` refuses such rows now; this also stops delivery
+    /// to one that exists anyway: made before the distro registered here,
+    /// pushed by a peer as a backup, or stored before that refusal.
+    ///
+    /// Snapshots only, like `plan_channel_fanout`: run the result with
+    /// `run_sync_dispatch` after the `FedNode` guard is dropped.
+    pub(crate) fn plan_sync_dispatch(&self, routing_hash: &[u8]) -> SyncDispatch {
+        // The distro table's guard is released at the end of this statement,
+        // before the subscription table is taken.
+        let devices = match self.distro_table.lock() {
+            Ok(table) if table.is_distro(routing_hash) => Some(table.devices_snapshot(routing_hash)),
+            Ok(_) => None,
+            Err(_) => return SyncDispatch::Unjudged,
+        };
+        let Some(devices) = devices else {
+            return SyncDispatch::Channel(self.plan_channel_fanout(routing_hash));
+        };
+        let channel_rows = self
+            .subscription_table
+            .lock()
+            .map(|t| t.get_subscribers_with_owner(routing_hash).len())
+            .unwrap_or(0);
+        if channel_rows > 0 {
+            log(
+                format!(
+                    "[sync] {} is a distro registered here: its {channel_rows} channel subscription row(s) are not fanned out to (SPEC §6)",
+                    hexrep(routing_hash, false),
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+        }
+        SyncDispatch::Distro(devices)
     }
 
     pub fn new(identity: Identity, config: NodeConfig) -> Result<Self, String> {
@@ -1538,7 +1650,9 @@ fn run_sync_session(
 
                     let count = ingested.len();
 
-                    // Fanout each newly ingested blob to local subscribers.
+                    // Fanout each newly ingested blob: a distro's to its
+                    // devices, any other to the channel's subscribers, never
+                    // both (SPEC §6, "Channel and distro hashes").
                     if !ingested.is_empty() {
                         if let Some(arc) = nw2.as_ref().and_then(|w| w.upgrade()) {
                             // Everything the fan-out needs is snapshotted here,
@@ -1551,63 +1665,18 @@ fn run_sync_session(
                             // /rfed/distro/register on 2026-08-09).
                             let planned = match arc.lock() {
                                 Ok(guard) => {
-                                    let distro_devices: std::collections::HashMap<Vec<u8>, Vec<crate::distro::DistroEntry>> =
-                                        match guard.distro_table.lock() {
-                                            Ok(dtable) => ingested
-                                                .iter()
-                                                .filter(|(routing_hash, _)| dtable.is_distro(routing_hash))
-                                                .map(|(routing_hash, _)| {
-                                                    (routing_hash.clone(), dtable.devices_snapshot(routing_hash))
-                                                })
-                                                .collect(),
-                                            Err(_) => std::collections::HashMap::new(),
-                                        };
-                                    let plans: Vec<fanout::FanoutPlan> = ingested
+                                    let dispatches: Vec<SyncDispatch> = ingested
                                         .iter()
-                                        .map(|(routing_hash, _)| guard.plan_channel_fanout(routing_hash))
+                                        .map(|(routing_hash, _)| guard.plan_sync_dispatch(routing_hash))
                                         .collect();
-                                    Some((plans, distro_devices, guard.distro_fanout_ctx()))
+                                    Some((dispatches, guard.distro_fanout_ctx()))
                                 }
                                 Err(_) => None,
                             };
 
-                            if let Some((plans, distro_devices, ctx)) = planned {
-                                for ((routing_hash, blob), plan) in ingested.iter().zip(plans.iter()) {
-                                    // ── Channel fanout ────────────
-                                    plan.run(routing_hash, blob);
-
-                                    // ── Distro fanout ────────────
-                                    if let Some(devices) = distro_devices.get(routing_hash) {
-                                        // Every device the fan-out cannot confirm — unreachable,
-                                        // sent a packet nothing confirms, or pushed on rfed.link or
-                                        // a stream and never answered (Link.md) — is queued for
-                                        // /rfed/pull and woken. Until 2026-09-26 this caller woke by
-                                        // the device's identity hash, which no registration is
-                                        // stored under, so it woke no one.
-                                        let config = ctx.config.clone();
-                                        let on_unconfirmed = crate::handoff::defer_then_wake(
-                                            Arc::new(crate::notify::rns::LiveStack),
-                                            Arc::clone(&ctx.deferred_queue),
-                                            Arc::clone(&ctx.notify_registry),
-                                            Arc::new(move |device_id_hash: &[u8]| {
-                                                config.policy_for(device_id_hash).deferred_queue_limit
-                                            }),
-                                            routing_hash,
-                                            blob,
-                                            None,
-                                        );
-                                        if let Ok(hooks) = ctx.hook_registry.lock() {
-                                            crate::distro::distro_fanout(
-                                                routing_hash,
-                                                blob,
-                                                devices,
-                                                &hooks,
-                                                Some(&ctx.propagation_streams),
-                                                Some(&ctx.link_sessions),
-                                                on_unconfirmed,
-                                            );
-                                        }
-                                    }
+                            if let Some((dispatches, ctx)) = planned {
+                                for ((routing_hash, blob), dispatch) in ingested.iter().zip(dispatches) {
+                                    run_sync_dispatch(routing_hash, blob, dispatch, &ctx);
                                 }
                             }
                         }
@@ -2754,6 +2823,127 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
 // ── rfed.channel ─────────────────────────────────────────────────────────────
 
+/// Why `/rfed/subscribe` (`/channel/subscribe` on rfed.link) refused. Every
+/// refusal is answered with a bare msgpack `false` (SPEC §6, "Channel and
+/// distro hashes"), which is what the clients parse; the reason is told only
+/// in the log, each in words of its own.
+#[derive(Debug, PartialEq, Eq)]
+enum SubscribeRefusal {
+    /// The payload did not parse, or its signature did not verify.
+    Unsigned(String),
+    /// `channel_hash` is not 16 bytes.
+    BadChannelHash(usize),
+    /// The FedNode mutex is poisoned.
+    NodeUnavailable,
+    /// The subscriber's tier policy allows no subscriptions.
+    Policy { subscriber: Vec<u8> },
+    /// `channel_hash` is a distro registered at this node, not a channel.
+    DistroHash { channel: Vec<u8>, subscriber: Vec<u8> },
+    /// The DistroTable could not be read, so the node cannot tell whether
+    /// `channel_hash` is a distro's.
+    DistroTableUnavailable { channel: Vec<u8> },
+}
+
+impl std::fmt::Display for SubscribeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubscribeRefusal::Unsigned(e) => write!(f, "subscribe_cb: {e}"),
+            SubscribeRefusal::BadChannelHash(len) => write!(f, "subscribe_cb: bad channel_hash len={len}"),
+            SubscribeRefusal::NodeUnavailable => write!(f, "subscribe_cb: FedNode lock poisoned — subscription not stored"),
+            SubscribeRefusal::Policy { subscriber } => {
+                write!(f, "subscription denied for {} (policy)", hexrep(subscriber, false))
+            }
+            SubscribeRefusal::DistroHash { channel, subscriber } => write!(
+                f,
+                "subscription refused for {}: {} is a distro registered at this node, not a channel (SPEC §6)",
+                hexrep(subscriber, false),
+                hexrep(channel, false),
+            ),
+            SubscribeRefusal::DistroTableUnavailable { channel } => write!(
+                f,
+                "subscription refused: distro table lock poisoned, so {} cannot be told from a distro's hash",
+                hexrep(channel, false),
+            ),
+        }
+    }
+}
+
+/// `/rfed/subscribe` and `/channel/subscribe`: verify the signed payload,
+/// judge it, and store `(subscriber_hash, channel_hash)`. Returns the stamp
+/// cost the response announces (None: no stamp), or why it refused.
+///
+/// A distro registered here is never a channel (SPEC §6, "Channel and distro
+/// hashes"; James, 2026-10-03). Before this check anyone could subscribe to a
+/// user's distro address as a channel and be sent that distro's messages,
+/// still encrypted but with their timing and size, as this node pulled them
+/// from its peers. The subscriber's device key is no exception: devices
+/// register under a distro, they never subscribe to it.
+fn subscribe(node: &Arc<Mutex<FedNode>>, data: &[u8]) -> Result<Option<u32>, SubscribeRefusal> {
+    // Payload: fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig].
+    // Subscriber identity is derived from pubkey; sig proves key ownership.
+    let (channel_hash, subscriber_hash, _pubkey) =
+        verify_signed_payload(data).map_err(SubscribeRefusal::Unsigned)?;
+    if channel_hash.len() != 16 {
+        return Err(SubscribeRefusal::BadChannelHash(channel_hash.len()));
+    }
+
+    let lock_start = Instant::now();
+    let guard = node.lock().map_err(|_| SubscribeRefusal::NodeUnavailable)?;
+    let lock_held = lock_start.elapsed();
+    if lock_held > Duration::from_secs(1) {
+        log(format!("[rfed] LOCK-WARN subscribe_cb: FedNode lock acquired after {:.2}s", lock_held.as_secs_f64()), LOG_WARNING, false, false);
+    }
+    if !guard.config.policy_for(&subscriber_hash).allow_subscription {
+        return Err(SubscribeRefusal::Policy { subscriber: subscriber_hash });
+    }
+    // The distro table's guard is released at the end of this statement,
+    // before the subscription table is taken.
+    let is_distro = match guard.distro_table.lock() {
+        Ok(table) => table.is_distro(&channel_hash),
+        Err(_) => return Err(SubscribeRefusal::DistroTableUnavailable { channel: channel_hash }),
+    };
+    if is_distro {
+        return Err(SubscribeRefusal::DistroHash { channel: channel_hash, subscriber: subscriber_hash });
+    }
+
+    if let Ok(mut subs) = guard.subscription_table.lock() {
+        subs.subscribe(subscriber_hash.clone(), channel_hash.clone());
+    }
+    // Queue for backup push.
+    if let Ok(mut q) = guard.pending_backup_pushes.lock() {
+        const PENDING_BACKUP_CAP: usize = 1024;
+        if q.len() < PENDING_BACKUP_CAP {
+            q.push((subscriber_hash, channel_hash));
+        }
+    }
+    // stamp_cost is None when disabled (including configured 0) so clients
+    // skip the stamp tail entirely.
+    Ok(guard.config.default_policy.stamp_cost.filter(|c| *c > 0))
+}
+
+/// The response `subscribe_cb` sends: `[true, stamp_cost_or_nil]`, or a bare
+/// msgpack `false` for every refusal, whose reason goes to the log.
+fn subscribe_response(node: &Arc<Mutex<FedNode>>, data: &[u8]) -> Vec<u8> {
+    match subscribe(node, data) {
+        Ok(cost) => {
+            let resp = rmpv::Value::Array(vec![
+                rmpv::Value::Boolean(true),
+                match cost {
+                    Some(c) => rmpv::Value::Integer(rmpv::Integer::from(c as i64)),
+                    None    => rmpv::Value::Nil,
+                },
+            ]);
+            let mut buf = Vec::new();
+            rmpv::encode::write_value(&mut buf, &resp).unwrap_or_default();
+            buf
+        }
+        Err(refusal) => {
+            log(format!("[rfed] {refusal}"), LOG_WARNING, false, false);
+            rmp_serde::to_vec(&false).unwrap_or_default()
+        }
+    }
+}
+
 fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // Snapshot anti-spam knobs once — both are Copy so no lock required later.
     let (stamp_cost, stamp_flexibility) = {
@@ -2932,66 +3122,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let sub_node = Arc::clone(node);
     let subscribe_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                       _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
-        // Payload: fixarray-3 [bin(16) channel_hash, bin(64) pubkey, bin(64) sig].
-        // Subscriber identity is derived from pubkey; sig proves key ownership.
-        let (channel_hash, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
-            Ok(v) => v,
-            Err(e) => {
-                log(format!("[rfed] subscribe_cb: {e}"), LOG_WARNING, false, false);
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-        };
-
-        if channel_hash.len() != 16 {
-            log(format!("[rfed] subscribe_cb: bad channel_hash len={}", channel_hash.len()), LOG_WARNING, false, false);
-            return rmp_serde::to_vec(&false).unwrap_or_default();
-        }
-        let lock_start = Instant::now();
-        if let Ok(guard) = sub_node.lock() {
-            let lock_held = lock_start.elapsed();
-            if lock_held > Duration::from_secs(1) {
-                log(format!("[rfed] LOCK-WARN subscribe_cb: FedNode lock acquired after {:.2}s", lock_held.as_secs_f64()), LOG_WARNING, false, false);
-            }
-            if !guard.config.policy_for(&subscriber_hash).allow_subscription {
-                log(
-                    format!(
-                        "[rfed] subscription denied for {} (policy)",
-                        reticulum_rust::hexrep(&subscriber_hash, false),
-                    ),
-                    LOG_WARNING,
-                    false,
-                    false,
-                );
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-            if let Ok(mut subs) = guard.subscription_table.lock() {
-                subs.subscribe(subscriber_hash.clone(), channel_hash.clone());
-            }
-            // Queue for backup push.
-            {
-                if let Ok(mut q) = guard.pending_backup_pushes.lock() {
-                    const PENDING_BACKUP_CAP: usize = 1024;
-                    if q.len() < PENDING_BACKUP_CAP {
-                        q.push((subscriber_hash, channel_hash));
-                    }
-                }
-            }
-            // Response: [true, stamp_cost_or_nil]
-            // stamp_cost is Nil when disabled (including configured 0) so
-            // clients skip the stamp tail entirely.
-            let cost = guard.config.default_policy.stamp_cost.filter(|c| *c > 0);
-            let resp = rmpv::Value::Array(vec![
-                rmpv::Value::Boolean(true),
-                match cost {
-                    Some(c) => rmpv::Value::Integer(rmpv::Integer::from(c as i64)),
-                    None    => rmpv::Value::Nil,
-                },
-            ]);
-            let mut buf = Vec::new();
-            rmpv::encode::write_value(&mut buf, &resp).unwrap_or_default();
-            return buf;
-        }
-        rmp_serde::to_vec(&false).unwrap_or_default()
+        subscribe_response(&sub_node, data)
     });
 
     // UNSUBSCRIBE
@@ -5245,7 +5376,7 @@ mod announce_order_tests {
     use super::*;
     use crate::config::TierPolicy;
 
-    fn config(tag: &str, propagation: bool) -> NodeConfig {
+    pub(super) fn config(tag: &str, propagation: bool) -> NodeConfig {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let dir = std::env::temp_dir().join(format!("rfed_announce_order_{tag}_{unique}"));
         std::fs::create_dir_all(&dir).unwrap();
@@ -5279,7 +5410,7 @@ mod announce_order_tests {
 
     /// Serialises the tests here that publish to Transport's process-wide
     /// published set or drive its jobs.
-    fn transport_guard() -> std::sync::MutexGuard<'static, ()> {
+    pub(super) fn transport_guard() -> std::sync::MutexGuard<'static, ()> {
         static GUARD: Mutex<()> = Mutex::new(());
         GUARD.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -5476,5 +5607,201 @@ mod announce_order_tests {
         let node = FedNode::new(Identity::new(true), config).expect("node");
         let sync = node.sync.lock().unwrap();
         assert_eq!((sync.transfer_limit_bytes, sync.sync_limit_bytes), (7 * 1024 * 1024, 70 * 1024 * 1024));
+    }
+}
+
+/// SPEC §6, "Channel and distro hashes" (James, 2026-10-03): a distro
+/// registered at this node is never a channel. `/rfed/subscribe` refuses its
+/// hash, and a blob peer sync stores under it goes to the distro's devices
+/// only, never to a channel subscription row under that hash.
+#[cfg(test)]
+mod distro_namespace_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::announce_order_tests::{config, transport_guard};
+    use super::*;
+
+    fn identity_hash(identity: &Identity) -> Vec<u8> {
+        identity.hash.clone().expect("identity hash")
+    }
+
+    fn lxmf_delivery(identity: &Identity) -> Vec<u8> {
+        Destination::hash(Some(&identity_hash(identity)), "lxmf", &["delivery"])
+    }
+
+    /// `[bin(16) channel_hash, bin(64) pubkey, bin(64) sig(channel_hash)]`,
+    /// as every client signs `/rfed/subscribe`.
+    fn signed_subscribe(subscriber: &Identity, channel_hash: &[u8]) -> Vec<u8> {
+        let payload = rmpv::Value::Array(vec![
+            rmpv::Value::Binary(channel_hash.to_vec()),
+            rmpv::Value::Binary(subscriber.get_public_key().expect("pubkey")),
+            rmpv::Value::Binary(subscriber.sign(channel_hash)),
+        ]);
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &payload).unwrap();
+        out
+    }
+
+    fn node(tag: &str) -> Arc<Mutex<FedNode>> {
+        Arc::new(Mutex::new(FedNode::new(Identity::new(true), config(tag, false)).expect("node")))
+    }
+
+    fn remove_node_dir(node: &Arc<Mutex<FedNode>>) {
+        let dir = node.lock().unwrap().config.config_dir.clone();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// What `/rfed/distro/register` stores for a device of a distro.
+    fn register_device(node: &Arc<Mutex<FedNode>>, distro_hash: &[u8], device: &Identity) {
+        let guard = node.lock().unwrap();
+        guard.distro_table.lock().unwrap().register(
+            distro_hash.to_vec(),
+            lxmf_delivery(device),
+            device.get_public_key().unwrap(),
+        );
+    }
+
+    fn subscribers(node: &Arc<Mutex<FedNode>>, channel_hash: &[u8]) -> Vec<Vec<u8>> {
+        let guard = node.lock().unwrap();
+        let table = guard.subscription_table.lock().unwrap();
+        table.get_subscribers_with_owner(channel_hash).into_iter().map(|(sub, _)| sub).collect()
+    }
+
+    /// Whether the deferred queue holds a blob for `routing_hash` in the
+    /// bucket of `queue_key`, the identity hash a pull drains by.
+    fn queued(node: &Arc<Mutex<FedNode>>, queue_key: &[u8], routing_hash: &[u8]) -> bool {
+        let guard = node.lock().unwrap();
+        let queue = guard.deferred_queue.lock().unwrap();
+        queue.has_pending_matching(queue_key, |routing| routing == routing_hash)
+    }
+
+    fn has_any_queued(node: &Arc<Mutex<FedNode>>, queue_key: &[u8]) -> bool {
+        node.lock().unwrap().deferred_queue.lock().unwrap().has_pending(queue_key)
+    }
+
+    #[test]
+    fn a_registered_distros_hash_cannot_be_subscribed_as_a_channel() {
+        let _guard = transport_guard();
+        let node = node("ns_subscribe");
+        let distro_hash = lxmf_delivery(&Identity::new(true));
+        let device = Identity::new(true);
+        register_device(&node, &distro_hash, &device);
+        let stranger = Identity::new(true);
+
+        // Refused for a reason of its own, and answered as every refusal is.
+        let payload = signed_subscribe(&stranger, &distro_hash);
+        assert_eq!(
+            subscribe(&node, &payload),
+            Err(SubscribeRefusal::DistroHash { channel: distro_hash.clone(), subscriber: identity_hash(&stranger) }),
+        );
+        assert_eq!(subscribe_response(&node, &payload), vec![0xc2], "a bare msgpack false (SPEC §6)");
+        // The distro's own device is no exception: it registers under the
+        // distro, it never subscribes to it.
+        assert!(matches!(
+            subscribe(&node, &signed_subscribe(&device, &distro_hash)),
+            Err(SubscribeRefusal::DistroHash { .. }),
+        ));
+        assert!(subscribers(&node, &distro_hash).is_empty(), "no subscription row is stored");
+        assert!(
+            node.lock().unwrap().pending_backup_pushes.lock().unwrap().is_empty(),
+            "nothing is queued for a backup push"
+        );
+
+        // A channel's hash is still taken, from the same subscriber.
+        let channel_hash = identity_hash(&Identity::new(true));
+        let accepted = subscribe_response(&node, &signed_subscribe(&stranger, &channel_hash));
+        let value = rmpv::decode::read_value(&mut Cursor::new(&accepted[..])).unwrap();
+        assert_eq!(value.as_array().and_then(|a| a.first()).and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(subscribers(&node, &channel_hash), vec![identity_hash(&stranger)]);
+
+        remove_node_dir(&node);
+    }
+
+    /// The rows the subscribe refusal cannot reach: one made before the
+    /// distro registered here and a backup row a peer pushed. A distro blob
+    /// that sync brings in goes to the distro's device and to neither row;
+    /// a channel blob in the same batch still goes to its subscriber.
+    #[test]
+    fn a_synced_distro_blob_reaches_only_the_distro_fanout() {
+        let _guard = transport_guard();
+        let node = node("ns_sync");
+        let distro_hash = lxmf_delivery(&Identity::new(true));
+        let device = Identity::new(true);
+
+        // Before the distro registered here its hash was only 16 bytes.
+        let stranger = Identity::new(true);
+        assert!(subscribe(&node, &signed_subscribe(&stranger, &distro_hash)).is_ok());
+        let backup_subscriber = identity_hash(&Identity::new(true));
+        let backup_owner = identity_hash(&Identity::new(true));
+        node.lock().unwrap().subscription_table.lock().unwrap().subscribe_backup(
+            backup_subscriber.clone(),
+            distro_hash.clone(),
+            backup_owner,
+        );
+        register_device(&node, &distro_hash, &device);
+
+        let channel_hash = identity_hash(&Identity::new(true));
+        let member = Identity::new(true);
+        assert!(subscribe(&node, &signed_subscribe(&member, &channel_hash)).is_ok());
+
+        // Planned under the FedNode mutex, run after it is released, as the
+        // MESSAGE_GET response callback does.
+        let (for_distro, for_channel, ctx) = {
+            let guard = node.lock().unwrap();
+            (
+                guard.plan_sync_dispatch(&distro_hash),
+                guard.plan_sync_dispatch(&channel_hash),
+                guard.distro_fanout_ctx(),
+            )
+        };
+        match &for_distro {
+            SyncDispatch::Distro(devices) => assert_eq!(
+                devices.iter().map(|d| d.device_lxmf_hash.clone()).collect::<Vec<_>>(),
+                vec![lxmf_delivery(&device)],
+            ),
+            SyncDispatch::Channel(_) => panic!("a registered distro's hash must not go by the channel fan-out"),
+            SyncDispatch::Unjudged => panic!("the distro table is readable"),
+        }
+        match &for_channel {
+            SyncDispatch::Channel(plan) => assert_eq!(plan.subscribers, vec![(identity_hash(&member), None)]),
+            _ => panic!("any other hash goes by the channel fan-out"),
+        }
+        run_sync_dispatch(&distro_hash, b"distro blob", for_distro, &ctx);
+        run_sync_dispatch(&channel_hash, b"channel blob", for_channel, &ctx);
+
+        // No recipient has a live session, so each one the fan-out reached is
+        // queued for its pull under its identity hash.
+        assert!(queued(&node, &identity_hash(&device), &distro_hash), "the device gets the distro blob");
+        assert!(!has_any_queued(&node, &identity_hash(&stranger)), "the earlier channel row gets nothing");
+        assert!(!has_any_queued(&node, &backup_subscriber), "the backup row gets nothing");
+        assert!(queued(&node, &identity_hash(&member), &channel_hash), "the channel blob reaches its subscriber");
+        assert!(!queued(&node, &identity_hash(&device), &channel_hash), "the device is no subscriber of the channel");
+
+        remove_node_dir(&node);
+    }
+
+    /// The MESSAGE_GET response callback plans with `plan_sync_dispatch` and
+    /// delivers with `run_sync_dispatch`, and the wired subscribe handler is
+    /// `subscribe_response`: the functions the tests above drive.
+    #[test]
+    fn the_live_handlers_go_through_the_guarded_functions() {
+        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/destinations.rs"))
+            .expect("read destinations.rs");
+        let start = source
+            .find("let get_response: Arc<dyn Fn(RequestReceipt) + Send + Sync> =")
+            .expect("MESSAGE_GET response callback present");
+        let end = start + source[start..].find("let get_failed:").expect("its failure callback follows");
+        let callback = &source[start..end];
+        assert!(callback.contains("guard.plan_sync_dispatch(routing_hash)"), "sync ingest plans with plan_sync_dispatch");
+        assert!(callback.contains("run_sync_dispatch(routing_hash, blob, dispatch, &ctx);"), "and delivers with run_sync_dispatch");
+        assert!(!callback.contains("plan_channel_fanout("), "no channel fan-out that skips the distro check");
+        assert!(!callback.contains("distro_fanout("), "no second fan-out beside the dispatch");
+
+        let wire = source.find("fn wire_channel_destination(").expect("channel wiring present");
+        let wire_end = wire + source[wire..].find("fn wire_delivery_destination(").expect("delivery wiring follows");
+        assert!(
+            source[wire..wire_end].contains("subscribe_response(&sub_node, data)"),
+            "subscribe_cb answers with subscribe_response"
+        );
     }
 }
