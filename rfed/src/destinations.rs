@@ -1477,6 +1477,7 @@ impl FedNode {
         // ── Part 3: failover delivery + chain-of-custody re-push ──────
         let (adopted, wakes) = backup_delivery_tick(
             Arc::clone(&self.subscription_table),
+            Arc::clone(&self.distro_table),
             Arc::clone(&self.blob_store),
             Arc::clone(&self.deferred_queue),
             Arc::clone(&self.notify_registry),
@@ -1931,8 +1932,17 @@ pub type BackupWake = (crate::notify::NotifyRegistration, Vec<u8>);
 /// subscribers. The caller may re-push the triples to its own backup node so
 /// the chain of custody extends further, unless doing so would send them
 /// straight back to the current owner.
+///
+/// A backup row under the hash of a distro registered here is not delivered
+/// to (SPEC §6, "Channel and distro hashes"). The BlobStore holds a distro's
+/// messages under its hash, and this tick queues every blob stored under a
+/// row's hash for the row's subscriber and wakes it, so until 2026-10-03 such
+/// a row was handed the distro's messages. `backup_push_response` stores no
+/// new one; this covers a row stored before the distro registered here, or
+/// before that refusal.
 fn backup_delivery_tick(
     subscription_table: Arc<Mutex<crate::subscription::SubscriptionTable>>,
+    distro_table: Arc<Mutex<DistroTable>>,
     blob_store: Arc<Mutex<crate::blob_store::BlobStore>>,
     deferred_queue: Arc<Mutex<crate::deferred_queue::DeferredQueue>>,
     notify_registry: Arc<Mutex<crate::notify::NotifyRegistry>>,
@@ -1947,6 +1957,31 @@ fn backup_delivery_tick(
         .unwrap_or_default();
     if entries.is_empty() {
         return (Vec::new(), Vec::new());
+    }
+
+    // The distro table's guard is released at the end of this statement,
+    // before anything else is taken.
+    let distros = match distro_table.lock() {
+        Ok(table) => table.registered_distro_hashes(),
+        Err(_) => {
+            log(
+                "[backup] distro table lock poisoned: no backup row delivered to — a distro cannot be told from a channel (SPEC §6)",
+                LOG_ERROR, false, false,
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let (entries, distro_rows): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .partition(|(_, ch_hash, _)| !distros.contains(ch_hash));
+    if !distro_rows.is_empty() {
+        log(
+            format!(
+                "[backup] {} backup row(s) under a distro registered here not delivered to (SPEC §6)",
+                distro_rows.len(),
+            ),
+            LOG_NOTICE, false, false,
+        );
     }
 
     // Group by owner — one liveness check per owner node.
@@ -2104,10 +2139,11 @@ mod backup_chain_tests {
         notify.lock().unwrap().register(key.clone(), Some(channel.clone()), relay.clone());
         let distro = Arc::new(Mutex::new(DistroTable::load(dir.join("distro.rmp"))));
         // No peer heard: the owner counts as offline.
-        let sync = Arc::new(Mutex::new(FedSync::new(Arc::clone(&blobs), Arc::clone(&subscriptions), distro)));
+        let sync = Arc::new(Mutex::new(FedSync::new(Arc::clone(&blobs), Arc::clone(&subscriptions), Arc::clone(&distro))));
 
         let (adopted, wakes) = backup_delivery_tick(
             subscriptions,
+            distro,
             blobs,
             Arc::clone(&deferred),
             notify,
@@ -2579,6 +2615,125 @@ mod deferred_flush_size_tests {
     }
 }
 
+/// `/rfed/backup/push` on rfed.node (`/node/backup/push` on rfed.link): store
+/// the `(subscriber_hash, channel_hash)` pairs an owner node signs as backup
+/// rows under that owner. Answers msgpack `true`, or `false` for a refusal,
+/// on which the owner queues the whole batch again.
+///
+/// A pair whose `channel_hash` is a distro registered here is not stored
+/// (SPEC §6, "Channel and distro hashes"), as `/rfed/subscribe` stores none:
+/// the owner may not know the distro, and any self-signed owner is accepted
+/// while `trusted_backup_peers` is empty. The rest of the batch is stored and
+/// the push answered `true`, so the owner does not push it again.
+fn backup_push_response(node: &Arc<Mutex<FedNode>>, data: &[u8]) -> Vec<u8> {
+    let (pairs_bytes, _owner_identity_hash, pubkey) = match verify_signed_payload(data) {
+        Ok(v) => v,
+        Err(e) => {
+            log(
+                format!("[backup] invalid BACKUP_PUSH payload: {e}"),
+                LOG_WARNING, false, false,
+            );
+            return rmp_serde::to_vec(&false).unwrap_or_default();
+        }
+    };
+
+    let owner_identity = match Identity::from_public_key(&pubkey) {
+        Ok(identity) => identity,
+        Err(e) => {
+            log(
+                format!("[backup] BACKUP_PUSH owner key decode error: {e}"),
+                LOG_WARNING, false, false,
+            );
+            return rmp_serde::to_vec(&false).unwrap_or_default();
+        }
+    };
+
+    let owner_hash = match Destination::new_outbound(
+        Some(owner_identity),
+        DestinationType::Single,
+        APP_NAME.to_string(),
+        vec!["node".to_string()],
+    ) {
+        Ok(dest) => dest.hash,
+        Err(e) => {
+            log(
+                format!("[backup] BACKUP_PUSH owner hash derivation error: {e}"),
+                LOG_WARNING, false, false,
+            );
+            return rmp_serde::to_vec(&false).unwrap_or_default();
+        }
+    };
+
+    let pairs: Vec<(Vec<u8>, Vec<u8>)> = match rmp_serde::from_slice(&pairs_bytes) {
+        Ok(pairs) => pairs,
+        Err(e) => {
+            log(
+                format!("[backup] BACKUP_PUSH pairs decode error: {e}"),
+                LOG_WARNING, false, false,
+            );
+            return rmp_serde::to_vec(&false).unwrap_or_default();
+        }
+    };
+
+    let guard = match node.lock() {
+        Ok(g) => g,
+        Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
+    };
+
+    // If trusted_backup_peers is non-empty, only accept from listed nodes.
+    let trusted = guard.config.trusted_backup_peers.is_empty()
+        || guard.config.trusted_backup_peers.iter().any(|h| h == &owner_hash);
+    if !trusted {
+        log(
+            format!("[backup] rejected BACKUP_PUSH from untrusted owner {}",
+                hexrep(&owner_hash, false)),
+            LOG_WARNING, false, false,
+        );
+        return rmp_serde::to_vec(&false).unwrap_or_default();
+    }
+
+    // The distro table's guard is released at the end of this statement,
+    // before the subscription table is taken.
+    let distros = match guard.distro_table.lock() {
+        Ok(table) => table.registered_distro_hashes(),
+        Err(_) => {
+            log(
+                format!(
+                    "[backup] rejected BACKUP_PUSH from owner {}: distro table lock poisoned, so a distro cannot be told from a channel (SPEC §6)",
+                    hexrep(&owner_hash, false),
+                ),
+                LOG_ERROR, false, false,
+            );
+            return rmp_serde::to_vec(&false).unwrap_or_default();
+        }
+    };
+    let (pairs, distro_pairs): (Vec<_>, Vec<_>) = pairs
+        .into_iter()
+        .partition(|(_, ch_hash)| !distros.contains(ch_hash));
+    if !distro_pairs.is_empty() {
+        log(
+            format!(
+                "[backup] BACKUP_PUSH from owner {}: {} pair(s) under a distro registered here not stored (SPEC §6)",
+                hexrep(&owner_hash, false),
+                distro_pairs.len(),
+            ),
+            LOG_NOTICE, false, false,
+        );
+    }
+
+    if let Ok(mut subs) = guard.subscription_table.lock() {
+        for (sub_hash, ch_hash) in &pairs {
+            subs.subscribe_backup(sub_hash.clone(), ch_hash.clone(), owner_hash.clone());
+        }
+    }
+    log(
+        format!("[backup] registered {} backup sub(s) from owner {}",
+            pairs.len(), hexrep(&owner_hash, false)),
+        LOG_NOTICE, false, false,
+    );
+    rmp_serde::to_vec(&true).unwrap_or_default()
+}
+
 // ── rfed.node ────────────────────────────────────────────────────────────────
 
 fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
@@ -2622,83 +2777,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     let backup_push_node = Arc::clone(node);
     let backup_push_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
                                         _caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
-        let (pairs_bytes, _owner_identity_hash, pubkey) = match verify_signed_payload(data) {
-            Ok(v) => v,
-            Err(e) => {
-                log(
-                    format!("[backup] invalid BACKUP_PUSH payload: {e}"),
-                    LOG_WARNING, false, false,
-                );
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-        };
-
-        let owner_identity = match Identity::from_public_key(&pubkey) {
-            Ok(identity) => identity,
-            Err(e) => {
-                log(
-                    format!("[backup] BACKUP_PUSH owner key decode error: {e}"),
-                    LOG_WARNING, false, false,
-                );
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-        };
-
-        let owner_hash = match Destination::new_outbound(
-            Some(owner_identity),
-            DestinationType::Single,
-            APP_NAME.to_string(),
-            vec!["node".to_string()],
-        ) {
-            Ok(dest) => dest.hash,
-            Err(e) => {
-                log(
-                    format!("[backup] BACKUP_PUSH owner hash derivation error: {e}"),
-                    LOG_WARNING, false, false,
-                );
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-        };
-
-        let pairs: Vec<(Vec<u8>, Vec<u8>)> = match rmp_serde::from_slice(&pairs_bytes) {
-            Ok(pairs) => pairs,
-            Err(e) => {
-                log(
-                    format!("[backup] BACKUP_PUSH pairs decode error: {e}"),
-                    LOG_WARNING, false, false,
-                );
-                return rmp_serde::to_vec(&false).unwrap_or_default();
-            }
-        };
-
-        let guard = match backup_push_node.lock() {
-            Ok(g) => g,
-            Err(_) => return rmp_serde::to_vec(&false).unwrap_or_default(),
-        };
-
-        // If trusted_backup_peers is non-empty, only accept from listed nodes.
-        let trusted = guard.config.trusted_backup_peers.is_empty()
-            || guard.config.trusted_backup_peers.iter().any(|h| h == &owner_hash);
-        if !trusted {
-            log(
-                format!("[backup] rejected BACKUP_PUSH from untrusted owner {}",
-                    hexrep(&owner_hash, false)),
-                LOG_WARNING, false, false,
-            );
-            return rmp_serde::to_vec(&false).unwrap_or_default();
-        }
-
-        if let Ok(mut subs) = guard.subscription_table.lock() {
-            for (sub_hash, ch_hash) in &pairs {
-                subs.subscribe_backup(sub_hash.clone(), ch_hash.clone(), owner_hash.clone());
-            }
-        }
-        log(
-            format!("[backup] registered {} backup sub(s) from owner {}",
-                pairs.len(), hexrep(&owner_hash, false)),
-            LOG_NOTICE, false, false,
-        );
-        rmp_serde::to_vec(&true).unwrap_or_default()
+        backup_push_response(&backup_push_node, data)
     });
 
     // CAPABILITIES — public query returning node features and config surface.
@@ -5780,6 +5859,176 @@ mod distro_namespace_tests {
         remove_node_dir(&node);
     }
 
+    /// The backup tick is the other way a channel row reaches the BlobStore:
+    /// for a backup row whose owner node has gone quiet it queues every blob
+    /// stored under the row's hash for the subscriber, and wakes it. A backup
+    /// row under a registered distro's hash (pushed by a peer where the
+    /// distro is not registered, or stored before it registered here) gets
+    /// none of the distro's blobs and no wake. A channel's backup row in the
+    /// same tick still does. Driven through `FedNode::tick_backup_delivery`,
+    /// the call main.rs makes.
+    #[test]
+    fn a_backup_row_under_a_distros_hash_is_not_delivered_to() {
+        let _guard = transport_guard();
+        let node = node("ns_backup_tick");
+        let distro_hash = lxmf_delivery(&Identity::new(true));
+        let channel_hash = identity_hash(&Identity::new(true));
+        let stranger = identity_hash(&Identity::new(true));
+        let member = identity_hash(&Identity::new(true));
+        // Never heard by sync: the owner counts as offline.
+        let owner_node = identity_hash(&Identity::new(true));
+        let relay = "7fd918372492bf099fc7f74ccf6739ac".to_string();
+        {
+            let guard = node.lock().unwrap();
+            {
+                let mut subs = guard.subscription_table.lock().unwrap();
+                subs.subscribe_backup(stranger.clone(), distro_hash.clone(), owner_node.clone());
+                subs.subscribe_backup(member.clone(), channel_hash.clone(), owner_node.clone());
+            }
+            {
+                let mut store = guard.blob_store.lock().unwrap();
+                store.store(&distro_hash, b"distro blob").expect("store distro blob");
+                store.store(&channel_hash, b"channel blob").expect("store channel blob");
+            }
+            let mut notify = guard.notify_registry.lock().unwrap();
+            notify.register(crate::notify::notify_key(&stranger), Some(distro_hash.clone()), relay.clone());
+            notify.register(crate::notify::notify_key(&member), Some(channel_hash.clone()), relay);
+        }
+        register_device(&node, &distro_hash, &Identity::new(true));
+
+        let wakes = node.lock().unwrap().tick_backup_delivery();
+
+        assert!(!has_any_queued(&node, &stranger), "the distro's blobs are not queued for the backup row");
+        assert!(queued(&node, &member, &channel_hash), "a channel's backup row is still delivered to");
+        assert_eq!(
+            wakes.iter().map(|(_, channel)| channel.clone()).collect::<Vec<_>>(),
+            vec![channel_hash.clone()],
+            "only the channel's subscriber is woken"
+        );
+
+        remove_node_dir(&node);
+    }
+
+    /// `[bin pairs, bin(64) pubkey, bin(64) sig(pairs)]`, as
+    /// `push_subscriptions_to_backup` signs a BACKUP_PUSH.
+    fn signed_backup_push(owner: &Identity, pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let pairs_payload = rmp_serde::to_vec(&pairs.to_vec()).unwrap();
+        let payload = rmpv::Value::Array(vec![
+            rmpv::Value::Binary(pairs_payload.clone()),
+            rmpv::Value::Binary(owner.get_public_key().expect("pubkey")),
+            rmpv::Value::Binary(owner.sign(&pairs_payload)),
+        ]);
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &payload).unwrap();
+        out
+    }
+
+    /// A peer's BACKUP_PUSH stores no row under a registered distro's hash,
+    /// as `/rfed/subscribe` stores none. The other pairs of the batch are
+    /// stored and the push is answered `true`: `false` would make the owner
+    /// queue the whole batch and push it again.
+    #[test]
+    fn a_backup_push_stores_no_row_under_a_distros_hash() {
+        let _guard = transport_guard();
+        let node = node("ns_backup_push");
+        let distro_hash = lxmf_delivery(&Identity::new(true));
+        register_device(&node, &distro_hash, &Identity::new(true));
+        let channel_hash = identity_hash(&Identity::new(true));
+        let stranger = identity_hash(&Identity::new(true));
+        let member = identity_hash(&Identity::new(true));
+        let owner = Identity::new(true);
+        let owner_node = Destination::hash(Some(&identity_hash(&owner)), APP_NAME, &["node"]);
+
+        let answer = backup_push_response(
+            &node,
+            &signed_backup_push(&owner, &[(stranger, distro_hash.clone()), (member.clone(), channel_hash.clone())]),
+        );
+
+        assert_eq!(answer, vec![0xc3], "the push is answered true");
+        assert!(subscribers(&node, &distro_hash).is_empty(), "no row under the distro's hash");
+        let guard = node.lock().unwrap();
+        assert_eq!(
+            guard.subscription_table.lock().unwrap().get_subscribers_with_owner(&channel_hash),
+            vec![(member, Some(owner_node))],
+            "the channel's pair is stored as a backup row under the owner node"
+        );
+        drop(guard);
+
+        remove_node_dir(&node);
+    }
+
+    fn poison_distro_table(node: &Arc<Mutex<FedNode>>) {
+        let table = Arc::clone(&node.lock().unwrap().distro_table);
+        let poisoner = std::thread::spawn(move || {
+            let _held = table.lock().unwrap();
+            panic!("test: poisoning the distro table");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(node.lock().unwrap().distro_table.is_poisoned());
+    }
+
+    /// A poisoned DistroTable cannot tell a distro's hash from a channel's,
+    /// so nothing that needs the answer goes ahead: subscribe is refused,
+    /// sync ingest fans out to no one, a backup push is refused and the
+    /// backup tick delivers to no row. Each would otherwise reach a channel
+    /// row under what may be a distro's hash.
+    #[test]
+    fn a_poisoned_distro_table_fails_closed() {
+        let _guard = transport_guard();
+        let node = node("ns_poisoned");
+        let hash = identity_hash(&Identity::new(true));
+        let early = Identity::new(true);
+        assert!(subscribe(&node, &signed_subscribe(&early, &hash)).is_ok());
+        let backup_subscriber = identity_hash(&Identity::new(true));
+        {
+            let guard = node.lock().unwrap();
+            // Its owner node is never heard by sync, so it counts as offline.
+            guard.subscription_table.lock().unwrap().subscribe_backup(
+                backup_subscriber.clone(),
+                hash.clone(),
+                identity_hash(&Identity::new(true)),
+            );
+            guard.blob_store.lock().unwrap().store(&hash, b"stored blob").expect("store blob");
+        }
+        poison_distro_table(&node);
+
+        let late = Identity::new(true);
+        let payload = signed_subscribe(&late, &hash);
+        assert_eq!(
+            subscribe(&node, &payload),
+            Err(SubscribeRefusal::DistroTableUnavailable { channel: hash.clone() }),
+            "subscribe is refused"
+        );
+        assert_eq!(subscribe_response(&node, &payload), vec![0xc2], "with a bare msgpack false");
+
+        let (dispatch, ctx) = {
+            let guard = node.lock().unwrap();
+            (guard.plan_sync_dispatch(&hash), guard.distro_fanout_ctx())
+        };
+        assert!(matches!(dispatch, SyncDispatch::Unjudged), "sync ingest chooses no fan-out");
+        run_sync_dispatch(&hash, b"synced blob", dispatch, &ctx);
+
+        let pushed_subscriber = identity_hash(&Identity::new(true));
+        assert_eq!(
+            backup_push_response(&node, &signed_backup_push(&Identity::new(true), &[(pushed_subscriber.clone(), hash.clone())])),
+            vec![0xc2],
+            "a backup push is refused"
+        );
+
+        let wakes = node.lock().unwrap().tick_backup_delivery();
+        assert!(wakes.is_empty(), "the backup tick wakes no one");
+
+        assert!(!has_any_queued(&node, &identity_hash(&early)), "the channel row gets nothing from sync");
+        assert!(!has_any_queued(&node, &backup_subscriber), "the backup row gets nothing from the tick");
+        assert_eq!(
+            subscribers(&node, &hash),
+            vec![identity_hash(&early), backup_subscriber],
+            "neither the refused subscribe nor the refused push stored a row"
+        );
+
+        remove_node_dir(&node);
+    }
+
     /// The MESSAGE_GET response callback plans with `plan_sync_dispatch` and
     /// delivers with `run_sync_dispatch`, and the wired subscribe handler is
     /// `subscribe_response`: the functions the tests above drive.
@@ -5803,5 +6052,14 @@ mod distro_namespace_tests {
             source[wire..wire_end].contains("subscribe_response(&sub_node, data)"),
             "subscribe_cb answers with subscribe_response"
         );
+
+        let push = source.find("let backup_push_cb = Arc::new(").expect("BACKUP_PUSH handler present");
+        let push_end = push + source[push..].find("\n    });").expect("the handler closes");
+        let handler = &source[push..push_end];
+        assert!(
+            handler.contains("backup_push_response(&backup_push_node, data)"),
+            "BACKUP_PUSH answers with backup_push_response"
+        );
+        assert!(!handler.contains("subscribe_backup("), "and stores no row of its own");
     }
 }
