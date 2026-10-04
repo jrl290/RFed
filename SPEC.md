@@ -1994,15 +1994,18 @@ twice stores it once (rule 5). C's state never changes M's delivery state,
 and it creates no message of its own on the sending device.
 
 Retichat-js keeps C in its distro outbox from 73a725d (branch
-`distro-channels-web`, not merged; §17.12 Implementation index). At 367b266
+`distro-channels-web`, not merged; §17.12 Implementation index). At 2683ea4
 it follows these rules. 145ca2f did not: it dropped C when the device gave
 up D, and a flush of the outbox already under way could upload C again on
 its own failure. 74fbbcd brought it in line ("Retichat-js departures" in the
-§17.12 Implementation index). Retichat-ios at 07f6d70 and Retichat-android
-at 47bdb0a still hand C to the LXMF router once and keep nothing
-(`ChatRepository.sendDistroSentCopy` on both), so a copy whose upload is not
-proved, or that is made while no propagation link can be had, is lost. Their
-follow-up is "The phones' outbox" in the §17.12 Implementation index.
+§17.12 Implementation index). 367b266's departure, a failure record kept
+per channel, touched only the membership messages: each sent copy is owed
+under its own id, so no other message's decision could take its record.
+Retichat-ios at 07f6d70 and Retichat-android at 47bdb0a still hand C to
+the LXMF router once and keep nothing (`ChatRepository.sendDistroSentCopy`
+on both), so a copy whose upload is not proved, or that is made while no
+propagation link can be had, is lost. Their follow-up is "The phones'
+outbox" in the §17.12 Implementation index.
 
 **No copy is sent for:** identity transfers (`"rfed.distro.transfer"`,
 §17.9), delivery notifications and ticket-only messages, group messages,
@@ -2217,7 +2220,9 @@ device still keeps C until the propagation node proves it has it:
   link coming up, and, for an upload left open on a STALE link that a newer
   link replaced, that old link's close or the loss of that upload while the
   newer link is up (the third ruling, below). Only events end one: the node's
-  proof, or one of the three failures below. There is no timer.
+  proof, or one of the three failures below. A build that throws ends the
+  attempt before anything leaves ("A build that throws is a failure",
+  below). There is no timer.
 - The node's proof settles C: it is owed no more and never goes again. A
   proof that comes after the upload was reported lost settles it too.
 - An upload that is not proved (its packet was reported lost, or the link
@@ -2240,14 +2245,14 @@ device still keeps C until the propagation node proves it has it:
   "comes up" is, the second that a failure alone never sends an upload
   again, the third the replaced STALE link (these three just below), the
   fourth the phones' "packet reported lost" ("The phones' outbox" in the
-  Implementation index), and the fifth a distro given up (below).
+  Implementation index), and the fifth a distro given up (below). The
+  bullets after the three rulings apply them. Each one that is this
+  section's own rule or reading, not James's words, says so.
   - **What "comes up" is.** The propagation link comes up when a new
     propagation link is established, or when a STALE link recovers because
     the node is heard from on it again. Both count (James, 2026-10-03). A
     STALE link is one the node has not been heard on, and its recovery is
-    the node heard on it again: an event, not a clock. A link that has been
-    replaced is no longer the propagation link, and its recovery is not a
-    coming-up.
+    the node heard on it again: an event, not a clock.
   - **Never on its own failure.** An upload is never sent again on the
     strength of its own failure alone. A failure waits for the next
     coming-up, even when a send pass is already running on the link that is
@@ -2273,9 +2278,52 @@ device still keeps C until the propagation node proves it has it:
     follows the second ruling: it waits for the next coming-up. A connection
     that stops decides every upload and sends nothing, since no link stays
     up after it.
+  - **A late proof after the third ruling's send** (this section's rule).
+    When the loss report for the old link's upload sent C on the newer
+    link, and the node then proves that first upload late over the old
+    link, the late proof settles C. C is owed no more and does not go
+    again, and the upload on the newer link changes nothing. If both
+    uploads reached the node, the siblings get C twice and hold the second
+    as a repeat ("Receiving"). That is the cost of a loss report that was
+    wrong, as with any upload.
+  - **A failure belongs to the exact message** (this section's rule, which
+    the second ruling needs). A send pass reads when the last upload of
+    that very message was decided unproved: the message as packed, owed
+    under its id, not anything else owed under the same channel. A
+    membership message that a later action on the channel replaced is owed
+    no more. A decision about it never replaces, clears or stands for the
+    newer message's record: not its proof or late proof, not its loss
+    report or its link's close, not its build throwing. A message owed no
+    more keeps no record. Without this rule the second ruling fails when two
+    actions on one channel overlap. The join's upload is left open on a
+    replaced STALE link, and the user's leave goes at once on the newer
+    link. The leave's upload is reported lost while a pass builds an
+    earlier entry. Then the old link's close decides the join, and its
+    record takes the leave's place, so the pass uploads the leave again at
+    once, on its own failure (Retichat-js 367b266, "Retichat-js
+    departures").
+  - **A replaced link's recovery is not a coming-up** (this section's
+    reading of the first and third rulings together, not James's words). A
+    STALE link that a new propagation link has replaced is no longer the
+    propagation link. Under the third ruling it keeps only its grace for a
+    late proof, and what is owed goes on the newer link. So when the node
+    is heard on the replaced link again, no send pass runs on it, and what
+    is owed waits for the current link's next coming-up. An upload still
+    open on the replaced link is decided as the third ruling says.
   - Only the three events that §3 names decide an upload: the packet
     reported lost, the link closing, the connection stopping. Replacing a
     link is none of them.
+  - **A build that throws is a failure** (this section's rule, under the
+    second ruling). Building an upload (the distro's key, the encryption,
+    the stamp, the packet) can throw before anything leaves. The device
+    says so, C stays owed, and the failure is recorded as for an upload
+    decided unproved, so no send pass already under way builds it again. It
+    goes once on the next coming-up. A build abandoned because the link
+    went down while it ran is no failure: nothing left and nothing is
+    decided, and C goes when the link is next up. In Retichat-js a stamp
+    that cannot be mined does not throw: `_buildPropagationPacked` sends the
+    upload without one and logs that the node will refuse it. What throws
+    there is the key, the encryption or the packet.
   - At most one upload of C is in flight. While an upload has left and is
     not decided, C is not uploaded again on any link, including a new link
     that replaced the old one. Two uploads at once would cost two stamps
@@ -2310,8 +2358,11 @@ device still keeps C until the propagation node proves it has it:
   comings-up, never re-addressed, never sent to another distro and never
   packed again (§17.11).
 
-Retichat-js at 367b266 meets every point. 145ca2f departed from three, each
-a ruling James made on 2026-10-03:
+Retichat-js at 2683ea4 meets every point. 367b266 departed from one: it
+kept a failure record per channel, so the second ruling failed when two
+actions on one channel overlapped ("A failure belongs to the exact
+message"). 9d45faa brought it in line. 145ca2f departed from three, each a
+ruling James made on 2026-10-03:
 - a flush already under way uploaded an entry again on its own failure;
 - a replaced link's close left the entry waiting while a newer link was up;
 - giving up D dropped the sent copies too.
@@ -2490,70 +2541,100 @@ Where each part lives or is to be made, by function (not line).
 | Part | Where | Status (2026-10-04) |
 |---|---|---|
 | Namespace guard (§6) | RFed-rust `rfed/src/destinations.rs`: `subscribe` (behind `subscribe_cb`), `plan_sync_dispatch` / `run_sync_dispatch` (sync ingest), `plan_channel_fanout` (a publish), `backup_push_response`, `backup_delivery_tick` | made 2026-10-03, not pushed or deployed: 454dc59 (subscribe, sync ingest), 7b19a94 (backup tick, BACKUP_PUSH), 49001ad (publish, the distro's own key); takes effect with an rfed redeploy. The sync reads of §6 "Not covered" stay open for James |
-| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | made 2026-10-03 on branch `distro-channels-web` (main untouched at 24d83e6), not merged, pushed or deployed. Eight commits, the last 367b266: 69ff01e (the section); 9f058e9 (review of 69ff01e: a post's record keeps its packed timestamp, a named device never learns a sibling's clear, a dropped C is judged again, the distro's uploads said sent only on the node's proof); 73a725d (C and the §17.11 sent copy kept until proved, "On the sending device"; a cut upload decided; DISPLAY_NAMES §4.2 learned at the post's time); a448e98 (a flush checks each owed entry again before and after its build; a write storage refuses); 3411e19 (the second upload cited as James's §3 exception; what is owed to a distro given up dropped then, said; a refused write cuts storage down to what is still owed; `at_ms` bounded at 2^53 − 1; an upload whose C is owed no more not said to fail); 145ca2f (a replaced propagation link decides nothing, and an upload that has left blocks a second one on any link; an earlier flush never uploads again what a newer one saw lost; the drop line says when an upload already left); 74fbbcd (James's rulings of 2026-10-03, DESIGN_PRINCIPLES §3: a failed upload waits for the propagation link's next coming-up even while a flush runs; a replaced link's close, or the loss of its upload, with a newer link up sends the entry once on that link; giving up a distro drops only the membership messages owed to it, and a sent copy keeps its distro's key and still goes to that distro); 367b266 (review of 74fbbcd: tests for an upload that an earlier flush made, reported lost while a later flush on the same link builds, and an exact pin of the flush's two callers). No departure is known at 367b266. It passes the distro unit suites (`distro_outbox`, `distro_channels`, `distro_upload`, `distro_sent_sync`, `lxmf_signature`, `distro_channels_page`: 159 tests, 158 pass and the boot test skipped without `RETICHAT_BOOT_TESTS`; with it set, the boot test passes too). On the private staging chain on 2026-10-04, `stage_distro_channels` passed at 367b266, 140 of 140 checks, twice. Its sections 9, 10 and 11 run James's second, third and fifth rulings. The stage fails 145ca2f in exactly those three sections, 3 of 140 checks, and 9f058e9 in 8 checks, the first of them section 0c's reload. The chain does not run the fifth ruling's other half, a distro replaced by another: that rests on unit tests. What each run showed is under "The web on the staging chain" below |
+| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | made 2026-10-03 and 2026-10-04 on branch `distro-channels-web` (main untouched at 24d83e6), not merged, pushed or deployed. Ten commits, the last 2683ea4: 69ff01e (the section); 9f058e9 (review of 69ff01e: a post's record keeps its packed timestamp, a named device never learns a sibling's clear, a dropped C is judged again, the distro's uploads said sent only on the node's proof); 73a725d (C and the §17.11 sent copy kept until proved, "On the sending device"; a cut upload decided; DISPLAY_NAMES §4.2 learned at the post's time); a448e98 (a flush checks each owed entry again before and after its build; a write storage refuses); 3411e19 (the second upload cited as James's §3 exception; what is owed to a distro given up dropped then, said; a refused write cuts storage down to what is still owed; `at_ms` bounded at 2^53 − 1; an upload whose C is owed no more not said to fail); 145ca2f (a replaced propagation link decides nothing, and an upload that has left blocks a second one on any link; an earlier flush never uploads again what a newer one saw lost; the drop line says when an upload already left); 74fbbcd (James's rulings of 2026-10-03, DESIGN_PRINCIPLES §3: a failed upload waits for the propagation link's next coming-up even while a flush runs; a replaced link's close, or the loss of its upload, with a newer link up sends the entry once on that link; giving up a distro drops only the membership messages owed to it, and a sent copy keeps its distro's key and still goes to that distro); 367b266 (review of 74fbbcd: tests for an upload that an earlier flush made, reported lost while a later flush on the same link builds, and an exact pin of the flush's two callers); 9d45faa (review of 367b266: a failure record belongs to one message, its id and its packed bytes, and is made only while that message is the one owed, so a decision about an older action on a channel never replaces or clears the newer action's record; the verifier's probe VR4-OW); 2683ea4 (review of 9d45faa: the pin of the flush's callers reaches through `_onPropagationLinkEstablished` and the two link events). No departure is known at 2683ea4. It passes the distro unit suites (`distro_outbox`, `distro_channels`, `distro_upload`, `distro_sent_sync`, `lxmf_signature`, `distro_channels_page`: 174 tests, 173 pass and the boot test skipped without `RETICHAT_BOOT_TESTS`; with it set, the boot test passes too). On the private staging chain on 2026-10-04, `stage_distro_channels` passed at 2683ea4, 154 of 154 checks, twice. Its sections 9, 10, 10b and 11 run James's rulings: the second, the third, the second again where two actions on one channel overlap, and the fifth. The stage failed 367b266 in section 10b alone (1 of 154 checks), 145ca2f in sections 9, 10, 10b and 11 (4 checks), and 9f058e9 in 10 checks, the first of them section 0c's reload. The chain does not run the fifth ruling's other half, a distro replaced by another: that rests on unit tests. What each run showed is under "The web on the staging chain" below |
 | Shared Rust for the phones | LXMF-rust, below | not started |
 | iOS | Retichat-ios at 07f6d70, below | not started |
 | Android | Retichat-android at 47bdb0a, below | not started |
 
-**The web on the staging chain** (2026-10-04). The chain ran
-test-harnesses 21cde9b, the staging rfed binary 17641fb39035 (17641fb to
-c24f0b5 changes only this file), the local PHP node (an export of
+**The web on the staging chain** (2026-10-04, 15:21 to 16:01Z). The chain
+ran test-harnesses ba10bb7, the staging rfed binary 17641fb39035 (17641fb
+to 950d53c changes only this file), the local PHP node (an export of
 Reticulum-post 3281ad5 on 127.0.0.1:8080) and the RPi backbone. An old
-build E, Retichat-js 24d83e6, ran on 127.0.0.1:8897. Each web export was
-byte-identical to `git archive` of its commit. Isolation was checked before
-and after: no chain process held a connection to a non-private address,
-and every URL in every run was 127.0.0.1.
+build E, Retichat-js 24d83e6, ran on 127.0.0.1:8897. Each web export
+(2683ea4, 367b266, 145ca2f, 9f058e9 and 24d83e6) matched `git archive` of
+its commit byte for byte, apart from the export's own
+`.staging-export.json`, whose commit matched. The refs were recorded before the first run
+and after the last, and nothing changed between the two. Isolation was
+checked before and after:
+- no `STAGING_`, `HARNESS_` or `PROBE_` variable was set, and
+  `STAGING_ALLOW_PRODUCTION_PHP` was unset;
+- the gateway's `node_url` was 127.0.0.1:8080;
+- the RPi had no uplinks, and its only peers were rfed, the gateway and
+  the iOS simulator, all on the test Mac;
+- no chain process held a connection to a non-private address;
+- every URL in every run was on 127.0.0.1.
 
-- `stage_distro_channels` at 367b266 ran twice (06:10:03 to 06:11:49Z and
-  06:12:13 to 06:13:58Z) and passed 140 of 140 checks each time.
+- `stage_distro_channels` at 2683ea4 ran twice (15:21:21 to 15:23:26Z and
+  15:23:29 to 15:25:36Z) and passed 154 of 154 checks each time. In each
+  run rfed took 26 uploads for D, counted in rfed's log: 9 in sections 0
+  to 8, 5 in 9, 4 in 10, 7 in 10b and 1 in 11.
   - Section 0c passed: a join made before the propagation link could be
     up, kept across a reload, went once from the reloaded page. So did 5b,
     a leave whose upload was lost with the exchange, which went once more
     from the reloaded page on its link's "established". So did 5c, a join
     whose upload the node held but never proved, cut by the link's close;
     it went once more on the same page's next link-up, and the second copy
-    was dropped as held. The round trip passed too. Over sections 0 to 8,
-    A made 10 uploads, and rfed took 9 of them.
+    was dropped as held. The round trip and the no-loop check passed too.
   - Section 9 (the second ruling). The send pass on the link's recovery
     from STALE listed 5 entries. A's own join was lost to the exchange's
-    503 (06:11:27.197Z) while that pass built the 4 entries before it, and
-    the pass's own 4 uploads were lost too, with the exchange down. The pass
-    did not send the join again, and A logged that it waits for the
-    propagation link's next coming-up. On the re-opened link's
-    "established", all 5 went once and were proved, and B joined each
-    channel.
+    503 at 15:22:43.258Z while that pass built. At 43.652 A logged that the
+    join waits for the propagation link's next coming-up. No upload decided
+    unproved went again before a coming-up. All 5 went once on the
+    re-opened link's "established" (48.869) and reached B.
   - Section 10 (the third ruling). The STALE link that was replaced decided
     nothing. One join was settled by the node's late proof over the old
-    link, with one upload. The old link's own close sent the other join once
-    on the new link, 101 ms after the close in the first run and 96 ms in
-    the second. A's exchange was held at the time, so the close alone sent
-    it: the join was uploaded before anything more reached A.
+    link, with one upload. The old link's own close began the other join's
+    upload on the new link: at the page's first task after the close, its
+    attempt was open there and its build had begun, before any timer the
+    page set. The join was uploaded once, 96 ms after the close (104 ms in
+    the second run). A's exchange was held from before the close, and
+    nothing more reached A before the upload. The stage cannot tell apart a
+    wait the page might take once that build has begun. Only
+    DESIGN_PRINCIPLES §1's 5 s and the exchange's record bound it.
+  - Section 10b (the second ruling, where two actions on one channel
+    overlap). A joined a channel, and the join's upload stayed open on a
+    link that went STALE and was replaced. A left the channel with the new
+    link up. The leave's upload was lost at 15:23:11.246Z while the send
+    pass on the new link's recovery built 4 earlier joins. The replaced
+    link's own close then decided the join, at 11.250, as owed no more,
+    with nothing to go again. When the pass reached the leave (11.624), A
+    logged that it waits for the next coming-up. The leave and each earlier
+    join went once on the next coming-up, and B joined and left once.
   - Section 11 (the fifth ruling, for a distro forgotten). The join owed to
-    D was dropped, and A's log said so. The sent copy stayed owed, went once
-    on the next coming-up and was proved, and B filed it once.
-  - In each run rfed took 19 uploads for D, counted in rfed's log: 9 in
-    sections 0 to 8, 5 in 9, 4 in 10 and 1 in 11.
-- At 145ca2f the stage failed 3 of 140 checks, one each in sections 9, 10
-  and 11, as the stage's header predicts for that commit:
-  - In 9, A's own join was uploaded at 06:15:24.999Z and lost to the 503 at
-    25.050, while the "recovered" pass (25.043) ran. The same pass uploaded
-    it again at 25.564, with no coming-up between, and it was lost again at
-    25.568.
-  - In 10, the old link's close left the join owed until the next coming-up,
-    so it was not uploaded on the new link.
-  - In 11, the sent copy was dropped with D, so nothing was owed and B never
-    got the message.
+    D was dropped, and A's log said so. The sent copy stayed owed, went
+    once on the next coming-up and was proved, and B showed the message
+    once.
+- At 367b266 the stage failed 1 of 154 checks: section 10b, as it must.
+  The leave was lost at 15:27:32.426Z, and the replaced link's close
+  decided the join "owed no more" at 32.429. The same pass uploaded the
+  leave again at 32.935, with no coming-up between, and A never said the
+  leave waits. That upload was lost too, with the exchange down, so it
+  never reached rfed, which took 26 uploads for D. Everything else passed.
+- At 145ca2f the stage failed 4 of 154 checks, in sections 9, 10, 10b and
+  11:
+  - In 9, A's own join was uploaded at 15:29:16.087Z. The "recovered" pass
+    began at 16.101, and the 503 lost the join at 16.112. The same pass
+    uploaded it again at 16.610, with no coming-up between, and it was lost
+    again at 16.615.
+  - In 10, the old link's close left the other join owed until the next
+    coming-up. It was not uploaded on the close, and rfed took 3 uploads in
+    that section, not 4.
+  - In 10b, the leave was uploaded again while the pass ran, and rfed took
+    8 in that section, not 7.
+  - In 11, the sent copy was dropped with D, so nothing was owed and B
+    never got the message.
 
   Everything else passed, 0c, 5b, 5c and the round trip included. rfed took
-  17 uploads for D: 9, 5, 3 and 0.
-- At 9f058e9 the stage failed 8 checks, and 129 passed. The first failure is
-  0c's reload check. The join, made before the propagation node's identity
-  was ready, was given up at once, so the reload lost it and it was never
-  uploaded. The others follow from that: 0c's second join, 5b, 5c, the round
-  trip, and sections 9, 10 and 11, which found nothing owed.
-- At 367b266, `stage_channel_send`, `stage_names` and distro-pipeline
-  stages 3 to 6 passed. The harness's offline suite passed at 21cde9b: 370
-  tests, 328 pass and 42 skipped without Chromium, and 370 of 370 with
+  25 uploads for D: 9, 5, 3, 8 and 0.
+- At 9f058e9 the stage failed 10 checks, and 141 passed. The first failure
+  is 0c's reload check. The join, made before the propagation node's
+  identity was ready, was given up at once, so the reload lost it and it
+  was never uploaded. The others follow from that: 0c's second join, 5b,
+  5c, the round trip, and sections 9, 10, 10b (two checks) and 11, which
+  found nothing owed. rfed took 10 uploads for D.
+- At 2683ea4, `stage_channel_send`, `stage_names` and distro-pipeline
+  stages 3 to 6 passed. The harness's offline suite passed at ba10bb7: 389
+  tests, 336 pass and 53 skipped without Chromium, and 389 of 389 with
   `RETICHAT_BOOT_TESTS=1`.
 - Not staged: the other half of the fifth ruling. No section gives A a
   second distro, so the case of a device that takes another distro and
@@ -2561,20 +2642,22 @@ and every URL in every run was 127.0.0.1.
   replaced by D2: the sent-copy owed to D still goes to D …" in
   `distro_channels.test.mjs`).
 
-The runs also showed three faults that no stage judges. Their code is the
-same at 24d83e6, so they predate the branch:
+Faults that no stage judges. Their code is the same at 24d83e6, so they
+predate the branch. These runs showed two of them:
 
-- A link request sent as a packet is decided only by its response budget,
-  about 14.5 s, and never by the exchange's report that its packet was
-  lost. This is a DESIGN_PRINCIPLES §1 gap (`lib/rns/link.js`;
-  `link_request_lost.test.mjs` covers only LINKREQUESTs). In section 9 of
-  the first run, the `/distro/pull` sent at a resume was lost with the 503
-  and failed only 14.4 s after the loss was reported.
 - A DM to a distro address waits the fixed propagation delay (5.0 s in
   stage 3), though it has no direct leg: a timer in place of an event.
 - In stage 4, rfed logged a SEND-ASSERT ("link.establish succeeded after
-  6.26s") for the Python reference sender's link to rfed's
+  6.19s") for the Python reference sender's link to rfed's
   `lxmf.propagation`.
+
+An earlier staging of the same day (06:10Z, at 367b266) showed a third. A
+link request sent as a packet is decided only by its response budget,
+about 14.5 s, and never by the exchange's report that its packet was lost.
+This is a DESIGN_PRINCIPLES §1 gap (`lib/rns/link.js`;
+`link_request_lost.test.mjs` covers only LINKREQUESTs). There, in section
+9, the `/distro/pull` sent at a resume was lost with the 503 and failed
+only 14.4 s after the loss was reported.
 
 **LXMF-rust** (shared by both phones).
 
@@ -2707,16 +2790,22 @@ uploaded from the phones' outbox below. If an upload goes through the
 router, the router must not re-send it on its own.
 
 **The phones' outbox** (both phones; the follow-up for the phone lanes).
-Retichat-js 367b266 is the model (`lib/distro_outbox.js`; `_oweDistro`,
-`_sendDistroOutbox`, `_unprovedSince`, `_distroAttemptOpen`, `_uploadOwed`,
-`_stillOwed` and `_dropMembershipOwedToOtherDistros` in `app.js`), and the
-list below is the contract. The phones must not copy the gaps that earlier
-web commits had (145ca2f and before; "Retichat-js departures" below):
+Retichat-js 2683ea4 is the model (`lib/distro_outbox.js`, `DistroOutbox`
+and `UnprovedUploads`; `_oweDistro`, `_sendDistroOutbox`,
+`_unprovedSince`, `_distroAttemptOpen`, `_uploadOwed`, `_stillOwed` and
+`_dropMembershipOwedToOtherDistros` in `app.js`), and the list below is the
+contract. The phones must not copy the gaps that earlier web commits had
+("Retichat-js departures" below):
 - a flush that checks an entry only for being owed and not in flight, and so
-  uploads again at once an upload decided unproved while it builds;
+  uploads again at once an upload decided unproved while it builds
+  (145ca2f and before);
 - a replaced link's close that leaves the entry waiting while a newer link
-  is up;
-- sent copies dropped with D.
+  is up (145ca2f);
+- sent copies dropped with D (3411e19, 145ca2f);
+- a failure record kept per channel and written whatever is owed, so that a
+  decision about an older action on the channel takes the newer action's
+  record, and a flush under way uploads the newer one again at once on its
+  own failure (367b266).
 
 "Tests every client makes for the sending device" below is the check.
 
@@ -2736,14 +2825,20 @@ web commits had (145ca2f and before; "Retichat-js departures" below):
   STALE propagation link recovers because the node is heard from on it
   again (James, 2026-10-03: both count). Each coming-up starts one flush of
   what is owed, and nothing else starts one: not a resume of the app, not a
-  timer, not a failure.
+  timer, not a failure. A STALE link that a new one has replaced is no
+  longer the propagation link, and its recovery starts no flush. That is
+  this section's reading of the first and third rulings, not James's words
+  ("On the sending device").
 - The node's proof settles the entry, a proof after a loss report included.
   The loss report, the link's close and the app's stop each decide an upload
   unproved. The device says so, the entry stays owed, and it is uploaded
   again on the link's next coming-up. It is never sent again at the failure
   itself, never on a timer, and never by a flush that was already under way,
   even when that flush is running on the link that is up (James,
-  2026-10-03).
+  2026-10-03). A build that throws before anything leaves is a failure too,
+  said and recorded the same way (this section's rule, "On the sending
+  device"). A build abandoned because the link went down is none: nothing
+  is decided, and the entry goes when the link is next up.
 - A STALE link replaced by a new one decides nothing (James, 2026-10-03).
   While its upload is open, no flush uploads that entry on any link, and a
   proof over the old link settles it: one upload, one stamp, one fan-out.
@@ -2751,7 +2846,11 @@ web commits had (145ca2f and before; "Retichat-js departures" below):
   unproved while a newer propagation link is already up (ACTIVE), that is
   the event: the entry goes once on the newer link at once. With no newer
   link up, it waits for the next coming-up. A failure of that upload waits
-  for the next coming-up like any other. The app's stop sends nothing.
+  for the next coming-up like any other. The app's stop sends nothing. If
+  the loss of the old link's upload was the event and the node then proves
+  that upload late, the proof settles the entry: it is owed no more and
+  does not go again, and a sibling that gets it twice holds the second as
+  a repeat (this section's rule).
 - A flush uploads an entry only if the entry's last failure was decided
   before the coming-up that started the flush, whoever made the upload
   that failed. Knowing who is in flight is not enough, because once an
@@ -2759,21 +2858,38 @@ web commits had (145ca2f and before; "Retichat-js departures" below):
   action, by an earlier flush, or on a link since replaced, if decided
   while a flush builds an earlier entry, would be found owed and uploaded
   by that flush at once. The web keeps the rule this way (74fbbcd,
-  367b266):
+  367b266, 9d45faa):
   - count the comings-up, and let each flush take the next count;
-  - when an upload of an entry, or its build, is decided unproved, record
-    with the entry the count current at that moment, in the task of the
-    event that decides it;
-  - let a flush taken at count n upload only an entry with no record or
-    with a record below n, checked when the entry's turn comes and again
-    once its upload is built.
+  - when an upload of a message, or its build, is decided unproved, record
+    the count current at that moment, in the task of the event that
+    decides it. The record is that exact message's, keyed by the entry's id
+    and the message as packed (its bytes or its LXMF message hash), never
+    by the id alone. It is made only while that message is the one owed
+    under its id;
+  - let a flush taken at count n upload a message only if that message has
+    no record or a record below n, checked when its turn comes and again
+    once its upload is built. The flush reads that message's own record
+    and no other.
 
   The record must be the count current when the upload is decided, not the
   count of the flush that made it. Otherwise a later flush on the same link,
   building when an earlier flush's upload is reported lost, uploads it again
-  at once (found in review of Retichat-js 74fbbcd). A proof clears only the
-  record of its own message, so a later action on the same channel keeps
-  the record of its own failure.
+  at once (found in review of Retichat-js 74fbbcd).
+
+  The record must also belong to the exact message, because a membership
+  message's id is its channel and two actions on one channel can both have
+  an upload undecided. A decision about the older message never writes,
+  replaces or clears the newer message's record. That covers its proof or
+  late proof, its loss report, its link's close and its build throwing. A
+  message owed no more keeps no record: its record goes when it is proved,
+  replaced by a later action or dropped with D, and only its own. Retichat-js
+  367b266 kept one record per channel and wrote it whatever was owed. A join
+  whose upload was open on a replaced link was decided by that link's close
+  after the leave that replaced it was reported lost, and its record took
+  the leave's. The flush under way then uploaded the leave again at once,
+  on its own failure (the verifier's probe VR4-OW; on the chain, section
+  10b at 367b266). The record need not outlive the process. After a
+  restart, the first coming-up is after every failure decided before it.
 - Each entry a flush listed is checked again before its upload is built and
   before it leaves: still owed, still the same message, and, for a
   membership message, still owed to the distro the device holds. A build
@@ -2812,7 +2928,7 @@ DESIGN_PRINCIPLES §1 violation (a late success), and it settles the entry
 all the same: it is owed no more and does not go again. The web's event is
 the exchange's loss report (`_onPacketsLost`).
 
-**Retichat-js** (as made, branch `distro-channels-web` at 367b266).
+**Retichat-js** (as made, branch `distro-channels-web` at 2683ea4).
 
 - Posting: `RnsClient.sendChannelMessage` decides the posting identity once,
   `sendingIdentity()` (D when held, else the device), and packs with it
@@ -2843,38 +2959,57 @@ the exchange's loss report (`_onPacketsLost`).
   id `channel:<channel hash>`, which also holds the §17.11 sent copies). Each
   entry carries its distro's public key (`distroKey`).
 - Uploading: `_uploadOwed` uploads C at once when the propagation link is
-  ACTIVE. `_sendDistroOutbox` uploads what is owed when the link comes up. Its
-  only two callers are the link's `"established"` and the current link's
-  `"recovered"`, and `distro_sent_sync.test.mjs` fails if anything else in
-  the page names it. Each call is one coming-up, counted in
-  `_propComingUps`, and the flush takes the new count. `_stillOwed` checks
-  each entry again before and after its build, and for a membership message
-  checks that it is owed to the distro held. `_uploadForDistro` and
-  `DistroUploads` (`lib/distro_upload.js`) decide the upload: by the node's
-  proof, by the exchange's loss report (`_onPacketsLost`), or by `cut()` on
-  a disconnect or the link's close.
+  ACTIVE. `_sendDistroOutbox` uploads what is owed when the link comes up.
+  It runs from the current link's `"recovered"` listener, and from the
+  `"established"` listener through `_onPropagationLinkEstablished` (the
+  work that runs once a link is established), and from nothing else. A
+  `"recovered"` of a link that is no longer current runs no flush (this
+  section's reading of the first and third rulings). The pin in
+  `distro_sent_sync.test.mjs` fails if anything else in the page names
+  either method, if either call leaves its listener, or if `app.js` or a
+  script under `lib/` other than `lib/rns/link.js` fires `"established"`
+  or `"recovered"`. 2683ea4 extended the pin to the `"established"` work
+  and the two events: in review of 9d45faa, an announce that ran that work
+  again while the link was up passed every earlier test. Each call is one
+  coming-up, counted in `_propComingUps`, and the flush takes the new
+  count. `_stillOwed` checks each entry again before and after its build,
+  and for a membership message checks that it is owed to the distro held.
+  `_uploadForDistro` and `DistroUploads` (`lib/distro_upload.js`) decide
+  the upload: by the node's proof, by the exchange's loss report
+  (`_onPacketsLost`), or by `cut()` on a disconnect or the link's close.
 - A failure waits for the next coming-up. `DistroUploads` calls the upload's
   `onLost` in the task of the event that decides it. `_uploadOwed` then
-  records the failure in `_distroUnproved`, with the `_propComingUps` count
-  current then. A failed build is recorded the same way. A flush skips an
-  entry whose record is at its own count or later (`_unprovedSince`), and
-  checks again once the stamp is mined. So no flush already under way sends
-  a failed upload again, whoever made it. 145ca2f's `_distroFlush`, which
-  stopped an earlier flush once a newer one began, is gone, because this
-  rule covers that case. Only a proof settles the entry (`DistroOutbox.settle`,
-  a late proof through `upload.onLateProof` included), and it clears only
-  its own message's record.
+  records the failure in `_distroUnproved`, an `UnprovedUploads`
+  (`lib/distro_outbox.js`, 9d45faa), with the `_propComingUps` count
+  current then. A build that throws is recorded the same way. The record
+  is one message's, keyed by the entry's id and its packed bytes, and it is
+  made only while that message is the one owed under its id
+  (`DistroOutboxStore.get(entry.id)?.packed === entry.packed`). Recording,
+  reading or forgetting one message's record never touches another's, the
+  same channel's included. A flush skips a message whose own record is at
+  its count or later (`_unprovedSince`), and checks again once the stamp is
+  mined. So no flush already under way sends a failed upload again,
+  whoever made it, and an older action's decision cannot take a newer
+  action's record. 145ca2f's `_distroFlush`, which stopped an earlier flush
+  once a newer one began, is gone, because this rule covers that case. Only
+  a proof settles the entry (`DistroOutbox.settle`, a late proof through
+  `upload.onLateProof` included). A message's record goes, and only its
+  own, when it is proved (late too), when the user's action replaces it
+  (`_oweDistro`) and when it is dropped with D. The record lives in the
+  page's memory: a reload starts with none, and the reloaded page's first
+  coming-up sends what is owed.
 - A replaced link: `_establishPropagationLink` replaces a STALE link
   without deciding its uploads. When the old link's close, or the loss
   report, decides one while a newer propagation link is up and current,
-  `_uploadOwed` uploads the entry once on that link at once.
-  `disconnect()` lets go of the newer link first, so a stopped connection
-  sends nothing. The in-flight check (`_distroAttemptOpen`, over
-  `_distroOutboxInFlight`) skips an entry being built for the same link,
-  and one whose upload has left and is not decided, on any link. The
-  comments of `lib/distro_outbox.js`, `lib/distro_upload.js`,
-  `_oweDistro`, `_sendDistroOutbox` and `_uploadOwed` cite James's §3
-  exception and rulings.
+  `_uploadOwed` uploads the entry once on that link at once. A late proof
+  of the first upload, coming after that, settles the entry
+  (`upload.onLateProof`). `disconnect()` lets go of the newer link first,
+  so a stopped connection sends nothing. The in-flight check
+  (`_distroAttemptOpen`, over `_distroOutboxInFlight`) skips an entry being
+  built for the same link, and one whose upload has left and is not
+  decided, on any link. The comments of `lib/distro_outbox.js`,
+  `lib/distro_upload.js`, `_oweDistro`, `_sendDistroOutbox` and
+  `_uploadOwed` cite James's §3 exception and rulings.
 - Reporting: `_distroOwedOutcome` says a failure, as a warning and a
   Harness error, only while the entry is still owed.
 - A distro given up: `_dropMembershipOwedToOtherDistros`
@@ -2907,11 +3042,42 @@ the exchange's loss report (`_onPacketsLost`).
   `ChannelSenderNamesStore.forget`, `ChannelPostNamesStore.forget` and the
   stream memo. No C is sent.
 
-**Retichat-js departures.** None is known at 367b266. 145ca2f had three,
-each against a ruling James made on 2026-10-03 (DESIGN_PRINCIPLES §3, what a
-device owes its distro). 74fbbcd fixed all three, each with tests that fail
-without the fix, and 367b266 added tests for a case that 74fbbcd's tests
-missed. Each departure below was shown by running 145ca2f's own code:
+**Retichat-js departures.** None is known at 2683ea4. 367b266 had one,
+against James's second ruling, and 9d45faa fixed it with tests that fail
+without the fix. It was shown by running 367b266's own code, and on the
+staging chain:
+
+- *A decision about an older action took the newer action's failure record*
+  (367b266; the verifier of 367b266, probe VR4-OW, 2026-10-04; James's second
+  ruling). `_distroUnproved` kept one record per entry id, which for a
+  membership message is its channel, and `_uploadOwed` wrote it whatever was
+  owed. The user joins CH, and the join's upload is left open, unproved, on a
+  STALE link that a newer link replaces. The user leaves CH: the leave goes
+  at once on the newer link. A coming-up's flush lists the leave behind an
+  earlier entry and builds that entry. The leave's upload is reported lost,
+  and its record is written. Then the old link's close decides the join (or
+  the exchange reports the join's packet lost, or the join's build throws),
+  and the join's record replaces the leave's. The flush finds no record of
+  the leave and uploads it again at once, on its own failure, after the log
+  has said it waits for the next coming-up. The probe was appended to a copy
+  of `distro_channels.test.mjs` in a `git archive` of 367b266, with the
+  shipped link handlers. The variant where the join is decided after the
+  leave's loss failed; the variants where it is decided before, or never,
+  passed. On the staging chain (2026-10-04, 15:27Z) 367b266 failed section
+  10b and nothing else: the leave was lost at 32.426, the join was decided
+  owed no more at 32.429, and the same pass uploaded the leave again at
+  32.935, with no coming-up between ("The web on the staging chain" above). It cost one
+  more upload, one more stamp and, had both reached the node, one more
+  fan-out, which the siblings would hold as a repeat. Only membership
+  messages were exposed: a sent copy is owed under its own id. Fixed in
+  9d45faa (`UnprovedUploads`: one record per message, made only while that
+  message is owed, forgotten when it is owed no more, and only its own).
+
+145ca2f had three, each against a ruling James made on 2026-10-03
+(DESIGN_PRINCIPLES §3, what a device owes its distro). 74fbbcd fixed all
+three, each with tests that fail without the fix, and 367b266 added tests
+for a case that 74fbbcd's tests missed. Each departure below was shown by
+running 145ca2f's own code:
 
 - *A flush already under way uploaded again an upload decided unproved
   while it built* (145ca2f; found by the review of this section's earlier
@@ -2936,9 +3102,11 @@ missed. Each departure below was shown by running 145ca2f's own code:
 
   In each case C goes a second time on its own failure: a second stamp is
   mined, and if both uploads reach the node, it fans C out twice. On the
-  staging chain (2026-10-04) 145ca2f sent the second upload: the
-  "recovered" pass uploaded A's own join again 514 ms after its loss, with
-  no coming-up between ("The web on the staging chain" above). Fixed in 74fbbcd (`_propComingUps`, `_distroUnproved`,
+  staging chain (2026-10-04, 15:29Z) 145ca2f sent the second upload: the
+  "recovered" pass uploaded A's own join again 498 ms after its loss, with
+  no coming-up between ("The web on the staging chain" above). Its section
+  10b failed the same way, with the leave uploaded again while the pass
+  ran. Fixed in 74fbbcd (`_propComingUps`, `_distroUnproved`,
   `_unprovedSince`; `_distroFlush` removed, as the rule covers its case).
   The review of 74fbbcd found that recording a failure at the coming-up of
   the flush that made the upload, instead of the coming-up current when the
@@ -2953,7 +3121,8 @@ missed. Each departure below was shown by running 145ca2f's own code:
   unproved. 145ca2f kept the entry for the next coming-up, though the newer
   link was up. James ruled that the close is the event, and the entry goes
   once on the newer link at once. On the chain, the entry was not uploaded
-  in that section. Fixed in 74fbbcd (`_uploadOwed`).
+  on the close, and rfed took 3 uploads in that section, not 4. Fixed in
+  74fbbcd (`_uploadOwed`).
 - *Sent copies were dropped with D* (3411e19 and 145ca2f, through
   `_dropOwedToOtherDistros` and `DistroOutbox.dropAllBut`; James's fifth
   ruling). Giving up D dropped every entry owed to D, the sent copies
@@ -3036,11 +3205,20 @@ it must catch:
   again, is a coming-up: what is owed goes on it, once. Mutation: no flush
   on the recovery leaves it waiting for an establishment that may never
   come.
+- A STALE link that a new attempt has replaced, and that then recovers,
+  starts no flush: what is owed waits for the current link's coming-up
+  (this section's reading of the first and third rulings). Mutation: a
+  flush on the recovery of any link, current or not, sends on a link that
+  is no longer the propagation link.
 - Nothing but the link's coming-up starts a flush: not a resume of the app
   or page, not a timer, and not a failure. Mutation: a flush started on a
   resume sends a failed upload again with no coming-up between.
 - A proof that comes after the loss report settles C, and it does not go
   again. Mutation: ignoring the late proof uploads it again on the next link.
+- A build that throws: said, C still owed, and a flush under way that
+  listed it does not build it again; it goes once on the next coming-up.
+  Mutation: a build failure left unrecorded is built again by the flush
+  under way, with no coming-up between.
 - The link closing, or the connection stopping, before the proof decides the
   upload unproved, and C goes once on the next link. Mutation: a close that
   decides nothing leaves the upload open, and C never goes again.
@@ -3057,6 +3235,11 @@ it must catch:
     the late proof can settle it;
   - a close that leaves C for the next coming-up while the newer link is up
     (Retichat-js 145ca2f) does not send it.
+
+  And when the loss report sent C on the new link, a late proof of the
+  first upload over the old link settles C: a loss of the new link's upload
+  then sends nothing, and C does not go on the next coming-up. Mutation:
+  ignoring the late proof uploads C again on the next coming-up.
 - Two flushes on one link, with a loss between them: the earlier flush does
   not upload again what the newer one saw lost. Mutation: a flush that goes
   on after a newer one began uploads it with no coming-up between.
@@ -3074,6 +3257,27 @@ it must catch:
   (Retichat-js 145ca2f does, and fails the first two cases). Recording the
   failure at the coming-up of the flush that made the upload, not the one
   current when the failure is decided, fails the third.
+- Two actions on one channel whose decisions overlap ("A failure belongs to
+  the exact message"). The user joins CH, and the join's upload stays open,
+  unproved, on a STALE link that a new one replaces. The user leaves CH,
+  and the leave goes at once on the new link. A coming-up's flush lists the
+  leave behind an earlier entry and builds that entry. The leave's upload
+  is reported lost. Then the join is decided: by the old link's close, by
+  its loss report, or by its build throwing. The flush neither uploads the
+  leave nor mines a stamp for it, the leave goes once on the next coming-up,
+  and the join, owed no more, keeps no record and never goes again. The
+  same holds with the join decided before the leave's loss, proved after
+  it, or reported lost before it and proved late after it. With two §17.11
+  sent copies in place of the join and the leave, the older copy is still
+  owed: decided lost while the new link is up, it goes once on that link
+  at once (the third ruling). Mutations:
+  - one record per channel, written whatever is owed (Retichat-js 367b266),
+    uploads the leave again at once, on its own failure;
+  - forgetting every record under the id when one message is owed no more
+    (an older action's proof clearing the newer's record) does the same;
+  - reading any record under the id, not the message's own, holds back or
+    lets through the wrong message;
+  - recording a failure for a message owed no more leaves a record behind.
 - On the phones (James's ruling on "the packet reported lost", "The phones'
   outbox" above): the packet receipt of an upload times out. The
   propagation link is torn down, and the close decides the upload unproved,
@@ -3088,37 +3292,68 @@ it must catch:
     coming-up;
   - ignoring the late proof sends C again on the next establishment.
 
-Retichat-js 367b266 has a test for each case except the last, which covers
-the phones' event, not the web's. Nine mutations of 367b266 for James's
-rulings were run on 2026-10-04 against `distro_outbox`, `distro_channels`,
-`distro_upload` and `distro_sent_sync`, each on a scratch copy of a
-`git archive` of the commit. Unmutated, those suites pass all 147 of their
-tests. Each mutation was caught; the number is how many tests failed:
+Retichat-js 2683ea4 has a test for each case except two. The phones' case
+covers the phones' event, not the web's. A late proof after the third
+ruling's send is not a test of its own: a scratch probe in the harness of
+`distro_channels.test.mjs` showed that 2683ea4 settles C and sends it no
+more, and that ignoring the late proof fails the probe. The suites'
+general late-proof tests catch that mutation too (below). Seventeen
+mutations of 2683ea4 were run on 2026-10-04 against `distro_outbox`,
+`distro_channels`, `distro_upload` and `distro_sent_sync`, each on a
+scratch copy of a `git archive` of the commit. Unmutated, those suites pass
+all 162 of their tests. Each mutation was caught; the number is how many
+tests failed.
 
+James's rulings:
 - a flush that does not look at when an entry's upload failed
-  (`_unprovedSince` always false): 12, among them the four "uploaded
+  (`_unprovedSince` always false): 24, among them the four "uploaded
   outside the flush that is running" cases and the replaced-link close
   during an `"established"` flush;
 - a failure recorded at the coming-up of the flush that made the upload,
   not the one current when it is decided: 4, the four "uploaded by an
   earlier flush" cases;
-- an upload sent again at its own failure, on the link that is up: 22;
+- an upload sent again at its own failure, on the link that is up: 35;
 - a replaced link's close or loss, with a newer link up, that does not send
-  on it: 3;
-- a replacement that decides the replaced link's uploads: 7, "a STALE
+  on it: 7, the two replaced-link tests, the close during an
+  `"established"` flush, and four of the two-sent-copies cases;
+- a replacement that decides the replaced link's uploads: 17, "a STALE
   propagation link replaced by a new one decides nothing … one upload, one
   stamp, one fan-out" among them;
-- no flush on the current link's `"recovered"`: 6, "what the distro is owed
-  goes when a STALE propagation link recovers" among them;
+- no flush on the current link's `"recovered"`: 17, "what the distro is
+  owed goes when a STALE propagation link recovers" among them;
 - sent copies dropped with D (`dropMembershipNotFor` dropping every entry
-  owed to another distro): 5;
+  owed to another distro): 6;
 - a sent copy encrypted with the key of the distro held when it is built,
-  not its own: 2;
+  not its own: 3;
 - a third caller of `_sendDistroOutbox`, on a page resume: 1, the test that
-  pins its two callers.
+  pins its callers.
+
+The failure record (9d45faa):
+- the record as at 367b266, one per id, written whatever is owed, and the
+  replaced message's record not forgotten: 5. They are the join-and-leave
+  cases decided by the close and by the loss report after the leave's loss,
+  the older build that throws, "a failed join replaced by a leave leaves no
+  record behind", and the unit test of `UnprovedUploads`;
+- one record per id alone, the owed check kept: 1, the unit test (the owed
+  check by itself also stops the overwrite);
+- the owed check alone removed: 4;
+- forgetting one message clearing every record under its id: 4, "the proof
+  of an earlier action on a channel does not clear the failure of the later
+  one" among them;
+- the reader taking any record under the id: 7.
+
+This section's readings and rules:
+- a replaced link's recovery counted as a coming-up (the `"recovered"`
+  listener without its "current link" check): 1, "a recovery of a link that
+  is no longer the propagation link sends nothing";
+- a build that throws left unrecorded: 1, "an upload whose build fails
+  while a flush that listed it builds an earlier entry is not built again by
+  that flush";
+- the late proof ignored (`onLateProof` does nothing): 2, the two general
+  late-proof tests.
 
 With `RETICHAT_BOOT_TESTS=1`, the Chromium page test
-(`distro_channels_page`) passes at 367b266. In it, the membership message
+(`distro_channels_page`) passes at 2683ea4. In it, the membership message
 owed to a forgotten distro is dropped, and its sent copy still goes to that
 distro.
 
