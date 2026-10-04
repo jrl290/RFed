@@ -1994,7 +1994,7 @@ twice stores it once (rule 5). C's state never changes M's delivery state,
 and it creates no message of its own on the sending device.
 
 Retichat-js keeps C in its distro outbox from 73a725d (branch
-`distro-channels-web`, not merged; §17.12 Implementation index). At b6c7f7f
+`distro-channels-web`, not merged; §17.12 Implementation index). At 90640bf
 it follows these rules. 145ca2f did not: it dropped C when the device gave
 up D, and a flush of the outbox already under way could upload C again on
 its own failure. 74fbbcd brought it in line ("Retichat-js departures" in the
@@ -2367,9 +2367,10 @@ device still keeps C until the propagation node proves it has it:
   comings-up, never re-addressed, never sent to another distro and never
   packed again (§17.11).
 
-Retichat-js at b6c7f7f, the branch's final commit, meets every point; the
-Resource case no ruling names is open for James (above). b6c7f7f changes no
-code of 2683ea4's: its `app.js` and `lib/` differ only in comments. 367b266
+Retichat-js at 90640bf, the branch's final commit, meets every point; the
+Resource case no ruling names is open for James (above). 90640bf changes no
+code of 2683ea4's, nor did b6c7f7f before it: their `app.js` and `lib/`
+differ from 2683ea4's only in comments. 367b266
 departed from one point: it kept a failure record per channel, so the
 second ruling failed when two actions on one channel overlapped ("A failure
 belongs to the exact message"). 9d45faa brought it in line. 145ca2f departed from three, each a
@@ -2552,7 +2553,7 @@ Where each part lives or is to be made, by function (not line).
 | Part | Where | Status (2026-10-04) |
 |---|---|---|
 | Namespace guard (§6) | RFed-rust `rfed/src/destinations.rs`: `subscribe` (behind `subscribe_cb`), `plan_sync_dispatch` / `run_sync_dispatch` (sync ingest), `plan_channel_fanout` (a publish), `backup_push_response`, `backup_delivery_tick` | made 2026-10-03, not pushed or deployed: 454dc59 (subscribe, sync ingest), 7b19a94 (backup tick, BACKUP_PUSH), 49001ad (publish, the distro's own key); takes effect with an rfed redeploy. The sync reads of §6 "Not covered" stay open for James |
-| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | made 2026-10-03 and 2026-10-04 on branch `distro-channels-web` (main untouched at 24d83e6), not merged, pushed or deployed. Eleven commits, the last b6c7f7f, the branch's final commit: 69ff01e (the section); 9f058e9 (review of 69ff01e: a post's record keeps its packed timestamp, a named device never learns a sibling's clear, a dropped C is judged again, the distro's uploads said sent only on the node's proof); 73a725d (C and the §17.11 sent copy kept until proved, "On the sending device"; a cut upload decided; DISPLAY_NAMES §4.2 learned at the post's time); a448e98 (a flush checks each owed entry again before and after its build; a write storage refuses); 3411e19 (the second upload cited as James's §3 exception; what is owed to a distro given up dropped then, said; a refused write cuts storage down to what is still owed; `at_ms` bounded at 2^53 − 1; an upload whose C is owed no more not said to fail); 145ca2f (a replaced propagation link decides nothing, and an upload that has left blocks a second one on any link; an earlier flush never uploads again what a newer one saw lost; the drop line says when an upload already left); 74fbbcd (James's rulings of 2026-10-03, DESIGN_PRINCIPLES §3: a failed upload waits for the propagation link's next coming-up even while a flush runs; a replaced link's close, or the loss of its upload, with a newer link up sends the entry once on that link; giving up a distro drops only the membership messages owed to it, and a sent copy keeps its distro's key and still goes to that distro); 367b266 (review of 74fbbcd: tests for an upload that an earlier flush made, reported lost while a later flush on the same link builds, and an exact pin of the flush's two callers); 9d45faa (review of 367b266: a failure record belongs to one message, its id and its packed bytes, and is made only while that message is the one owed, so a decision about an older action on a channel never replaces or clears the newer action's record; the verifier's probe VR4-OW); 2683ea4 (review of 9d45faa: the pin of the flush's callers reaches through `_onPropagationLinkEstablished` and the two link events); b6c7f7f (verifier of 2683ea4: the pin of `_uploadOwed`'s three callers and of everything that reaches them; comments credit the loss report in the third ruling to James, 2026-10-04; `app.js` and `lib/` differ from 2683ea4 only in comments). No departure is known at b6c7f7f. It passes the distro unit suites (`distro_outbox`, `distro_channels`, `distro_upload`, `distro_sent_sync`, `lxmf_signature`, `distro_channels_page`: 175 tests, 174 pass and the boot test skipped without `RETICHAT_BOOT_TESTS`; with it set, the boot test passes too). On the private staging chain on 2026-10-04, `stage_distro_channels` passed at 2683ea4, 154 of 154 checks, twice; that is b6c7f7f's code, which was not staged again. Its sections 9, 10, 10b and 11 run James's rulings: the second, the third, the second again where two actions on one channel overlap, and the fifth. The stage failed 367b266 in section 10b alone (1 of 154 checks), 145ca2f in sections 9, 10, 10b and 11 (4 checks), and 9f058e9 in 10 checks, the first of them section 0c's reload. The chain does not run the fifth ruling's other half, a distro replaced by another: that rests on unit tests. What each run showed is under "The web on the staging chain" below |
+| Web: posting as D, own posts, dedupe, membership sync | Retichat-js, below | made 2026-10-03 and 2026-10-04 on branch `distro-channels-web` (main untouched at 24d83e6), not merged, pushed or deployed. Twelve commits, the last 90640bf, the branch's final commit: 69ff01e (the section); 9f058e9 (review of 69ff01e: a post's record keeps its packed timestamp, a named device never learns a sibling's clear, a dropped C is judged again, the distro's uploads said sent only on the node's proof); 73a725d (C and the §17.11 sent copy kept until proved, "On the sending device"; a cut upload decided; DISPLAY_NAMES §4.2 learned at the post's time); a448e98 (a flush checks each owed entry again before and after its build; a write storage refuses); 3411e19 (the second upload cited as James's §3 exception; what is owed to a distro given up dropped then, said; a refused write cuts storage down to what is still owed; `at_ms` bounded at 2^53 − 1; an upload whose C is owed no more not said to fail); 145ca2f (a replaced propagation link decides nothing, and an upload that has left blocks a second one on any link; an earlier flush never uploads again what a newer one saw lost; the drop line says when an upload already left); 74fbbcd (James's rulings of 2026-10-03, DESIGN_PRINCIPLES §3: a failed upload waits for the propagation link's next coming-up even while a flush runs; a replaced link's close, or the loss of its upload, with a newer link up sends the entry once on that link; giving up a distro drops only the membership messages owed to it, and a sent copy keeps its distro's key and still goes to that distro); 367b266 (review of 74fbbcd: tests for an upload that an earlier flush made, reported lost while a later flush on the same link builds, and an exact pin of the flush's two callers); 9d45faa (review of 367b266: a failure record belongs to one message, its id and its packed bytes, and is made only while that message is the one owed, so a decision about an older action on a channel never replaces or clears the newer action's record; the verifier's probe VR4-OW); 2683ea4 (review of 9d45faa: the pin of the flush's callers reaches through `_onPropagationLinkEstablished` and the two link events); b6c7f7f (verifier of 2683ea4: the pin of `_uploadOwed`'s three callers, and of their callers up to a DM's dispatch and the user's join and leave; comments credit the loss report in the third ruling to James, 2026-10-04; `app.js` and `lib/` differ from 2683ea4 only in comments); 90640bf (verifier of b6c7f7f: the pin reaches up to where each path to the upload begins, `_uploadForDistro` and the readers of what is owed are pinned, and so is every close, loss report and event the page and `lib/` make, however written; `app.js` and `lib/` differ from 2683ea4 only in comments). No departure is known at 90640bf. It passes the distro unit suites (`distro_outbox`, `distro_channels`, `distro_upload`, `distro_sent_sync`, `lxmf_signature`, `distro_channels_page`: 176 tests, 175 pass and the boot test skipped without `RETICHAT_BOOT_TESTS`; with it set, the boot test passes too). On the private staging chain on 2026-10-04, `stage_distro_channels` passed at 2683ea4, 154 of 154 checks, twice; that is 90640bf's code, which was not staged again. Its sections 9, 10, 10b and 11 run James's rulings: the second, the third, the second again where two actions on one channel overlap, and the fifth. The stage failed 367b266 in section 10b alone (1 of 154 checks), 145ca2f in sections 9, 10, 10b and 11 (4 checks), and 9f058e9 in 10 checks, the first of them section 0c's reload. The chain does not run the fifth ruling's other half, a distro replaced by another: that rests on unit tests. What each run showed is under "The web on the staging chain" below |
 | Shared Rust for the phones | LXMF-rust, below | not started |
 | iOS | Retichat-ios at 07f6d70, below | not started |
 | Android | Retichat-android at 47bdb0a, below | not started |
@@ -2807,7 +2808,7 @@ uploaded from the phones' outbox below. If an upload goes through the
 router, the router must not re-send it on its own.
 
 **The phones' outbox** (both phones; the follow-up for the phone lanes).
-Retichat-js b6c7f7f is the model (`lib/distro_outbox.js`, `DistroOutbox`
+Retichat-js 90640bf is the model (`lib/distro_outbox.js`, `DistroOutbox`
 and `UnprovedUploads`; `_oweDistro`, `_sendDistroOutbox`,
 `_unprovedSince`, `_distroAttemptOpen`, `_uploadOwed`, `_stillOwed` and
 `_dropMembershipOwedToOtherDistros` in `app.js`), and the list below is the
@@ -2947,7 +2948,7 @@ DESIGN_PRINCIPLES §1 violation (a late success), and it settles the entry
 all the same: it is owed no more and does not go again. The web's event is
 the exchange's loss report (`_onPacketsLost`).
 
-**Retichat-js** (as made, branch `distro-channels-web` at b6c7f7f, whose
+**Retichat-js** (as made, branch `distro-channels-web` at 90640bf, whose
 code is 2683ea4's).
 
 - Posting: `RnsClient.sendChannelMessage` decides the posting identity once,
@@ -3001,14 +3002,31 @@ code is 2683ea4's).
   reads no failure record when it is called without a coming-up, so it has
   three callers and no other: the coming-up pass, the user's own action
   (`_oweDistro`, with a message packed in that action) and the third
-  ruling's send. b6c7f7f pins them in `distro_sent_sync.test.mjs`, with
-  everything that reaches each: `_oweDistro` and the user's actions above
-  it, every call of `DistroUploads.lost` and `cut`, the loss report's one
-  listener, the page's closes (it closes a propagation link only in
-  `disconnect()`, once it has let go of it), and the events that only the
-  Link and the exchange fire. In the verifier of 2683ea4's probe RX1, an
-  announce that uploaded every owed entry through `_uploadOwed` passed
-  every earlier test.
+  ruling's send. b6c7f7f pinned them in `distro_sent_sync.test.mjs`, with
+  `_oweDistro`'s two callers, every call of `DistroUploads.lost` and
+  `cut`, the loss report's one listener, the page's closes (it closes a
+  propagation link only in `disconnect()`, once it has let go of it), and
+  the events that only the Link and the exchange fire. In the verifier of
+  2683ea4's probe RX1, an announce that uploaded every owed entry through
+  `_uploadOwed` passed every earlier test. That pin stopped at a DM's
+  dispatch and the user's join and leave, and left `_uploadForDistro`
+  open: in the verifier of b6c7f7f's probes, the window's `"online"`
+  dispatching every failed DM again, or leaving and joining every channel
+  again, or re-uploading every owed entry through a bound alias of
+  `_uploadForDistro`, passed the whole suite. 90640bf pins what reaches
+  each path up to where it begins: the user's own send (the composer's
+  send button and Enter key, and the test harness's send), join (the
+  channel form's Join button and Enter key, and the harness's
+  `joinChannel`) and leave (the channel's Leave button, once confirmed,
+  and the harness's `leaveChannel`), and a DM the user sent before the
+  exchange first registered after a connect (`_dispatchQueued`). It pins
+  `_uploadForDistro` to its one caller, `_uploadOwed`; the outbox, its
+  attempts in flight and its failure records to the places that read
+  them; and every place the page and `lib/` say close or lost (and `lib/`
+  a link's coming-up or recovery), with the page firing one event of its
+  own. So a new path is caught however it is written: by name, through an
+  alias, as an optional or a computed call. What it cannot see is a name
+  assembled at run time or found by reflection.
 - A failure waits for the next coming-up. `DistroUploads` calls the upload's
   `onLost` in the task of the event that decides it. `_uploadOwed` then
   records the failure in `_distroUnproved`, an `UnprovedUploads`
@@ -3075,7 +3093,7 @@ code is 2683ea4's).
   `ChannelSenderNamesStore.forget`, `ChannelPostNamesStore.forget` and the
   stream memo. No C is sent.
 
-**Retichat-js departures.** None is known at b6c7f7f. 367b266 had one,
+**Retichat-js departures.** None is known at 90640bf. 367b266 had one,
 against James's second ruling, and 9d45faa fixed it with tests that fail
 without the fix. It was shown by running 367b266's own code, and on the
 staging chain:
@@ -3391,7 +3409,8 @@ owed to a forgotten distro is dropped, and its sent copy still goes to that
 distro.
 
 b6c7f7f adds one test to `distro_sent_sync`: the pin of `_uploadOwed`'s
-three callers and of everything that reaches them ("Retichat-js", as made).
+three callers, and of their callers up to a DM's dispatch and the user's
+join and leave ("Retichat-js", as made).
 Twenty-six mutations of b6c7f7f were run on 2026-10-04, each adding a stray
 caller or path at one pinned place on a scratch copy, and the pin caught
 every one. The full suite of 2683ea4 (968 tests) missed 14 of the same
@@ -3401,12 +3420,44 @@ calling it without its coming-up, `DistroUploads.lost` on an announce, and
 the page closing a replaced STALE link itself. Comments naming every
 pinned call change nothing. `git diff 2683ea4 b6c7f7f -- app.js lib/`
 touches comment lines only, and with comments out the code of each file is
-2683ea4's. In test-harnesses f24a451, every distro test pins b6c7f7f, and
-a test fails unless those pins agree, the stage's header names the same
-head, and that head serves the code the chain ran (2683ea4), differing only
-in comments and the web's tests. The harness's suites pass there: 390
-tests, 337 pass and 53 skipped without Chromium, and 390 of 390 with
-`RETICHAT_BOOT_TESTS=1`, the live tests at b6c7f7f included.
+2683ea4's. In test-harnesses f24a451, every distro test's pin names
+b6c7f7f, and a test fails unless those pins agree, the stage's header
+names the same head, and that head serves the code the chain ran
+(2683ea4), differing only in comments and the web's tests. Two lines of
+`link_close.test.mjs`'s header still called 367b266, where its link tests
+run, the branch's head; that test read only the pins, not the prose. The
+harness's suites pass there: 390 tests, 337 pass and 53 skipped without
+Chromium, and 390 of 390 with `RETICHAT_BOOT_TESTS=1`, the live tests at
+b6c7f7f included.
+
+90640bf answers the verifier of b6c7f7f ("Retichat-js", as made): a
+second test in `distro_sent_sync` pins what reaches `_oweDistro`'s two
+callers up to where each path begins, and the first now pins
+`_uploadForDistro`, and every close, loss report and event the page and
+`lib/` make. Sixty mutations were run on 2026-10-04 against
+`distro_sent_sync`, each on a scratch copy: forty new ones, each a stray
+caller or path at a newly pinned place, and the verifier of b6c7f7f's
+twenty probes. Each was caught by the assertion meant for it. b6c7f7f's
+full suite (969 tests) missed 35 of the same 60. Among them were the
+verifier's R5, R12, R13, R14 and R17; a send from the page's own
+`"online"`, `"focus"`, or a synthetic click or Enter key; uploads read
+straight from the outbox, its storage or its attempts in flight, and a
+new reader of its failure records; and the page closing a replaced STALE
+link by an optional or a computed call. Seven negatives pass on the full suite (970
+tests), among them log lines saying close, lost, emit and established.
+`git diff 2683ea4 90640bf -- app.js lib/` touches comment lines only, and
+acorn's tokens and AST of `app.js`, `lib/distro_upload.js` and
+`lib/distro_outbox.js` are 2683ea4's. `npm test` passes, 970 tests with
+24 skipped for Chromium, and `npm run test:full` passes 970 of 970.
+
+In test-harnesses 7e18425, every distro test pins 90640bf.
+`link_close.test.mjs`'s header says its runs at 367b266 are of the head's
+link code. A new test fails unless every "head" a staging source names is
+the pin, and unless the head serves 367b266's link code (`lib/rns/` and
+`test_link_pair.mjs`) unchanged. On f24a451's tree it fails on exactly
+those two lines. The harness's suites pass there: 391 tests, 338 pass
+and 53 skipped without Chromium, and 391 of 391 with
+`RETICHAT_BOOT_TESTS=1`, the live tests at 90640bf included.
 
 Earlier, before James's rulings, ten mutations of Retichat-js 145ca2f were
 run on 2026-10-03 against `distro_outbox`, `distro_channels`,
