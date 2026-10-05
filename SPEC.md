@@ -2316,12 +2316,12 @@ device still keeps C until the propagation node proves it has it:
     open on the replaced link is decided as the third ruling says.
   - Only the three events that §3 names decide an upload: the packet
     reported lost, the link closing, the connection stopping. Replacing a
-    link is none of them. One case no ruling names: Retichat-js also decides
-    an upload that went as a Resource (a §17.11 sent copy larger than the
-    link's MDU) when the Resource fails, and with a newer link up takes that
-    for the third ruling's event, as it takes the loss report. That is open
-    for James (the verifier of 2683ea4). The phones have the same open
-    question: a Resource upload has no packet receipt to time out.
+    link is none of them. An upload that went as a Resource (a §17.11 sent
+    copy larger than the link's MDU) has no packet to report lost: the
+    Resource's own failure decides it, and with a newer link up it is the
+    third ruling's event, as the loss report is (James, 2026-10-04: "same
+    as a loss"). On the phones a Resource upload has no packet receipt to
+    time out; its own failure is the same event (James, 2026-10-04).
   - **A build that throws is a failure** (this section's rule, under the
     second ruling). Building an upload (the distro's key, the encryption,
     the stamp, the packet) can throw before anything leaves. The device
@@ -2367,8 +2367,8 @@ device still keeps C until the propagation node proves it has it:
   comings-up, never re-addressed, never sent to another distro and never
   packed again (§17.11).
 
-Retichat-js at 90640bf, the branch's final commit, meets every point; the
-Resource case no ruling names is open for James (above). 90640bf changes no
+Retichat-js at 90640bf, the branch's final commit, meets every point,
+including the Resource case James ruled on 2026-10-04 (above). 90640bf changes no
 code of 2683ea4's, nor did b6c7f7f before it: their `app.js` and `lib/`
 differ from 2683ea4's only in comments. 367b266
 departed from one point: it kept a failure record per channel, so the
@@ -3052,8 +3052,8 @@ code is 2683ea4's).
   without deciding its uploads. When the old link's close (James,
   2026-10-03), or the loss report (James, 2026-10-04), decides one while a
   newer propagation link is up and current, `_uploadOwed` uploads the entry
-  once on that link at once. A Resource's failure is taken the same way,
-  the case no ruling names (above). A late proof of the first upload,
+  once on that link at once. A Resource's failure is taken the same way
+  (James, 2026-10-04). A late proof of the first upload,
   coming after that, settles the entry (`upload.onLateProof`). `disconnect()` lets go of the newer link first,
   so a stopped connection sends nothing. The in-flight check
   (`_distroAttemptOpen`, over `_distroOutboxInFlight`) skips an entry being
