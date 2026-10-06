@@ -2846,7 +2846,15 @@ contract. The phones must not copy the gaps that earlier web commits had
   timer, not a failure. A STALE link that a new one has replaced is no
   longer the propagation link, and its recovery starts no flush. That is
   this section's reading of the first and third rulings, not James's words
-  ("On the sending device").
+  ("On the sending device"). One exception: an interface coming back online
+  starts a flush of the uploads that never left the device (below).
+- An upload that never left the device, because no interface could carry it
+  (its packet could not be queued), is not a failure: nothing was sent. It
+  goes when an interface comes back online, an event like the coming-up, as
+  well as at the next coming-up. A loss after the packet left still waits
+  for the next coming-up (James, 2026-10-06: on staging a short network drop
+  left the propagation link up, so no coming-up followed, and such an upload
+  waited 35 s for an unrelated close).
 - The node's proof settles the entry, a proof after a loss report included.
   The loss report, the link's close and the app's stop each decide an upload
   unproved. The device says so, the entry stays owed, and it is uploaded
