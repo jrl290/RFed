@@ -45,4 +45,13 @@ impl Mark {
     pub(crate) fn containing(&self, needle: &str) -> Vec<String> {
         self.lines().into_iter().filter(|line| line.contains(needle)).collect()
     }
+
+    /// Every thread's lines since the mark that contain `needle`: for a line
+    /// written on a thread the test did not start (a link's failed request
+    /// runs its callback on one of its own). `needle` must name something
+    /// only this test has, such as a hash it made, since other tests write
+    /// beside it.
+    pub(crate) fn any_thread_containing(&self, needle: &str) -> Vec<String> {
+        lines()[self.0..].iter().filter(|(_, line)| line.contains(needle)).map(|(_, line)| line.clone()).collect()
+    }
 }

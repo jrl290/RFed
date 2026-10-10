@@ -914,9 +914,12 @@ mod tests {
     }
 
     /// A §17.13 sync hand-off at the late hand-off points: the stream tier's
-    /// unproven push (and an unanswered rfed.link push, whose `on_failed`
-    /// calls the same closure with the same device) ends in one enqueue and
-    /// no wake.
+    /// unproven push ends in one enqueue and no wake, and so does the
+    /// closure itself, which an unanswered rfed.link push's `on_failed`
+    /// calls with the same device. That rfed.link path is run end to end,
+    /// through `distro_fanout`'s first tier on a live link whose request
+    /// fails, by lxmf_propagation's
+    /// `a_live_rfed_link_session_gets_the_push_and_its_failure_queues_without_a_wake`.
     #[test]
     fn a_sync_hand_off_at_the_late_points_queues_once_and_wakes_no_one() {
         let dir = temp_path("late_sync_hand_off");

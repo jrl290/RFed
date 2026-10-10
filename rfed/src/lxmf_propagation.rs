@@ -5141,6 +5141,8 @@ mod tests {
             blobs: Arc<Mutex<BlobStore>>,
             queue: Arc<Mutex<DeferredQueue>>,
             notify: Arc<Mutex<NotifyRegistry>>,
+            /// The rfed.link sessions the fan-out's first tier pushes on.
+            sessions: Arc<Mutex<LinkSessionRegistry>>,
             relay_hash: Vec<u8>,
             stack: Arc<FakeStack>,
         }
@@ -5162,12 +5164,13 @@ mod tests {
                 let relay_hash = Destination::hash(relay.hash.as_deref(), "rfed", &["notify"]);
                 let recalled = Identity::from_public_key(&relay.get_public_key().unwrap()).unwrap();
                 let stack = Arc::new(FakeStack::new(&relay_hash, Some(recalled)));
+                let sessions = Arc::new(Mutex::new(LinkSessionRegistry::default()));
                 let node = LxmfPropagationNode::new(
                     Identity::new(true),
                     &config(&dir),
                     Arc::clone(&notify),
                     Arc::new(Mutex::new(PropagationStreamRegistry::default())),
-                    Arc::new(Mutex::new(LinkSessionRegistry::default())),
+                    Arc::clone(&sessions),
                     Some(Arc::clone(&table)),
                     Some(Arc::clone(&blobs)),
                     None,
@@ -5180,7 +5183,7 @@ mod tests {
                     n.stamp_flexibility = 0;
                     n.relay_stack = Arc::clone(&stack) as Arc<dyn RelayStack + Send + Sync>;
                 }
-                Rig { dir, node, table, blobs, queue, notify, relay_hash, stack }
+                Rig { dir, node, table, blobs, queue, notify, sessions, relay_hash, stack }
             }
 
             /// Register a device for `distro`, with a notify registration
@@ -5520,6 +5523,68 @@ mod tests {
             assert!(plain.2.is_empty());
             assert_eq!(claimed.2.len(), 1);
             assert!(claimed.2[0].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 1 unmatched, 0 ignored"), "{}", claimed.2[0]);
+        }
+
+        // ── A device with a live rfed.link session ──────────────────────
+
+        /// An ACTIVE link with a session key and no interface: a request on
+        /// it is sent (no interface carries it, and none answers it), so it
+        /// stays pending until the link closes, which fails it.
+        fn live_link() -> LinkHandle {
+            let owner = Destination::new_inbound(
+                Some(Identity::new(true)), DestinationType::Single, "rfed".into(), vec!["link".into()],
+            )
+            .expect("destination");
+            let mut link = Link::new_inbound(owner).expect("link");
+            link.link_id = rand::random::<[u8; 16]>().to_vec();
+            link.derived_key = Some(vec![7u8; 64]);
+            link.state = reticulum_rust::link::STATE_ACTIVE;
+            link.status = reticulum_rust::link::STATE_ACTIVE;
+            LinkHandle::spawn(link)
+        }
+
+        /// DISTRO-SYNC-PROOF-DESIGN §13.1: with an accepted proof, a device
+        /// holding a live rfed.link session gets the `/lxmf/delivery` push,
+        /// as without one: nothing is queued for it and nobody is woken.
+        /// When that push goes unanswered (here: the link closes before a
+        /// response, which fails the request), the fan-out's own rfed.link
+        /// tier hands the device off as distro sync: one row, no wake.
+        #[test]
+        fn a_live_rfed_link_session_gets_the_push_and_its_failure_queues_without_a_wake() {
+            let rig = Rig::new("live_link", 0);
+            let (d, d_hash) = distro();
+            let device = rig.device(&d_hash);
+            let link = live_link();
+            rig.sessions.lock().unwrap().configure_delivery(link.clone(), device.wake_key.clone());
+            let (sealed, message) = sealed_message(&d, &d_hash, 7);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], Some(vec![own_claim(&d, &sealed)])));
+
+            assert!(rig.holds(&sync_transient_id(&sealed)[..16]));
+            let pushed = mark.containing("[rfed.link] /lxmf/delivery pushed ");
+            assert_eq!(pushed.len(), 1, "{:?}", mark.lines());
+            assert!(pushed[0].ends_with(&format!("to {}", hexrep(&link.link_id(), false))), "{}", pushed[0]);
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (0, 0), "delivered live: not queued, not woken");
+            assert!(mark.containing("[handoff] ").is_empty(), "{:?}", mark.lines());
+            assert!(mark.containing("has no live session").is_empty(), "{:?}", mark.lines());
+
+            // The push is never answered: the close fails it, and its
+            // on_failed hook (built by distro_fanout from the QueueOnly
+            // hand-off) runs on a thread of its own.
+            // The hand-off's line is its last act, after any wake, so the
+            // test waits for it (on that thread) before counting.
+            let handoff = format!("[handoff] {} unconfirmed for {}: ", hexrep(&device.wake_key, false), hexrep(&d_hash, false));
+            let mark = crate::test_log::mark();
+            link.teardown();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while mark.any_thread_containing(&handoff).is_empty() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let lines = mark.any_thread_containing(&handoff);
+            assert_eq!(lines.len(), 1, "one hand-off for the unanswered push: {lines:?}");
+            assert!(lines[0].ends_with("queued for pull, NOT woken (distro sync, 1 of 64 un-pulled)"), "{}", lines[0]);
+            assert_eq!(rig.rows(&device, &d_hash), 1, "the unanswered push queues the blob once");
+            assert_eq!(rig.wakes(), 0, "and wakes no one: an accepted proof's hand-off");
         }
 
         // ── Dedup: a message fans out once, on first sight ──────────────
