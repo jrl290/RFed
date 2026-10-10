@@ -83,6 +83,65 @@ impl EnqueueOutcome {
     }
 }
 
+/// What a run of enqueues for one subscriber came to
+/// ([`DeferredQueue::enqueue_all`]), for the callers that queue several
+/// blobs at once: the backup node adopting an offline owner's subscriber, and
+/// the announce flush putting back what it could not send. Their drops speak
+/// as a hand-off's do ([`EnqueueTally::loss_lines`], RFed SPEC §7 "Limits").
+/// Until 2026-10-10 they ignored the outcome, and the backup line counted a
+/// refused blob as queued.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EnqueueTally {
+    /// In the queue now.
+    pub queued: usize,
+    /// Of those, how many evicted the subscriber's oldest entry to fit.
+    pub evicted: usize,
+    /// Refused at the global limit: lost to the pull.
+    pub refused: usize,
+}
+
+impl EnqueueTally {
+    /// Count one enqueue's outcome.
+    pub fn add(&mut self, outcome: &EnqueueOutcome) {
+        match outcome {
+            EnqueueOutcome::Queued => self.queued += 1,
+            EnqueueOutcome::QueuedEvictingOldest { .. } => {
+                self.queued += 1;
+                self.evicted += 1;
+            }
+            EnqueueOutcome::RefusedGlobalLimit => self.refused += 1,
+        }
+    }
+
+    /// The lines for what the run lost, for the caller to log with every
+    /// lock released: a WARNING for the blobs the global limit refused, a
+    /// NOTICE for the older entries evicted to make room. `tag` begins each
+    /// line (`[backup]`, `[deferred]`); `why` says what the blobs were.
+    pub fn loss_lines(&self, tag: &str, subscriber_hash: &[u8], why: &str) -> Vec<(i32, String)> {
+        let subscriber = reticulum_rust::hexrep(subscriber_hash, false);
+        let mut lines = Vec::new();
+        if self.refused > 0 {
+            lines.push((
+                reticulum_rust::LOG_WARNING,
+                format!(
+                    "{tag} {} blob(s) for {subscriber} ({why}) NOT queued: global limit, lost to the pull",
+                    self.refused,
+                ),
+            ));
+        }
+        if self.evicted > 0 {
+            lines.push((
+                reticulum_rust::LOG_NOTICE,
+                format!(
+                    "{tag} {subscriber} bucket full: its {} oldest entry(ies) evicted to queue blob(s) ({why})",
+                    self.evicted,
+                ),
+            ));
+        }
+        lines
+    }
+}
+
 /// The entries [`DeferredQueue::evict_expired`] removed for one subscriber and
 /// one routing hash.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -302,6 +361,21 @@ impl DeferredQueue {
             Some(old) => EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash: old.channel_hash },
             None => EnqueueOutcome::Queued,
         }
+    }
+
+    /// Enqueue each `(routing_hash, blob)` for `subscriber_hash`, in order,
+    /// and tally what became of them (see [`EnqueueTally`]).
+    pub fn enqueue_all(
+        &mut self,
+        subscriber_hash: &[u8],
+        blobs: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+        per_subscriber_limit: usize,
+    ) -> EnqueueTally {
+        let mut tally = EnqueueTally::default();
+        for (routing_hash, blob) in blobs {
+            tally.add(&self.enqueue(subscriber_hash.to_vec(), routing_hash, blob, per_subscriber_limit));
+        }
+        tally
     }
 
     /// How many entries `subscriber_hash` has queued under `routing_hash` (a
@@ -857,5 +931,51 @@ mod tests {
         );
         assert!(!block[lines..].contains("node.lock()"), "no FedNode lock is held while logging");
         assert!(!block[lines..].contains("deferred_queue.lock()"), "nor the queue's");
+    }
+
+    /// `enqueue_all` tallies each enqueue: queued, queued by evicting the
+    /// subscriber's oldest entry, refused at the global limit. The tally's
+    /// lines say what was lost, a WARNING for a refusal and a NOTICE for an
+    /// eviction, and nothing for a run that lost nothing.
+    #[test]
+    fn enqueue_all_tallies_what_became_of_each_blob() {
+        let mut q = fresh_queue();
+        q.global_limit = 4;
+        let sub = vec![0xA1; 16];
+        let blobs = |n: u8| (0..n).map(|i| (vec![0xC1; 16], vec![i])).collect::<Vec<_>>();
+
+        let clean = q.enqueue_all(&sub, blobs(2), 3);
+        assert_eq!(clean, EnqueueTally { queued: 2, evicted: 0, refused: 0 });
+        assert!(clean.loss_lines("[x]", &sub, "why").is_empty());
+
+        // Per-subscriber limit 3: the third fits, the fourth evicts the
+        // oldest.
+        let evicting = q.enqueue_all(&sub, blobs(2), 3);
+        assert_eq!(evicting, EnqueueTally { queued: 2, evicted: 1, refused: 0 });
+        assert_eq!(q.count_matching(&sub, &[0xC1; 16]), 3);
+
+        // Another subscriber's blob fills the queue to its global limit of
+        // 4: everything after it is refused.
+        let other = vec![0xB2; 16];
+        assert_eq!(q.enqueue(other.clone(), vec![0xC2; 16], vec![9], 3), EnqueueOutcome::Queued);
+        let refused = q.enqueue_all(&other, blobs(2), 3);
+        assert_eq!(refused, EnqueueTally { queued: 0, evicted: 0, refused: 2 });
+
+        let run = EnqueueTally { queued: 2, evicted: 1, refused: 1 };
+        let lines = run.loss_lines("[backup]", &sub, "owner offline");
+        let sub_hex = reticulum_rust::hexrep(&sub, false);
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    reticulum_rust::LOG_WARNING,
+                    format!("[backup] 1 blob(s) for {sub_hex} (owner offline) NOT queued: global limit, lost to the pull"),
+                ),
+                (
+                    reticulum_rust::LOG_NOTICE,
+                    format!("[backup] {sub_hex} bucket full: its 1 oldest entry(ies) evicted to queue blob(s) (owner offline)"),
+                ),
+            ]
+        );
     }
 }

@@ -917,7 +917,12 @@ evicted entry's routing hash. When the global limit is reached, a new entry
 is dropped, and the hand-off that tried to queue it logs a WARNING naming
 the recipient and the routing hash (`DeferredQueue::enqueue` returns
 `EnqueueOutcome`; the hand-off's `[handoff]` line reads `NOT queued: global
-limit`). An entry older than 7 days is evicted, and the node logs, per
+limit`). The other callers, which queue several blobs for one subscriber at
+once (a backup node adopting an offline owner's subscriber, and the
+announce flush putting back what it drained and could not send), log the
+same per run: a WARNING `… NOT queued: global limit, lost to the pull` for
+the refused blobs and a NOTICE for the evictions, and count as queued only
+what was (`DeferredQueue::enqueue_all`, `EnqueueTally`). An entry older than 7 days is evicted, and the node logs, per
 recipient and routing hash, how many expired unpulled (a WARNING for a
 distro registered here).
 

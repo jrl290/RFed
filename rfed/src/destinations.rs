@@ -2110,31 +2110,45 @@ fn backup_delivery_tick(
             }
 
             let limit = config.policy_for(sub_hash.as_slice()).deferred_queue_limit;
-            let mut enqueued = 0usize;
-            if let Ok(mut q) = deferred_queue.lock() {
-                for (ch, blob) in &blobs {
-                    q.enqueue(sub_hash.clone(), ch.clone(), blob.clone(), limit);
-                    enqueued += 1;
-                }
-            }
-            if enqueued > 0 {
+            let offered = blobs.len();
+            // Counted per outcome (RFed SPEC §7 "Limits"): until 2026-10-10
+            // every blob counted as queued, also one the global limit refused.
+            let tally = deferred_queue.lock().ok().map(|mut q| q.enqueue_all(sub_hash, blobs, limit));
+            let Some(tally) = tally else {
                 log(
                     format!(
-                        "[backup] queued {enqueued} blob(s) for subscriber {} (owner offline)",
+                        "[backup] {offered} blob(s) for subscriber {} NOT queued: the deferred queue is poisoned",
+                        hexrep(sub_hash, false)
+                    ),
+                    LOG_WARNING, false, false,
+                );
+                continue;
+            };
+            if tally.queued > 0 {
+                log(
+                    format!(
+                        "[backup] queued {} blob(s) for subscriber {} (owner offline)",
+                        tally.queued,
                         hexrep(sub_hash, false)
                     ),
                     LOG_NOTICE, false, false,
                 );
-                adopted.push((sub_hash.clone(), ch_hash.clone(), owner_hash.clone()));
-                // Collected, not sent: the caller holds the FedNode mutex.
-                if let Ok(notify) = notify_registry.lock() {
-                    wakes.extend(
-                        notify
-                            .get_for_channel(&crate::notify::notify_key(sub_hash), Some(ch_hash.as_slice()))
-                            .into_iter()
-                            .map(|reg| (reg.clone(), ch_hash.clone())),
-                    );
-                }
+            }
+            for (level, line) in tally.loss_lines("[backup]", sub_hash, "owner offline") {
+                log(line, level, false, false);
+            }
+            // Adopted and woken as before, also when the global limit
+            // refused every blob: the wake still makes the subscriber
+            // drain what is queued for it, as a refused hand-off's does.
+            adopted.push((sub_hash.clone(), ch_hash.clone(), owner_hash.clone()));
+            // Collected, not sent: the caller holds the FedNode mutex.
+            if let Ok(notify) = notify_registry.lock() {
+                wakes.extend(
+                    notify
+                        .get_for_channel(&crate::notify::notify_key(sub_hash), Some(ch_hash.as_slice()))
+                        .into_iter()
+                        .map(|reg| (reg.clone(), ch_hash.clone())),
+                );
             }
         }
     }
@@ -2227,6 +2241,58 @@ mod backup_chain_tests {
         assert_eq!(registration.subscriber_hash, key, "woken under the delivery hash");
         assert_eq!(registration.relay_hash, relay);
         assert_eq!(wake_channel, &channel);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// With the deferred queue at its global limit, the backup tick queues
+    /// nothing and says so as a WARNING; its `[backup] queued` line counts
+    /// only what was queued (until 2026-10-10 it counted every blob it
+    /// offered). The subscriber is still adopted and woken, as before, so it
+    /// drains what is queued for it.
+    #[test]
+    fn a_backup_blob_the_global_limit_refuses_is_a_warning_not_counted_queued() {
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("rfed_backup_refused_{unique}"));
+        std::fs::create_dir_all(dir.join("blobs")).expect("temp dir");
+        let (subscriber, channel, owner) = (vec![0x32; 16], vec![0x42; 16], vec![0x12; 16]);
+
+        let subscriptions = Arc::new(Mutex::new(SubscriptionTable::load(dir.join("subs.rmp"))));
+        subscriptions.lock().unwrap().subscribe_backup(subscriber.clone(), channel.clone(), owner.clone());
+        let blobs = Arc::new(Mutex::new(BlobStore::open(dir.join("blobs"), 1 << 20)));
+        blobs.lock().unwrap().store(&channel, b"inner blob").expect("store blob");
+        let deferred = Arc::new(Mutex::new(DeferredQueue::load(dir.join("deferred.rmp"))));
+        {
+            let mut queue = deferred.lock().unwrap();
+            queue.global_limit = 1;
+            queue.enqueue(vec![0xEE; 16], vec![0xCC; 16], b"someone else's".to_vec(), 256);
+        }
+        let notify = Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp"))));
+        let distro = Arc::new(Mutex::new(DistroTable::load(dir.join("distro.rmp"))));
+        let sync = Arc::new(Mutex::new(FedSync::new(Arc::clone(&blobs), Arc::clone(&subscriptions), Arc::clone(&distro))));
+
+        let mark = crate::test_log::mark();
+        let (adopted, _) = backup_delivery_tick(
+            subscriptions,
+            distro,
+            blobs,
+            Arc::clone(&deferred),
+            notify,
+            &config(&dir),
+            sync,
+            90.0,
+        );
+
+        assert!(!deferred.lock().unwrap().has_pending(&subscriber), "nothing queued");
+        assert_eq!(adopted.len(), 1, "adopted as before");
+        assert!(mark.containing("[backup] queued").is_empty(), "nothing counted as queued: {:?}", mark.lines());
+        let warnings = mark.containing("NOT queued: global limit");
+        assert_eq!(warnings.len(), 1, "{:?}", mark.lines());
+        assert!(warnings[0].contains("[Warning]"), "{}", warnings[0]);
+        assert!(warnings[0].ends_with(&format!(
+            "[backup] 1 blob(s) for {} (owner offline) NOT queued: global limit, lost to the pull",
+            reticulum_rust::hexrep(&subscriber, false),
+        )), "{}", warnings[0]);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2475,11 +2541,13 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                         false,
                     );
                     // Re-enqueue everything — we'll try again on next announce.
-                    if let Ok(mut q) = deferred_queue.lock() {
-                        for pb in pending {
-                            q.enqueue(sub_id_hash.clone(), pb.channel_hash, pb.blob, limit);
-                        }
-                    }
+                    requeue_drained(
+                        &deferred_queue,
+                        &sub_id_hash,
+                        pending.into_iter().map(|pb| (pb.channel_hash, pb.blob)).collect(),
+                        limit,
+                        "not sent: no delivery destination",
+                    );
                     return;
                 }
             };
@@ -2575,33 +2643,71 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                     }
                 }
             }
+            // Re-enqueue the blobs that did not transmit so they survive for the
+            // next announce / path-ready trigger instead of being dropped.
+            let as_entries = |blobs: &[&crate::deferred_queue::PendingBlob]| -> Vec<(Vec<u8>, Vec<u8>)> {
+                blobs.iter().map(|pb| (pb.channel_hash.clone(), pb.blob.clone())).collect()
+            };
+            if !failed.is_empty() {
+                requeue_drained(&deferred_queue, &sub_id_hash, as_entries(&failed), limit, "not transmitted");
+            }
+            // Put back first, then say how many are queued: the queue was
+            // released after the drain, so other hand-offs may have taken the
+            // room (until 2026-10-10 this said "left queued" before the
+            // re-queue, also for blobs the global limit then refused).
             if !oversized.is_empty() {
+                let kept = requeue_drained(&deferred_queue, &sub_id_hash, as_entries(&oversized), limit, "above the packet MDU");
                 log(
                     format!(
-                        "[deferred] {} blob(s) for {} exceed the {}-byte packet MDU — left queued for /channel/pull or a bound rfed.link",
+                        "[deferred] {} blob(s) for {} exceed the {}-byte packet MDU — {} left queued for /channel/pull or a bound rfed.link",
                         oversized.len(),
                         hexrep(&sub_id_hash, false),
                         reticulum_rust::packet::ENCRYPTED_MDU,
+                        kept,
                     ),
                     LOG_NOTICE,
                     false,
                     false,
                 );
-                failed.extend(oversized);
-            }
-            // Re-enqueue the blobs that did not transmit so they survive for the
-            // next announce / path-ready trigger instead of being dropped.
-            if !failed.is_empty() {
-                if let Ok(mut q) = deferred_queue.lock() {
-                    for pb in failed {
-                        q.enqueue(sub_id_hash.clone(), pb.channel_hash.clone(), pb.blob.clone(), limit);
-                    }
-                }
             }
         }),
     });
 
     Ok(())
+}
+
+/// Put blobs the announce flush drained back in the deferred queue for
+/// `subscriber`, and say what that lost; returns how many are queued again.
+/// The flush releases the queue between its drain and this, so other
+/// hand-offs may have taken the room: a blob the global limit now refuses is
+/// lost to the pull, and that is a WARNING, as a hand-off's refusal is (RFed
+/// SPEC §7 "Limits"). Logs with the queue released. Until 2026-10-10 the
+/// flush ignored what its re-queue did.
+fn requeue_drained(
+    deferred_queue: &Mutex<crate::deferred_queue::DeferredQueue>,
+    subscriber: &[u8],
+    blobs: Vec<(Vec<u8>, Vec<u8>)>,
+    limit: usize,
+    why: &str,
+) -> usize {
+    let offered = blobs.len();
+    let tally = deferred_queue.lock().ok().map(|mut queue| queue.enqueue_all(subscriber, blobs, limit));
+    let Some(tally) = tally else {
+        log(
+            format!(
+                "[deferred] {offered} blob(s) for {} ({why}) NOT queued again: the deferred queue is poisoned",
+                hexrep(subscriber, false),
+            ),
+            LOG_WARNING,
+            false,
+            false,
+        );
+        return 0;
+    };
+    for (level, line) in tally.loss_lines("[deferred]", subscriber, why) {
+        log(line, level, false, false);
+    }
+    tally.queued
 }
 
 /// Whether a `channel_hash | blob` delivery payload fits one encrypted DATA
@@ -2680,6 +2786,53 @@ mod deferred_flush_size_tests {
         let gate = fragment.find("fits_in_delivery_packet(payload.len())").expect("size gate present");
         let packet = fragment.find("reticulum_rust::packet::Packet::new(").expect("packet build present");
         assert!(gate < packet, "the size gate must run before Packet::new in the deferred flush");
+    }
+
+    /// The flush puts back what it drained and could not send, with the
+    /// queue released in between. A blob the global limit then refuses is a
+    /// WARNING, and the count it returns is what is queued again.
+    #[test]
+    fn a_requeue_the_global_limit_refuses_is_a_warning() {
+        use super::requeue_drained;
+        use crate::deferred_queue::DeferredQueue;
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rfed_requeue_{unique}.rmp"));
+        crate::store_db::remove_store_files(&path);
+        let queue = std::sync::Mutex::new(DeferredQueue::load(path.clone()));
+        queue.lock().unwrap().global_limit = 2;
+        let subscriber = vec![0x5B; 16];
+        let blobs = |n: u8| (0..n).map(|i| (vec![0xC5; 16], vec![i])).collect::<Vec<_>>();
+
+        let mark = crate::test_log::mark();
+        assert_eq!(requeue_drained(&queue, &subscriber, blobs(3), 256, "not transmitted"), 2);
+        let lines = mark.containing("[deferred] ");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("[Warning]"), "{}", lines[0]);
+        assert!(lines[0].ends_with(&format!(
+            "[deferred] 1 blob(s) for {} (not transmitted) NOT queued: global limit, lost to the pull",
+            reticulum_rust::hexrep(&subscriber, false),
+        )), "{}", lines[0]);
+
+        queue.lock().unwrap().global_limit = 4096;
+        let mark = crate::test_log::mark();
+        assert_eq!(requeue_drained(&queue, &subscriber, blobs(1), 256, "not transmitted"), 1);
+        assert!(mark.containing("[deferred] ").is_empty(), "a re-queue that loses nothing is quiet");
+        crate::store_db::remove_store_files(&path);
+    }
+
+    /// Every enqueue of the announce flush goes through `requeue_drained`,
+    /// whose outcome speaks; none ignores what the queue did.
+    #[test]
+    fn the_announce_flush_requeues_only_through_requeue_drained() {
+        let source = include_str!("destinations.rs");
+        let start = source.find("back online — flushing").expect("the deferred flush");
+        let end = start + source[start..].find("\n    });\n").expect("the flush closes");
+        let flush = &source[start..end];
+        assert_eq!(flush.matches("requeue_drained(").count(), 3, "the no-destination, unsent and oversized re-queues");
+        assert!(!flush.contains(".enqueue("), "no enqueue of its own");
+        let mdu_line = flush.find("exceed the {}-byte packet MDU").expect("the oversized NOTICE");
+        let oversized_requeue = flush.find("\"above the packet MDU\"").expect("the oversized re-queue");
+        assert!(oversized_requeue < mdu_line, "queued again before it says how many are left queued");
     }
 }
 
