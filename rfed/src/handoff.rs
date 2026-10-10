@@ -649,6 +649,74 @@ mod tests {
         assert!(lines[1].contains("NOT woken (distro sync, 1 of 64 un-pulled)"), "{}", lines[1]);
     }
 
+    /// Both eviction arms of the 64 bound, with the device's bucket full at a
+    /// per-device limit of 64. When the evicted oldest entry was one of D's
+    /// own, the count stays at 64 (one in, one of D's out); when it was
+    /// another routing hash's, the 63 of D become 64. Both wake, and the
+    /// line says 64. (Until 2026-10-10 only the second arm ran in a test, so
+    /// counting `held + 1` for the first went unseen.)
+    #[test]
+    fn a_full_bucket_pins_both_eviction_arms_of_the_64_bound() {
+        let run = |oldest_is_distro: bool| -> (usize, Vec<String>, usize) {
+            let rig = Rig::new("evict_bound");
+            let device = rig.device(0x91);
+            let distro = vec![0xD9; 16];
+            {
+                let mut queue = rig.queue.lock().unwrap();
+                let first = if oldest_is_distro { distro.clone() } else { vec![0xC9; 16] };
+                queue.enqueue(device.queue_key.clone(), first, b"oldest".to_vec(), 64);
+                for n in 0..63u8 {
+                    queue.enqueue(device.queue_key.clone(), distro.clone(), vec![n], 64);
+                }
+            }
+            let hand_off = distro_hand_off(
+                Arc::clone(&rig.stack) as Arc<dyn RelayStack + Send + Sync>,
+                Arc::clone(&rig.queue),
+                Arc::clone(&rig.notify),
+                Arc::new(|_| 64),
+                &distro,
+                b"sync",
+                Wake::QueueOnly,
+            );
+            let mark = crate::test_log::mark();
+            hand_off(device.clone());
+            let held = rig.queue.lock().unwrap().count_matching(&device.queue_key, &distro);
+            (rig.wakes(), mark.containing("[handoff] "), held)
+        };
+
+        for oldest_is_distro in [true, false] {
+            let (wakes, lines, held) = run(oldest_is_distro);
+            assert_eq!(held, 64, "oldest is the distro's: {oldest_is_distro}");
+            assert_eq!(wakes, 1, "the 64th un-pulled wakes (oldest is the distro's: {oldest_is_distro})");
+            assert_eq!(lines.len(), 3, "bound, eviction, push: {lines:?}");
+            assert!(lines[0].ends_with("woken anyway: 64 un-pulled"), "oldest is the distro's: {oldest_is_distro}: {}", lines[0]);
+            assert!(lines[1].contains("bucket full: its oldest entry, for "), "{}", lines[1]);
+            assert!(lines[2].contains("queued for pull, woken via 1 of 1"), "{}", lines[2]);
+        }
+
+        // Below the bound the count shows in the quiet line: 10 of D's
+        // blobs fill a bucket of 10, and an eleventh evicts one of them.
+        let rig = Rig::new("evict_quiet");
+        let device = rig.device(0x92);
+        let distro = vec![0xDA; 16];
+        for n in 0..10u8 {
+            rig.queue.lock().unwrap().enqueue(device.queue_key.clone(), distro.clone(), vec![n], 10);
+        }
+        let hand_off = distro_hand_off(
+            Arc::clone(&rig.stack) as Arc<dyn RelayStack + Send + Sync>,
+            Arc::clone(&rig.queue),
+            Arc::clone(&rig.notify),
+            Arc::new(|_| 10),
+            &distro,
+            b"sync",
+            Wake::QueueOnly,
+        );
+        let mark = crate::test_log::mark();
+        hand_off(device.clone());
+        assert_eq!(rig.wakes(), 0);
+        assert!(mark.lines().iter().any(|l| l.contains("NOT woken (distro sync, 10 of 64 un-pulled)")), "{:?}", mark.lines());
+    }
+
     /// A poisoned queue cannot hold the blob, so a QueueOnly hand-off pushes
     /// and says it was not queued, as Push does.
     #[test]
