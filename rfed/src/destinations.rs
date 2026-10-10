@@ -2808,6 +2808,82 @@ fn backup_push_response(node: &Arc<Mutex<FedNode>>, data: &[u8]) -> Vec<u8> {
 
 // ── rfed.node ────────────────────────────────────────────────────────────────
 
+/// The `/rfed/capabilities` map (SPEC §17 "Capabilities Query") for a node
+/// configured as `cfg`. Clients tolerate unknown keys, so it only grows.
+fn capabilities(cfg: &NodeConfig) -> Vec<(rmpv::Value, rmpv::Value)> {
+    let mut caps: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
+
+    // Protocol version — bump when wire formats change.
+    caps.push((
+        rmpv::Value::String("protocol_version".into()),
+        rmpv::Value::Integer(1.into()),
+    ));
+
+    // Node display name.
+    caps.push((
+        rmpv::Value::String("display_name".into()),
+        rmpv::Value::String(cfg.display_name.clone().into()),
+    ));
+
+    // Which commits this binary was built from — rfed plus its three path
+    // dependencies. CI builds ghcr rfed:latest from sibling repos cloned at
+    // build time and does not rebuild when they change, so a node's actual
+    // contents were previously unknowable from the outside. Now you can ask
+    // it. See rfed/build.rs and scripts/check-sibling-drift.sh.
+    caps.push((
+        rmpv::Value::String("build".into()),
+        rmpv::Value::String(crate::BUILD_STAMP.into()),
+    ));
+
+    // Feature flags — reflects what this node has enabled.
+    caps.push((
+        rmpv::Value::String("subscription".into()),
+        rmpv::Value::Boolean(cfg.default_policy.allow_subscription),
+    ));
+    caps.push((
+        rmpv::Value::String("notify".into()),
+        rmpv::Value::Boolean(cfg.default_policy.allow_notify_registration),
+    ));
+    caps.push((
+        rmpv::Value::String("lxmf_propagation".into()),
+        rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
+    ));
+    caps.push((
+        rmpv::Value::String("channel_stream".into()),
+        rmpv::Value::Boolean(true),
+    ));
+    caps.push((
+        rmpv::Value::String("propagation_stream".into()),
+        rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
+    ));
+    caps.push((
+        rmpv::Value::String("distro".into()),
+        rmpv::Value::Boolean(true),
+    ));
+    // RFed SPEC §17.13: this node honours the distro sync proof on
+    // `lxmf.propagation` uploads (DISTRO-SYNC-PROOF-DESIGN §4.4). Clients
+    // need not ask, an older node being safe; operators and staging do.
+    caps.push((
+        rmpv::Value::String("distro_sync".into()),
+        rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
+    ));
+    caps.push((
+        rmpv::Value::String("backup".into()),
+        rmpv::Value::Boolean(cfg.primary_node.is_some() || !cfg.secondary_nodes.is_empty()),
+    ));
+
+    // Anti-spam parameters.
+    caps.push((
+        rmpv::Value::String("stamp_cost".into()),
+        match cfg.default_policy.stamp_cost.filter(|c| *c > 0) {
+            Some(c) => rmpv::Value::Integer(c.into()),
+            None    => rmpv::Value::Nil,
+        },
+    ));
+
+    caps
+}
+
 fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // OFFER — peer sends its manifest (IDs it has); we return our manifest
     //         so the caller can compute the gap and pull via MESSAGE_GET.
@@ -2862,70 +2938,7 @@ fn wire_node_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
-        let cfg = &guard.config;
-
-        let mut caps: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
-
-        // Protocol version — bump when wire formats change.
-        caps.push((
-            rmpv::Value::String("protocol_version".into()),
-            rmpv::Value::Integer(1.into()),
-        ));
-
-        // Node display name.
-        caps.push((
-            rmpv::Value::String("display_name".into()),
-            rmpv::Value::String(cfg.display_name.clone().into()),
-        ));
-
-        // Which commits this binary was built from — rfed plus its three path
-        // dependencies. CI builds ghcr rfed:latest from sibling repos cloned at
-        // build time and does not rebuild when they change, so a node's actual
-        // contents were previously unknowable from the outside. Now you can ask
-        // it. See rfed/build.rs and scripts/check-sibling-drift.sh.
-        caps.push((
-            rmpv::Value::String("build".into()),
-            rmpv::Value::String(crate::BUILD_STAMP.into()),
-        ));
-
-        // Feature flags — reflects what this node has enabled.
-        caps.push((
-            rmpv::Value::String("subscription".into()),
-            rmpv::Value::Boolean(cfg.default_policy.allow_subscription),
-        ));
-        caps.push((
-            rmpv::Value::String("notify".into()),
-            rmpv::Value::Boolean(cfg.default_policy.allow_notify_registration),
-        ));
-        caps.push((
-            rmpv::Value::String("lxmf_propagation".into()),
-            rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
-        ));
-        caps.push((
-            rmpv::Value::String("channel_stream".into()),
-            rmpv::Value::Boolean(true),
-        ));
-        caps.push((
-            rmpv::Value::String("propagation_stream".into()),
-            rmpv::Value::Boolean(cfg.lxmf_propagation_enabled),
-        ));
-        caps.push((
-            rmpv::Value::String("distro".into()),
-            rmpv::Value::Boolean(true),
-        ));
-        caps.push((
-            rmpv::Value::String("backup".into()),
-            rmpv::Value::Boolean(cfg.primary_node.is_some() || !cfg.secondary_nodes.is_empty()),
-        ));
-
-        // Anti-spam parameters.
-        caps.push((
-            rmpv::Value::String("stamp_cost".into()),
-            match cfg.default_policy.stamp_cost.filter(|c| *c > 0) {
-                Some(c) => rmpv::Value::Integer(c.into()),
-                None    => rmpv::Value::Nil,
-            },
-        ));
+        let caps = capabilities(&guard.config);
 
         let mut buf = Vec::new();
         if rmpv::encode::write_value(&mut buf, &rmpv::Value::Map(caps)).is_ok() {
@@ -6307,5 +6320,30 @@ mod distro_namespace_tests {
             "BACKUP_PUSH answers with backup_push_response"
         );
         assert!(!handler.contains("subscribe_backup("), "and stores no row of its own");
+    }
+}
+
+/// `/rfed/capabilities` (SPEC §17 "Capabilities Query").
+#[cfg(test)]
+mod capabilities_tests {
+    use super::announce_order_tests::config;
+    use super::capabilities;
+
+    fn flag(caps: &[(rmpv::Value, rmpv::Value)], key: &str) -> Option<rmpv::Value> {
+        caps.iter().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v.clone())
+    }
+
+    /// `distro_sync` says whether the node honours the §17.13 sync proof on
+    /// `lxmf.propagation` uploads: exactly when that service runs.
+    #[test]
+    fn distro_sync_mirrors_lxmf_propagation() {
+        for enabled in [true, false] {
+            let cfg = config("caps_distro_sync", enabled);
+            let caps = capabilities(&cfg);
+            assert_eq!(flag(&caps, "distro_sync"), Some(rmpv::Value::Boolean(enabled)));
+            assert_eq!(flag(&caps, "distro_sync"), flag(&caps, "lxmf_propagation"));
+            assert_eq!(flag(&caps, "distro"), Some(rmpv::Value::Boolean(true)), "the existing keys stay");
+            let _ = std::fs::remove_dir_all(&cfg.config_dir);
+        }
     }
 }
