@@ -491,10 +491,11 @@ mod tests {
         let distro = vec![0xD1; 16];
         let mark = crate::test_log::mark();
 
-        rig.hand_off(&distro, b"blob", Wake::Push)(device.clone());
+        let handed = rig.hand_off(&distro, b"blob", Wake::Push)(device.clone());
 
         assert_eq!(rig.queue.lock().unwrap().count_matching(&device.queue_key, &distro), 1);
         assert_eq!(rig.wakes(), 1, "the registration whose relay has a path is woken");
+        assert_eq!(handed, HandOffOutcome { queued: true, woken: true, pushed_because: None }, "what the line says");
         let lines = mark.containing("[handoff] ");
         assert_eq!(lines.len(), 1, "one line per hand-off: {lines:?}");
         let line = &lines[0];
@@ -532,10 +533,11 @@ mod tests {
         let distro = vec![0xD2; 16];
         let mark = crate::test_log::mark();
 
-        rig.hand_off(&distro, b"sync", Wake::QueueOnly)(device.clone());
+        let handed = rig.hand_off(&distro, b"sync", Wake::QueueOnly)(device.clone());
 
         assert_eq!(rig.queue.lock().unwrap().count_matching(&device.queue_key, &distro), 1, "one enqueue");
         assert_eq!(rig.wakes(), 0, "no wake");
+        assert_eq!(handed, HandOffOutcome { queued: true, woken: false, pushed_because: None }, "what the line says");
         let lines = mark.containing("[handoff] ");
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
@@ -568,8 +570,13 @@ mod tests {
         assert!(mark.lines().iter().any(|l| l.contains("NOT woken (distro sync, 63 of 64 un-pulled)")));
 
         let mark = crate::test_log::mark();
-        hand_off(device.clone());
+        let handed = hand_off(device.clone());
         assert_eq!(rig.wakes(), 1, "the 64th wakes");
+        assert_eq!(
+            handed,
+            HandOffOutcome { queued: true, woken: true, pushed_because: Some("64 un-pulled".into()) },
+            "woken, with the bound as why",
+        );
         let lines = mark.containing("[handoff] ");
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(lines[0].ends_with(&format!(
@@ -654,8 +661,9 @@ mod tests {
         rig.queue.lock().unwrap().global_limit = 2;
         rig.fill_to(2);
         let mark = crate::test_log::mark();
-        rig.hand_off(&[0xD6; 16], b"blob", Wake::Push)(device.clone());
+        let handed = rig.hand_off(&[0xD6; 16], b"blob", Wake::Push)(device.clone());
         assert_eq!(rig.wakes(), 1);
+        assert_eq!(handed, HandOffOutcome { queued: false, woken: true, pushed_because: None }, "not queued, woken");
         let lines = mark.containing("[handoff] ");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("[Warning]"), "{}", lines[0]);
@@ -774,8 +782,12 @@ mod tests {
         })
         .join();
         let mark = crate::test_log::mark();
-        rig.hand_off(&[0xD8; 16], b"sync", Wake::QueueOnly)(device.clone());
+        let handed = rig.hand_off(&[0xD8; 16], b"sync", Wake::QueueOnly)(device.clone());
         assert_eq!(rig.wakes(), 1);
+        assert_eq!(
+            handed,
+            HandOffOutcome { queued: false, woken: true, pushed_because: Some("deferred queue poisoned".into()) },
+        );
         let lines = mark.containing("[handoff] ");
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("NOT queued (deferred queue poisoned) for pull, woken via 1 of 1"), "{}", lines[0]);
