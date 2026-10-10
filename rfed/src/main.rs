@@ -66,6 +66,8 @@ mod link_session;
 mod lxmf_propagation;
 mod stream_registry;
 pub mod notify;
+#[cfg(test)]
+mod test_log;
 
 use config::{NodeConfig, TierPolicy};
 use destinations::FedNode;

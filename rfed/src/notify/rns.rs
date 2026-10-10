@@ -450,11 +450,10 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::{Arc, Mutex};
 
     use reticulum_rust::destination::Destination;
     use reticulum_rust::identity::Identity;
-    use reticulum_rust::{hexrep, LOG_NOTICE, LOG_STDOUT};
+    use reticulum_rust::hexrep;
     use rmpv::decode::read_value;
     use rmpv::Value;
 
@@ -647,37 +646,18 @@ mod tests {
         assert_eq!(outcome.drop_reason(), Some(WakeDrop::NotTransmitted));
     }
 
-    /// Puts the log back on stdout when the capturing test ends, pass or fail.
-    struct LogToStdoutOnDrop;
-
-    impl Drop for LogToStdoutOnDrop {
-        fn drop(&mut self) {
-            reticulum_rust::set_logdest(LOG_STDOUT);
-        }
-    }
-
     /// X7: every drop writes a line rfed shows at its default level, NOTICE:
     /// the routing drops at NOTICE, the faults at WARNING. Until 2026-09-25
     /// no path and no identity were DEBUG lines.
     ///
-    /// The only test that captures the log, because the log is process-wide.
-    /// Lines from tests running alongside are told apart by relay hash.
+    /// The log is process-wide: crate::test_log keeps each line with the
+    /// thread that wrote it, and this test reads its own.
     #[test]
     fn every_drop_is_logged_at_a_level_shown_by_default() {
-        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = Arc::clone(&lines);
-        reticulum_rust::set_loglevel(LOG_NOTICE);
-        reticulum_rust::ffi::set_log_callback(move |line| {
-            if let Ok(mut lines) = sink.lock() {
-                lines.push(line);
-            }
-        });
-        let _restore = LogToStdoutOnDrop;
+        let mark = crate::test_log::mark();
 
         let wake_line = |registration: &NotifyRegistration| -> Vec<String> {
-            let marker = format!("wake NOT sent to relay={} ", registration.relay_hash);
-            let captured = lines.lock().unwrap().clone();
-            captured.into_iter().filter(|line| line.contains(&marker)).collect()
+            mark.containing(&format!("wake NOT sent to relay={} ", registration.relay_hash))
         };
         let a_relay = |app_name: &str, aspect: &str| {
             let relay = Identity::new(true);
