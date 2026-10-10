@@ -65,9 +65,11 @@ use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_NOTICE, LOG_WARNING, LOG_ERROR}
 use rmpv::decode::read_value;
 use rmpv::encode::write_value;
 use rmpv::Value;
+use lxmf_rust::distro::{decode_sync_extension, verify_sync_claim, SyncClaim, SyncClaims};
 
 use crate::config::NodeConfig;
 use crate::distro::DistroTable;
+use crate::handoff::Wake;
 use crate::notify::rns::{LiveStack, RelayStack};
 use crate::notify::NotifyRegistry;
 use crate::link_session::LinkSessionRegistry;
@@ -595,6 +597,10 @@ pub struct LxmfPropagationNode {
     /// How outbound peer sync reaches the network: AppLinks-held links in
     /// production (`AppLinksSyncIo`), a recording fake in the unit tests.
     sync_io: Arc<dyn PeerSyncIo>,
+    /// The stack a distro fan-out's hand-off wakes devices through: the
+    /// running Reticulum stack (`LiveStack`) in production, a recording fake
+    /// in the unit tests.
+    relay_stack: Arc<dyn RelayStack + Send + Sync>,
     /// Where network callbacks deliver sync events: the channel of the one
     /// sync worker thread `enable` starts. `None` until then.
     sync_event_sink: Option<SyncEventSink>,
@@ -674,6 +680,7 @@ impl LxmfPropagationNode {
             outbound_sync_msgs_per_min: DEFAULT_OUTBOUND_SYNC_MSGS_PER_MIN,
             outbound_sync_hold_logged: false,
             sync_io: Arc::new(AppLinksSyncIo),
+            relay_stack: Arc::new(LiveStack),
             sync_event_sink: None,
             self_handle: None,
         }));
@@ -1459,8 +1466,15 @@ impl LxmfPropagationNode {
     /// `peer.queue_handled_message` for every validated message, a duplicate
     /// included). Until 2026-09-28 rfed queued each one back to its sender,
     /// and outbound sync offered every inbound batch straight back.
+    ///
+    /// A client's batch may carry RFed SPEC §17.13 sync claims. They are
+    /// matched after the stamps, only to stamp-valid messages for a distro
+    /// registered here: an accepted claim makes that message's fan-out a
+    /// sync one (`Wake::QueueOnly`). Logging stays bounded by the stamp-valid
+    /// distro messages: one verdict line for each that carried a claim, and
+    /// at most one `[distro-sync]` summary line per batch.
     pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8], sender: Option<&Identity>) {
-        let Some(messages) = decode_propagation_batch(data) else { return };
+        let Some(PropagationBatch { messages, claims }) = decode_propagation_batch(data) else { return };
         if messages.is_empty() {
             return;
         }
@@ -1477,6 +1491,22 @@ impl LxmfPropagationNode {
         // Validate PN (Propagation Node) stamps on all messages. Stamps below
         // `min_cost` are rejected; only validated messages proceed.
         let validated = lx_stamper::validate_pn_stamps(&messages, min_cost);
+        let mut sync_claims = BatchClaims::of(claims, from_peer.is_some());
+
+        // Whose batch it was, as the reference's "Received N messages from
+        // {remote_str}": a batch treated as a client's says so. (The staging
+        // harnesses parse the counts; the origin stays at the end.)
+        let origin = match (sender, &from_peer) {
+            (_, Some(peer)) => format!("peer {}", hexrep(peer, false)),
+            (Some(identity), None) => format!(
+                "{} (not a peer)",
+                hexrep(
+                    &Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(identity)),
+                    false,
+                ),
+            ),
+            (None, None) => "a sender with no identity (handled as a client's)".to_string(),
+        };
 
         let mut stored = 0usize;
         let mut streamed = 0usize;
@@ -1499,10 +1529,21 @@ impl LxmfPropagationNode {
                     format!("[distro] intercepted propagated message for {}", hexrep(dest_hash, false)),
                     LOG_NOTICE, false, false,
                 );
+                // RFed SPEC §17.13: an accepted sync proof makes the fan-out
+                // a sync one, which queues unconfirmed devices without a
+                // wake. A refused proof, or none, wakes as before. RFed never
+                // refuses or drops a message for its claim.
+                let verdict = sync_claims.verdict_for(transient_id, lxmf_data);
+                let wake = if matches!(verdict, Some(Ok(()))) { Wake::QueueOnly } else { Wake::Push };
                 // Fan out to registered devices immediately — but only on
                 // first sight. See `ingest_distro_blob`.
-                if delivery.ingest_distro_blob(dest_hash, lxmf_data, &mut stored) {
-                    delivery.distro_fanout(dest_hash, lxmf_data);
+                let first_sight = delivery.ingest_distro_blob(dest_hash, lxmf_data, &mut stored);
+                if let Some(verdict) = &verdict {
+                    let (level, line) = sync_verdict_line(transient_id, dest_hash, verdict, first_sight);
+                    log(line, level, false, false);
+                }
+                if first_sight {
+                    delivery.distro_fanout(dest_hash, lxmf_data, wake);
                 }
                 continue;
             }
@@ -1535,20 +1576,15 @@ impl LxmfPropagationNode {
 
         let total = messages.len();
         let invalid_stamps = total - validated.len();
-        // Whose batch it was, as the reference's "Received N messages from
-        // {remote_str}": a batch treated as a client's says so. (The staging
-        // harnesses parse the counts; the origin stays at the end.)
-        let origin = match (sender, &from_peer) {
-            (_, Some(peer)) => format!("peer {}", hexrep(peer, false)),
-            (Some(identity), None) => format!(
-                "{} (not a peer)",
-                hexrep(
-                    &Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(identity)),
-                    false,
-                ),
-            ),
-            (None, None) => "a sender with no identity (handled as a client's)".to_string(),
-        };
+        if invalid_stamps > 0 && from_peer.is_none() {
+            log(
+                invalid_stamp_line(&invalid_stamp_ids(&messages, &validated), min_cost, &origin),
+                LOG_WARNING, false, false,
+            );
+        }
+        if let Some(summary) = sync_claims.summary(&origin) {
+            log(summary, LOG_NOTICE, false, false);
+        }
         log(
             format!(
                 "[lxmf.prop] processed {} msgs: {} stored, {} streamed, {} notified, {} bad-stamp, from {}",
@@ -1581,6 +1617,7 @@ impl LxmfPropagationNode {
             distro_blob_store: self.distro_blob_store.clone(),
             distro_hook_registry: self.distro_hook_registry.clone(),
             deferred_queue: self.deferred_queue.clone(),
+            relay_stack: Arc::clone(&self.relay_stack),
         }
     }
 }
@@ -1610,8 +1647,24 @@ fn lock_node<'a>(
 
 const NODE_LOCK_WAIT_WARN_SECS: f64 = 1.0;
 
-/// `[timebase, [lxmf_payload, ...]]` — the propagation wire format.
-fn decode_propagation_batch(data: &[u8]) -> Option<Vec<Vec<u8>>> {
+/// One decoded propagation upload: its messages, and the §17.13 sync
+/// claims of its third element, if it has one.
+struct PropagationBatch {
+    /// The bin entries of `data[1]`, each `lxmf_data | stamp`.
+    messages: Vec<Vec<u8>>,
+    /// `data[2]` read by `lxmf_rust::distro::decode_sync_extension` (RFed
+    /// SPEC §17.13): counts and at most one claim per message, never a
+    /// string. `None` when the upload has no third element. Ingest honours
+    /// them only in a client's batch (`ingest_propagation_batch`).
+    claims: Option<SyncClaims>,
+}
+
+/// `[timebase, [lxmf_payload, ...]]` — the propagation wire format — and,
+/// from a client to an RFed, `[timebase, [lxmf_payload, ...], {"rfed.distro.sync":
+/// [claim, ...]}]` (RFed SPEC §17.13). Only `data[1]` and `data[2]` are read:
+/// an RFed before §17.13 read `data[1]` alone, and so does every reader of
+/// the messages here.
+fn decode_propagation_batch(data: &[u8]) -> Option<PropagationBatch> {
     let items = match read_value(&mut Cursor::new(data)) {
         Ok(Value::Array(a)) => a,
         _ => {
@@ -1643,13 +1696,151 @@ fn decode_propagation_batch(data: &[u8]) -> Option<Vec<Vec<u8>>> {
                     LOG_WARNING, false, false,
                 );
             }
-            Some(messages)
+            // Bounded by the message count (decode_sync_extension, rule 3),
+            // and silent: what the claims came to is logged once per batch.
+            let claims = items.get(2).map(|extension| decode_sync_extension(extension, messages.len()));
+            Some(PropagationBatch { messages, claims })
         }
         _ => {
             log("[lxmf.prop] packet missing message array", LOG_DEBUG, false, false);
             None
         }
     }
+}
+
+/// The §17.13 sync claims of one batch as ingest uses them (RFed SPEC
+/// §17.13 "At RFed"): each taken by the stamp-valid distro message it names,
+/// verified there, and everything counted for the batch's one summary line.
+/// Nothing is logged per claim.
+struct BatchClaims {
+    claims: SyncClaims,
+    accepted: usize,
+    refused: usize,
+}
+
+impl BatchClaims {
+    /// The claims of a batch. Read only from a client's batch: a batch from
+    /// one of our LXMF peers that carries an extension counts as ignored, and
+    /// none of its claims is looked at (peers never send or forward one).
+    fn of(claims: Option<SyncClaims>, from_peer: bool) -> Self {
+        let claims = match (claims, from_peer) {
+            (Some(claims), false) => claims,
+            (Some(_), true) => SyncClaims { ignored: 1, ..SyncClaims::default() },
+            (None, _) => SyncClaims::default(),
+        };
+        BatchClaims { claims, accepted: 0, refused: 0 }
+    }
+
+    /// The verdict on the claim naming this message, if one does. Called only
+    /// for a message whose PN stamp is valid and whose destination is a
+    /// distro registered here, so Ed25519 runs only for messages that paid a
+    /// stamp. `transient_id` and `lxmf_data` are as `validate_pn_stamps`
+    /// returns them. A claim is taken once: a second copy of the message in
+    /// the batch finds none.
+    fn verdict_for(&mut self, transient_id: &[u8], lxmf_data: &[u8]) -> Option<Result<(), &'static str>> {
+        let id: [u8; lxmf_rust::distro::DISTRO_SYNC_ID_LEN] =
+            transient_id.get(..lxmf_rust::distro::DISTRO_SYNC_ID_LEN)?.try_into().ok()?;
+        let claim = self.claims.by_id.remove(&id)?;
+        let verdict = verify_claim(&claim, transient_id, lxmf_data);
+        match verdict {
+            Ok(()) => self.accepted += 1,
+            Err(_) => self.refused += 1,
+        }
+        Some(verdict)
+    }
+
+    /// The batch's summary line, when its claims had any problem: a refusal,
+    /// a malformed or duplicate claim, a claim that matched no stamp-valid
+    /// distro message (unmatched), or an extension ignored as a whole
+    /// (ignored: a peer's batch, or claims that are not an array of 1 to N).
+    fn summary(&self, origin: &str) -> Option<String> {
+        let unmatched = self.claims.by_id.len();
+        let SyncClaims { malformed, duplicate, ignored, .. } = self.claims;
+        if self.refused + malformed + duplicate + unmatched + ignored == 0 {
+            return None;
+        }
+        Some(format!(
+            "[distro-sync] batch from {origin}: {} accepted, {} refused, {malformed} malformed, {duplicate} duplicate, {unmatched} unmatched, {ignored} ignored",
+            self.accepted, self.refused,
+        ))
+    }
+}
+
+/// `lxmf_rust::distro::verify_sync_claim`, counted per thread in the tests
+/// (they show that no Ed25519 runs for a claim whose message paid no stamp).
+fn verify_claim(claim: &SyncClaim, transient_id: &[u8], lxmf_data: &[u8]) -> Result<(), &'static str> {
+    #[cfg(test)]
+    tests::sync_proof_tests::VERIFICATIONS.with(|n| n.set(n.get() + 1));
+    verify_sync_claim(claim, transient_id, lxmf_data)
+}
+
+/// The one verdict line for a stamp-valid distro message that carried a
+/// claim (RFed SPEC §17.13), with whether this node fans it out
+/// (`first_sight`: a message fans out once, on first sight).
+fn sync_verdict_line(
+    transient_id: &[u8],
+    dest_hash: &[u8],
+    verdict: &Result<(), &'static str>,
+    first_sight: bool,
+) -> (i32, String) {
+    let id = hexrep(&transient_id[..transient_id.len().min(lxmf_rust::distro::DISTRO_SYNC_ID_LEN)], false);
+    let distro = hexrep(dest_hash, false);
+    match (verdict, first_sight) {
+        (Ok(()), true) => (
+            LOG_NOTICE,
+            format!("[distro-sync] {id} for {distro}: proof accepted, unconfirmed devices queued, not woken"),
+        ),
+        (Ok(()), false) => (
+            LOG_NOTICE,
+            format!("[distro-sync] {id} for {distro}: proof accepted, already held: no fan-out"),
+        ),
+        (Err(reason), true) => (
+            LOG_WARNING,
+            format!("[distro-sync] {id} for {distro}: proof refused ({reason}), fanning out with wake"),
+        ),
+        (Err(reason), false) => (
+            LOG_WARNING,
+            format!("[distro-sync] {id} for {distro}: proof refused ({reason}), already held: no fan-out"),
+        ),
+    }
+}
+
+/// The messages of a client's batch that `validate_pn_stamps` dropped, by
+/// their transient id as LXMF computes it (SHA-256 of all but the last 32
+/// bytes, the stamp). RFed's link stack proves a client's upload before its
+/// stamps are checked (RFed-spec LXMFProp.md §10.5; LXMF proves only when
+/// every stamp is valid), so the sending client takes such a message as
+/// delivered: this is the one place its drop can be seen.
+fn invalid_stamp_ids(messages: &[Vec<u8>], validated: &[(Vec<u8>, Vec<u8>, u32, Vec<u8>)]) -> Vec<Vec<u8>> {
+    let valid: HashSet<(&[u8], &[u8])> =
+        validated.iter().map(|(tid, _, _, stamp)| (tid.as_slice(), stamp.as_slice())).collect();
+    messages
+        .iter()
+        .filter_map(|message| {
+            let split = message.len().saturating_sub(lx_stamper::STAMP_SIZE);
+            let tid = reticulum_rust::identity::full_hash(&message[..split]);
+            (!valid.contains(&(tid.as_slice(), &message[split..]))).then_some(tid)
+        })
+        .collect()
+}
+
+/// At most this many transient ids are named in the line for a client
+/// batch's invalid stamps; the rest are counted.
+const INVALID_STAMP_IDS_LOGGED: usize = 4;
+
+/// The one WARNING for the messages of a client's batch dropped for an
+/// invalid PN stamp (DISTRO-SYNC-PROOF-DESIGN Open question 5, James
+/// 2026-10-10: the departure is tracked, but its drop must speak).
+fn invalid_stamp_line(ids: &[Vec<u8>], min_cost: u32, origin: &str) -> String {
+    let mut named: Vec<String> = ids.iter().take(INVALID_STAMP_IDS_LOGGED).map(|id| hexrep(id, false)).collect();
+    if ids.len() > INVALID_STAMP_IDS_LOGGED {
+        named.push(format!("and {} more", ids.len() - INVALID_STAMP_IDS_LOGGED));
+    }
+    format!(
+        "[lxmf.prop] {} message(s) from {origin} dropped for an invalid stamp (cost {min_cost} required), after the link proved the upload: {}",
+        ids.len(),
+        named.join(", "),
+    )
 }
 
 /// Everything message delivery needs that is not the node itself: shared
@@ -1664,6 +1855,8 @@ struct DeliveryHandles {
     distro_blob_store: Option<Arc<Mutex<crate::blob_store::BlobStore>>>,
     distro_hook_registry: Option<Arc<Mutex<crate::notify::HookRegistry>>>,
     deferred_queue: Option<Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
+    /// What a distro hand-off wakes through (`LxmfPropagationNode::relay_stack`).
+    relay_stack: Arc<dyn RelayStack + Send + Sync>,
 }
 
 /// Wake the recipient of `lxmf_data` through its notify registrations, so it
@@ -1732,7 +1925,12 @@ impl DeliveryHandles {
             .unwrap_or(false)
     }
 
-    fn distro_fanout(&self, dest_hash: &[u8], lxmf_data: &[u8]) {
+    /// Fan `lxmf_data`, a message to the distro `dest_hash`, out to its
+    /// registered devices, every one of them, the sender's own included
+    /// (RFed SPEC §17.13: a proof names no device). `wake` is the hand-off's
+    /// for a device the fan-out cannot confirm: `QueueOnly` for a message
+    /// with an accepted sync proof, else `Push`.
+    fn distro_fanout(&self, dest_hash: &[u8], lxmf_data: &[u8], wake: Wake) {
         // NEVER REMOVE the snapshot-then-drop. The distro_table lock is
         // released before distro_fanout does any network work — holding
         // it across the fan-out wedged /rfed/distro/register in
@@ -1758,15 +1956,19 @@ impl DeliveryHandles {
             hooks,
             Some(&self.stream_registry),
             Some(&self.link_sessions),
-            self.distro_hand_off(Arc::new(LiveStack), dest_hash, lxmf_data),
+            self.distro_hand_off(Arc::clone(&self.relay_stack), dest_hash, lxmf_data, wake),
         );
         if handed_off > 0 {
             log(
                 format!(
-                    "[distro] {} of {} device(s) with no live session for distro {} — queued for /rfed/pull and pushed",
+                    "[distro] {} of {} device(s) with no live session for distro {} — {}",
                     handed_off,
                     devices.len(),
                     hexrep(dest_hash, false),
+                    match wake {
+                        Wake::Push => "queued for /rfed/pull and pushed",
+                        Wake::QueueOnly => "queued for /rfed/pull, not woken (distro sync)",
+                    },
                 ),
                 LOG_NOTICE,
                 false,
@@ -1776,24 +1978,27 @@ impl DeliveryHandles {
     }
 
     /// What a distro fan-out from propagation ingest does with a device it
-    /// could not confirm: [`crate::distro::defer_then_wake`] on the deferred
-    /// queue `/rfed/pull` drains and the notify registry the device registered
-    /// with. Until 2026-09-26 it only queued: no device was ever woken.
+    /// could not confirm: the one distro hand-off builder,
+    /// [`crate::handoff::distro_hand_off`], on the deferred queue
+    /// `/rfed/pull` drains and the notify registry the device registered
+    /// with, pushing or not as `wake` says. Until 2026-09-26 it only queued:
+    /// no device was ever woken.
     fn distro_hand_off(
         &self,
         stack: Arc<dyn RelayStack + Send + Sync>,
         dest_hash: &[u8],
         lxmf_data: &[u8],
+        wake: Wake,
     ) -> crate::distro::OnUnconfirmed {
         match &self.deferred_queue {
-            Some(queue) => crate::distro::defer_then_wake(
+            Some(queue) => crate::handoff::distro_hand_off(
                 stack,
                 Arc::clone(queue),
                 Arc::clone(&self.registry),
                 Arc::new(|_| DISTRO_DEFERRED_QUEUE_LIMIT),
                 dest_hash,
                 lxmf_data,
-                None,
+                wake,
             ),
             None => {
                 let distro = hexrep(dest_hash, false);
@@ -4667,14 +4872,14 @@ mod tests {
 
         #[test]
         fn bin_entries_are_messages() {
-            let m = decode_propagation_batch(&batch(vec![Value::Binary(vec![1; 40]), Value::Binary(vec![2; 40])])).unwrap();
+            let m = decode_propagation_batch(&batch(vec![Value::Binary(vec![1; 40]), Value::Binary(vec![2; 40])])).unwrap().messages;
             assert_eq!(m.len(), 2);
         }
 
         #[test]
         fn str_entries_are_dropped_not_messages() {
             // PyPI msgpack.packb(bytes) without use_bin_type=True produces exactly this.
-            let m = decode_propagation_batch(&batch(vec![Value::String("x".repeat(40).into())])).unwrap();
+            let m = decode_propagation_batch(&batch(vec![Value::String("x".repeat(40).into())])).unwrap().messages;
             assert!(m.is_empty(), "a str entry is not a message");
         }
 
@@ -4775,6 +4980,7 @@ mod tests {
             distro_blob_store: None,
             distro_hook_registry: None,
             deferred_queue: Some(Arc::clone(&queue)),
+            relay_stack: Arc::new(crate::notify::rns::LiveStack),
         };
         let stack = Arc::new(FakeStack::new(&relay_hash, Some(relay_public)));
         let distro_hash = vec![0x22; 16];
@@ -4784,6 +4990,7 @@ mod tests {
             Arc::clone(&stack) as Arc<dyn RelayStack + Send + Sync>,
             &distro_hash,
             &lxmf_data,
+            crate::handoff::Wake::Push,
         );
         hand_off(device.clone());
 
@@ -4793,6 +5000,585 @@ mod tests {
         assert_eq!(pending[0].blob, lxmf_data);
         assert_eq!(stack.packets.lock().unwrap().len(), 1, "and the device's registration was woken");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// RFed SPEC §17.13, the distro sync proof at ingest
+    /// (DISTRO-SYNC-PROOF-DESIGN §6, §13.1 "RFed"). Each test ingests real
+    /// uploads into a propagation node with a distro table, a BlobStore, a
+    /// deferred queue and a relay stack that records every wake.
+    pub(crate) mod sync_proof_tests {
+        use super::super::*;
+        use std::cell::Cell;
+
+        use crate::blob_store::BlobStore;
+        use crate::deferred_queue::DeferredQueue;
+        use crate::distro::Unconfirmed;
+        use crate::notify::rns::fake::FakeStack;
+        use lxmf_rust::distro::{seal_for_sync, sync_signed_bytes, sync_transient_id, DISTRO_SYNC_KEY};
+
+        thread_local! {
+            /// How many claims this thread verified (`verify_claim`).
+            pub(crate) static VERIFICATIONS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn verifications() -> usize {
+            VERIFICATIONS.with(|n| n.get())
+        }
+
+        fn config(dir: &std::path::Path) -> NodeConfig {
+            NodeConfig {
+                config_dir: dir.to_path_buf(),
+                rns_config_dir: None,
+                identity_file: dir.join("identity"),
+                display_name: "test".into(),
+                announce_interval_secs: 600,
+                announce_at_start: false,
+                default_policy: crate::config::TierPolicy::default(),
+                vip_policy: crate::config::TierPolicy::vip_default(),
+                vip_subscribers: Vec::new(),
+                peering_cost: None,
+                storage_limit_bytes: 0,
+                transfer_limit_bytes: None,
+                sync_limit_bytes: None,
+                channel_transfer_limit_bytes: crate::sync::DEFAULT_CHANNEL_TRANSFER_LIMIT_BYTES,
+                channel_sync_limit_bytes: crate::sync::DEFAULT_CHANNEL_SYNC_LIMIT_BYTES,
+                static_peers: Vec::new(),
+                from_static_only: false,
+                trusted_backup_peers: Vec::new(),
+                primary_node: None,
+                secondary_nodes: Vec::new(),
+                owner_offline_secs: 90.0,
+                lxmf_propagation_enabled: true,
+                lxmf_propagation_autopeer: false,
+                lxmf_propagation_peers: Vec::new(),
+            }
+        }
+
+        /// A propagation node wired as main.rs wires it for distros.
+        struct Rig {
+            dir: std::path::PathBuf,
+            node: Arc<Mutex<LxmfPropagationNode>>,
+            table: Arc<Mutex<DistroTable>>,
+            blobs: Arc<Mutex<BlobStore>>,
+            queue: Arc<Mutex<DeferredQueue>>,
+            notify: Arc<Mutex<NotifyRegistry>>,
+            relay_hash: Vec<u8>,
+            stack: Arc<FakeStack>,
+        }
+
+        impl Rig {
+            /// Stamps are checked at exactly `stamp_cost` (no flexibility):
+            /// 0 takes any 32 bytes, so a test needs no mining.
+            fn new(tag: &str, stamp_cost: u32) -> Rig {
+                let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+                let dir = std::env::temp_dir().join(format!("rfed_sync_proof_{tag}_{unique}"));
+                std::fs::create_dir_all(&dir).expect("temp dir");
+                let table_path = dir.join("distro.rmp");
+                crate::store_db::remove_store_files(&table_path);
+                let table = Arc::new(Mutex::new(DistroTable::load(table_path)));
+                let blobs = Arc::new(Mutex::new(BlobStore::open(dir.join("blobs"), 1 << 24)));
+                let queue = Arc::new(Mutex::new(DeferredQueue::load(dir.join("deferred.rmp"))));
+                let notify = Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp"))));
+                let relay = Identity::new(true);
+                let relay_hash = Destination::hash(relay.hash.as_deref(), "rfed", &["notify"]);
+                let recalled = Identity::from_public_key(&relay.get_public_key().unwrap()).unwrap();
+                let stack = Arc::new(FakeStack::new(&relay_hash, Some(recalled)));
+                let node = LxmfPropagationNode::new(
+                    Identity::new(true),
+                    &config(&dir),
+                    Arc::clone(&notify),
+                    Arc::new(Mutex::new(PropagationStreamRegistry::default())),
+                    Arc::new(Mutex::new(LinkSessionRegistry::default())),
+                    Some(Arc::clone(&table)),
+                    Some(Arc::clone(&blobs)),
+                    None,
+                    Some(Arc::clone(&queue)),
+                )
+                .expect("propagation node");
+                {
+                    let mut n = node.lock().unwrap();
+                    n.stamp_cost = stamp_cost;
+                    n.stamp_flexibility = 0;
+                    n.relay_stack = Arc::clone(&stack) as Arc<dyn RelayStack + Send + Sync>;
+                }
+                Rig { dir, node, table, blobs, queue, notify, relay_hash, stack }
+            }
+
+            /// Register a device for `distro`, with a notify registration
+            /// for wakes, as the apps do. Its two hand-off keys.
+            fn device(&self, distro: &[u8]) -> Unconfirmed {
+                let identity = Identity::new(true);
+                let pubkey = identity.get_public_key().unwrap();
+                let lxmf = crate::distro::lxmf_delivery_hash_from_pubkey(&pubkey).unwrap();
+                self.table.lock().unwrap().register(distro.to_vec(), lxmf.clone(), pubkey);
+                self.notify.lock().unwrap().register(lxmf.clone(), None, hexrep(&self.relay_hash, false));
+                Unconfirmed { queue_key: identity.hash.unwrap(), wake_key: lxmf }
+            }
+
+            fn ingest(&self, upload: &[u8]) {
+                LxmfPropagationNode::ingest_propagation_batch(&self.node, upload, None);
+            }
+
+            fn rows(&self, device: &Unconfirmed, distro: &[u8]) -> usize {
+                self.queue.lock().unwrap().count_matching(&device.queue_key, distro)
+            }
+
+            fn wakes(&self) -> usize {
+                self.stack.packets.lock().unwrap().len()
+            }
+
+            fn holds(&self, id: &[u8]) -> bool {
+                self.blobs.lock().unwrap().index.contains_key(id)
+            }
+        }
+
+        impl Drop for Rig {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        /// A distro D: its identity and `lxmf.delivery` hash.
+        fn distro() -> (Identity, Vec<u8>) {
+            let d = Identity::new(true);
+            let hash = Destination::hash(d.hash.as_deref(), "lxmf", &["delivery"]);
+            (d, hash)
+        }
+
+        /// A packed message to D (only its destination matters to RFed).
+        fn packed_to(d_hash: &[u8], marker: u8) -> Vec<u8> {
+            [d_hash, &[marker; 200][..]].concat()
+        }
+
+        /// `[bin16 id, bin64 distro_pubkey, bin64 sig]`.
+        fn claim_value(id: &[u8], pubkey: &[u8], sig: &[u8]) -> Value {
+            Value::Array(vec![Value::Binary(id.to_vec()), Value::Binary(pubkey.to_vec()), Value::Binary(sig.to_vec())])
+        }
+
+        /// The claim D's own device makes for `sealed`.
+        fn own_claim(d: &Identity, sealed: &[u8]) -> Value {
+            let tid = sync_transient_id(sealed);
+            let d_hash: [u8; 16] = sealed[..16].try_into().unwrap();
+            claim_value(&tid[..16], &d.get_public_key().unwrap(), &d.sign(&sync_signed_bytes(&d_hash, &tid)))
+        }
+
+        /// `[timebase, [message, ...]]`, and the extension as `data[2]`.
+        fn upload(messages: &[Vec<u8>], claims: Option<Vec<Value>>) -> Vec<u8> {
+            let mut items = vec![
+                Value::F64(1_790_000_000.0),
+                Value::Array(messages.iter().map(|m| Value::Binary(m.clone())).collect()),
+            ];
+            if let Some(claims) = claims {
+                items.push(Value::Map(vec![(Value::String(DISTRO_SYNC_KEY.into()), Value::Array(claims))]));
+            }
+            let mut out = Vec::new();
+            write_value(&mut out, &Value::Array(items)).unwrap();
+            out
+        }
+
+        /// A sealed message to D, as its device seals it, with a stamp.
+        fn sealed_message(d: &Identity, d_hash: &[u8], marker: u8) -> (Vec<u8>, Vec<u8>) {
+            let sealed = seal_for_sync(d, &packed_to(d_hash, marker)).expect("seal").sealed;
+            let message = [&sealed[..], &[marker; 32][..]].concat();
+            (sealed, message)
+        }
+
+        /// What follows the `[time] [Level]` prefix of a captured line.
+        fn text(line: &str) -> &str {
+            let after_time = line.find("] ").map(|i| i + 2).unwrap_or(0);
+            let rest = &line[after_time..];
+            rest[rest.find("] ").map(|i| i + 2).unwrap_or(0)..].trim_start()
+        }
+
+        // ── Decoding ────────────────────────────────────────────────────
+
+        /// An RFed before §17.13 read `data[1]` alone; this one still takes
+        /// the messages whatever `data[2]` is, and only a map with the key
+        /// carries claims.
+        #[test]
+        fn a_third_element_of_any_kind_leaves_the_messages_as_they_were() {
+            let messages = vec![vec![0x11; 200], vec![0x22; 200]];
+            for junk in [
+                Value::Nil,
+                Value::String("rfed.distro.sync".into()),
+                Value::Binary(vec![0x81, 0xa1, 0x78, 0x01]),
+                Value::Array(vec![Value::Integer(7.into())]),
+                Value::Map(vec![(Value::String("other".into()), Value::Boolean(true))]),
+            ] {
+                let mut out = Vec::new();
+                let items = vec![
+                    Value::F64(0.0),
+                    Value::Array(messages.iter().map(|m| Value::Binary(m.clone())).collect()),
+                    junk.clone(),
+                    Value::String("a fourth element".into()),
+                ];
+                write_value(&mut out, &Value::Array(items)).unwrap();
+                let batch = decode_propagation_batch(&out).expect("a batch");
+                assert_eq!(batch.messages, messages, "data[2] = {junk:?}");
+                let claims = batch.claims.expect("a third element");
+                assert!(claims.by_id.is_empty());
+                assert_eq!(claims.ignored, 1, "ignored as a whole: {junk:?}");
+            }
+            let two = decode_propagation_batch(&upload(&messages, None)).unwrap();
+            assert_eq!(two.messages, messages);
+            assert!(two.claims.is_none(), "today's two-element upload has no claims at all");
+        }
+
+        // ── The golden vector (LXMF-rust tests/distro_sync_vectors.json) ─
+
+        fn vector(key: &str) -> Vec<u8> {
+            let json = include_str!("../../../LXMF-rust/tests/distro_sync_vectors.json");
+            let start = json.find(&format!("\"{key}\": \"")).unwrap_or_else(|| panic!("{key} in the vector")) + key.len() + 5;
+            let end = start + json[start..].find('"').unwrap();
+            reticulum_rust::decode_hex(&json[start..end]).unwrap_or_else(|| panic!("{key} is hex"))
+        }
+
+        /// The upload Python built (RNS 1.5.2, LXMF 1.1.1, umsgpack), with
+        /// its stamp at cost 16, is one RFed accepts: the device of D is
+        /// queued and nobody is woken.
+        #[test]
+        fn the_golden_vector_is_accepted() {
+            let d_hash = vector("lxmf_delivery_hash_hex");
+            let id = vector("id_hex");
+            let envelope = vector("envelope_hex");
+
+            let batch = decode_propagation_batch(&envelope).expect("the vector's envelope");
+            assert_eq!(batch.messages, vec![vector("lxmf_data_hex")]);
+            let claims = batch.claims.expect("its extension");
+            let claim = claims.by_id.get(&<[u8; 16]>::try_from(&id[..]).unwrap()).expect("its claim, by id");
+            assert_eq!(claim.sig.to_vec(), vector("sig_hex"));
+            assert_eq!(verify_sync_claim(claim, &vector("transient_id_hex"), &vector("sealed_hex")), Ok(()));
+
+            let rig = Rig::new("golden", 16);
+            let device = rig.device(&d_hash);
+            let mark = crate::test_log::mark();
+            rig.ingest(&envelope);
+
+            assert!(rig.holds(&id), "stored under transient_id[0..16]");
+            assert_eq!(rig.rows(&device, &d_hash), 1);
+            assert_eq!(rig.wakes(), 0);
+            let verdict = mark.containing("[distro-sync] ");
+            assert_eq!(verdict.len(), 1, "{verdict:?}");
+            assert_eq!(
+                text(&verdict[0]),
+                format!("[distro-sync] {} for {}: proof accepted, unconfirmed devices queued, not woken", hexrep(&id, false), hexrep(&d_hash, false)),
+            );
+        }
+
+        // ── Accepted, refused, none ─────────────────────────────────────
+
+        /// An accepted proof: every registered device, the sender's own
+        /// among them (RFed cannot tell which, and excludes none), queued
+        /// once; no wake; the fan-out's summary says so.
+        #[test]
+        fn an_accepted_proof_queues_every_device_and_wakes_none() {
+            let rig = Rig::new("accepted", 0);
+            let (d, d_hash) = distro();
+            let sender = rig.device(&d_hash);
+            let sibling = rig.device(&d_hash);
+            let (sealed, message) = sealed_message(&d, &d_hash, 1);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], Some(vec![own_claim(&d, &sealed)])));
+
+            assert!(rig.holds(&sync_transient_id(&sealed)[..16]));
+            assert_eq!((rig.rows(&sender, &d_hash), rig.rows(&sibling, &d_hash)), (1, 1));
+            assert_eq!(rig.wakes(), 0, "nobody woken");
+            let lines = mark.lines();
+            assert!(lines.iter().any(|l| l.contains("proof accepted, unconfirmed devices queued, not woken")), "{lines:?}");
+            assert!(lines.iter().any(|l| l.ends_with(&format!(
+                "[distro] 2 of 2 device(s) with no live session for distro {} — queued for /rfed/pull, not woken (distro sync)",
+                hexrep(&d_hash, false),
+            ))), "{lines:?}");
+            assert_eq!(lines.iter().filter(|l| l.contains("NOT woken (distro sync, 1 of 64 un-pulled)")).count(), 2);
+            assert!(mark.containing("[distro-sync] batch").is_empty(), "a clean batch writes no summary");
+        }
+
+        /// The regression guard: with no claim, a signature over another
+        /// message, a stranger's key, or a claim signed with another key
+        /// for a stranger's message to D, the hand-off is today's: one
+        /// enqueue and one wake per device.
+        #[test]
+        fn without_an_accepted_proof_every_device_is_woken_as_before() {
+            let (d, d_hash) = distro();
+            let stranger = Identity::new(true);
+            let cases: Vec<(&str, Box<dyn Fn(&[u8]) -> Option<Vec<Value>>>)> = vec![
+                ("no claim", Box::new(|_| None)),
+                (
+                    "a signature over another message",
+                    Box::new(|sealed: &[u8]| {
+                        let tid = sync_transient_id(sealed);
+                        let other = sync_transient_id(b"another sealed message");
+                        let d_hash: [u8; 16] = sealed[..16].try_into().unwrap();
+                        Some(vec![claim_value(&tid[..16], &d.get_public_key().unwrap(), &d.sign(&sync_signed_bytes(&d_hash, &other)))])
+                    }),
+                ),
+                (
+                    "a stranger's key",
+                    Box::new(|sealed: &[u8]| {
+                        let tid = sync_transient_id(sealed);
+                        let d_hash: [u8; 16] = sealed[..16].try_into().unwrap();
+                        Some(vec![claim_value(&tid[..16], &stranger.get_public_key().unwrap(), &stranger.sign(&sync_signed_bytes(&d_hash, &tid)))])
+                    }),
+                ),
+                (
+                    "D's key, signed by a stranger",
+                    Box::new(|sealed: &[u8]| {
+                        let tid = sync_transient_id(sealed);
+                        let d_hash: [u8; 16] = sealed[..16].try_into().unwrap();
+                        Some(vec![claim_value(&tid[..16], &d.get_public_key().unwrap(), &stranger.sign(&sync_signed_bytes(&d_hash, &tid)))])
+                    }),
+                ),
+            ];
+            for (n, (case, claims)) in cases.iter().enumerate() {
+                let rig = Rig::new("refused", 0);
+                let device = rig.device(&d_hash);
+                // A stranger's message to D: sealed to D by anyone, not proven by D.
+                let (sealed, message) = sealed_message(&d, &d_hash, 0x40 + n as u8);
+                let mark = crate::test_log::mark();
+                rig.ingest(&upload(&[message], claims(&sealed)));
+
+                assert_eq!(rig.rows(&device, &d_hash), 1, "{case}: queued");
+                assert_eq!(rig.wakes(), 1, "{case}: and woken");
+                let verdicts = mark.containing("[distro-sync] ");
+                if claims(&sealed).is_none() {
+                    assert!(verdicts.is_empty(), "{case}: no claim, no verdict: {verdicts:?}");
+                    assert!(mark.lines().iter().any(|l| l.contains("queued for /rfed/pull and pushed")), "{case}");
+                } else {
+                    assert_eq!(verdicts.len(), 2, "{case}: the verdict and the batch summary: {verdicts:?}");
+                    assert!(verdicts[0].contains("[Warning]"), "{case}: {}", verdicts[0]);
+                    assert!(verdicts[0].contains(": proof refused ("), "{case}: {}", verdicts[0]);
+                    assert!(verdicts[0].ends_with("), fanning out with wake"), "{case}: {}", verdicts[0]);
+                    assert!(verdicts[1].ends_with(": 0 accepted, 1 refused, 0 malformed, 0 duplicate, 0 unmatched, 0 ignored"), "{case}: {}", verdicts[1]);
+                }
+            }
+        }
+
+        /// RFed reads claims only from a client's batch. A batch from one of
+        /// our LXMF peers that carries one is ignored and counted, and its
+        /// message to D wakes.
+        #[test]
+        fn a_peers_batch_is_not_read_for_claims() {
+            let rig = Rig::new("peer_batch", 0);
+            let (d, d_hash) = distro();
+            let device = rig.device(&d_hash);
+            let peer = Identity::new(true);
+            let peer_prop = Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(&peer));
+            rig.node.lock().unwrap().peers.insert(peer_prop.clone(), PropPeer::new(peer_prop.clone()));
+            let (sealed, message) = sealed_message(&d, &d_hash, 2);
+            let before = verifications();
+            let mark = crate::test_log::mark();
+            LxmfPropagationNode::ingest_propagation_batch(&rig.node, &upload(&[message], Some(vec![own_claim(&d, &sealed)])), Some(&peer));
+
+            assert_eq!(verifications(), before, "no claim of a peer's batch is verified");
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (1, 1), "a peer's copy wakes, as FedSync's does");
+            let summary = mark.containing("[distro-sync] ");
+            assert_eq!(summary.len(), 1, "{summary:?}");
+            assert!(summary[0].ends_with(&format!(
+                "[distro-sync] batch from peer {}: 0 accepted, 0 refused, 0 malformed, 0 duplicate, 0 unmatched, 1 ignored",
+                hexrep(&peer_prop, false),
+            )), "{}", summary[0]);
+        }
+
+        /// A claim for a message whose destination is not a distro here: the
+        /// message is stored and dispatched exactly as a plain upload's is,
+        /// and the claim is counted unmatched, never verified.
+        #[test]
+        fn a_claim_for_a_message_that_is_not_a_distro_here_is_unmatched() {
+            let (d, d_hash) = distro();
+            let (sealed, message) = sealed_message(&d, &d_hash, 3);
+            let processed = |claims: Option<Vec<Value>>| -> (String, usize, Vec<String>) {
+                let rig = Rig::new("unmatched", 0);
+                let mark = crate::test_log::mark();
+                rig.ingest(&upload(&[message.clone()], claims));
+                let line = mark.containing("[lxmf.prop] processed ").pop().expect("the processed line");
+                let entries = rig.node.lock().unwrap().entries.len();
+                (text(&line).to_string(), entries, mark.containing("[distro-sync] "))
+            };
+            let before = verifications();
+            let plain = processed(None);
+            let claimed = processed(Some(vec![own_claim(&d, &sealed)]));
+            assert_eq!(verifications(), before, "no distro message, no verification");
+            assert_eq!(plain.0, claimed.0, "the same processing");
+            assert_eq!((plain.1, claimed.1), (1, 1), "stored in the messagestore both times");
+            assert!(plain.2.is_empty());
+            assert_eq!(claimed.2.len(), 1);
+            assert!(claimed.2[0].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 1 unmatched, 0 ignored"), "{}", claimed.2[0]);
+        }
+
+        // ── Dedup: a message fans out once, on first sight ──────────────
+
+        /// The device seals once, so a re-upload after a lost proof carries
+        /// the same sealed bytes with a new stamp: held, not fanned out again.
+        #[test]
+        fn a_reupload_with_a_new_stamp_does_not_fan_out_again() {
+            let rig = Rig::new("reupload", 0);
+            let (d, d_hash) = distro();
+            let device = rig.device(&d_hash);
+            let (sealed, first) = sealed_message(&d, &d_hash, 4);
+            rig.ingest(&upload(&[first], Some(vec![own_claim(&d, &sealed)])));
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (1, 0));
+
+            let second = [&sealed[..], &[0x99; 32][..]].concat();
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[second], Some(vec![own_claim(&d, &sealed)])));
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (1, 0), "no second fan-out");
+            let verdict = mark.containing("[distro-sync] ");
+            assert_eq!(verdict.len(), 1, "{verdict:?}");
+            assert!(verdict[0].ends_with(": proof accepted, already held: no fan-out"), "{}", verdict[0]);
+            assert!(mark.containing("[handoff] ").is_empty());
+        }
+
+        /// A valid claim on a blob first ingested without one does nothing.
+        #[test]
+        fn a_proof_for_a_blob_already_held_without_one_does_nothing() {
+            let rig = Rig::new("held_unproven", 0);
+            let (d, d_hash) = distro();
+            let device = rig.device(&d_hash);
+            let (sealed, message) = sealed_message(&d, &d_hash, 5);
+            rig.ingest(&upload(&[message.clone()], None));
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (1, 1), "first sight, no proof: woken");
+
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], Some(vec![own_claim(&d, &sealed)])));
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (1, 1), "nothing more");
+            let verdict = mark.containing("[distro-sync] ");
+            assert_eq!(verdict.len(), 1);
+            assert!(verdict[0].ends_with(&format!(
+                "[distro-sync] {} for {}: proof accepted, already held: no fan-out",
+                hexrep(&sync_transient_id(&sealed)[..16], false),
+                hexrep(&d_hash, false),
+            )), "{}", verdict[0]);
+        }
+
+        // ── Bounded and quiet ───────────────────────────────────────────
+
+        /// 10^5 malformed claims on a one-message upload: the extension is
+        /// ignored as a whole (more claims than messages), nothing is
+        /// verified, and the batch writes two lines: its summary and the
+        /// processed line. A malformed claim within the bound is counted.
+        #[test]
+        fn a_hundred_thousand_malformed_claims_write_two_lines() {
+            let rig = Rig::new("flood", 0);
+            let message = [&[0x5A; 16][..], &[0x5B; 200][..]].concat();
+            let before = verifications();
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message.clone()], Some(vec![Value::Nil; 100_000])));
+            let lines = mark.lines();
+            assert_eq!(verifications(), before);
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 0 unmatched, 1 ignored"), "{}", lines[0]);
+            assert!(text(&lines[1]).starts_with("[lxmf.prop] processed 1 msgs: 1 stored,"), "{}", lines[1]);
+
+            let mark = crate::test_log::mark();
+            let other = [&[0x5A; 16][..], &[0x5C; 200][..]].concat();
+            rig.ingest(&upload(&[other], Some(vec![claim_value(&[1; 15], &[2; 64], &[3; 64])])));
+            let lines = mark.lines();
+            assert_eq!(lines.len(), 2, "{lines:?}");
+            assert!(lines[0].ends_with(": 0 accepted, 0 refused, 1 malformed, 0 duplicate, 0 unmatched, 0 ignored"), "{}", lines[0]);
+        }
+
+        /// N messages to a registered distro whose stamps fail, with N
+        /// well-formed claims: no Ed25519 runs (a claim is looked at only for
+        /// a stamp-valid message), and the batch writes a fixed number of
+        /// lines, whatever N is: the processed line, the claims' summary,
+        /// and the one WARNING for the dropped messages (Open question 5).
+        #[test]
+        fn bad_stamps_with_claims_verify_nothing_and_write_a_fixed_number_of_lines() {
+            let rig = Rig::new("bad_stamps", 40);
+            let (d, d_hash) = distro();
+            let device = rig.device(&d_hash);
+            let n = 12;
+            let mut messages = Vec::new();
+            let mut claims = Vec::new();
+            for i in 0..n {
+                let (sealed, message) = sealed_message(&d, &d_hash, 0x60 + i as u8);
+                messages.push(message);
+                claims.push(if i % 2 == 0 {
+                    own_claim(&d, &sealed)
+                } else {
+                    claim_value(&rand::random::<[u8; 16]>(), &[0x77; 64], &[0x78; 64])
+                });
+            }
+            let before = verifications();
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&messages, Some(claims)));
+            assert_eq!(verifications(), before, "no claim verified for an unpaid message");
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (0, 0), "nothing stored, nobody queued");
+            let lines = mark.lines();
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            assert!(lines[0].contains("[Warning]") && text(&lines[0]).starts_with(&format!("[lxmf.prop] {n} message(s) from a sender with no identity (handled as a client's) dropped for an invalid stamp (cost 40 required)")), "{}", lines[0]);
+            assert!(lines[1].ends_with(&format!(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, {n} unmatched, 0 ignored")), "{}", lines[1]);
+            assert_eq!(text(&lines[2]), format!("[lxmf.prop] processed {n} msgs: 0 stored, 0 streamed, 0 notified, {n} bad-stamp, from a sender with no identity (handled as a client's)"));
+        }
+
+        // ── Q5: a client's message dropped for its stamp speaks ─────────
+
+        /// RFed proves a client's upload before checking its stamps, so the
+        /// client takes a message RFed then drops as delivered. The drop is a
+        /// WARNING naming the message's transient id (James, 2026-10-10). A
+        /// peer's bad stamps are only counted, as before.
+        #[test]
+        fn a_clients_message_dropped_for_its_stamp_is_a_warning_with_its_id() {
+            let rig = Rig::new("q5", 40);
+            let message = [&[0x3A; 16][..], &[0x3B; 200][..]].concat();
+            let tid = reticulum_rust::identity::full_hash(&message[..message.len() - 32]);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message.clone()], None));
+            let warnings = mark.containing("dropped for an invalid stamp");
+            assert_eq!(warnings.len(), 1, "{:?}", mark.lines());
+            assert!(warnings[0].contains("[Warning]"));
+            assert!(text(&warnings[0]).ends_with(&format!("after the link proved the upload: {}", hexrep(&tid, false))), "{}", warnings[0]);
+
+            // Many: four named, the rest counted, still one line.
+            let many: Vec<Vec<u8>> = (0..6u8).map(|i| [&[0x3A; 16][..], &[0x40 + i; 200][..]].concat()).collect();
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&many, None));
+            let warnings = mark.containing("dropped for an invalid stamp");
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].ends_with(", and 2 more"), "{}", warnings[0]);
+            let named = warnings[0].split("after the link proved the upload: ").nth(1).expect("the ids");
+            assert_eq!(named.split(", ").filter(|id| id.len() == 64).count(), 4, "{named}");
+
+            // A peer's batch: counted in the processed line only.
+            let peer = Identity::new(true);
+            let peer_prop = Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(&peer));
+            rig.node.lock().unwrap().peers.insert(peer_prop.clone(), PropPeer::new(peer_prop));
+            let mark = crate::test_log::mark();
+            LxmfPropagationNode::ingest_propagation_batch(&rig.node, &upload(&[message], None), Some(&peer));
+            assert!(mark.containing("dropped for an invalid stamp").is_empty());
+            assert_eq!(mark.containing("1 bad-stamp").len(), 1);
+        }
+
+        // ── Pins ────────────────────────────────────────────────────────
+
+        /// The staging harnesses parse the processed line; it is unchanged.
+        #[test]
+        fn the_processed_line_is_unchanged() {
+            let source = include_str!("lxmf_propagation.rs");
+            assert!(source.contains(concat!(
+                "                \"[lxmf.prop] processed {} msgs: {} stored, {} streamed, {} notified, {} bad-stamp, from {}\",\n",
+                "                total, stored, streamed, notified, invalid_stamps, origin,\n",
+            )));
+        }
+
+        /// Both distro entry points build their hand-off with
+        /// `handoff::distro_hand_off`; neither queues or wakes by hand
+        /// (FedSync's is pinned in destinations.rs).
+        #[test]
+        fn the_ingest_distro_hand_off_is_the_shared_builder() {
+            let source = include_str!("lxmf_propagation.rs");
+            let start = source.find("    fn distro_hand_off(\n").expect("DeliveryHandles::distro_hand_off");
+            let body = &source[start..start + source[start..].find("\n    }\n").expect("its end")];
+            assert!(body.contains("crate::handoff::distro_hand_off("));
+            assert!(body.contains("                wake,\n"), "with the ingest's wake");
+            for forbidden in ["defer_then_wake(", ".enqueue(", "get_for_channel("] {
+                assert!(!body.contains(forbidden), "no {forbidden} of its own");
+            }
+            let ingest = &source[source.find("if delivery.is_distro(dest_hash) {").unwrap()..];
+            let ingest = &ingest[..ingest.find("continue;").unwrap()];
+            assert!(ingest.contains("let first_sight = delivery.ingest_distro_blob(dest_hash, lxmf_data, &mut stored);"));
+            assert!(ingest.contains("if first_sight {\n                    delivery.distro_fanout(dest_hash, lxmf_data, wake);"));
+        }
     }
 
     /// Outbound peer sync goes through AppLinks-held links only: the
@@ -4955,7 +5741,7 @@ mod tests {
                 on_concluded: OnConcluded,
             ) -> Result<(), String> {
                 self.record(format!("resource {}", hexrep(&link_id[..1], false)));
-                let messages = decode_propagation_batch(&data).map(|m| m.len()).unwrap_or(0) as u64;
+                let messages = decode_propagation_batch(&data).map(|b| b.messages.len()).unwrap_or(0) as u64;
                 self.sent.lock().unwrap().push((monotonic_now(), peer.to_vec(), messages));
                 self.resources.lock().unwrap().push_back((data, on_concluded));
                 Ok(())
@@ -5138,7 +5924,7 @@ mod tests {
                 }
                 other => panic!("batch not an array: {other:?}"),
             }
-            let messages = decode_propagation_batch(&payload).expect("rfed's own ingest reads the batch");
+            let messages = decode_propagation_batch(&payload).expect("rfed's own ingest reads the batch").messages;
             assert_eq!(messages.len(), 3);
             assert!(messages.iter().all(|m| m.len() == 300), "each message goes with its stamp, as stored");
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (3, 0), "nothing is handled while the Resource is in flight");
@@ -5218,7 +6004,7 @@ mod tests {
             h.pump();
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (1, 2));
             let (payload, concluded) = h.io.take_resource();
-            assert_eq!(decode_propagation_batch(&payload).unwrap().len(), 1);
+            assert_eq!(decode_propagation_batch(&payload).unwrap().messages.len(), 1);
             concluded(complete());
             h.pump();
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 3));
@@ -5376,7 +6162,7 @@ mod tests {
             respond(msgpack(Value::Boolean(true)));
             h.pump();
             let (payload, concluded) = h.io.take_resource();
-            assert_eq!(decode_propagation_batch(&payload).unwrap().len(), 5);
+            assert_eq!(decode_propagation_batch(&payload).unwrap().messages.len(), 5);
             assert_eq!(h.node.lock().unwrap().outbound_sent_in_window(), 5);
 
             // Completing does not make room: the persistent strategy's next
@@ -6119,7 +6905,7 @@ mod tests {
             respond(msgpack(Value::Boolean(true)));
             h.pump();
             let (payload, concluded) = h.io.take_resource();
-            assert_eq!(decode_propagation_batch(&payload).unwrap().len(), 1, "the readable one is sent");
+            assert_eq!(decode_propagation_batch(&payload).unwrap().messages.len(), 1, "the readable one is sent");
             assert!(!h.node.lock().unwrap().entries.contains_key(&ids[0]), "the one without a file leaves the store");
             assert!(!h.peer(&other, |p| p.unhandled_ids.contains(&ids[0])), "and every peer's queue");
             concluded(complete());
