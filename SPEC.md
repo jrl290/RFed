@@ -3643,7 +3643,7 @@ upload as an ordinary one, with a wake.
 that carried a claim, one verdict after the usual `[distro] intercepted …`
 line:
 
-    [distro-sync] <id> for <D>: proof accepted, fanning out as distro sync (each [handoff] line says whether its device was woken)   (NOTICE)
+    [distro-sync] <id> for <D>: proof accepted, fanning out as distro sync (each device's hand-off line says whether it was woken)   (NOTICE)
     [distro-sync] <id> for <D>: proof refused (<reason>), fanning out with wake             (WARNING)
     [distro-sync] <id> for <D>: proof accepted|refused (<reason>), already held: no fan-out
 

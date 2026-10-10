@@ -1795,7 +1795,7 @@ fn sync_verdict_line(
     match (verdict, first_sight) {
         (Ok(()), true) => (
             LOG_NOTICE,
-            format!("[distro-sync] {id} for {distro}: proof accepted, fanning out as distro sync (each [handoff] line says whether its device was woken)"),
+            format!("[distro-sync] {id} for {distro}: proof accepted, fanning out as distro sync (each device's hand-off line says whether it was woken)"),
         ),
         (Ok(()), false) => (
             LOG_NOTICE,
@@ -2042,8 +2042,8 @@ impl DeliveryHandles {
                     devices.len(),
                     hexrep(dest_hash, false),
                     match wake {
-                        Wake::Push => "handed off with a push (each [handoff] line says what was queued and who was woken)",
-                        Wake::QueueOnly => "handed off as distro sync, pushed only at a bound (each [handoff] line says what was queued and who was woken)",
+                        Wake::Push => "handed off with a push (each hand-off line says what was queued and who was woken)",
+                        Wake::QueueOnly => "handed off as distro sync, pushed only at a bound (each hand-off line says what was queued and who was woken)",
                     },
                 ),
                 LOG_NOTICE,
@@ -5341,7 +5341,7 @@ mod tests {
             assert_eq!(
                 text(&verdict[0]),
                 format!(
-                    "[distro-sync] {} for {}: proof accepted, fanning out as distro sync (each [handoff] line says whether its device was woken)",
+                    "[distro-sync] {} for {}: proof accepted, fanning out as distro sync (each device's hand-off line says whether it was woken)",
                     hexrep(&id, false),
                     hexrep(&d_hash, false),
                 ),
@@ -5369,7 +5369,7 @@ mod tests {
             let lines = mark.lines();
             assert!(lines.iter().any(|l| l.contains("proof accepted, fanning out as distro sync")), "{lines:?}");
             assert!(lines.iter().any(|l| l.ends_with(&format!(
-                "[distro] 2 of 2 device(s) with no live session for distro {} — handed off as distro sync, pushed only at a bound (each [handoff] line says what was queued and who was woken)",
+                "[distro] 2 of 2 device(s) with no live session for distro {} — handed off as distro sync, pushed only at a bound (each hand-off line says what was queued and who was woken)",
                 hexrep(&d_hash, false),
             ))), "{lines:?}");
             assert_eq!(lines.iter().filter(|l| l.contains("NOT woken (distro sync, 1 of 64 un-pulled)")).count(), 2);
@@ -5459,7 +5459,7 @@ mod tests {
                 let verdicts = mark.containing("[distro-sync] ");
                 if claims(&sealed).is_none() {
                     assert!(verdicts.is_empty(), "{case}: no claim, no verdict: {verdicts:?}");
-                    assert!(mark.lines().iter().any(|l| l.contains("— handed off with a push (each [handoff] line says")), "{case}");
+                    assert!(mark.lines().iter().any(|l| l.contains("— handed off with a push (each hand-off line says")), "{case}");
                 } else {
                     assert_eq!(verdicts.len(), 2, "{case}: the verdict and the batch summary: {verdicts:?}");
                     assert!(verdicts[0].contains("[Warning]"), "{case}: {}", verdicts[0]);
