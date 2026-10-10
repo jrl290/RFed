@@ -1578,7 +1578,7 @@ impl LxmfPropagationNode {
         let invalid_stamps = total - validated.len();
         if invalid_stamps > 0 && from_peer.is_none() {
             log(
-                invalid_stamp_line(&invalid_stamp_ids(&messages, &validated), min_cost, &origin),
+                dropped_messages_line(&dropped_messages(&messages, &validated), min_cost, &origin),
                 LOG_WARNING, false, false,
             );
         }
@@ -1812,41 +1812,104 @@ fn sync_verdict_line(
     }
 }
 
+/// At most this many transient ids are named for each reason in the line
+/// for a client batch's dropped messages; the rest are counted.
+const DROPPED_IDS_LOGGED: usize = 4;
+
+/// A message this long or shorter, its stamp included, is not an LXMF
+/// message: `validate_pn_stamp` refuses it before it looks at the stamp
+/// (LXStamper.validate_pn_stamp: `len(transient_data) <= LXMF_OVERHEAD +
+/// STAMP_SIZE`).
+const TOO_SHORT_FOR_LXMF: usize = lxmf_rust::LXMessage::LXMF_OVERHEAD + lx_stamper::STAMP_SIZE;
+
 /// The messages of a client's batch that `validate_pn_stamps` dropped, by
-/// their transient id as LXMF computes it (SHA-256 of all but the last 32
-/// bytes, the stamp). RFed's link stack proves a client's upload before its
-/// stamps are checked (RFed-spec LXMFProp.md §10.5; LXMF proves only when
-/// every stamp is valid), so the sending client takes such a message as
-/// delivered: this is the one place its drop can be seen.
-fn invalid_stamp_ids(messages: &[Vec<u8>], validated: &[(Vec<u8>, Vec<u8>, u32, Vec<u8>)]) -> Vec<Vec<u8>> {
-    let valid: HashSet<(&[u8], &[u8])> =
-        validated.iter().map(|(tid, _, _, stamp)| (tid.as_slice(), stamp.as_slice())).collect();
-    messages
-        .iter()
-        .filter_map(|message| {
-            let split = message.len().saturating_sub(lx_stamper::STAMP_SIZE);
-            let tid = reticulum_rust::identity::full_hash(&message[..split]);
-            (!valid.contains(&(tid.as_slice(), &message[split..]))).then_some(tid)
-        })
-        .collect()
+/// why: too short to be an LXMF message, or a stamp under the cost. Each kind
+/// is counted, and its first [`DROPPED_IDS_LOGGED`] are named by transient
+/// id as LXMF computes it (SHA-256 of all but the last 32 bytes, the stamp).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DroppedMessages {
+    too_short: usize,
+    too_short_ids: Vec<Vec<u8>>,
+    invalid_stamp: usize,
+    invalid_stamp_ids: Vec<Vec<u8>>,
 }
 
-/// At most this many transient ids are named in the line for a client
-/// batch's invalid stamps; the rest are counted.
-const INVALID_STAMP_IDS_LOGGED: usize = 4;
+/// Sort the messages `validate_pn_stamps` dropped from `messages`.
+/// `validated` is what it returned, in the batch's order (it keeps the
+/// order), so one walk pairs each with its message by bytes; nothing is
+/// hashed for a message that validated, or for a dropped one past the first
+/// few of its kind. The batch is unauthenticated input up to the Resource
+/// limit: until 2026-10-10 every dropped message was hashed and its id kept,
+/// to print four.
+///
+/// RFed's link stack proves a client's upload before its stamps are checked
+/// (RFed-spec LXMFProp.md §10.5; LXMF proves only when every stamp is valid),
+/// so the sending client takes such a message as delivered: the line built
+/// from this is the one place its drop can be seen.
+fn dropped_messages(messages: &[Vec<u8>], validated: &[(Vec<u8>, Vec<u8>, u32, Vec<u8>)]) -> DroppedMessages {
+    let id_of = |message: &[u8]| -> Vec<u8> {
+        #[cfg(test)]
+        tests::sync_proof_tests::DROPPED_IDS_HASHED.with(|n| n.set(n.get() + 1));
+        reticulum_rust::identity::full_hash(&message[..message.len().saturating_sub(lx_stamper::STAMP_SIZE)])
+    };
+    let mut dropped = DroppedMessages::default();
+    let mut next_valid = validated.iter().peekable();
+    for message in messages {
+        if message.len() <= TOO_SHORT_FOR_LXMF {
+            dropped.too_short += 1;
+            if dropped.too_short_ids.len() < DROPPED_IDS_LOGGED {
+                dropped.too_short_ids.push(id_of(message));
+            }
+            continue;
+        }
+        let this_one = next_valid.peek().is_some_and(|(_, lxmf_data, _, stamp)| {
+            message.len() == lxmf_data.len() + stamp.len()
+                && message[..lxmf_data.len()] == lxmf_data[..]
+                && message[lxmf_data.len()..] == stamp[..]
+        });
+        if this_one {
+            next_valid.next();
+            continue;
+        }
+        dropped.invalid_stamp += 1;
+        if dropped.invalid_stamp_ids.len() < DROPPED_IDS_LOGGED {
+            dropped.invalid_stamp_ids.push(id_of(message));
+        }
+    }
+    dropped
+}
 
-/// The one WARNING for the messages of a client's batch dropped for an
-/// invalid PN stamp (DISTRO-SYNC-PROOF-DESIGN Open question 5, James
+/// The one WARNING for the messages of a client's batch that
+/// `validate_pn_stamps` dropped, each counted under its reason with the
+/// first few named (DISTRO-SYNC-PROOF-DESIGN Open question 5, James
 /// 2026-10-10: the departure is tracked, but its drop must speak).
-fn invalid_stamp_line(ids: &[Vec<u8>], min_cost: u32, origin: &str) -> String {
-    let mut named: Vec<String> = ids.iter().take(INVALID_STAMP_IDS_LOGGED).map(|id| hexrep(id, false)).collect();
-    if ids.len() > INVALID_STAMP_IDS_LOGGED {
-        named.push(format!("and {} more", ids.len() - INVALID_STAMP_IDS_LOGGED));
+fn dropped_messages_line(dropped: &DroppedMessages, min_cost: u32, origin: &str) -> String {
+    let named = |count: usize, ids: &[Vec<u8>]| -> String {
+        let mut named: Vec<String> = ids.iter().map(|id| hexrep(id, false)).collect();
+        if count > ids.len() {
+            named.push(format!("and {} more", count - ids.len()));
+        }
+        named.join(", ")
+    };
+    let mut reasons = Vec::new();
+    if dropped.invalid_stamp > 0 {
+        reasons.push(format!(
+            "{} with an invalid stamp (cost {min_cost} required): {}",
+            dropped.invalid_stamp,
+            named(dropped.invalid_stamp, &dropped.invalid_stamp_ids),
+        ));
+    }
+    if dropped.too_short > 0 {
+        reasons.push(format!(
+            "{} too short to be an LXMF message ({TOO_SHORT_FOR_LXMF} bytes or fewer with its stamp): {}",
+            dropped.too_short,
+            named(dropped.too_short, &dropped.too_short_ids),
+        ));
     }
     format!(
-        "[lxmf.prop] {} message(s) from {origin} dropped for an invalid stamp (cost {min_cost} required), after the link proved the upload: {}",
-        ids.len(),
-        named.join(", "),
+        "[lxmf.prop] {} message(s) from {origin} dropped, after the link proved the upload: {}",
+        dropped.invalid_stamp + dropped.too_short,
+        reasons.join("; "),
     )
 }
 
@@ -5032,6 +5095,9 @@ mod tests {
         thread_local! {
             /// How many claims this thread verified (`verify_claim`).
             pub(crate) static VERIFICATIONS: Cell<usize> = const { Cell::new(0) };
+            /// How many dropped messages this thread hashed for their id
+            /// (`dropped_messages`).
+            pub(crate) static DROPPED_IDS_HASHED: Cell<usize> = const { Cell::new(0) };
         }
 
         fn verifications() -> usize {
@@ -5557,7 +5623,7 @@ mod tests {
             assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (0, 0), "nothing stored, nobody queued");
             let lines = mark.lines();
             assert_eq!(lines.len(), 3, "{lines:?}");
-            assert!(lines[0].contains("[Warning]") && text(&lines[0]).starts_with(&format!("[lxmf.prop] {n} message(s) from a sender with no identity (handled as a client's) dropped for an invalid stamp (cost 40 required)")), "{}", lines[0]);
+            assert!(lines[0].contains("[Warning]") && text(&lines[0]).starts_with(&format!("[lxmf.prop] {n} message(s) from a sender with no identity (handled as a client's) dropped, after the link proved the upload: {n} with an invalid stamp (cost 40 required): ")), "{}", lines[0]);
             assert!(lines[1].ends_with(&format!(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, {n} unmatched, 0 ignored")), "{}", lines[1]);
             assert_eq!(text(&lines[2]), format!("[lxmf.prop] processed {n} msgs: 0 stored, 0 streamed, 0 notified, {n} bad-stamp, from a sender with no identity (handled as a client's)"));
         }
@@ -5575,19 +5641,22 @@ mod tests {
             let tid = reticulum_rust::identity::full_hash(&message[..message.len() - 32]);
             let mark = crate::test_log::mark();
             rig.ingest(&upload(&[message.clone()], None));
-            let warnings = mark.containing("dropped for an invalid stamp");
+            let warnings = mark.containing("dropped, after the link proved the upload");
             assert_eq!(warnings.len(), 1, "{:?}", mark.lines());
             assert!(warnings[0].contains("[Warning]"));
-            assert!(text(&warnings[0]).ends_with(&format!("after the link proved the upload: {}", hexrep(&tid, false))), "{}", warnings[0]);
+            assert!(text(&warnings[0]).ends_with(&format!(
+                "dropped, after the link proved the upload: 1 with an invalid stamp (cost 40 required): {}",
+                hexrep(&tid, false),
+            )), "{}", warnings[0]);
 
             // Many: four named, the rest counted, still one line.
             let many: Vec<Vec<u8>> = (0..6u8).map(|i| [&[0x3A; 16][..], &[0x40 + i; 200][..]].concat()).collect();
             let mark = crate::test_log::mark();
             rig.ingest(&upload(&many, None));
-            let warnings = mark.containing("dropped for an invalid stamp");
+            let warnings = mark.containing("dropped, after the link proved the upload");
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].ends_with(", and 2 more"), "{}", warnings[0]);
-            let named = warnings[0].split("after the link proved the upload: ").nth(1).expect("the ids");
+            let named = warnings[0].split("(cost 40 required): ").nth(1).expect("the ids");
             assert_eq!(named.split(", ").filter(|id| id.len() == 64).count(), 4, "{named}");
 
             // A peer's batch: counted in the processed line only.
@@ -5596,8 +5665,82 @@ mod tests {
             rig.node.lock().unwrap().peers.insert(peer_prop.clone(), PropPeer::new(peer_prop));
             let mark = crate::test_log::mark();
             LxmfPropagationNode::ingest_propagation_batch(&rig.node, &upload(&[message], None), Some(&peer));
-            assert!(mark.containing("dropped for an invalid stamp").is_empty());
+            assert!(mark.containing("dropped, after the link proved").is_empty());
             assert_eq!(mark.containing("1 bad-stamp").len(), 1);
+        }
+
+        /// `validate_pn_stamp` drops a message of LXMF_OVERHEAD + STAMP_SIZE
+        /// (144) bytes or fewer before it looks at the stamp. Such a message
+        /// is counted and named as too short, not as a stamp failure (at
+        /// cost 0, where every stamp is valid, it was logged as "an invalid
+        /// stamp (cost 0 required)" until 2026-10-10). A batch with both
+        /// kinds still writes one WARNING.
+        #[test]
+        fn a_message_too_short_for_lxmf_is_named_as_too_short() {
+            let rig = Rig::new("q5_short", 0);
+            let short = vec![0x3C; 100];
+            let edge = vec![0x3D; TOO_SHORT_FOR_LXMF];
+            assert_eq!(TOO_SHORT_FOR_LXMF, 144);
+            let id = |m: &[u8]| hexrep(&reticulum_rust::identity::full_hash(&m[..m.len() - 32]), false);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[short.clone(), edge.clone()], None));
+            let warnings = mark.containing("dropped, after the link proved the upload");
+            assert_eq!(warnings.len(), 1, "{:?}", mark.lines());
+            assert!(text(&warnings[0]).ends_with(&format!(
+                "2 message(s) from a sender with no identity (handled as a client's) dropped, after the link proved the upload: 2 too short to be an LXMF message (144 bytes or fewer with its stamp): {}, {}",
+                id(&short),
+                id(&edge),
+            )), "{}", warnings[0]);
+            assert!(!warnings[0].contains("invalid stamp"), "{}", warnings[0]);
+
+            // Both kinds in one client batch: one line, the stamp failures first.
+            let rig = Rig::new("q5_both", 40);
+            let bad = [&[0x3A; 16][..], &[0x3E; 200][..]].concat();
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[short.clone(), bad.clone(), edge.clone()], None));
+            let warnings = mark.containing("dropped, after the link proved the upload");
+            assert_eq!(warnings.len(), 1, "{:?}", mark.lines());
+            assert!(text(&warnings[0]).ends_with(&format!(
+                "3 message(s) from a sender with no identity (handled as a client's) dropped, after the link proved the upload: 1 with an invalid stamp (cost 40 required): {}; 2 too short to be an LXMF message (144 bytes or fewer with its stamp): {}, {}",
+                id(&bad),
+                id(&short),
+                id(&edge),
+            )), "{}", warnings[0]);
+        }
+
+        /// The sorting walks the batch once and hashes only the dropped
+        /// messages it names, whatever the batch holds: 10^5 empty entries
+        /// (a ~200 KB client Resource) cost four hashes, not 10^5, and a
+        /// message that validated is paired by its bytes, never hashed.
+        #[test]
+        fn sorting_the_dropped_messages_hashes_only_those_it_names() {
+            let hashed = || DROPPED_IDS_HASHED.with(|n| n.get());
+            let before = hashed();
+            let junk = vec![Vec::new(); 100_000];
+            let dropped = dropped_messages(&junk, &[]);
+            assert_eq!((dropped.too_short, dropped.too_short_ids.len(), dropped.invalid_stamp), (100_000, 4, 0));
+            assert_eq!(hashed() - before, 4);
+
+            // Valid and invalid interleaved: each valid one is matched in
+            // order, by its bytes; only the dropped ones are named.
+            let messages: Vec<Vec<u8>> = (0..10u8).map(|i| [&[0x5D; 16][..], &[i; 200][..]].concat()).collect();
+            let validated: Vec<(Vec<u8>, Vec<u8>, u32, Vec<u8>)> = messages
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i % 3 != 0)
+                .map(|(_, m)| {
+                    let split = m.len() - 32;
+                    (reticulum_rust::identity::full_hash(&m[..split]), m[..split].to_vec(), 0, m[split..].to_vec())
+                })
+                .collect();
+            let before = hashed();
+            let dropped = dropped_messages(&messages, &validated);
+            assert_eq!(hashed() - before, 4, "four of messages 0, 3, 6 and 9 named");
+            assert_eq!(dropped.invalid_stamp, 4);
+            let expected: Vec<Vec<u8>> =
+                [0usize, 3, 6, 9].iter().map(|&i| reticulum_rust::identity::full_hash(&messages[i][..messages[i].len() - 32])).collect();
+            assert_eq!(dropped.invalid_stamp_ids, expected);
+            assert_eq!(dropped.too_short, 0);
         }
 
         // ── Pins ────────────────────────────────────────────────────────
