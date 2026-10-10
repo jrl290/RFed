@@ -786,7 +786,8 @@ ciphertext. Not covered:
   (`/rfed/offer`, `/rfed/get`) and on `rfed.link` (`/node/offer`,
   `/node/get`), which every web client opens. So anyone can read every
   distro message a node holds, the `rfed.distro.channel` membership
-  messages (§17.12) and the §17.11 sent copies included, without
+  messages (§17.12), the §17.11 sent copies and the `rfed.distro.group`
+  group syncs (§17.14) included, without
   subscribing to anything: the ciphertext, its size and id, and its timing
   by polling. Peers need the distro blobs, so they cannot be left out of
   sync; closing this needs peers to authenticate to OFFER and GET, which is
@@ -886,8 +887,10 @@ delivery (Reticulum-rust B35): a push that is still open when it lands is
 delivered and not deferred, but a push already deferred stays deferred, so a
 client can receive the same blob live and again by pull. Clients dedupe: distro blobs by a seen
 key of `source + LXMF timestamp`, and a stored distro message by an id of
-source, timestamp and content (§17.11 rule 5); channel blobs by their own
-message identity.
+source, timestamp and content (§17.11 rule 5), except a §17.12 membership
+message, a §17.14 group sync and a group message, which are keyed by their
+LXMF message hash ahead of that seen key (§17.14 "Group messages through the
+distro"); channel blobs by their own message identity.
 
 One deferred bucket holds everything for an identity, and one identity, a
 device's, is often both a channel subscriber and a distro device (§6,
@@ -1805,6 +1808,7 @@ Sender → LXMF message encrypted to distro identity
 | Reply identity | The poster's posting identity: the distro when the device holds one, otherwise the device (§17.12) | All devices reply as the distro identity |
 | Ingress | `/channel/publish` on `rfed.link`, or a DATA packet to the legacy `rfed.channel` / `rfed.channel.publish` | `lxmf.propagation` (intercepted) |
 | Membership across a distro's devices | Synced by the `rfed.distro.channel` message (§17.12); each device subscribes itself | Each device registers itself |
+| Groups across a distro's devices | — | The user is D in a group that lists D; the user's own group actions are synced by the `rfed.distro.group` message (§17.14) |
 | Routing hash | Channel identity hash (§1); a registered distro's hash is refused (§6) | The distro's `lxmf.delivery` hash |
 
 ### 17.2 Cross-Node Distribution
@@ -2032,9 +2036,13 @@ outbox" in the §17.12 Implementation index.
 **No copy is sent for:** identity transfers (`"rfed.distro.transfer"`,
 §17.9), delivery notifications and ticket-only messages, group messages,
 channel messages, messages whose destination is D itself (the channel
-membership messages of §17.12 among them), or when the device holds no
-distro identity. A channel post needs no copy: every sibling subscribed to
-the channel receives the post itself (§17.12).
+membership messages of §17.12 and the group syncs of §17.14 among them), or
+when the device holds no distro identity. A channel post needs no copy: every
+sibling subscribed to the channel receives the post itself (§17.12). A group
+message gets no §17.11 copy either: the user's own group actions and posts
+reach the siblings as the group sync of §17.14, which carries the group, not
+a recipient, and which older clients drop rather than file as a direct
+message.
 
 **Receiving.** A device unwraps a fan-out blob with its distro key (§17.3).
 A message whose `fields[0xFB]` is `"rfed.distro.sent"` is a copy, and the
@@ -3565,13 +3573,16 @@ catch:
 
 ### 17.13 Distro sync proof
 
-A device's own uploads to its distro, the §17.11 sent copy and the §17.12
-membership message, are distro sync: every device of D gets them, and none
-needs a wake for them. RFed cannot tell them from another sender's message to
-D, because the source is inside the encryption to D. The sending device
-therefore proves with D's key that an upload is its own sync, and RFed
-delivers a proven upload without a wake (James, 2026-10-10; both kinds, the
-membership message included).
+A device's own uploads to its distro, the §17.11 sent copy, the §17.12
+membership message and the §17.14 group sync, are distro sync: every device of
+D gets them, and none needs a wake for them. RFed cannot tell them from another
+sender's message to D, because the source is inside the encryption to D. The
+sending device therefore proves with D's key that an upload is its own sync,
+and RFed delivers a proven upload without a wake (James, 2026-10-10; both
+kinds, the membership message included; the group sync added the same day,
+when James decided §17.14). The proof and RFed's handling name no kind, so the
+third kind changed nothing at RFed: it is checked, fanned out and queued
+exactly as the other two (§17.14 "RFed").
 
 **The upload.** The proof travels in the client upload to `lxmf.propagation`
 that carries the message, as a third element of the envelope (with it, the
@@ -3702,6 +3713,268 @@ for 7 days loses the sync it was not woken for, as an offline device does
 (§7 "Limits", §17.12 "In RFed's queue"); the node logs it.
 
 **Capabilities.** `/rfed/capabilities` reports `distro_sync` (§17).
+
+### 17.14 Groups and the distro
+
+Decided by James, 2026-10-10. RFed joins groups and the distro nowhere: groups
+are peer to peer (RFed-spec/Group.md), and RFed fans out to a distro's devices
+whatever is addressed to the distro (§17.3), never reading it. This section is
+the contract for a device that holds a distro identity D and takes part in
+groups. Group.md "Distro holders" is the normative summary;
+GROUPS-DISTRO-DESIGN.md (workspace root) is the design, with every client's
+changes. Before it, every client acted in groups as its device and filed every
+group message addressed to D as a direct message: a placeholder bubble on iOS
+and the web, a blank one on Android, one per invite chunk (Retichat-ios
+bbae30c, Retichat-android 8456878, Retichat-js 6d0cf8b).
+
+**The user's address in a group.** The user acts in each group as the address
+the creator's fixed list names: D when it names D (on every device of D), the
+device when it names only the device (on that device only), D when it names
+both. A group created on a device that holds D is created as D: the creator's
+list entry is D, the recorded creator is D, and the invite chunks are signed
+by D with D's key in D's chunk. Groups that already list a device address stay
+on that device; nothing is migrated. In a group where the user is D, every
+envelope goes out with LXMF source D, signed by D's key, `GROUP_SENDER` = D,
+and an `accept` or `leave` carries `"<D>:" + base64(D's 64-byte public key)`
+as its sender's key. A device that no longer holds the D a group lists cannot
+act in it, says so to the user, and never sends from the device address
+instead. In such a group the user's own addresses are D, the device and the
+other devices of D that this device has learned from the `fields[0xFD]` of a
+D-signed sync (§17.11, §17.12, this section): none is ever a send target, an
+allowlisted contact or another member.
+
+**Group messages through the distro.** A message a device unwraps from a
+distro fan-out blob (§17.3) whose fields carry a group id (Group.md "Field
+Keys", either form) is a group message, handled exactly as one that reached the
+device directly. A device classifies every unwrapped message in this order,
+and the first that matches decides:
+
+1. the distro markers in `fields[0xFB]`: an identity transfer (§17.9), a sent
+   copy (§17.11), a membership message (§17.12), a group sync (below);
+2. a group message: the fields carry a group id and no distro
+   `fields[0xFB]`. A message that carries a distro marker is decided by step 1
+   whatever else it carries; its group entries are not read;
+3. everything else, as before: the seen key of source and timestamp, the
+   delivery-notification test and the direct-message path.
+
+A group message and a group sync are a repeat only when their LXMF message
+hash is one already seen; the device keys them by it (`grp:<hash>`,
+`gsync:<hash>`) **before** the seen key of source and timestamp, as §17.12
+keys a membership message. Without it, the chunks of one invite that a web
+client packs in the same millisecond share that key, and all but the first are
+dropped. A group message passes the same admission as on the direct path,
+decided on the packet's own source and its signature: an `invite` counts only
+from an inviter allowlisted on the receiving device when its privacy filter is
+on, and must list D; `accept`, `leave`, `status` and regular messages follow
+Group.md's rules. It is never stored as a direct message, never makes a contact
+or a hidden contact, and never posts a direct-message notification. A
+`relay_req` that arrives this way is not acted on (every device of D would
+relay it) and is dropped with a log line; no Retichat client sends one. A
+group message whose source is D is the user's own echo and is dropped with a
+log line.
+
+A group message that the rules would drop only because the group is not joined
+on this device yet (held pending, or not held, and not left) is **held**
+instead: the blob as received, persisted, at most 64 blobs and 256 KiB per
+device, the oldest dropped first with a log line, a blob over 64 KiB never
+held. When the group becomes joined on this device, its held blobs go through
+this classification again, in arrival order; when it is left, or the device
+gives up D, they are forgotten. That is the ordering of DESIGN_PRINCIPLES.md
+§5 (the message depends on the group being joined), not a retry. The same
+holds for a `post` group sync.
+
+**The unwrap.** `lxmf_rust::distro::unwrap_blob` returns, besides the keys of
+§17.11 and §17.12, the message's LXMF hash, its packed bytes (the blob's first
+16 bytes followed by the plaintext: destination, source, signature, payload),
+its group id and action, and the parsed group sync. Each phone's bridge runs
+its group receipt (`group_status::receipt`, in Retichat-ios
+`rust/retichat-ffi` and Retichat-android `rust/retichat-jni`) on it, as the
+direct path does, so an `accept` or `leave` from a sender whose key the device
+does not hold is verified under the key it carries, and a creator can keep the
+packed copy it answers with. The unwrap JSON of `retichat_distro_unwrap` and
+`nativeDistroUnwrap` gains:
+
+| Key | Type | Value |
+|---|---|---|
+| `hash` | string | The LXMF message hash, 64 lowercase hex |
+| `group_id` | string or null | The group id (Group.md reader rule), 32 lowercase hex; null when absent, malformed, or when `fields[0xFB]` is a distro marker |
+| `group_action` | string or null | The group action, as sent |
+| `group_sync` | object or null | Set exactly when `fields[0xFB]` is `"rfed.distro.group"`: `by` (`fields[0xFD]` lowercased, `""` when absent), `problem` (null, or why rule 4 below fails), and `op`, `group_id`, `at_ms`, `name`, `members`, `keys`, `creator`, `text` (null when absent or when `problem` is set) |
+| `sender_key` | string or null | The key an `accept` or `leave` carries for its own sender, when it binds, 128 lowercase hex |
+| `packed` | string or null | The packed message of an `accept` or `leave` of at most the receipt's limit, base64 with padding |
+
+and `signature_validated` / `unverified_reason` are the receipt's verdict.
+
+**The group sync.** Group sends never go to oneself, so the user's other
+devices never learn the user's own group actions from the members. The device
+that acts therefore sends them a group sync G for each of these actions in a
+group where the user is D:
+
+- creating the group: `create`;
+- accepting an invite: `accept`;
+- declining, leaving or deleting the group: `leave` (one op: a decline is a
+  leave, and deleting a group leaves it, Group.md);
+- each post the user sends: `post`, once per post, not per member or attempt.
+
+Nothing else sends one: not applying a received G, not a `status` answer, not
+restoring at start, not a group whose user address is the device, and not a
+device that does not hold the D the group lists.
+
+| | Group sync G |
+|---|---|
+| Destination | D's `lxmf.delivery` |
+| Source / signature | D, signed with D's key (the "send as distro" path of §17.11) |
+| Title, content | Empty. A post's text travels in 0xFC, never in content |
+| `fields[0x0C]` (FIELD_TICKET) | An empty bin, as in §17.12: no ticket, there so that older clients take G for a delivery notification and drop it. Receivers neither read nor remember it |
+| `fields[0xFB]` (FIELD_CUSTOM_TYPE) | `"rfed.distro.group"` |
+| `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, group_id, at_ms, ...]`, by op below |
+| `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
+| Other fields | None: no `0xD1` (no name, no group entries) and none of `0xA0`–`0xA8`, so nothing takes G for a group message; receivers ignore any other field |
+| Method | PROPAGATED at once (D is a distro, §17.10), with a §17.13 sync proof; RFed intercepts it on `lxmf.propagation` and fans it out to every registered device of D, the sender included, waking none (§17.13) |
+
+`fields[0xFC]` by op. `op` is a str; `group_id` a str of 32 hex characters
+(written lowercase, compared lowercased); `at_ms` the time of the user's action
+in milliseconds since the epoch, a msgpack integer from 0 to 2^53 − 1 in any
+integer encoding, read by its value, under every rule of §17.12 "`at_ms` on the
+wire" (the web writes int 64 `0xd3`, rmpv and umsgpack uint 64 `0xcf`).
+Receivers ignore elements after the last one defined for the op.
+
+| op | `fields[0xFC]` |
+|---|---|
+| `create` | `["create", group_id, at_ms, name, members, keys]`: the creator is D |
+| `accept` | `["accept", group_id, at_ms, name, members, keys, creator]` |
+| `leave` | `["leave", group_id, at_ms]` |
+| `post` | `["post", group_id, at_ms, text]`: `at_ms` is the post's own time as the sending device stored it |
+
+- `name`: the group's name, UTF-8 str (receivers accept bin), possibly empty.
+- `members`: a str, the group's `GROUP_MEMBERS` csv exactly as the invite
+  carried it (for `create`, as the device wrote it into its invite chunks),
+  read with the invite's own parser. It must name D.
+- `keys`: an array of str, `GROUP_MEMBER_KEYS` entries (`<hash>:<base64 key>`)
+  for the listed members whose keys the sending device holds, in any order,
+  possibly empty. A receiver binds each as it binds an invite chunk's (the
+  key's `lxmf.delivery` destination must be the entry's hash, and the hash
+  listed) and ignores one that does not bind.
+- `creator`: a str of 32 hex characters, the invite's authenticated source as
+  the accepting device recorded it: listed, and not D.
+- `text`: the post's content unchanged, UTF-8 str (receivers accept bin). Text
+  only, as §17.11: attachments are **not** copied. An attachment-only post
+  copies an empty text, which a sibling shows as it shows such a §17.11 copy.
+
+So a sibling can hold the group from an `accept` or `create` alone, without the
+invite: its own privacy filter may have dropped the invite, it may have been
+offline longer than RFed keeps it, or the sync may arrive first. A `leave` is
+about 220 bytes packed and a `create` or `accept` about 150 bytes per member;
+G is never split, and every proven upload is a Resource (§17.13 "The upload").
+
+*On the sending device.* G is packed and signed by D, encrypted to D and sealed
+for §17.13 once, when the user acts, in the same step that records the action
+on the device, and kept until the propagation node proves it. Every rule of
+§17.12 "On the sending device" applies to G as written there for the membership
+message, under the same decided exception of DESIGN_PRINCIPLES.md §3 (extended
+by James on 2026-10-10 from two kinds to three), with two differences, the ones
+§17.11 makes for a sent copy:
+
+- Each G is owed on its own, under its own LXMF message hash; no later G
+  replaces it. None needs to: the receive rules give the same result in
+  whatever order the Gs arrive.
+- Giving up D does not drop it (proposed with this section; James to confirm
+  with the §3 text). G reports an act the user already made as D toward the
+  members, so the siblings must learn it whatever this device does next. It is
+  already packed and signed as D, so it stays owed to D, is uploaded to D on
+  later comings-up, and is never re-addressed, sent under another distro or
+  packed again; the device keeps D's public key with it.
+
+*Receiving.* A device unwraps a fan-out blob with its distro key (§17.3). A
+message whose `fields[0xFB]` is `"rfed.distro.group"` is a group sync. It is a
+repeat only when its LXMF message hash is one already seen; a repeat is dropped
+silently. The device applies these rules in order; the first rule that drops G
+ends the check.
+
+1. **Source.** If the unwrapped source is not D, G is ignored and logged.
+2. **Signature.** G MUST carry a valid LXMF signature by D's key, checked
+   exactly as §17.11 rule 2 checks a sent copy, over the payload bytes as
+   received; one that fails is dropped with a log line. D's public key is
+   announced, so anyone can encrypt a message to D that claims source D.
+   Without this check a stranger could make every device of D hold a group as
+   its creator and answer for it, or take the user out of a group for good.
+3. **Own echo.** If `fields[0xFD]` is this device's own `lxmf.delivery`
+   address, G is dropped silently and recorded as seen. Any other value is
+   remembered as a device of D (the user's own address, above).
+4. **Form.** `op` one of the four; `group_id` 32 hex characters; `at_ms` an
+   integer from 0 to 2^53 − 1; for `create` and `accept`, `name` a str or bin,
+   `members` a str whose list parses and names D, `keys` an array of str; for
+   `accept`, `creator` 32 hex characters, listed, not D; for `post`, `text` a
+   str or bin. Anything else is dropped with a log line.
+5. **Apply,** by the group's state on this device, as below. Applying G never
+   sends anything to the members and never sends a G, so nothing loops. It
+   asks nothing of the user: no notification, no alert, no prompt.
+
+| G | Group not held | Held, pending | Held, joined | Held, left or declined |
+|---|---|---|---|---|
+| `create` | held, joined: the list, the recorded creator D, the user D, every other member invited, `keys` bound and remembered; then its held messages | ignored and logged | nothing | nothing |
+| `accept` | held, joined: the list, the recorded creator `creator` (accepted), the user D accepted, every other member invited, `keys` bound and remembered, the members passing the privacy filter by association; then its held messages | joined, as the user's own accept on this device would make it, without sending: its held messages after | nothing | nothing: a leave is final, and an accept never reopens it |
+| `leave` | the group id recorded as left, so a later invite, `create` or `accept` for it is ignored | declined, as the user's own decline on this device would, without sending | left, as the user's own leave on this device would, without sending | nothing |
+| `post` | held (above) | held (above) | stored as the user's own outgoing post in the group: sender D, state SENT (as §17.11 rule 5: never DELIVERED, never sending or failed), timestamp `at_ms`, the text, no notification, its id G's LXMF hash | dropped |
+
+Every device of D therefore ends in the same state in whatever order the Gs
+arrive: a left group stays left, a joined one stays joined until a leave, and
+two siblings that accept and leave concurrently both end left, as the members
+do. A device whose conversation was deleted keeps it deleted; the others keep
+theirs as a left group until the user deletes it there.
+
+**Which device answers.** When the group's creator is D, every device of D
+that holds the group answers each `accept` it receives that carries its
+sender's key with its own `status`, from the packed copies it keeps of the
+`accept`s and `leave`s that reach it through D (Group.md "The creator's
+answer"; James, 2026-10-10). A member may receive one `status` per such
+device; each element is checked on its own, so duplicates change nothing. A
+device that has applied D's `leave` answers nothing.
+
+**RFed.** No change. RFed decides a distro intercept by the destination alone
+(`DeliveryHandles::is_distro`), takes a claim by the message's transient id
+and checks it with `lxmf_rust::distro::verify_sync_claim`, which reads no
+kind, and chooses `Wake::QueueOnly` or `Wake::Push` from that verdict alone
+(`lxmf_propagation.rs`, the distro intercept); the hand-off bounds count blobs
+whatever their kind (`handoff::distro_hand_off`). A G is a distro blob like
+any other.
+
+*A device that is offline.* As §17.12 for C: a G that carries an accepted
+§17.13 proof is handed off without a wake, within the bounds of §17.3, and is
+applied when the device next collects its backlog. An iOS notification service extension does not apply G
+(the app does, when it next runs) and shows no notification for G or for a
+group control message; it shows a group post only for a group the app holds
+as joined.
+
+*Not covered.* G can be lost in the ways §17.12 "Not covered" lists for C,
+except that giving up D does not lose it (above). A device that imports D after
+an action, or misses G in RFed's queue, does not learn it; no catch-up exchange
+is defined. A held message evicted by the bounds is lost, with a log line.
+
+*Older clients.* G has empty content, an empty ticket and no attachment, the
+form §17.12 "Older clients" analyses for C, so every client that drops C drops
+G: Retichat-android from 076f310, Retichat-ios from 24c64a4 (and its NSE from
+a6ac519), Retichat-js from adee619. A web build before adee619 shows it as an
+empty incoming message from D. An older device of the user keeps showing group
+messages that reach it through D as before, a placeholder or a blank direct
+message, and acts in groups as its device address, which a group that lists D
+does not count, until it is updated.
+
+*Privacy.* `fields[0xFD]` reveals which device acted, to holders of D only, as
+in §17.11. A group's member list and keys, and the user's posts, sit encrypted
+to D in RFed's BlobStore and deferred queues, as every distro blob does.
+
+#### Implementation index
+
+| Part | Where | Status (2026-10-10) |
+|---|---|---|
+| Spec | RFed-spec Group.md "Distro holders"; this section; DESIGN_PRINCIPLES.md §3 (text proposed in GROUPS-DISTRO-DESIGN.md §16, awaiting James) | written 2026-10-10 on branches `group-distro`, not merged |
+| Shared Rust | LXMF-rust `distro`: `DistroMessage` hash, packed, group id and action, group sync; `set_group_sync_fields`, `read_group_sync`, `to_json_with_receipt`; `name_ledger::is_own_devices_message`; golden vector `tests/distro_group_sync_vectors.json` made with the Python reference | not started |
+| Phone bridges | Retichat-ios `rust/retichat-ffi`, Retichat-android `rust/retichat-jni`: `group_status::receipt_parts` on the distro unwrap; `retichat_message_set_distro_group_sync` / `nativeMessageSetDistroGroupSync` | not started |
+| iOS | Retichat-ios (off distro-sync bbae30c) | not started |
+| Android | Retichat-android (release-0.1.11, held for it) | not started |
+| Web | Retichat-js (off main 6d0cf8b) | not started |
+| RFed | none needed (above) | — |
 
 ### 17.9 Distro Identity Transfer
 
