@@ -856,7 +856,8 @@ stop at the first one that takes the push:
 4. Otherwise the blob is handed off at once.
 
 A push that is **never confirmed** is not lost and is not re-sent on another
-live tier: it is **handed off** once (`handoff::defer_then_wake`). The blob
+live tier: it is **handed off** once (`handoff::defer_then_wake`; a distro
+device's by `handoff::distro_hand_off`, §17.3). The blob
 moves to the deferred queue, and then the subscriber is pushed through its
 notify registrations (§9) so that it collects the blob with `/channel/pull`
 or `/rfed/pull`. That is a change of route, not a retry. Tier 1 is
@@ -910,8 +911,15 @@ propagation sync.
 | Per subscriber (VIP tier) | 2048 blobs | `policy.vip.deferred_queue_limit` |
 | Global | 4096 entries | Hard cap |
 
-When a per-subscriber limit is exceeded, the oldest entry is evicted.
-When the global limit is reached, new entries are silently dropped.
+When a per-subscriber limit is exceeded, the oldest entry is evicted, and
+the hand-off that evicted it logs a NOTICE naming the recipient and the
+evicted entry's routing hash. When the global limit is reached, a new entry
+is dropped, and the hand-off that tried to queue it logs a WARNING naming
+the recipient and the routing hash (`DeferredQueue::enqueue` returns
+`EnqueueOutcome`; the hand-off's `[handoff]` line reads `NOT queued: global
+limit`). An entry older than 7 days is evicted, and the node logs, per
+recipient and routing hash, how many expired unpulled (a WARNING for a
+distro registered here).
 
 ### Delivery Triggers
 
@@ -1733,6 +1741,7 @@ this node.  Any caller may issue the request; the payload is ignored.
 | `channel_stream` | Boolean | Whether live per-channel streaming is available. |
 | `propagation_stream` | Boolean | Whether propagation streaming support is available (currently mirrors `lxmf_propagation`). |
 | `distro` | Boolean | Whether distro (multi-device fanout) is available. Always `true` on current rfed. |
+| `distro_sync` | Boolean | Whether this node honours the §17.13 distro sync proof on `lxmf.propagation` uploads. Mirrors `lxmf_propagation`. |
 | `backup` | Boolean | Whether backup failover is configured (primary or secondary nodes set). |
 | `stamp_cost` | Integer / Nil | Required PoW leading-zero bits, or Nil if stamping is disabled. |
 
@@ -1818,8 +1827,13 @@ message reaches its recipient (§7 "Live delivery and its proof"):
    queued in the **DeferredQueue** under the device's identity hash, and then
    the device is pushed through its LXMF notify registrations (§9), stored
    under its `lxmf.delivery` hash, so that it collects the blob with
-   `/rfed/pull` (`distro::defer_then_wake`). Queue first: the push makes the
-   device pull. The push carries no sender and no channel.
+   `/rfed/pull` (`handoff::distro_hand_off` with `Wake::Push`). Queue first:
+   the push makes the device pull. The push carries no sender and no channel.
+   A blob that arrived with an accepted §17.13 sync proof is queued and not
+   pushed (`Wake::QueueOnly`), at every hand-off point alike, unless the
+   device then holds 64 or more queued blobs of the distro, or the queue
+   holds three quarters of its global limit or more: then it is pushed as
+   above.
 
 The leading 16 bytes of the blob are its destination, the distro's
 `lxmf.delivery` hash, which is how the device tells a distro message from
@@ -1890,6 +1904,8 @@ The FedSync engine treats channel and distro blobs uniformly:
   distro registered at this node and `fanout_blob()` for any other hash,
   never both (§6, "Channel and distro hashes"), then enqueues missed
   subscribers/devices in the DeferredQueue.
+  A blob that arrives by FedSync carries no §17.13 proof, so its hand-off
+  wakes (§17.13 "Not covered").
 
 ### 17.8 Deferred PULL on distro.register
 
@@ -1961,12 +1977,12 @@ with D's key) to a recipient R, where R != D, also sends a copy C:
 | `fields[0xFB]` (FIELD_CUSTOM_TYPE) | `"rfed.distro.sent"` |
 | `fields[0xFC]` (FIELD_CUSTOM_DATA) | R's `lxmf.delivery` address, 32 lowercase hex characters |
 | `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
-| Method | PROPAGATED at once (D is a distro, §17.10); RFed intercepts it on `lxmf.propagation` like any distro message (§17.1) and fans it out to every registered device of D, the sender included |
+| Method | PROPAGATED at once (D is a distro, §17.10), with a §17.13 sync proof; RFed intercepts it on `lxmf.propagation` like any distro message (§17.1) and fans it out to every registered device of D, the sender included, waking none (§17.13). Without an accepted proof (an older sender) an unconfirmed device is woken |
 
 C is made once per message the user sent, not once per delivery attempt or
 method: a DIRECT attempt of M followed by a propagated fallback is still one
-message and one copy. C is packed and signed by D once, when it is made, and
-the sending device keeps it until the propagation node proves it has it. An
+message and one copy. C is packed and signed by D, encrypted to D and proven
+for §17.13 once, when it is made, and the sending device keeps it until the propagation node proves it has it. An
 upload of C that is not proved (its packet was reported lost, or the link
 closed or the connection stopped first) is uploaded again when the
 propagation link next comes up: an event, never a timer. That second upload
@@ -1989,8 +2005,9 @@ membership message, with two differences:
   never packed again. Only the membership messages owed to D are dropped
   (§17.12).
 
-Every upload of C is the same packed message, so a sibling that gets it
-twice stores it once (rule 5). C's state never changes M's delivery state,
+Every upload of C is the same sealed message (§17.13), so RFed holds a second
+upload as the message it already has and fans it out once; a sibling that
+gets it twice anyway stores it once (rule 5). C's state never changes M's delivery state,
 and it creates no message of its own on the sending device.
 
 Retichat-js keeps C in its distro outbox from 73a725d (branch
@@ -2147,7 +2164,7 @@ device that holds no distro.
 | `fields[0xFC]` (FIELD_CUSTOM_DATA) | A msgpack array, as a native array, never a bin holding packed msgpack (CHECK_THESE_THINGS_FIRST.md §11): `[op, name, at_ms]`. `op` is the str `"join"` or `"leave"`. `name` is the channel's full name as the sending device stores it, as UTF-8 str (receivers accept bin too): `<root>.<name>` for every channel joined since the name rules of 2026-09-27, and for a channel joined earlier the name it was joined with, which may break those rules (Retichat-js before b75e02e joined any trimmed name). `at_ms` is the time of the user's action in milliseconds since the epoch (rule 5 below): a msgpack integer from 0 to 2^53 − 1, in any integer encoding: the web writes int 64 (`0xd3`), rmpv and umsgpack write uint 64 (`0xcf`) ("`at_ms` on the wire" below). A larger value is no `at_ms`, and rule 4 drops it. Receivers ignore elements after the third |
 | `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
 | `fields[0xD1]` | None: C is a message to one's own devices and carries no Message Display Name (DISPLAY_NAMES.md §4.1) |
-| Method | PROPAGATED at once (D is a distro, §17.10); RFed intercepts it on `lxmf.propagation` and fans it out to every registered device of D, the sender included |
+| Method | PROPAGATED at once (D is a distro, §17.10), with a §17.13 sync proof; RFed intercepts it on `lxmf.propagation` and fans it out to every registered device of D, the sender included, waking none (§17.13) |
 
 The name is all a sibling needs to join. For a public channel it is
 `public.<name>`. For a private channel it is `<root>.<name>`, which is the
@@ -2211,8 +2228,9 @@ reads its own.
 nothing in the sending device's list, which changed when the user acted. The
 device still keeps C until the propagation node proves it has it:
 
-- C is packed and signed by D once, when the user acts, and written to
-  persistent storage before anything can yield.
+- C is packed and signed by D, encrypted to D and proven for §17.13 once,
+  when the user acts, and written with its proof to persistent storage
+  before anything can yield.
 - It is uploaded at once when the propagation link is up, and otherwise when
   the link next comes up. That wait is the ordering of DESIGN_PRINCIPLES.md
   §5, not a retry: the link coming up is the readiness signal, and C has not
@@ -2341,7 +2359,8 @@ device still keeps C until the propagation node proves it has it:
     it (a proof after the loss report included), when a later action on the
     channel replaces it, or when the device gives up D (below; a §17.11
     sent copy is not dropped then).
-- Every upload of C is the same LXMF message, packed once. A sibling that gets
+- Every upload of C is the same LXMF message, packed and sealed once
+  (§17.13); RFed does not fan out a second upload of it. A sibling that gets
   C twice (the node had an upload whose proof never reached the sender, or the
   sender uploaded it again) holds the second as a repeat ("Receiving") and
   applies C once.
@@ -2450,11 +2469,20 @@ millisecond would share it, and one of the two actions would be lost.
    no alert, no prompt; the channel list simply changes.
 
 *A device that is offline.* C is a distro blob like any other. A device with
-no live route has it handed off (§17.3): queued in its deferred bucket and
-woken through its LXMF notify registration, and it applies C when it next
-collects its backlog with `/distro/pull` (`/rfed/pull` on
-`rfed.distro.register`). A device registered at another RFed node gets C
-through FedSync (§17.2).
+no live route has it handed off (§17.3): queued in its deferred bucket. When C
+carries an accepted §17.13 proof (every C a sealing device uploads to its
+RFed) the device is not woken for it, within the bounds of §17.3: it applies
+C when it next collects its backlog with `/distro/pull` (`/rfed/pull` on
+`rfed.distro.register`), whatever starts that: the app opening, its
+propagation stream opening, or a wake for anything else. A device that
+applies C as it pulls and collects its distro and channel backlogs in one
+pass collects the distro backlog first, so a leave is applied before a post
+in the channel it left is shown or notified. An iOS notification service
+extension does not apply C (the app does, when it next runs) and pulls a
+channel a push names before the distro, so it can show a post in a channel
+left on another device until the app has run. A C with no accepted proof (an
+older sender) still wakes the device. A device registered at another RFed
+node gets C through FedSync (§17.2), with a wake (§17.13 "Not covered").
 
 *Not covered.* C can be lost before it leaves the sending device, and in
 RFed's queue.
@@ -2492,12 +2520,15 @@ In RFed's queue there are three ways (§7 "Limits"):
 - A device's bucket holds at most its per-subscriber limit (256 by default),
   shared with its channel posts, and the oldest entry is evicted first.
 - The whole queue holds at most 4096 entries. When it is full, a new entry,
-  C included, is dropped without a word (`DeferredQueue::enqueue`, reached
-  from the hand-off in `handoff.rs`).
+  C included, is dropped, and the hand-off logs a WARNING naming the device
+  and D (`EnqueueOutcome::RefusedGlobalLimit`, `handoff.rs`).
 
 When C is lost on the sending device, no sibling learns the change. A device
 that is offline for longer than 7 days, whose bucket overflows, or whose C met
-a full queue does not learn it either. Neither does a device that imports D
+a full queue does not learn it either. A device that is reachable but is
+neither opened nor woken for anything for 7 days loses, in the same way, a C
+that did not wake it (§17.13); the node logs that expiry per device. Neither
+does a device that imports D
 after the change. Such a device keeps its own list until the next change of
 that channel; there the user joins by name, as before. No catch-up exchange
 is defined.
@@ -3526,6 +3557,114 @@ catch:
   Retichat-js at 145ca2f, removing the `Number.isSafeInteger` check fails
   the `readChannelSync` bound test and "rule 4: a C whose at_ms is above
   2^53 − 1 is dropped, whatever its encoding, and never applied".
+
+### 17.13 Distro sync proof
+
+A device's own uploads to its distro, the §17.11 sent copy and the §17.12
+membership message, are distro sync: every device of D gets them, and none
+needs a wake for them. RFed cannot tell them from another sender's message to
+D, because the source is inside the encryption to D. The sending device
+therefore proves with D's key that an upload is its own sync, and RFed
+delivers a proven upload without a wake (James, 2026-10-10; both kinds, the
+membership message included).
+
+**The upload.** The proof travels in the client upload to `lxmf.propagation`
+that carries the message, as a third element of the envelope (with it, the
+upload is larger than the link MDU and goes as a Resource):
+
+    [ timebase f64, [ lxmf_data, ... ], { "rfed.distro.sync": [ claim, ... ] } ]
+    claim = [ bin(16) id, bin(64) distro_pubkey, bin(64) sig ]
+
+| Item | Value |
+|---|---|
+| `lxmf_data` | `sealed` followed by the PN stamp (32 bytes), as LXMF |
+| `sealed` | `D_hash(16) | D.encrypt(packed[16:])`; `transient_id = SHA-256(sealed)` |
+| `id` | `transient_id[0:16]`: the message of this upload the claim is for |
+| `distro_pubkey` | D's 64-byte public key |
+| `sig` | D's Ed25519 signature over `"rfed.distro.sync" (16 ASCII bytes) | 0x01 | D_hash(16) | transient_id(32)` |
+
+Every value is native msgpack (bin for bytes, str for the key); nothing is
+pre-encoded and wrapped (CHECK_THESE_THINGS_FIRST §11). A reader takes
+`data[1]` as before, takes `data[2]` only as a map and only its key
+`"rfed.distro.sync"`, and ignores anything else. It ignores the whole
+extension when the claims are not an array of 1 to N elements, N being the
+number of messages in `data[1]`, or when the map holds the key twice. A claim
+that is not `[bin16, bin64, bin64]`, and two claims with one `id`, are
+ignored. The PN stamp is required at the node's cost, as without a proof. The
+claim names no device: a proof marks one sealed message as D's own sync and
+nothing else. One implementation serves the device and RFed
+(`lxmf_rust::distro`: `seal_for_sync`, `sealed_upload`,
+`decode_sync_extension`, `verify_sync_claim`); the golden vector is
+LXMF-rust `tests/distro_sync_vectors.json`, which RFed's tests also accept.
+
+**On the sending device.** The device seals each message once, when it is
+owed: packed and signed as D as before, then encrypted once to D, and the
+signed bytes above signed with D's key. It keeps `sealed` and `sig` with the
+owed entry. Every upload carries the same sealed bytes and proof; only the
+stamp and timebase are made again. A sent copy owed to a distro the device
+has given up is therefore still proven. An entry owed before the device
+could seal is uploaded without a proof. The device sends the third element
+only to the `lxmf.propagation` destination of the RFed identity it registered
+D with; to any other node (a Settings override, an LXMF propagation node) it
+sends LXMF's two-element envelope, because LXMF ignores a Resource whose
+envelope is not exactly two elements
+(`LXMRouter.propagation_resource_concluded`). It never also hands the message
+to its LXMF router. A Resource upload whose first advertisement no interface
+could carry never left the device (DESIGN_PRINCIPLES §3).
+
+**At RFed.** RFed reads claims only from a client's upload (a batch not from
+one of its LXMF peers; a peer's batch that carries an extension counts as
+ignored). For each message whose stamp is valid and whose destination is a
+distro registered here, RFed takes the claim with that message's `id` and
+accepts it when `distro_pubkey`'s `lxmf.delivery` hash is the message's
+destination and `sig` is valid over the signed bytes with the message's
+`transient_id`. Ed25519 therefore runs only for a message that paid its
+stamp. An accepted claim makes the message's fan-out (§17.3) a sync fan-out:
+every registered device, the sender included, gets the live push as usual,
+and one the push does not confirm is queued for `/distro/pull` and not woken,
+unless that device then holds 64 or more queued blobs of D or the deferred
+queue holds three quarters of its global limit or more, when it is woken as
+without a proof (`handoff::distro_hand_off`, `Wake::QueueOnly`; both bounds
+are counts read under the one queue lock that enqueues, never a clock). A
+claim that fails, that matches no message of the upload, or that is for a
+destination that is not a distro here changes nothing: the message is stored
+and fanned out as without it, with a wake. RFed never refuses or drops a
+message because of its claim. A message fans out once, on first sight; a
+claim on a message already held does nothing. The claim is not stored or
+forwarded. An RFed before this section reads `data[1]` alone and handles the
+upload as an ordinary one, with a wake.
+
+**What RFed logs.** Nothing per claim. For each stamp-valid distro message
+that carried a claim, one verdict after the usual `[distro] intercepted …`
+line:
+
+    [distro-sync] <id> for <D>: proof accepted, unconfirmed devices queued, not woken      (NOTICE)
+    [distro-sync] <id> for <D>: proof refused (<reason>), fanning out with wake             (WARNING)
+    [distro-sync] <id> for <D>: proof accepted|refused (<reason>), already held: no fan-out
+
+For an upload whose claims had any problem, one summary:
+
+    [distro-sync] batch from <origin>: <a> accepted, <r> refused, <m> malformed, <d> duplicate, <u> unmatched, <x> ignored
+
+(unmatched: a claim that matched no stamp-valid distro message; ignored: a
+peer's batch, or an extension ignored as a whole). The batch's
+`[lxmf.prop] processed …` line is unchanged. A sync hand-off writes
+`[handoff] <device> unconfirmed for <D>: queued for pull, NOT woken (distro
+sync, <n> of 64 un-pulled)`, or, at a bound, `[handoff] distro sync for
+<device> of <D> woken anyway: <n> un-pulled | queue at <t> of <limit>`
+followed by the usual `[handoff] … woken via …` line.
+
+**Not covered** (these still wake devices): sync from clients that do not
+seal, and entries owed before sealing; uploads to any node but the
+RFed-derived one; a copy that reaches D's home node by LXMF peer sync or by
+FedSync; delivery notifications recipients send to D; anything not signed
+by D.
+
+**Without a wake.** A device that is neither opened nor woken for anything
+for 7 days loses the sync it was not woken for, as an offline device does
+(§7 "Limits", §17.12 "In RFed's queue"); the node logs it.
+
+**Capabilities.** `/rfed/capabilities` reports `distro_sync` (§17).
 
 ### 17.9 Distro Identity Transfer
 
