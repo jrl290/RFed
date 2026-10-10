@@ -56,6 +56,85 @@ pub struct PendingBlob {
     id: i64,
 }
 
+// ── What a change to the queue came to ────────────────────────────────────────
+
+/// What [`DeferredQueue::enqueue`] did with a blob (RFed SPEC §7 "Limits").
+/// The queue itself logs nothing: the hand-off that asked says what became
+/// of the blob, so every drop speaks once, under the recipient and routing
+/// hash it was meant for (DESIGN_PRINCIPLES §2). Until 2026-10-10 an enqueue
+/// at the global limit returned without a word, and the hand-off logged
+/// "queued" anyway.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    /// Queued.
+    Queued,
+    /// Queued, after the subscriber's oldest entry was evicted to stay within
+    /// its per-subscriber limit. `evicted_routing_hash` is that entry's
+    /// routing hash (a channel's hash, or a distro's `lxmf.delivery` hash).
+    QueuedEvictingOldest { evicted_routing_hash: Vec<u8> },
+    /// Not queued: the whole queue already holds `global_limit` entries.
+    RefusedGlobalLimit,
+}
+
+impl EnqueueOutcome {
+    /// Whether the blob is in the queue now.
+    pub fn queued(&self) -> bool {
+        !matches!(self, EnqueueOutcome::RefusedGlobalLimit)
+    }
+}
+
+/// The entries [`DeferredQueue::evict_expired`] removed for one subscriber and
+/// one routing hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Expired {
+    /// The bucket: a distro device's or a channel subscriber's identity hash.
+    pub subscriber_hash: Vec<u8>,
+    /// A channel's hash, or a distro's `lxmf.delivery` hash.
+    pub routing_hash: Vec<u8>,
+    /// How many of its entries expired unpulled.
+    pub count: usize,
+}
+
+/// The log lines for entries that expired unpulled, one per subscriber and
+/// routing hash: a WARNING for a distro registered here (`is_distro`), whose
+/// device lost its sync or mail, and a NOTICE otherwise. `max_age_secs` is the
+/// age they were evicted at. The caller logs them with every lock released.
+pub fn expiry_lines(
+    expired: &[Expired],
+    is_distro: impl Fn(&[u8]) -> bool,
+    max_age_secs: f64,
+) -> Vec<(i32, String)> {
+    let age = if max_age_secs >= 86_400.0 && max_age_secs % 86_400.0 == 0.0 {
+        format!("{} days", (max_age_secs / 86_400.0) as u64)
+    } else {
+        format!("{max_age_secs:.0} s")
+    };
+    expired
+        .iter()
+        .map(|e| {
+            let subscriber = reticulum_rust::hexrep(&e.subscriber_hash, false);
+            let routing = reticulum_rust::hexrep(&e.routing_hash, false);
+            if is_distro(&e.routing_hash) {
+                (
+                    reticulum_rust::LOG_WARNING,
+                    format!(
+                        "[deferred] {} distro blob(s) for device {subscriber} of {routing} expired unpulled after {age}",
+                        e.count,
+                    ),
+                )
+            } else {
+                (
+                    reticulum_rust::LOG_NOTICE,
+                    format!(
+                        "[deferred] {} blob(s) for {subscriber} on {routing} expired unpulled after {age}",
+                        e.count,
+                    ),
+                )
+            }
+        })
+        .collect()
+}
+
 // ── DeferredQueue ─────────────────────────────────────────────────────────────
 
 /// In-memory queue with disk backing; keyed by subscriber destination hash.
@@ -177,19 +256,20 @@ impl DeferredQueue {
     /// `NodeConfig::policy_for(subscriber_hash).deferred_queue_limit` so that
     /// VIP subscribers get a larger budget than regular ones.
     ///
-    /// If the per-subscriber limit is hit, the *oldest* entry is evicted first.
-    /// If the global limit would then still be exceeded, the enqueue is skipped
-    /// entirely (back-pressure).
+    /// If the queue already holds `global_limit` entries, the blob is refused
+    /// (back-pressure), before any eviction. Otherwise, if the per-subscriber
+    /// limit is hit, the subscriber's *oldest* entry is evicted first. The
+    /// outcome says which: the caller logs it (see [`EnqueueOutcome`]).
     pub fn enqueue(
         &mut self,
         subscriber_hash: Vec<u8>,
         channel_hash: Vec<u8>,
         blob: Vec<u8>,
         per_subscriber_limit: usize,
-    ) {
+    ) -> EnqueueOutcome {
         // Global back-pressure check.
         if self.total_len() >= self.global_limit {
-            return;
+            return EnqueueOutcome::RefusedGlobalLimit;
         }
 
         let enqueued_at = now();
@@ -218,6 +298,20 @@ impl DeferredQueue {
             enqueued_at,
             id,
         });
+        match evicted {
+            Some(old) => EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash: old.channel_hash },
+            None => EnqueueOutcome::Queued,
+        }
+    }
+
+    /// How many entries `subscriber_hash` has queued under `routing_hash` (a
+    /// channel's hash, or a distro's `lxmf.delivery` hash): its un-pulled
+    /// backlog of that kind. The bucket's other entries do not count.
+    pub fn count_matching(&self, subscriber_hash: &[u8], routing_hash: &[u8]) -> usize {
+        self.queue
+            .get(subscriber_hash)
+            .map(|bucket| bucket.iter().filter(|entry| entry.channel_hash == routing_hash).count())
+            .unwrap_or(0)
     }
 
     /// Drain and return all pending blobs for `subscriber_hash`.
@@ -345,23 +439,34 @@ impl DeferredQueue {
 
     /// Flush expired entries older than `max_age_secs`.  Call periodically
     /// to prevent indefinite accumulation for gone-forever subscribers.
-    pub fn evict_expired(&mut self, max_age_secs: f64) {
+    ///
+    /// Returns what was evicted, one count per subscriber and routing hash,
+    /// ordered by both, for the caller to log once its locks are released
+    /// ([`expiry_lines`]). Until 2026-10-10 expiry said nothing: a device that
+    /// never pulled lost its entries without a line anywhere.
+    pub fn evict_expired(&mut self, max_age_secs: f64) -> Vec<Expired> {
         let threshold = now() - max_age_secs;
-        let mut changed = false;
-        for bucket in self.queue.values_mut() {
-            let before = bucket.len();
-            bucket.retain(|e| e.enqueued_at >= threshold);
-            if bucket.len() != before {
-                changed = true;
-            }
+        let mut counts: std::collections::BTreeMap<(Vec<u8>, Vec<u8>), usize> = Default::default();
+        for (subscriber_hash, bucket) in self.queue.iter_mut() {
+            bucket.retain(|e| {
+                let keep = e.enqueued_at >= threshold;
+                if !keep {
+                    *counts.entry((subscriber_hash.clone(), e.channel_hash.clone())).or_default() += 1;
+                }
+                keep
+            });
         }
         // Remove now-empty buckets.
         self.queue.retain(|_, v| !v.is_empty());
-        if changed {
+        if !counts.is_empty() {
             crate::store_db::write(self.db.as_ref(), "deferred expiry", |c| {
                 c.execute("DELETE FROM deferred WHERE enqueued_at < ?1", [threshold]).map(|_| ())
             });
         }
+        counts
+            .into_iter()
+            .map(|((subscriber_hash, routing_hash), count)| Expired { subscriber_hash, routing_hash, count })
+            .collect()
     }
 }
 
@@ -608,5 +713,149 @@ mod tests {
         assert_eq!(page[0].blob, vec![0]);
         assert_eq!(page[2].blob, vec![2]);
         crate::store_db::remove_store_files(&p);
+    }
+
+    // ── Every drop speaks (DISTRO-SYNC-PROOF-DESIGN §6.4) ────────────────
+
+    /// At the global limit the blob is refused, before any eviction, and the
+    /// outcome says so; the hand-off logs it (handoff.rs). Until 2026-10-10
+    /// `enqueue` returned without a word and the hand-off logged "queued".
+    #[test]
+    fn an_enqueue_at_the_global_limit_is_refused_and_says_so() {
+        let mut q = fresh_queue();
+        q.global_limit = 3;
+        let sub = vec![0x61u8; 16];
+        let chan = vec![0x62u8; 16];
+        for i in 0..3u8 {
+            assert_eq!(q.enqueue(sub.clone(), chan.clone(), vec![i], 1024), EnqueueOutcome::Queued);
+        }
+        let refused = q.enqueue(vec![0x63; 16], chan.clone(), vec![9], 1024);
+        assert_eq!(refused, EnqueueOutcome::RefusedGlobalLimit);
+        assert!(!refused.queued());
+        assert_eq!(q.total_len(), 3, "nothing added");
+        assert!(!q.has_pending(&[0x63; 16]));
+        // A full subscriber at the global limit is refused too: no eviction first.
+        assert_eq!(q.enqueue(sub.clone(), chan.clone(), vec![10], 3), EnqueueOutcome::RefusedGlobalLimit);
+        assert_eq!(q.drain(&sub).iter().map(|p| p.blob[0]).collect::<Vec<_>>(), vec![0, 1, 2], "nothing evicted");
+    }
+
+    /// Over the per-subscriber limit the oldest entry goes, and the outcome
+    /// names its routing hash, so the hand-off can say what was lost.
+    #[test]
+    fn an_enqueue_over_the_subscriber_limit_evicts_the_oldest_and_names_it() {
+        let mut q = fresh_queue();
+        let sub = vec![0x71u8; 16];
+        let distro = vec![0xD7u8; 16];
+        let chan = vec![0xC7u8; 16];
+        assert_eq!(q.enqueue(sub.clone(), distro.clone(), b"d-1".to_vec(), 2), EnqueueOutcome::Queued);
+        assert_eq!(q.enqueue(sub.clone(), chan.clone(), b"c-1".to_vec(), 2), EnqueueOutcome::Queued);
+        let outcome = q.enqueue(sub.clone(), chan.clone(), b"c-2".to_vec(), 2);
+        assert_eq!(outcome, EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash: distro.clone() });
+        assert!(outcome.queued());
+        assert_eq!(q.drain(&sub).iter().map(|p| p.blob.clone()).collect::<Vec<_>>(), vec![b"c-1".to_vec(), b"c-2".to_vec()]);
+    }
+
+    /// The hand-off's 64 bound counts one device's entries for one distro:
+    /// its channel posts and other subscribers' entries do not count.
+    #[test]
+    fn count_matching_counts_one_subscribers_entries_for_one_routing_hash() {
+        let mut q = fresh_queue();
+        let device = vec![0x81u8; 16];
+        let other = vec![0x82u8; 16];
+        let distro = vec![0xD8u8; 16];
+        let chan = vec![0xC8u8; 16];
+        enqueue_n(&mut q, &device, &distro, 3);
+        enqueue_n(&mut q, &device, &chan, 5);
+        enqueue_n(&mut q, &other, &distro, 7);
+        assert_eq!(q.count_matching(&device, &distro), 3);
+        assert_eq!(q.count_matching(&device, &chan), 5);
+        assert_eq!(q.count_matching(&other, &distro), 7);
+        assert_eq!(q.count_matching(&other, &chan), 0);
+        assert_eq!(q.count_matching(&[0x83; 16], &distro), 0, "no bucket");
+        let _ = q.drain_channel_batch(&device, &distro, 2);
+        assert_eq!(q.count_matching(&device, &distro), 1, "a pull lowers the count");
+    }
+
+    /// Expiry returns what it evicted, per subscriber and routing hash, and
+    /// keeps what is younger.
+    #[test]
+    fn evict_expired_returns_the_counts_per_subscriber_and_routing_hash() {
+        let p = tmp_path();
+        crate::store_db::remove_store_files(&p);
+        let mut q = DeferredQueue::load(p.clone());
+        let device = vec![0x91u8; 16];
+        let other = vec![0x92u8; 16];
+        let distro = vec![0xD9u8; 16];
+        let chan = vec![0xC9u8; 16];
+        enqueue_n(&mut q, &device, &distro, 2);
+        enqueue_n(&mut q, &device, &chan, 1);
+        enqueue_n(&mut q, &other, &distro, 3);
+
+        assert!(q.evict_expired(3600.0).is_empty(), "nothing is an hour old");
+        assert_eq!(q.total_len(), 6);
+
+        // A negative age puts the threshold in the future: everything expires.
+        let mut expired = q.evict_expired(-10.0);
+        expired.sort_by(|a, b| (&a.subscriber_hash, &a.routing_hash).cmp(&(&b.subscriber_hash, &b.routing_hash)));
+        assert_eq!(
+            expired,
+            vec![
+                Expired { subscriber_hash: device.clone(), routing_hash: chan.clone(), count: 1 },
+                Expired { subscriber_hash: device.clone(), routing_hash: distro.clone(), count: 2 },
+                Expired { subscriber_hash: other.clone(), routing_hash: distro.clone(), count: 3 },
+            ]
+        );
+        assert_eq!(q.total_len(), 0);
+        assert!(q.evict_expired(-10.0).is_empty(), "each entry is counted once");
+        drop(q);
+        assert_eq!(DeferredQueue::load(p.clone()).total_len(), 0, "the rows are gone too");
+        crate::store_db::remove_store_files(&p);
+    }
+
+    /// A distro device that lost its entries to expiry is a WARNING, naming
+    /// the device and the distro; any other routing hash is a NOTICE.
+    #[test]
+    fn expiry_is_a_warning_for_a_distro_and_a_notice_otherwise() {
+        let distro = vec![0xDAu8; 16];
+        let lines = expiry_lines(
+            &[
+                Expired { subscriber_hash: vec![0xA1; 16], routing_hash: distro.clone(), count: 4 },
+                Expired { subscriber_hash: vec![0xA2; 16], routing_hash: vec![0xCA; 16], count: 1 },
+            ],
+            |routing| routing == distro.as_slice(),
+            7.0 * 24.0 * 3600.0,
+        );
+        assert_eq!(
+            lines,
+            vec![
+                (
+                    reticulum_rust::LOG_WARNING,
+                    format!("[deferred] 4 distro blob(s) for device {} of {} expired unpulled after 7 days", "a1".repeat(16), "da".repeat(16)),
+                ),
+                (
+                    reticulum_rust::LOG_NOTICE,
+                    format!("[deferred] 1 blob(s) for {} on {} expired unpulled after 7 days", "a2".repeat(16), "ca".repeat(16)),
+                ),
+            ]
+        );
+    }
+
+    /// main.rs takes the counts under the locks it already holds and logs
+    /// them after releasing them: a log write is file I/O.
+    #[test]
+    fn main_logs_expiry_after_releasing_its_locks() {
+        let main = include_str!("main.rs");
+        let start = main.find("enter(\"evict\");").expect("the eviction step");
+        let block = &main[start..start + main[start..].find("last_evict = Instant::now();").expect("its end")];
+        let collect = block.find("expired = q.evict_expired(evict_max_age);").expect("the counts are kept");
+        let lines = block.find("deferred_queue::expiry_lines(&expired,").expect("and logged");
+        assert!(collect < lines);
+        let between = &block[collect..lines];
+        assert!(
+            between.matches('}').count() >= 2,
+            "the queue guard and the node guard are dropped before the lines are written"
+        );
+        assert!(!block[lines..].contains("node.lock()"), "no FedNode lock is held while logging");
+        assert!(!block[lines..].contains("deferred_queue.lock()"), "nor the queue's");
     }
 }

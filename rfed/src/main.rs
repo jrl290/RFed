@@ -942,9 +942,26 @@ fn main() -> Result<(), String> {
         // Evict stale deferred-queue entries for gone-forever subscribers.
         enter("evict");
         if last_evict.elapsed() >= evict_interval {
+            // What expired is kept under the locks and said after they are
+            // released (DESIGN_PRINCIPLES §2): a distro device that never
+            // pulled loses its entries here, and until 2026-10-10 nothing
+            // said so.
+            let mut expired = Vec::new();
+            let mut distro_table = None;
             if let Ok(guard) = node.lock() {
                 if let Ok(mut q) = guard.deferred_queue.lock() {
-                    q.evict_expired(evict_max_age);
+                    expired = q.evict_expired(evict_max_age);
+                }
+                if !expired.is_empty() {
+                    distro_table = Some(Arc::clone(&guard.distro_table));
+                }
+            }
+            if !expired.is_empty() {
+                let distros = distro_table
+                    .and_then(|table| table.lock().ok().map(|table| table.registered_distro_hashes()))
+                    .unwrap_or_default();
+                for (level, line) in deferred_queue::expiry_lines(&expired, |routing| distros.contains(routing), evict_max_age) {
+                    log(line, level, false, false);
                 }
             }
             // Also evict expired LXMF propagation messages
