@@ -1777,6 +1777,13 @@ fn verify_claim(claim: &SyncClaim, transient_id: &[u8], lxmf_data: &[u8]) -> Res
 /// The one verdict line for a stamp-valid distro message that carried a
 /// claim (RFed SPEC §17.13), with whether this node fans it out
 /// (`first_sight`: a message fans out once, on first sight).
+///
+/// It is written before the fan-out, so it says what kind of fan-out follows
+/// and never how a device fared: an accepted proof's hand-off still pushes a
+/// device at a bound of §17.3, and the queue's global limit can refuse its
+/// blob. Each device's `[handoff]` line says what was queued and who was
+/// woken. Until 2026-10-10 this line said "unconfirmed devices queued, not
+/// woken" for every accepted proof, also when a bound woke one.
 fn sync_verdict_line(
     transient_id: &[u8],
     dest_hash: &[u8],
@@ -1788,7 +1795,7 @@ fn sync_verdict_line(
     match (verdict, first_sight) {
         (Ok(()), true) => (
             LOG_NOTICE,
-            format!("[distro-sync] {id} for {distro}: proof accepted, unconfirmed devices queued, not woken"),
+            format!("[distro-sync] {id} for {distro}: proof accepted, fanning out as distro sync (each [handoff] line says whether its device was woken)"),
         ),
         (Ok(()), false) => (
             LOG_NOTICE,
@@ -1958,6 +1965,12 @@ impl DeliveryHandles {
             Some(&self.link_sessions),
             self.distro_hand_off(Arc::clone(&self.relay_stack), dest_hash, lxmf_data, wake),
         );
+        // The summary names the kind of hand-off and not its outcome: each
+        // hand-off's own `[handoff]` line says whether its blob was queued
+        // (the global limit can refuse it) and whether its device was woken
+        // (a sync hand-off still pushes at a bound of §17.3). Until 2026-10-10
+        // it said "queued … not woken" for every sync hand-off, also for one
+        // a bound woke, and "queued … and pushed" also for a refused blob.
         if handed_off > 0 {
             log(
                 format!(
@@ -1966,8 +1979,8 @@ impl DeliveryHandles {
                     devices.len(),
                     hexrep(dest_hash, false),
                     match wake {
-                        Wake::Push => "queued for /rfed/pull and pushed",
-                        Wake::QueueOnly => "queued for /rfed/pull, not woken (distro sync)",
+                        Wake::Push => "handed off with a push (each [handoff] line says what was queued and who was woken)",
+                        Wake::QueueOnly => "handed off as distro sync, pushed only at a bound (each [handoff] line says what was queued and who was woken)",
                     },
                 ),
                 LOG_NOTICE,
@@ -5261,7 +5274,11 @@ mod tests {
             assert_eq!(verdict.len(), 1, "{verdict:?}");
             assert_eq!(
                 text(&verdict[0]),
-                format!("[distro-sync] {} for {}: proof accepted, unconfirmed devices queued, not woken", hexrep(&id, false), hexrep(&d_hash, false)),
+                format!(
+                    "[distro-sync] {} for {}: proof accepted, fanning out as distro sync (each [handoff] line says whether its device was woken)",
+                    hexrep(&id, false),
+                    hexrep(&d_hash, false),
+                ),
             );
         }
 
@@ -5284,13 +5301,47 @@ mod tests {
             assert_eq!((rig.rows(&sender, &d_hash), rig.rows(&sibling, &d_hash)), (1, 1));
             assert_eq!(rig.wakes(), 0, "nobody woken");
             let lines = mark.lines();
-            assert!(lines.iter().any(|l| l.contains("proof accepted, unconfirmed devices queued, not woken")), "{lines:?}");
+            assert!(lines.iter().any(|l| l.contains("proof accepted, fanning out as distro sync")), "{lines:?}");
             assert!(lines.iter().any(|l| l.ends_with(&format!(
-                "[distro] 2 of 2 device(s) with no live session for distro {} — queued for /rfed/pull, not woken (distro sync)",
+                "[distro] 2 of 2 device(s) with no live session for distro {} — handed off as distro sync, pushed only at a bound (each [handoff] line says what was queued and who was woken)",
                 hexrep(&d_hash, false),
             ))), "{lines:?}");
             assert_eq!(lines.iter().filter(|l| l.contains("NOT woken (distro sync, 1 of 64 un-pulled)")).count(), 2);
             assert!(mark.containing("[distro-sync] batch").is_empty(), "a clean batch writes no summary");
+        }
+
+        /// At a bound of §17.3 an accepted proof's hand-off pushes after all,
+        /// and no line of the upload says otherwise: the verdict and the
+        /// fan-out's summary name the kind of fan-out, and the `[handoff]`
+        /// lines say who was woken. (Until 2026-10-10 the verdict said "not
+        /// woken" and the summary "queued for /rfed/pull, not woken" here,
+        /// beside the `[handoff]` line that woke the device.)
+        #[test]
+        fn at_a_bound_no_line_says_a_woken_device_was_not_woken() {
+            let rig = Rig::new("bound_lines", 0);
+            let (d, d_hash) = distro();
+            let device = rig.device(&d_hash);
+            {
+                let mut queue = rig.queue.lock().unwrap();
+                for n in 0..63u8 {
+                    queue.enqueue(device.queue_key.clone(), d_hash.clone(), vec![n], 256);
+                }
+            }
+            let (sealed, message) = sealed_message(&d, &d_hash, 6);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], Some(vec![own_claim(&d, &sealed)])));
+
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (64, 1), "the 64th un-pulled blob wakes its device");
+            let lines = mark.lines();
+            assert!(lines.iter().any(|l| l.ends_with(&format!(
+                "[handoff] distro sync for {} of {} woken anyway: 64 un-pulled",
+                hexrep(&device.wake_key, false),
+                hexrep(&d_hash, false),
+            ))), "{lines:?}");
+            assert!(lines.iter().any(|l| l.contains("queued for pull, woken via 1 of 1 notify registration(s)")), "{lines:?}");
+            for line in &lines {
+                assert!(!line.to_lowercase().contains("not woken"), "a line denies the wake: {line}");
+            }
         }
 
         /// The regression guard: with no claim, a signature over another
@@ -5342,7 +5393,7 @@ mod tests {
                 let verdicts = mark.containing("[distro-sync] ");
                 if claims(&sealed).is_none() {
                     assert!(verdicts.is_empty(), "{case}: no claim, no verdict: {verdicts:?}");
-                    assert!(mark.lines().iter().any(|l| l.contains("queued for /rfed/pull and pushed")), "{case}");
+                    assert!(mark.lines().iter().any(|l| l.contains("— handed off with a push (each [handoff] line says")), "{case}");
                 } else {
                     assert_eq!(verdicts.len(), 2, "{case}: the verdict and the batch summary: {verdicts:?}");
                     assert!(verdicts[0].contains("[Warning]"), "{case}: {}", verdicts[0]);

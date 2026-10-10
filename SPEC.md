@@ -3638,7 +3638,7 @@ upload as an ordinary one, with a wake.
 that carried a claim, one verdict after the usual `[distro] intercepted …`
 line:
 
-    [distro-sync] <id> for <D>: proof accepted, unconfirmed devices queued, not woken      (NOTICE)
+    [distro-sync] <id> for <D>: proof accepted, fanning out as distro sync (each [handoff] line says whether its device was woken)   (NOTICE)
     [distro-sync] <id> for <D>: proof refused (<reason>), fanning out with wake             (WARNING)
     [distro-sync] <id> for <D>: proof accepted|refused (<reason>), already held: no fan-out
 
@@ -3652,7 +3652,11 @@ peer's batch, or an extension ignored as a whole). The batch's
 `[handoff] <device> unconfirmed for <D>: queued for pull, NOT woken (distro
 sync, <n> of 64 un-pulled)`, or, at a bound, `[handoff] distro sync for
 <device> of <D> woken anyway: <n> un-pulled | queue at <t> of <limit>`
-followed by the usual `[handoff] … woken via …` line.
+followed by the usual `[handoff] … woken via …` line. Only the `[handoff]`
+lines say whether a device was woken: the verdict is written before the
+fan-out, and the fan-out's `[distro] … — handed off as distro sync, pushed
+only at a bound` summary does not count the hand-offs, so neither claims a
+wake or its absence.
 
 **Not covered** (these still wake devices): sync from clients that do not
 seal, and entries owed before sealing; uploads to any node but the
