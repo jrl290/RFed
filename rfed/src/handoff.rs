@@ -122,9 +122,13 @@ pub struct HandOffOutcome {
     /// A wake left through at least one of the recipient's notify
     /// registrations: "woken via n of m", n > 0.
     pub woken: bool,
-    /// Why a [`Wake::QueueOnly`] hand-off pushed after all: the bound its
-    /// "woken anyway: …" line names, or "deferred queue poisoned". `None`
-    /// for a hand-off that pushes by kind, and for one that did not push.
+    /// Why a [`Wake::QueueOnly`] hand-off tried the push after all: the
+    /// bounds its "woken anyway: …" (or "at a bound, but NOT woken: …") line
+    /// names, joined by ", " when both hold ("64 un-pulled, queue at 3072 of
+    /// 4096"), or "deferred queue poisoned". Set whether or not a wake left:
+    /// `woken` says that, and the fan-out names it only for a woken device.
+    /// `None` for a hand-off that pushes by kind, and for a sync hand-off
+    /// that held its push back.
     pub pushed_because: Option<String>,
 }
 
@@ -303,9 +307,10 @@ pub const DISTRO_SYNC_UNWOKEN_LIMIT: usize = 64;
 /// the distro and the whole queue. The hand-off pushes after all, as `Push`
 /// does, when the device then holds [`DISTRO_SYNC_UNWOKEN_LIMIT`] or more, or
 /// when the queue held three quarters of its global limit or more: both
-/// counts, read at the hand-off, never a clock. Otherwise it logs, with the
-/// lock released, that the device was not woken, and never reads the notify
-/// registry. Either way it returns what its `[handoff]` line says.
+/// counts, read at the hand-off, never a clock. After that push it names the
+/// bound, as "woken anyway" only when a wake left. Otherwise it logs, with
+/// the lock released, that the device was not woken, and never reads the
+/// notify registry. Either way it returns what its `[handoff]` lines say.
 pub fn distro_hand_off(
     stack: Arc<dyn RelayStack + Send + Sync>,
     deferred_queue: Arc<Mutex<DeferredQueue>>,
@@ -350,19 +355,30 @@ pub fn distro_hand_off(
         }
         let queued = Queueing::Done(outcome);
         if !why.is_empty() {
-            log(
+            let why = why.join(", ");
+            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &queued);
+            // Written after the wake, so it says what the wake came to: a
+            // device with no notify registration, or none a wake left
+            // through, was not woken, bound or not. Until 2026-10-10 this
+            // line came first and said "woken anyway" before the wake was
+            // tried, also for a device the wake then missed.
+            let line = if handed.woken {
                 format!(
                     "[handoff] distro sync for {} of {} woken anyway: {}",
                     hexrep(&device.wake_key, false),
                     hexrep(&distro_hash, false),
-                    why.join(", "),
-                ),
-                LOG_NOTICE,
-                false,
-                false,
-            );
-            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &queued);
-            return HandOffOutcome { pushed_because: Some(why.join(", ")), ..handed };
+                    why,
+                )
+            } else {
+                format!(
+                    "[handoff] distro sync for {} of {} at a bound, but NOT woken: {}",
+                    hexrep(&device.wake_key, false),
+                    hexrep(&distro_hash, false),
+                    why,
+                )
+            };
+            log(line, LOG_NOTICE, false, false);
+            return HandOffOutcome { pushed_because: Some(why), ..handed };
         }
         log_eviction(&device, &distro_hash, &queued);
         log(
@@ -579,12 +595,12 @@ mod tests {
         );
         let lines = mark.containing("[handoff] ");
         assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(lines[0].ends_with(&format!(
+        assert!(lines[0].contains("queued for pull, woken via 1 of 1 notify registration(s)"), "{}", lines[0]);
+        assert!(lines[1].ends_with(&format!(
             "[handoff] distro sync for {} of {} woken anyway: 64 un-pulled",
             hexrep(&device.wake_key, false),
             hexrep(&distro, false),
-        )), "{}", lines[0]);
-        assert!(lines[1].contains("queued for pull, woken via 1 of 1 notify registration(s)"), "{}", lines[1]);
+        )), "after the wake it names: {}", lines[1]);
 
         hand_off(device.clone());
         assert_eq!(rig.wakes(), 2, "and every one after it while the backlog stands");
@@ -613,8 +629,45 @@ mod tests {
         hand_off(device.clone());
         assert_eq!(rig.wakes(), 1, "3072 queued: woken");
         let lines = mark.containing("[handoff] ");
-        assert!(lines[0].ends_with("woken anyway: queue at 3072 of 4096"), "{}", lines[0]);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[1].ends_with("woken anyway: queue at 3072 of 4096"), "{}", lines[1]);
         assert_eq!(rig.queue.lock().unwrap().count_matching(&device.queue_key, &distro), 2, "both queued");
+    }
+
+    /// At a bound, a device with no notify registration is pushed through
+    /// none: no line says it was woken. The pinned line says "woken via 0 of
+    /// 0", the bound line after it "at a bound, but NOT woken", and the
+    /// outcome is not woken, so the fan-out counts it so (James, 2026-10-10:
+    /// a line never claims what did not happen).
+    #[test]
+    fn at_a_bound_a_device_no_wake_left_for_is_not_called_woken() {
+        let rig = Rig::new("bound_unwoken");
+        let device = Unconfirmed { queue_key: vec![0x35; 16], wake_key: vec![0x35 ^ 0xFF; 16] };
+        let distro = vec![0xD3; 16];
+        {
+            let mut queue = rig.queue.lock().unwrap();
+            for n in 0..63u8 {
+                queue.enqueue(device.queue_key.clone(), distro.clone(), vec![n], 256);
+            }
+        }
+        let mark = crate::test_log::mark();
+        let handed = rig.hand_off(&distro, b"sync", Wake::QueueOnly)(device.clone());
+
+        assert_eq!(rig.wakes(), 0);
+        assert_eq!(
+            handed,
+            HandOffOutcome { queued: true, woken: false, pushed_because: Some("64 un-pulled".into()) },
+            "queued, not woken; the bound is why the push was tried",
+        );
+        let lines = mark.containing("[handoff] ");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("queued for pull, woken via 0 of 0 notify registration(s)"), "{}", lines[0]);
+        assert!(lines[1].ends_with(&format!(
+            "[handoff] distro sync for {} of {} at a bound, but NOT woken: 64 un-pulled",
+            hexrep(&device.wake_key, false),
+            hexrep(&distro, false),
+        )), "{}", lines[1]);
+        assert!(!lines.iter().any(|l| l.contains("woken anyway")), "{lines:?}");
     }
 
     /// The review's case: at 4095, a QueueOnly enqueue followed by a Push
@@ -740,10 +793,10 @@ mod tests {
             let (wakes, lines, held) = run(oldest_is_distro);
             assert_eq!(held, 64, "oldest is the distro's: {oldest_is_distro}");
             assert_eq!(wakes, 1, "the 64th un-pulled wakes (oldest is the distro's: {oldest_is_distro})");
-            assert_eq!(lines.len(), 3, "bound, eviction, push: {lines:?}");
-            assert!(lines[0].ends_with("woken anyway: 64 un-pulled"), "oldest is the distro's: {oldest_is_distro}: {}", lines[0]);
-            assert!(lines[1].contains("bucket full: its oldest entry, for "), "{}", lines[1]);
-            assert!(lines[2].contains("queued for pull, woken via 1 of 1"), "{}", lines[2]);
+            assert_eq!(lines.len(), 3, "eviction, push, bound: {lines:?}");
+            assert!(lines[0].contains("bucket full: its oldest entry, for "), "{}", lines[0]);
+            assert!(lines[1].contains("queued for pull, woken via 1 of 1"), "{}", lines[1]);
+            assert!(lines[2].ends_with("woken anyway: 64 un-pulled"), "oldest is the distro's: {oldest_is_distro}: {}", lines[2]);
         }
 
         // Below the bound the count shows in the quiet line: 10 of D's

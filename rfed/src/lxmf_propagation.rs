@@ -1822,7 +1822,8 @@ fn verdict_names(transient_id: &[u8], dest_hash: &[u8]) -> String {
 /// counts): "pushed live" is a push on a live session whose proof is still
 /// to come, not a delivery; "queued" and "woken" are the hand-offs made in
 /// the fan-out, with why a bound of §17.3 woke a device after all. A live
-/// push left unproven is handed off after this line, and only that
+/// push left unproven is handed off on a thread of its own, which runs
+/// before or after this line and is never counted by it: only that
 /// hand-off's own `[handoff]` line says what it came to. Until 2026-10-10
 /// this line was written before the fan-out and said only what kind of
 /// fan-out followed; before that it said "unconfirmed devices queued, not
@@ -2094,11 +2095,15 @@ impl DeliveryHandles {
         // did, as their own `[handoff]` lines say it: a blob the global limit
         // refused is not counted queued, and a sync hand-off a bound of §17.3
         // pushed is counted woken, with why (James, 2026-10-10: real counts).
-        // A live push left unproven is handed off after this line, which
-        // does not count it. Until 2026-10-10 it named only the kind of
-        // hand-off; before that it said "queued … not woken" for every sync
-        // hand-off, also for one a bound woke, and "queued … and pushed"
-        // also for a refused blob.
+        // A live push left unproven is handed off on a thread of its own,
+        // before or after this line, and is never counted in it. The kind is
+        // named, never claimed as done: a Push hand-off is "to be woken",
+        // and "<w> woken" says how many a wake left for (a device with no
+        // notify registration is not). Until 2026-10-10 it named only the
+        // kind of hand-off ("with a push", also when no push went out);
+        // before that it said "queued … not woken" for every sync hand-off,
+        // also for one a bound woke, and "queued … and pushed" also for a
+        // refused blob.
         if fanned.handed_off > 0 {
             log(
                 format!(
@@ -2107,7 +2112,7 @@ impl DeliveryHandles {
                     fanned.devices,
                     hexrep(dest_hash, false),
                     match wake {
-                        Wake::Push => "with a push",
+                        Wake::Push => "to be woken",
                         Wake::QueueOnly => "as distro sync",
                     },
                     fanned.hand_offs_said(),
@@ -5544,6 +5549,61 @@ mod tests {
             );
         }
 
+        /// A device with no notify registration is never called woken: a
+        /// Push hand-off's summary says "to be woken: 1 queued, 0 woken", and
+        /// at a bound of §17.3 a sync hand-off's bound line, its summary and
+        /// the verdict all say it was not woken (James, 2026-10-10: a line
+        /// never claims what did not happen).
+        #[test]
+        fn a_device_no_wake_left_for_is_counted_not_woken_in_every_line() {
+            let (d, d_hash) = distro();
+            // No claim: a Push hand-off, and no registration to push through.
+            let rig = Rig::new("push_unwoken", 0);
+            let device = rig.device(&d_hash);
+            rig.notify.lock().unwrap().unregister(&device.wake_key, None, &hexrep(&rig.relay_hash, false));
+            let (_, message) = sealed_message(&d, &d_hash, 0x50);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], None));
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (1, 0));
+            let lines: Vec<String> = mark.lines().iter().map(|l| text(l).to_string()).collect();
+            assert!(lines.contains(&format!(
+                "[distro] 1 of 1 device(s) with no live session for distro {} — handed off to be woken: 1 queued, 0 woken",
+                hexrep(&d_hash, false),
+            )), "{lines:?}");
+            assert!(lines.iter().any(|l| l.ends_with("queued for pull, woken via 0 of 0 notify registration(s)")), "{lines:?}");
+
+            // An accepted claim at the 64 bound, and no registration.
+            let rig = Rig::new("bound_unwoken", 0);
+            let device = rig.device(&d_hash);
+            rig.notify.lock().unwrap().unregister(&device.wake_key, None, &hexrep(&rig.relay_hash, false));
+            {
+                let mut queue = rig.queue.lock().unwrap();
+                for n in 0..63u8 {
+                    queue.enqueue(device.queue_key.clone(), d_hash.clone(), vec![n], 256);
+                }
+            }
+            let (sealed, message) = sealed_message(&d, &d_hash, 0x51);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], Some(vec![own_claim(&d, &sealed)])));
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (64, 0));
+            let lines: Vec<String> = mark.lines().iter().map(|l| text(l).to_string()).collect();
+            assert!(lines.contains(&format!(
+                "[handoff] distro sync for {} of {} at a bound, but NOT woken: 64 un-pulled",
+                hexrep(&device.wake_key, false),
+                hexrep(&d_hash, false),
+            )), "{lines:?}");
+            assert!(lines.contains(&format!(
+                "[distro] 1 of 1 device(s) with no live session for distro {} — handed off as distro sync: 1 queued, 0 woken",
+                hexrep(&d_hash, false),
+            )), "{lines:?}");
+            assert!(lines.contains(&format!(
+                "[distro-sync] {} for {}: proof accepted: 0 pushed live, 1 queued, 0 woken",
+                hexrep(&sync_transient_id(&sealed)[..16], false),
+                hexrep(&d_hash, false),
+            )), "{lines:?}");
+            assert!(!lines.iter().any(|l| l.contains("woken anyway")), "{lines:?}");
+        }
+
         /// The regression guard: with no claim, a signature over another
         /// message, a stranger's key, or a claim signed with another key
         /// for a stranger's message to D, the hand-off is today's: one
@@ -5594,7 +5654,7 @@ mod tests {
                 if claims(&sealed).is_none() {
                     assert!(verdicts.is_empty(), "{case}: no claim, no verdict: {verdicts:?}");
                     assert!(mark.lines().iter().any(|l| l.ends_with(&format!(
-                        "[distro] 1 of 1 device(s) with no live session for distro {} — handed off with a push: 1 queued, 1 woken",
+                        "[distro] 1 of 1 device(s) with no live session for distro {} — handed off to be woken: 1 queued, 1 woken",
                         hexrep(&d_hash, false),
                     ))), "{case}: {:?}", mark.lines());
                 } else {

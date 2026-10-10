@@ -767,9 +767,10 @@ pub fn distro_fanout(
 /// returns, for the summary lines written after it (James, 2026-10-10: real
 /// counts). Each count is true when it is read. A live push is counted as
 /// pushed, not delivered: its proof (the rfed.link response, the stream's
-/// link proof) is still to come, and a push left unproven is handed off
-/// later, on a thread of its own; only that hand-off's own `[handoff]` line
-/// says what it came to.
+/// link proof) is still to come, and a push left unproven is handed off on
+/// a thread of its own, before or after the summary lines, and is never
+/// counted here; only that hand-off's own `[handoff]` line says what it came
+/// to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DistroFanout {
     /// The devices fanned out to: the distro's registrations, snapshotted.
@@ -784,8 +785,9 @@ pub struct DistroFanout {
     /// Of those handed off, the ones a wake left for.
     pub woken: usize,
     /// For each woken device a §17.13 sync hand-off pushed after all, why
-    /// (its "woken anyway" bound, or "deferred queue poisoned"), in fan-out
-    /// order. Empty for a fan-out whose hand-offs push by kind.
+    /// (its "woken anyway" bounds, joined by ", " when both hold, or
+    /// "deferred queue poisoned"), in fan-out order. Empty for a fan-out
+    /// whose hand-offs push by kind.
     pub woken_because: Vec<String>,
     /// With an invalid key and no live session: not delivered, not queued,
     /// not woken.
@@ -804,8 +806,10 @@ impl DistroFanout {
 
     /// The hand-offs as the summary lines count them: "<q> queued, <w>
     /// woken", with why each was woken when a sync hand-off pushed after
-    /// all ("(64 un-pulled; queue at 3072 of 4096)"), then "<n> NOT queued"
-    /// for the hand-offs whose blob could not be queued, when there are any.
+    /// all, one device's bounds joined by ", " and the devices by "; "
+    /// ("(64 un-pulled, queue at 3072 of 4096; queue at 3073 of 4096)"),
+    /// then "<n> NOT queued" for the hand-offs whose blob could not be
+    /// queued, when there are any.
     pub fn hand_offs_said(&self) -> String {
         let mut said = format!("{} queued, {} woken", self.queued, self.woken);
         if !self.woken_because.is_empty() {
