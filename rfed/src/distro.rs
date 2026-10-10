@@ -598,10 +598,13 @@ fn stream_unproven_hook(on_unconfirmed: &OnUnconfirmed, entry: &DistroEntry) -> 
 /// Deliver `lxmf_blob` to every device of the distro the way a propagated
 /// message reaches its recipient (lxmf_propagation `dispatch_live_or_notify`):
 /// live on the device's `rfed.link` session, or else on its
-/// `rfed.propagation.stream`, and otherwise queued for `/rfed/pull` and
-/// pushed at once. Every device not confirmed goes to `on_unconfirmed` (build
-/// it with [`defer_then_wake`]). Returns how many devices were handed off here
-/// and now; the live tiers' hand-offs come later.
+/// `rfed.propagation.stream`, and otherwise handed off at once. Every device
+/// not confirmed goes to `on_unconfirmed` (build it with
+/// [`crate::handoff::distro_hand_off`]), which queues the blob for
+/// `/rfed/pull` and pushes the device, or for a blob with an accepted §17.13
+/// sync proof queues it without a push; its `[handoff]` line says which.
+/// Returns how many devices were handed off here and now; the live tiers'
+/// hand-offs come later.
 ///
 /// A delivery is confirmed only by the rfed.link response (Link.md "The
 /// response is the delivery proof") or the stream's link proof
@@ -710,7 +713,7 @@ pub fn distro_fanout(
                 if result.had_sessions() {
                     log(
                         format!(
-                            "[distro] stream delivery failed for device {} — queueing and pushing",
+                            "[distro] stream delivery failed for device {} — handing off",
                             hexrep(&entry.device_lxmf_hash, false),
                         ),
                         LOG_WARNING,
@@ -721,12 +724,12 @@ pub fn distro_fanout(
             }
         }
 
-        // ── No live session: queue for /rfed/pull and push now ───────
+        // ── No live session: hand off now ────────────────────────────
         match device {
             Some(device) => {
                 log(
                     format!(
-                        "[distro] device {} has no live session — queueing for /rfed/pull and pushing",
+                        "[distro] device {} has no live session — handing off",
                         hexrep(&entry.device_lxmf_hash, false),
                     ),
                     LOG_NOTICE,
@@ -894,6 +897,57 @@ mod tests {
         for forbidden in ["Packet::new(", ".send(", "has_path("] {
             assert!(!body.contains(forbidden), "distro_fanout must not use {forbidden}");
         }
+    }
+
+    /// The fan-out hands a device off; the hand-off decides whether it is
+    /// pushed and says so in its `[handoff]` line. So the fan-out's own lines
+    /// promise no push (a §17.13 sync hand-off makes none).
+    #[test]
+    fn the_distro_fanout_says_handing_off_not_pushing() {
+        let source = include_str!("distro.rs");
+        let start = source.find("pub fn distro_fanout(").expect("distro_fanout");
+        let end = start + source[start..].find("\n}\n").expect("distro_fanout closes");
+        let body = &source[start..end];
+        assert!(!body.contains("pushing"), "distro_fanout must not promise a push");
+        assert!(body.contains("\"[distro] stream delivery failed for device {} — handing off\","));
+        assert!(body.contains("\"[distro] device {} has no live session — handing off\","));
+    }
+
+    /// A §17.13 sync hand-off at the late hand-off points: the stream tier's
+    /// unproven push (and an unanswered rfed.link push, whose `on_failed`
+    /// calls the same closure with the same device) ends in one enqueue and
+    /// no wake.
+    #[test]
+    fn a_sync_hand_off_at_the_late_points_queues_once_and_wakes_no_one() {
+        let dir = temp_path("late_sync_hand_off");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let queue = Arc::new(Mutex::new(DeferredQueue::load(dir.join("deferred.rmp"))));
+        let notify = Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp"))));
+        let (device_identity, entry, _) = real_device(&[0xD9; 16]);
+        let device = expected_hand_off(&device_identity, &entry);
+        let relay = Identity::new(true);
+        let relay_hash = Destination::hash(relay.hash.as_deref(), "rfed", &["notify"]);
+        let relay_public = Identity::from_public_key(&relay.get_public_key().expect("relay key")).expect("relay");
+        notify.lock().unwrap().register(entry.device_lxmf_hash.clone(), None, hexrep(&relay_hash, false));
+        let stack = Arc::new(FakeStack::new(&relay_hash, Some(relay_public)));
+        let distro = vec![0xD9; 16];
+        let on_unconfirmed = crate::handoff::distro_hand_off(
+            Arc::clone(&stack) as Arc<dyn RelayStack + Send + Sync>,
+            Arc::clone(&queue),
+            Arc::clone(&notify),
+            Arc::new(|_| 256),
+            &distro,
+            &[0xAB; 40],
+            crate::handoff::Wake::QueueOnly,
+        );
+
+        let unproven = super::stream_unproven_hook(&on_unconfirmed, &entry).expect("a hook for a valid device");
+        unproven();
+        assert_eq!(queue.lock().unwrap().count_matching(&device.queue_key, &distro), 1, "the stream's: one enqueue");
+        on_unconfirmed(device.clone());
+        assert_eq!(queue.lock().unwrap().count_matching(&device.queue_key, &distro), 2, "rfed.link's: one more");
+        assert!(stack.packets.lock().unwrap().is_empty(), "and no wake");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // ── defer_then_wake ──────────────────────────────────────────────────

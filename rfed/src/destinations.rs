@@ -747,9 +747,11 @@ fn run_sync_dispatch(routing_hash: &[u8], blob: &[u8], dispatch: SyncDispatch, c
             // a stream and never answered (Link.md) — is queued for
             // /rfed/pull and woken. Until 2026-09-26 this caller woke by
             // the device's identity hash, which no registration is
-            // stored under, so it woke no one.
+            // stored under, so it woke no one. A blob FedSync delivers
+            // carries no §17.13 sync proof (SPEC §17.13 "Not covered"),
+            // so its hand-off always pushes.
             let config = ctx.config.clone();
-            let on_unconfirmed = crate::handoff::defer_then_wake(
+            let on_unconfirmed = crate::handoff::distro_hand_off(
                 Arc::new(crate::notify::rns::LiveStack),
                 Arc::clone(&ctx.deferred_queue),
                 Arc::clone(&ctx.notify_registry),
@@ -758,7 +760,7 @@ fn run_sync_dispatch(routing_hash: &[u8], blob: &[u8], dispatch: SyncDispatch, c
                 }),
                 routing_hash,
                 blob,
-                None,
+                crate::handoff::Wake::Push,
             );
             if let Ok(hooks) = ctx.hook_registry.lock() {
                 crate::distro::distro_fanout(
@@ -4916,12 +4918,14 @@ mod fanout_lock_scope_tests {
     }
 
     /// The federation-sync distro fan-out hands every device it cannot
-    /// confirm to `defer_then_wake`, which queues under the identity hash and
-    /// wakes under the lxmf.delivery hash. Until 2026-09-26 this caller did
-    /// both itself and woke by the identity hash, under which no registration
-    /// is stored: no device was ever woken from here.
+    /// confirm to the one distro hand-off builder, `handoff::distro_hand_off`,
+    /// with `Wake::Push`: it queues under the identity hash and wakes under
+    /// the lxmf.delivery hash. Until 2026-09-26 this caller did both itself
+    /// and woke by the identity hash, under which no registration is stored:
+    /// no device was ever woken from here. FedSync carries no §17.13 proof,
+    /// so it never hands off without a push.
     #[test]
-    fn federation_sync_distro_fanout_hands_off_through_defer_then_wake() {
+    fn federation_sync_distro_fanout_hands_off_through_distro_hand_off() {
         let source = destinations_source();
         let start = source
             .find("// ── Distro fanout ────────────")
@@ -4931,7 +4935,10 @@ mod fanout_lock_scope_tests {
                 .find("crate::distro::distro_fanout(")
                 .expect("the fan-out call follows its hand-off");
         let block = &source[start..end];
-        assert!(block.contains("crate::handoff::defer_then_wake("), "the hand-off is defer_then_wake");
+        assert!(block.contains("crate::handoff::distro_hand_off("), "the hand-off is the distro builder");
+        assert!(block.contains("crate::handoff::Wake::Push,"), "and it pushes");
+        assert!(!block.contains("Wake::QueueOnly"), "FedSync never hands off without a push");
+        assert!(!block.contains("defer_then_wake("), "no hand-off built by hand");
         assert!(!block.contains("get_for_channel("), "no wake of its own, under any key");
         assert!(!block.contains(".enqueue("), "no queueing of its own");
     }
