@@ -12,7 +12,9 @@
 //! points (propagation ingest and FedSync), so the class has one builder. A
 //! blob that came with an accepted §17.13 sync proof is queued and not pushed
 //! ([`Wake::QueueOnly`]), within two count bounds; everything else is pushed
-//! ([`Wake::Push`]).
+//! ([`Wake::Push`]). A distro hand-off returns what its `[handoff]` line says
+//! ([`HandOffOutcome`]), and the fan-out counts those for the summary lines
+//! it writes after it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -101,8 +103,30 @@ pub struct Unconfirmed {
 }
 
 /// What a fan-out does with a recipient it could not confirm. Build it with
-/// [`defer_then_wake`] (a channel's), or [`distro_hand_off`] (a distro's).
+/// [`defer_then_wake`] (a channel's), or [`distro_hand_off`] (a distro's,
+/// which also says what it came to: [`DistroHandOff`]).
 pub type OnUnconfirmed = Arc<dyn Fn(Unconfirmed) + Send + Sync>;
+
+/// What a distro fan-out does with a device it could not confirm, and what
+/// that came to. Build it with [`distro_hand_off`].
+pub type DistroHandOff = Arc<dyn Fn(Unconfirmed) -> HandOffOutcome + Send + Sync>;
+
+/// What one hand-off came to, as its `[handoff]` line says it. The distro
+/// fan-out counts these for its summary lines, which are written after it
+/// (James, 2026-10-10: real counts).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HandOffOutcome {
+    /// The blob is in the recipient's deferred bucket: the line's "queued
+    /// for pull".
+    pub queued: bool,
+    /// A wake left through at least one of the recipient's notify
+    /// registrations: "woken via n of m", n > 0.
+    pub woken: bool,
+    /// Why a [`Wake::QueueOnly`] hand-off pushed after all: the bound its
+    /// "woken anyway: …" line names, or "deferred queue poisoned". `None`
+    /// for a hand-off that pushes by kind, and for one that did not push.
+    pub pushed_because: Option<String>,
+}
 
 /// The one hand-off for a recipient a fan-out could not confirm: queue
 /// `blob` under `routing_hash` (a distro's `lxmf.delivery` hash, or a
@@ -121,6 +145,23 @@ pub fn defer_then_wake(
     blob: &[u8],
     wake_channel: Option<&[u8]>,
 ) -> OnUnconfirmed {
+    let hand_off = queue_then_wake(stack, deferred_queue, notify_registry, limit_for, routing_hash, blob, wake_channel);
+    Arc::new(move |recipient: Unconfirmed| {
+        hand_off(recipient);
+    })
+}
+
+/// [`defer_then_wake`]'s hand-off, saying what it came to: the distro
+/// [`Wake::Push`] hand-off is exactly this.
+fn queue_then_wake(
+    stack: Arc<dyn RelayStack + Send + Sync>,
+    deferred_queue: Arc<Mutex<DeferredQueue>>,
+    notify_registry: Arc<Mutex<NotifyRegistry>>,
+    limit_for: Arc<dyn Fn(&[u8]) -> usize + Send + Sync>,
+    routing_hash: &[u8],
+    blob: &[u8],
+    wake_channel: Option<&[u8]>,
+) -> DistroHandOff {
     let routing_hash = routing_hash.to_vec();
     let blob = blob.to_vec();
     let wake_channel = wake_channel.map(<[u8]>::to_vec);
@@ -133,7 +174,7 @@ pub fn defer_then_wake(
             }
             Err(_) => Queueing::Poisoned,
         };
-        wake_after_queueing(&*stack, &notify_registry, &recipient, &routing_hash, wake_channel.as_deref(), &queued);
+        wake_after_queueing(&*stack, &notify_registry, &recipient, &routing_hash, wake_channel.as_deref(), &queued)
     })
 }
 
@@ -190,8 +231,8 @@ fn log_eviction(recipient: &Unconfirmed, routing_hash: &[u8], queued: &Queueing)
 
 /// The push of a hand-off, once its blob is queued (or could not be): wake
 /// `recipient` through its notify registrations for `wake_channel`, then
-/// write the one `[handoff]` line saying what was queued and who was woken.
-/// The line's format is pinned by the staging harnesses
+/// write the one `[handoff]` line saying what was queued and who was woken,
+/// and return the same. The line's format is pinned by the staging harnesses
 /// (test-harnesses staging/lib/distro_channels.test.mjs).
 fn wake_after_queueing(
     stack: &dyn RelayStack,
@@ -200,7 +241,7 @@ fn wake_after_queueing(
     routing_hash: &[u8],
     wake_channel: Option<&[u8]>,
     queued: &Queueing,
-) {
+) -> HandOffOutcome {
     log_eviction(recipient, routing_hash, queued);
     // Snapshot, then wake with the registry released: a wake is a send.
     let registrations: Vec<NotifyRegistration> = match notify_registry.lock() {
@@ -228,6 +269,7 @@ fn wake_after_queueing(
         false,
         false,
     );
+    HandOffOutcome { queued: queued.queued(), woken: woken > 0, pushed_because: None }
 }
 
 /// Whether a distro hand-off pushes the device (RFed SPEC §17.3, §17.13).
@@ -255,14 +297,15 @@ pub const DISTRO_SYNC_UNWOKEN_LIMIT: usize = 64;
 /// (propagation ingest and FedSync): what the fan-out does with a device it
 /// could not confirm, for `blob`, a message to the distro `distro_hash`.
 ///
-/// [`Wake::Push`] is [`defer_then_wake`] with the device's LXMF registrations,
-/// unchanged. [`Wake::QueueOnly`] counts, under the one acquisition of the
-/// queue lock that enqueues, the device's queued blobs of the distro and the
-/// whole queue. The hand-off pushes after all, as `Push` does, when the
-/// device then holds [`DISTRO_SYNC_UNWOKEN_LIMIT`] or more, or when the queue
-/// held three quarters of its global limit or more: both counts, read at the
-/// hand-off, never a clock. Otherwise it logs, with the lock released, that
-/// the device was not woken, and never reads the notify registry.
+/// [`Wake::Push`] is [`defer_then_wake`]'s hand-off with the device's LXMF
+/// registrations, unchanged. [`Wake::QueueOnly`] counts, under the one
+/// acquisition of the queue lock that enqueues, the device's queued blobs of
+/// the distro and the whole queue. The hand-off pushes after all, as `Push`
+/// does, when the device then holds [`DISTRO_SYNC_UNWOKEN_LIMIT`] or more, or
+/// when the queue held three quarters of its global limit or more: both
+/// counts, read at the hand-off, never a clock. Otherwise it logs, with the
+/// lock released, that the device was not woken, and never reads the notify
+/// registry. Either way it returns what its `[handoff]` line says.
 pub fn distro_hand_off(
     stack: Arc<dyn RelayStack + Send + Sync>,
     deferred_queue: Arc<Mutex<DeferredQueue>>,
@@ -271,9 +314,9 @@ pub fn distro_hand_off(
     distro_hash: &[u8],
     blob: &[u8],
     wake: Wake,
-) -> OnUnconfirmed {
+) -> DistroHandOff {
     if wake == Wake::Push {
-        return defer_then_wake(stack, deferred_queue, notify_registry, limit_for, distro_hash, blob, None);
+        return queue_then_wake(stack, deferred_queue, notify_registry, limit_for, distro_hash, blob, None);
     }
     let distro_hash = distro_hash.to_vec();
     let blob = blob.to_vec();
@@ -294,8 +337,8 @@ pub fn distro_hand_off(
         let Some((held, total, global_limit, outcome)) = counted else {
             // Nothing could be queued, so a silence would lose the blob: push,
             // and say it was not queued, as `Push` does.
-            wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &Queueing::Poisoned);
-            return;
+            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &Queueing::Poisoned);
+            return HandOffOutcome { pushed_because: Some("deferred queue poisoned".to_string()), ..handed };
         };
         let un_pulled = un_pulled_after(held, &outcome, &distro_hash);
         let mut why = Vec::new();
@@ -318,8 +361,8 @@ pub fn distro_hand_off(
                 false,
                 false,
             );
-            wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &queued);
-            return;
+            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &queued);
+            return HandOffOutcome { pushed_because: Some(why.join(", ")), ..handed };
         }
         log_eviction(&device, &distro_hash, &queued);
         log(
@@ -334,6 +377,7 @@ pub fn distro_hand_off(
             false,
             false,
         );
+        HandOffOutcome { queued: queued.queued(), woken: false, pushed_because: None }
     })
 }
 
@@ -401,7 +445,7 @@ mod tests {
             device
         }
 
-        fn hand_off(&self, distro: &[u8], blob: &[u8], wake: Wake) -> OnUnconfirmed {
+        fn hand_off(&self, distro: &[u8], blob: &[u8], wake: Wake) -> DistroHandOff {
             distro_hand_off(
                 Arc::clone(&self.stack) as Arc<dyn RelayStack + Send + Sync>,
                 Arc::clone(&self.queue),

@@ -3640,28 +3640,48 @@ forwarded. An RFed before this section reads `data[1]` alone and handles the
 upload as an ordinary one, with a wake.
 
 **What RFed logs.** Nothing per claim. For each stamp-valid distro message
-that carried a claim, one verdict after the usual `[distro] intercepted …`
-line:
+that carried a claim, one verdict, after the usual `[distro] intercepted …`
+line. A refused proof's is written before the fan-out it names:
 
-    [distro-sync] <id> for <D>: proof accepted, fanning out as distro sync (each device's hand-off line says whether it was woken)   (NOTICE)
-    [distro-sync] <id> for <D>: proof refused (<reason>), fanning out with wake             (WARNING)
-    [distro-sync] <id> for <D>: proof accepted|refused (<reason>), already held: no fan-out
+    [distro-sync] <id> for <D>: proof refused (<reason>), fanning out with wake      (WARNING)
+    [distro-sync] <id> for <D>: proof refused (<reason>), already held: no fan-out   (WARNING)
+
+An accepted proof's is written after the fan-out, and counts what it did:
+
+    [distro-sync] <id> for <D>: proof accepted: <l> pushed live, <q> queued, <w> woken (<why>; …)   (NOTICE)
+    [distro-sync] <id> for <D>: proof accepted, already held: no fan-out                             (NOTICE)
+
+Each count is true when the line is written. `<l>`: devices pushed on their
+rfed.link session or propagation.stream, the proof still to come (pushed,
+not delivered). `<q>`: devices with no live session whose blob was queued
+for the pull. `<w>`: devices with no live session a wake left for, each with
+why a bound woke it after all: `<n> un-pulled`, `queue at <t> of <limit>`,
+or `deferred queue poisoned` (the parentheses only when one was woken).
+Then, only when there are any, `, <s> NOT queued` for hand-offs whose blob
+the queue refused, and `, <k> NOT delivered (invalid key)` for devices
+whose registered key yields no identity. A live push that is never proven
+is handed off after the line, which does not count it: that hand-off's own
+`[handoff]` line says what it came to. The fan-out's own summary, written
+after its hand-offs when it made any, counts them the same way:
+
+    [distro] <h> of <n> device(s) with no live session for distro <D> — handed off with a push: <q> queued, <w> woken
+    [distro] <h> of <n> device(s) with no live session for distro <D> — handed off as distro sync: <q> queued, <w> woken (<why>; …)
 
 For an upload whose claims had any problem, one summary:
 
-    [distro-sync] batch from <origin>: <a> accepted, <r> refused, <m> malformed, <d> duplicate, <u> unmatched, <x> ignored
+    [distro-sync] batch from <origin>: <a> accepted, <r> refused, <m> malformed, <d> duplicate, <c> not checked, <u> unmatched, <x> ignored
 
-(unmatched: a claim that matched no stamp-valid distro message; ignored: a
-peer's batch, or an extension ignored as a whole). The batch's
-`[lxmf.prop] processed …` line is unchanged. A sync hand-off writes
-`[handoff] <device> unconfirmed for <D>: queued for pull, NOT woken (distro
-sync, <n> of 64 un-pulled)`, or, at a bound, `[handoff] distro sync for
-<device> of <D> woken anyway: <n> un-pulled | queue at <t> of <limit>`
-followed by the usual `[handoff] … woken via …` line. Only the `[handoff]`
-lines say whether a device was woken: the verdict is written before the
-fan-out, and the fan-out's `[distro] … — handed off as distro sync, pushed
-only at a bound` summary does not count the hand-offs, so neither claims a
-wake or its absence.
+(not checked: a claim whose message RFed dropped, for an invalid stamp or as
+too short for LXMF, so it was never verified; unmatched: a claim that names
+a stamp-valid message that is not a distro message here, or no message of
+the upload; ignored: a peer's batch, or an extension ignored as a whole).
+The batch's `[lxmf.prop] processed …` line is unchanged. A sync hand-off
+writes `[handoff] <device> unconfirmed for <D>: queued for pull, NOT woken
+(distro sync, <n> of 64 un-pulled)`, or, at a bound, `[handoff] distro sync
+for <device> of <D> woken anyway: <n> un-pulled | queue at <t> of <limit>`
+followed by the usual `[handoff] … woken via …` line. Each device's
+`[handoff]` line is the record of that device; the summaries only count
+them.
 
 **Not covered** (these still wake devices): sync from clients that do not
 seal, and entries owed before sealing; uploads to any node but the

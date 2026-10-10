@@ -1472,7 +1472,8 @@ impl LxmfPropagationNode {
     /// registered here: an accepted claim makes that message's fan-out a
     /// sync one (`Wake::QueueOnly`). Logging stays bounded by the stamp-valid
     /// distro messages: one verdict line for each that carried a claim, and
-    /// at most one `[distro-sync]` summary line per batch.
+    /// at most one `[distro-sync]` summary line per batch. A claim whose
+    /// message was dropped for its stamp is counted there as not checked.
     pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8], sender: Option<&Identity>) {
         let Some(PropagationBatch { messages, claims }) = decode_propagation_batch(data) else { return };
         if messages.is_empty() {
@@ -1538,12 +1539,15 @@ impl LxmfPropagationNode {
                 // Fan out to registered devices immediately — but only on
                 // first sight. See `ingest_distro_blob`.
                 let first_sight = delivery.ingest_distro_blob(dest_hash, lxmf_data, &mut stored);
-                if let Some(verdict) = &verdict {
-                    let (level, line) = sync_verdict_line(transient_id, dest_hash, verdict, first_sight);
-                    log(line, level, false, false);
+                // A refused proof's verdict says only what kind of fan-out
+                // follows, so it comes first. An accepted proof's comes after
+                // the fan-out and counts what it did (`accepted_verdict_line`).
+                if let Some(Err(reason)) = verdict {
+                    log(refused_verdict_line(transient_id, dest_hash, reason, first_sight), LOG_WARNING, false, false);
                 }
-                if first_sight {
-                    delivery.distro_fanout(dest_hash, lxmf_data, wake);
+                let fanned = first_sight.then(|| delivery.distro_fanout(dest_hash, lxmf_data, wake));
+                if let Some(Ok(())) = verdict {
+                    log(accepted_verdict_line(transient_id, dest_hash, fanned.as_ref()), LOG_NOTICE, false, false);
                 }
                 continue;
             }
@@ -1578,7 +1582,7 @@ impl LxmfPropagationNode {
         let invalid_stamps = total - validated.len();
         if invalid_stamps > 0 && from_peer.is_none() {
             log(
-                dropped_messages_line(&dropped_messages(&messages, &validated), min_cost, &origin),
+                dropped_messages_line(&dropped_messages(&messages, &validated, &mut sync_claims), min_cost, &origin),
                 LOG_WARNING, false, false,
             );
         }
@@ -1710,12 +1714,17 @@ fn decode_propagation_batch(data: &[u8]) -> Option<PropagationBatch> {
 
 /// The §17.13 sync claims of one batch as ingest uses them (RFed SPEC
 /// §17.13 "At RFed"): each taken by the stamp-valid distro message it names,
-/// verified there, and everything counted for the batch's one summary line.
-/// Nothing is logged per claim.
+/// verified there, or by the dropped message it names, never verified; and
+/// everything counted for the batch's one summary line. Nothing is logged
+/// per claim.
 struct BatchClaims {
     claims: SyncClaims,
     accepted: usize,
     refused: usize,
+    /// Claims whose message `validate_pn_stamps` dropped (an invalid stamp,
+    /// or too short for LXMF): never checked, as their message paid nothing
+    /// (James, 2026-10-10). Until then they were counted unmatched.
+    not_checked: usize,
 }
 
 impl BatchClaims {
@@ -1728,7 +1737,7 @@ impl BatchClaims {
             (Some(_), true) => SyncClaims { ignored: 1, ..SyncClaims::default() },
             (None, _) => SyncClaims::default(),
         };
-        BatchClaims { claims, accepted: 0, refused: 0 }
+        BatchClaims { claims, accepted: 0, refused: 0, not_checked: 0 }
     }
 
     /// The verdict on the claim naming this message, if one does. Called only
@@ -1749,18 +1758,39 @@ impl BatchClaims {
         Some(verdict)
     }
 
+    /// Whether a claim is still to be taken: `dropped_messages` hashes a
+    /// dropped message it does not name only while one is.
+    fn any_open(&self) -> bool {
+        !self.claims.by_id.is_empty()
+    }
+
+    /// Take the claim naming a message `validate_pn_stamps` dropped, if one
+    /// does, as not checked: it is never verified. `transient_id` is the
+    /// dropped message's, as LXMF computes it.
+    fn not_checked(&mut self, transient_id: &[u8]) {
+        let Some(id) = transient_id.get(..lxmf_rust::distro::DISTRO_SYNC_ID_LEN) else { return };
+        let Ok(id) = <[u8; lxmf_rust::distro::DISTRO_SYNC_ID_LEN]>::try_from(id) else { return };
+        if self.claims.by_id.remove(&id).is_some() {
+            self.not_checked += 1;
+        }
+    }
+
     /// The batch's summary line, when its claims had any problem: a refusal,
-    /// a malformed or duplicate claim, a claim that matched no stamp-valid
-    /// distro message (unmatched), or an extension ignored as a whole
-    /// (ignored: a peer's batch, or claims that are not an array of 1 to N).
+    /// a malformed or duplicate claim, a claim whose message was dropped for
+    /// its stamp (not checked), a claim that names no message checked against
+    /// a distro here (unmatched: a stamp-valid message that is not a distro
+    /// message here, or no message of the batch), or an extension ignored as
+    /// a whole (ignored: a peer's batch, or claims that are not an array of
+    /// 1 to N).
     fn summary(&self, origin: &str) -> Option<String> {
         let unmatched = self.claims.by_id.len();
+        let not_checked = self.not_checked;
         let SyncClaims { malformed, duplicate, ignored, .. } = self.claims;
-        if self.refused + malformed + duplicate + unmatched + ignored == 0 {
+        if self.refused + malformed + duplicate + not_checked + unmatched + ignored == 0 {
             return None;
         }
         Some(format!(
-            "[distro-sync] batch from {origin}: {} accepted, {} refused, {malformed} malformed, {duplicate} duplicate, {unmatched} unmatched, {ignored} ignored",
+            "[distro-sync] batch from {origin}: {} accepted, {} refused, {malformed} malformed, {duplicate} duplicate, {not_checked} not checked, {unmatched} unmatched, {ignored} ignored",
             self.accepted, self.refused,
         ))
     }
@@ -1774,41 +1804,56 @@ fn verify_claim(claim: &SyncClaim, transient_id: &[u8], lxmf_data: &[u8]) -> Res
     verify_sync_claim(claim, transient_id, lxmf_data)
 }
 
-/// The one verdict line for a stamp-valid distro message that carried a
-/// claim (RFed SPEC §17.13), with whether this node fans it out
-/// (`first_sight`: a message fans out once, on first sight).
+/// The `<id> for <D>` of a verdict line: the claim's id, `transient_id[0..16]`.
+fn verdict_names(transient_id: &[u8], dest_hash: &[u8]) -> String {
+    format!(
+        "{} for {}",
+        hexrep(&transient_id[..transient_id.len().min(lxmf_rust::distro::DISTRO_SYNC_ID_LEN)], false),
+        hexrep(dest_hash, false),
+    )
+}
+
+/// The verdict line (NOTICE) for a stamp-valid distro message whose claim
+/// was accepted (RFed SPEC §17.13), written after its fan-out: `fanned` is
+/// what the fan-out did, or `None` for a message already held, which this
+/// node does not fan out again (a message fans out once, on first sight).
 ///
-/// It is written before the fan-out, so it says what kind of fan-out follows
-/// and never how a device fared: an accepted proof's hand-off still pushes a
-/// device at a bound of §17.3, and the queue's global limit can refuse its
-/// blob. Each device's `[handoff]` line says what was queued and who was
-/// woken. Until 2026-10-10 this line said "unconfirmed devices queued, not
+/// Every count is true when the line is written (James, 2026-10-10: real
+/// counts): "pushed live" is a push on a live session whose proof is still
+/// to come, not a delivery; "queued" and "woken" are the hand-offs made in
+/// the fan-out, with why a bound of §17.3 woke a device after all. A live
+/// push left unproven is handed off after this line, and only that
+/// hand-off's own `[handoff]` line says what it came to. Until 2026-10-10
+/// this line was written before the fan-out and said only what kind of
+/// fan-out followed; before that it said "unconfirmed devices queued, not
 /// woken" for every accepted proof, also when a bound woke one.
-fn sync_verdict_line(
-    transient_id: &[u8],
-    dest_hash: &[u8],
-    verdict: &Result<(), &'static str>,
-    first_sight: bool,
-) -> (i32, String) {
-    let id = hexrep(&transient_id[..transient_id.len().min(lxmf_rust::distro::DISTRO_SYNC_ID_LEN)], false);
-    let distro = hexrep(dest_hash, false);
-    match (verdict, first_sight) {
-        (Ok(()), true) => (
-            LOG_NOTICE,
-            format!("[distro-sync] {id} for {distro}: proof accepted, fanning out as distro sync (each device's hand-off line says whether it was woken)"),
-        ),
-        (Ok(()), false) => (
-            LOG_NOTICE,
-            format!("[distro-sync] {id} for {distro}: proof accepted, already held: no fan-out"),
-        ),
-        (Err(reason), true) => (
-            LOG_WARNING,
-            format!("[distro-sync] {id} for {distro}: proof refused ({reason}), fanning out with wake"),
-        ),
-        (Err(reason), false) => (
-            LOG_WARNING,
-            format!("[distro-sync] {id} for {distro}: proof refused ({reason}), already held: no fan-out"),
-        ),
+fn accepted_verdict_line(transient_id: &[u8], dest_hash: &[u8], fanned: Option<&crate::distro::DistroFanout>) -> String {
+    let names = verdict_names(transient_id, dest_hash);
+    let Some(fanned) = fanned else {
+        return format!("[distro-sync] {names}: proof accepted, already held: no fan-out");
+    };
+    let mut line = format!(
+        "[distro-sync] {names}: proof accepted: {} pushed live, {}",
+        fanned.pushed_live,
+        fanned.hand_offs_said(),
+    );
+    if fanned.unkeyed > 0 {
+        line.push_str(&format!(", {} NOT delivered (invalid key)", fanned.unkeyed));
+    }
+    line
+}
+
+/// The verdict line (WARNING) for a stamp-valid distro message whose claim
+/// was refused (RFed SPEC §17.13), written before its fan-out, if it gets
+/// one (`first_sight`: a message fans out once, on first sight). It says
+/// what kind of fan-out follows, and nothing of how a device fared: the
+/// fan-out's `[distro]` summary counts that.
+fn refused_verdict_line(transient_id: &[u8], dest_hash: &[u8], reason: &str, first_sight: bool) -> String {
+    let names = verdict_names(transient_id, dest_hash);
+    if first_sight {
+        format!("[distro-sync] {names}: proof refused ({reason}), fanning out with wake")
+    } else {
+        format!("[distro-sync] {names}: proof refused ({reason}), already held: no fan-out")
     }
 }
 
@@ -1834,32 +1879,50 @@ struct DroppedMessages {
     invalid_stamp_ids: Vec<Vec<u8>>,
 }
 
-/// Sort the messages `validate_pn_stamps` dropped from `messages`.
+/// Sort the messages `validate_pn_stamps` dropped from `messages`, and
+/// take the claim each names, if any, as not checked (`claims`).
 /// `validated` is what it returned, in the batch's order (it keeps the
 /// order), so one walk pairs each with its message by bytes; nothing is
 /// hashed for a message that validated, or for a dropped one past the first
-/// few of its kind. The batch is unauthenticated input up to the Resource
-/// limit: until 2026-10-10 every dropped message was hashed and its id kept,
-/// to print four.
+/// few of its kind once no claim of the batch is left open. The batch is
+/// unauthenticated input up to the Resource limit: until 2026-10-10 every
+/// dropped message was hashed and its id kept, to print four. A batch with
+/// claims costs at most one hash per dropped message (claims are at most as
+/// many as the messages, §17.13), and keeps no id past the first few.
 ///
 /// RFed's link stack proves a client's upload before its stamps are checked
 /// (RFed-spec LXMFProp.md §10.5; LXMF proves only when every stamp is valid),
 /// so the sending client takes such a message as delivered: the line built
 /// from this is the one place its drop can be seen.
-fn dropped_messages(messages: &[Vec<u8>], validated: &[(Vec<u8>, Vec<u8>, u32, Vec<u8>)]) -> DroppedMessages {
+fn dropped_messages(
+    messages: &[Vec<u8>],
+    validated: &[(Vec<u8>, Vec<u8>, u32, Vec<u8>)],
+    claims: &mut BatchClaims,
+) -> DroppedMessages {
     let id_of = |message: &[u8]| -> Vec<u8> {
         #[cfg(test)]
         tests::sync_proof_tests::DROPPED_IDS_HASHED.with(|n| n.set(n.get() + 1));
         reticulum_rust::identity::full_hash(&message[..message.len().saturating_sub(lx_stamper::STAMP_SIZE)])
+    };
+    // One dropped message: hashed when it is named, or while a claim of the
+    // batch is open; its claim, if any, is not checked.
+    let mut sort = |message: &[u8], ids: &mut Vec<Vec<u8>>| {
+        let named = ids.len() < DROPPED_IDS_LOGGED;
+        if !named && !claims.any_open() {
+            return;
+        }
+        let id = id_of(message);
+        claims.not_checked(&id);
+        if named {
+            ids.push(id);
+        }
     };
     let mut dropped = DroppedMessages::default();
     let mut next_valid = validated.iter().peekable();
     for message in messages {
         if message.len() <= TOO_SHORT_FOR_LXMF {
             dropped.too_short += 1;
-            if dropped.too_short_ids.len() < DROPPED_IDS_LOGGED {
-                dropped.too_short_ids.push(id_of(message));
-            }
+            sort(message, &mut dropped.too_short_ids);
             continue;
         }
         let this_one = next_valid.peek().is_some_and(|(_, lxmf_data, _, stamp)| {
@@ -1872,9 +1935,7 @@ fn dropped_messages(messages: &[Vec<u8>], validated: &[(Vec<u8>, Vec<u8>, u32, V
             continue;
         }
         dropped.invalid_stamp += 1;
-        if dropped.invalid_stamp_ids.len() < DROPPED_IDS_LOGGED {
-            dropped.invalid_stamp_ids.push(id_of(message));
-        }
+        sort(message, &mut dropped.invalid_stamp_ids);
     }
     dropped
 }
@@ -1999,19 +2060,20 @@ impl DeliveryHandles {
     /// registered devices, every one of them, the sender's own included
     /// (RFed SPEC §17.13: a proof names no device). `wake` is the hand-off's
     /// for a device the fan-out cannot confirm: `QueueOnly` for a message
-    /// with an accepted sync proof, else `Push`.
-    fn distro_fanout(&self, dest_hash: &[u8], lxmf_data: &[u8], wake: Wake) {
+    /// with an accepted sync proof, else `Push`. Returns what the fan-out
+    /// did, counted, for an accepted proof's verdict line.
+    fn distro_fanout(&self, dest_hash: &[u8], lxmf_data: &[u8], wake: Wake) -> crate::distro::DistroFanout {
         // NEVER REMOVE the snapshot-then-drop. The distro_table lock is
         // released before distro_fanout does any network work — holding
         // it across the fan-out wedged /rfed/distro/register in
         // production (see distro::distro_fanout's doc comment).
-        let Some(ref dt) = self.distro_table else { return };
+        let Some(ref dt) = self.distro_table else { return crate::distro::DistroFanout::default() };
         let devices = match dt.lock() {
             Ok(table) => table.devices_snapshot(dest_hash),
             Err(_) => Vec::new(),
         };
         if devices.is_empty() {
-            return;
+            return crate::distro::DistroFanout::default();
         }
         let hook_guard = self.distro_hook_registry.as_ref().and_then(|h| h.lock().ok());
         let default_hooks = crate::notify::HookRegistry::new();
@@ -2019,7 +2081,7 @@ impl DeliveryHandles {
             Some(g) => &**g,
             None => &default_hooks,
         };
-        let handed_off = crate::distro::distro_fanout(
+        let fanned = crate::distro::distro_fanout(
             dest_hash,
             lxmf_data,
             &devices,
@@ -2028,29 +2090,34 @@ impl DeliveryHandles {
             Some(&self.link_sessions),
             self.distro_hand_off(Arc::clone(&self.relay_stack), dest_hash, lxmf_data, wake),
         );
-        // The summary names the kind of hand-off and not its outcome: each
-        // hand-off's own `[handoff]` line says whether its blob was queued
-        // (the global limit can refuse it) and whether its device was woken
-        // (a sync hand-off still pushes at a bound of §17.3). Until 2026-10-10
-        // it said "queued … not woken" for every sync hand-off, also for one
-        // a bound woke, and "queued … and pushed" also for a refused blob.
-        if handed_off > 0 {
+        // The summary is written after the hand-offs and counts what they
+        // did, as their own `[handoff]` lines say it: a blob the global limit
+        // refused is not counted queued, and a sync hand-off a bound of §17.3
+        // pushed is counted woken, with why (James, 2026-10-10: real counts).
+        // A live push left unproven is handed off after this line, which
+        // does not count it. Until 2026-10-10 it named only the kind of
+        // hand-off; before that it said "queued … not woken" for every sync
+        // hand-off, also for one a bound woke, and "queued … and pushed"
+        // also for a refused blob.
+        if fanned.handed_off > 0 {
             log(
                 format!(
-                    "[distro] {} of {} device(s) with no live session for distro {} — {}",
-                    handed_off,
-                    devices.len(),
+                    "[distro] {} of {} device(s) with no live session for distro {} — handed off {}: {}",
+                    fanned.handed_off,
+                    fanned.devices,
                     hexrep(dest_hash, false),
                     match wake {
-                        Wake::Push => "handed off with a push (each hand-off line says what was queued and who was woken)",
-                        Wake::QueueOnly => "handed off as distro sync, pushed only at a bound (each hand-off line says what was queued and who was woken)",
+                        Wake::Push => "with a push",
+                        Wake::QueueOnly => "as distro sync",
                     },
+                    fanned.hand_offs_said(),
                 ),
                 LOG_NOTICE,
                 false,
                 false,
             );
         }
+        fanned
     }
 
     /// What a distro fan-out from propagation ingest does with a device it
@@ -2065,7 +2132,7 @@ impl DeliveryHandles {
         dest_hash: &[u8],
         lxmf_data: &[u8],
         wake: Wake,
-    ) -> crate::distro::OnUnconfirmed {
+    ) -> crate::distro::DistroHandOff {
         match &self.deferred_queue {
             Some(queue) => crate::handoff::distro_hand_off(
                 stack,
@@ -2088,6 +2155,7 @@ impl DeliveryHandles {
                         false,
                         false,
                     );
+                    crate::distro::HandOffOutcome::default()
                 })
             }
         }
@@ -5344,7 +5412,7 @@ mod tests {
             assert_eq!(
                 text(&verdict[0]),
                 format!(
-                    "[distro-sync] {} for {}: proof accepted, fanning out as distro sync (each device's hand-off line says whether it was woken)",
+                    "[distro-sync] {} for {}: proof accepted: 0 pushed live, 1 queued, 0 woken",
                     hexrep(&id, false),
                     hexrep(&d_hash, false),
                 ),
@@ -5355,7 +5423,8 @@ mod tests {
 
         /// An accepted proof: every registered device, the sender's own
         /// among them (RFed cannot tell which, and excludes none), queued
-        /// once; no wake; the fan-out's summary says so.
+        /// once; no wake. The fan-out's summary and then the verdict count
+        /// it, after the hand-offs (James, 2026-10-10: real counts).
         #[test]
         fn an_accepted_proof_queues_every_device_and_wakes_none() {
             let rig = Rig::new("accepted", 0);
@@ -5369,22 +5438,30 @@ mod tests {
             assert!(rig.holds(&sync_transient_id(&sealed)[..16]));
             assert_eq!((rig.rows(&sender, &d_hash), rig.rows(&sibling, &d_hash)), (1, 1));
             assert_eq!(rig.wakes(), 0, "nobody woken");
-            let lines = mark.lines();
-            assert!(lines.iter().any(|l| l.contains("proof accepted, fanning out as distro sync")), "{lines:?}");
-            assert!(lines.iter().any(|l| l.ends_with(&format!(
-                "[distro] 2 of 2 device(s) with no live session for distro {} — handed off as distro sync, pushed only at a bound (each hand-off line says what was queued and who was woken)",
+            let lines: Vec<String> = mark.lines().iter().map(|l| text(l).to_string()).collect();
+            let at = |line: &str| lines.iter().position(|l| l == line).unwrap_or_else(|| panic!("{line}: {lines:?}"));
+            let summary = at(&format!(
+                "[distro] 2 of 2 device(s) with no live session for distro {} — handed off as distro sync: 2 queued, 0 woken",
                 hexrep(&d_hash, false),
-            ))), "{lines:?}");
-            assert_eq!(lines.iter().filter(|l| l.contains("NOT woken (distro sync, 1 of 64 un-pulled)")).count(), 2);
+            ));
+            let verdict = at(&format!(
+                "[distro-sync] {} for {}: proof accepted: 0 pushed live, 2 queued, 0 woken",
+                hexrep(&sync_transient_id(&sealed)[..16], false),
+                hexrep(&d_hash, false),
+            ));
+            let handoffs: Vec<usize> = (0..lines.len()).filter(|&i| lines[i].ends_with("NOT woken (distro sync, 1 of 64 un-pulled)")).collect();
+            assert_eq!(handoffs.len(), 2, "{lines:?}");
+            assert!(handoffs.iter().all(|&i| i < summary) && summary < verdict, "hand-offs, then the summary, then the verdict: {lines:?}");
             assert!(mark.containing("[distro-sync] batch").is_empty(), "a clean batch writes no summary");
         }
 
         /// At a bound of §17.3 an accepted proof's hand-off pushes after all,
-        /// and no line of the upload says otherwise: the verdict and the
-        /// fan-out's summary name the kind of fan-out, and the `[handoff]`
-        /// lines say who was woken. (Until 2026-10-10 the verdict said "not
-        /// woken" and the summary "queued for /rfed/pull, not woken" here,
-        /// beside the `[handoff]` line that woke the device.)
+        /// and no line of the upload says otherwise: the fan-out's summary
+        /// and the verdict, both written after the hand-offs, count the
+        /// device woken and say why, as its `[handoff]` lines do. (Until
+        /// 2026-10-10 the verdict said "not woken" and the summary "queued
+        /// for /rfed/pull, not woken" here, beside the `[handoff]` line that
+        /// woke the device; then both named only the kind of fan-out.)
         #[test]
         fn at_a_bound_no_line_says_a_woken_device_was_not_woken() {
             let rig = Rig::new("bound_lines", 0);
@@ -5411,6 +5488,60 @@ mod tests {
             for line in &lines {
                 assert!(!line.to_lowercase().contains("not woken"), "a line denies the wake: {line}");
             }
+            assert!(lines.iter().any(|l| l.ends_with(&format!(
+                "[distro] 1 of 1 device(s) with no live session for distro {} — handed off as distro sync: 1 queued, 1 woken (64 un-pulled)",
+                hexrep(&d_hash, false),
+            ))), "{lines:?}");
+            let verdict = mark.containing("[distro-sync] ");
+            assert_eq!(verdict.len(), 1, "{verdict:?}");
+            assert!(verdict[0].ends_with(": proof accepted: 0 pushed live, 1 queued, 1 woken (64 un-pulled)"), "{}", verdict[0]);
+        }
+
+        /// The verdict counts each device as its hand-off went: of two
+        /// devices with no live session, the one at the 64 bound is woken
+        /// and its sibling is not, and a third on a live rfed.link session is
+        /// pushed live. A device with an invalid key is counted as not
+        /// delivered. Each count is true when the line is written.
+        #[test]
+        fn the_verdict_counts_each_device_as_its_hand_off_went() {
+            let rig = Rig::new("real_counts", 0);
+            let (d, d_hash) = distro();
+            let at_bound = rig.device(&d_hash);
+            let quiet = rig.device(&d_hash);
+            let live = rig.device(&d_hash);
+            let link = live_link();
+            rig.sessions.lock().unwrap().configure_delivery(link.clone(), live.wake_key.clone());
+            // A registration whose key yields no identity: no live session, no queue.
+            rig.table.lock().unwrap().register(d_hash.clone(), vec![0xBD; 16], vec![0; 3]);
+            {
+                let mut queue = rig.queue.lock().unwrap();
+                for n in 0..63u8 {
+                    queue.enqueue(at_bound.queue_key.clone(), d_hash.clone(), vec![n], 256);
+                }
+            }
+            let (sealed, message) = sealed_message(&d, &d_hash, 8);
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], Some(vec![own_claim(&d, &sealed)])));
+
+            assert_eq!(rig.rows(&at_bound, &d_hash), 64);
+            assert_eq!((rig.rows(&quiet, &d_hash), rig.rows(&live, &d_hash)), (1, 0));
+            assert_eq!(rig.wakes(), 1, "only the device at the bound");
+            assert_eq!(mark.containing("[rfed.link] /lxmf/delivery pushed ").len(), 1, "{:?}", mark.lines());
+            let lines: Vec<String> = mark.lines().iter().map(|l| text(l).to_string()).collect();
+            assert!(lines.contains(&format!(
+                "[distro] 2 of 4 device(s) with no live session for distro {} — handed off as distro sync: 2 queued, 1 woken (64 un-pulled)",
+                hexrep(&d_hash, false),
+            )), "{lines:?}");
+            let verdict = mark.containing("[distro-sync] ");
+            assert_eq!(verdict.len(), 1, "{verdict:?}");
+            assert_eq!(
+                text(&verdict[0]),
+                format!(
+                    "[distro-sync] {} for {}: proof accepted: 1 pushed live, 2 queued, 1 woken (64 un-pulled), 1 NOT delivered (invalid key)",
+                    hexrep(&sync_transient_id(&sealed)[..16], false),
+                    hexrep(&d_hash, false),
+                ),
+            );
         }
 
         /// The regression guard: with no claim, a signature over another
@@ -5462,13 +5593,16 @@ mod tests {
                 let verdicts = mark.containing("[distro-sync] ");
                 if claims(&sealed).is_none() {
                     assert!(verdicts.is_empty(), "{case}: no claim, no verdict: {verdicts:?}");
-                    assert!(mark.lines().iter().any(|l| l.contains("— handed off with a push (each hand-off line says")), "{case}");
+                    assert!(mark.lines().iter().any(|l| l.ends_with(&format!(
+                        "[distro] 1 of 1 device(s) with no live session for distro {} — handed off with a push: 1 queued, 1 woken",
+                        hexrep(&d_hash, false),
+                    ))), "{case}: {:?}", mark.lines());
                 } else {
                     assert_eq!(verdicts.len(), 2, "{case}: the verdict and the batch summary: {verdicts:?}");
                     assert!(verdicts[0].contains("[Warning]"), "{case}: {}", verdicts[0]);
                     assert!(verdicts[0].contains(": proof refused ("), "{case}: {}", verdicts[0]);
                     assert!(verdicts[0].ends_with("), fanning out with wake"), "{case}: {}", verdicts[0]);
-                    assert!(verdicts[1].ends_with(": 0 accepted, 1 refused, 0 malformed, 0 duplicate, 0 unmatched, 0 ignored"), "{case}: {}", verdicts[1]);
+                    assert!(verdicts[1].ends_with(": 0 accepted, 1 refused, 0 malformed, 0 duplicate, 0 not checked, 0 unmatched, 0 ignored"), "{case}: {}", verdicts[1]);
                 }
             }
         }
@@ -5494,7 +5628,7 @@ mod tests {
             let summary = mark.containing("[distro-sync] ");
             assert_eq!(summary.len(), 1, "{summary:?}");
             assert!(summary[0].ends_with(&format!(
-                "[distro-sync] batch from peer {}: 0 accepted, 0 refused, 0 malformed, 0 duplicate, 0 unmatched, 1 ignored",
+                "[distro-sync] batch from peer {}: 0 accepted, 0 refused, 0 malformed, 0 duplicate, 0 not checked, 0 unmatched, 1 ignored",
                 hexrep(&peer_prop, false),
             )), "{}", summary[0]);
         }
@@ -5522,7 +5656,7 @@ mod tests {
             assert_eq!((plain.1, claimed.1), (1, 1), "stored in the messagestore both times");
             assert!(plain.2.is_empty());
             assert_eq!(claimed.2.len(), 1);
-            assert!(claimed.2[0].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 1 unmatched, 0 ignored"), "{}", claimed.2[0]);
+            assert!(claimed.2[0].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 0 not checked, 1 unmatched, 0 ignored"), "{}", claimed.2[0]);
         }
 
         // ── A device with a live rfed.link session ──────────────────────
@@ -5564,9 +5698,15 @@ mod tests {
             let pushed = mark.containing("[rfed.link] /lxmf/delivery pushed ");
             assert_eq!(pushed.len(), 1, "{:?}", mark.lines());
             assert!(pushed[0].ends_with(&format!("to {}", hexrep(&link.link_id(), false))), "{}", pushed[0]);
-            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (0, 0), "delivered live: not queued, not woken");
+            assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (0, 0), "pushed live: not queued, not woken");
             assert!(mark.containing("[handoff] ").is_empty(), "{:?}", mark.lines());
             assert!(mark.containing("has no live session").is_empty(), "{:?}", mark.lines());
+            assert!(mark.containing("[distro] ").iter().all(|l| !l.contains("handed off")), "no hand-off to sum up: {:?}", mark.lines());
+            // Pushed live, its response still to come: the verdict counts the
+            // push, and says nothing of how it will end.
+            let verdict = mark.containing("[distro-sync] ");
+            assert_eq!(verdict.len(), 1, "{verdict:?}");
+            assert!(verdict[0].ends_with(": proof accepted: 1 pushed live, 0 queued, 0 woken"), "{}", verdict[0]);
 
             // The push is never answered: the close fails it, and its
             // on_failed hook (built by distro_fanout from the QueueOnly
@@ -5648,7 +5788,7 @@ mod tests {
             let lines = mark.lines();
             assert_eq!(verifications(), before);
             assert_eq!(lines.len(), 2, "{lines:?}");
-            assert!(lines[0].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 0 unmatched, 1 ignored"), "{}", lines[0]);
+            assert!(lines[0].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 0 not checked, 0 unmatched, 1 ignored"), "{}", lines[0]);
             assert!(text(&lines[1]).starts_with("[lxmf.prop] processed 1 msgs: 1 stored,"), "{}", lines[1]);
 
             let mark = crate::test_log::mark();
@@ -5656,14 +5796,16 @@ mod tests {
             rig.ingest(&upload(&[other], Some(vec![claim_value(&[1; 15], &[2; 64], &[3; 64])])));
             let lines = mark.lines();
             assert_eq!(lines.len(), 2, "{lines:?}");
-            assert!(lines[0].ends_with(": 0 accepted, 0 refused, 1 malformed, 0 duplicate, 0 unmatched, 0 ignored"), "{}", lines[0]);
+            assert!(lines[0].ends_with(": 0 accepted, 0 refused, 1 malformed, 0 duplicate, 0 not checked, 0 unmatched, 0 ignored"), "{}", lines[0]);
         }
 
         /// N messages to a registered distro whose stamps fail, with N
         /// well-formed claims: no Ed25519 runs (a claim is looked at only for
-        /// a stamp-valid message), and the batch writes a fixed number of
-        /// lines, whatever N is: the processed line, the claims' summary,
-        /// and the one WARNING for the dropped messages (Open question 5).
+        /// a stamp-valid message), and the batch writes 3 lines, whatever N
+        /// is: the one WARNING for the dropped messages (Open question 5),
+        /// the claims' summary, and the processed line. A claim naming one of
+        /// the dropped messages is counted not checked; one naming no message
+        /// of the batch, unmatched (James, 2026-10-10).
         #[test]
         fn bad_stamps_with_claims_verify_nothing_and_write_a_fixed_number_of_lines() {
             let rig = Rig::new("bad_stamps", 40);
@@ -5689,7 +5831,11 @@ mod tests {
             let lines = mark.lines();
             assert_eq!(lines.len(), 3, "{lines:?}");
             assert!(lines[0].contains("[Warning]") && text(&lines[0]).starts_with(&format!("[lxmf.prop] {n} message(s) from a sender with no identity (handled as a client's) dropped, after the link proved the upload: {n} with an invalid stamp (cost 40 required): ")), "{}", lines[0]);
-            assert!(lines[1].ends_with(&format!(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, {n} unmatched, 0 ignored")), "{}", lines[1]);
+            assert!(lines[1].ends_with(&format!(
+                ": 0 accepted, 0 refused, 0 malformed, 0 duplicate, {} not checked, {} unmatched, 0 ignored",
+                n / 2,
+                n / 2,
+            )), "{}", lines[1]);
             assert_eq!(text(&lines[2]), format!("[lxmf.prop] processed {n} msgs: 0 stored, 0 streamed, 0 notified, {n} bad-stamp, from a sender with no identity (handled as a client's)"));
         }
 
@@ -5774,15 +5920,17 @@ mod tests {
         }
 
         /// The sorting walks the batch once and hashes only the dropped
-        /// messages it names, whatever the batch holds: 10^5 empty entries
-        /// (a ~200 KB client Resource) cost four hashes, not 10^5, and a
-        /// message that validated is paired by its bytes, never hashed.
+        /// messages it names, and others only while a claim of the batch is
+        /// open: 10^5 empty entries (a ~200 KB client Resource) with no
+        /// claim cost four hashes, not 10^5, and a message that validated is
+        /// paired by its bytes, never hashed.
         #[test]
         fn sorting_the_dropped_messages_hashes_only_those_it_names() {
             let hashed = || DROPPED_IDS_HASHED.with(|n| n.get());
+            let no_claims = || BatchClaims::of(None, false);
             let before = hashed();
             let junk = vec![Vec::new(); 100_000];
-            let dropped = dropped_messages(&junk, &[]);
+            let dropped = dropped_messages(&junk, &[], &mut no_claims());
             assert_eq!((dropped.too_short, dropped.too_short_ids.len(), dropped.invalid_stamp), (100_000, 4, 0));
             assert_eq!(hashed() - before, 4);
 
@@ -5799,13 +5947,62 @@ mod tests {
                 })
                 .collect();
             let before = hashed();
-            let dropped = dropped_messages(&messages, &validated);
+            let dropped = dropped_messages(&messages, &validated, &mut no_claims());
             assert_eq!(hashed() - before, 4, "four of messages 0, 3, 6 and 9 named");
             assert_eq!(dropped.invalid_stamp, 4);
             let expected: Vec<Vec<u8>> =
                 [0usize, 3, 6, 9].iter().map(|&i| reticulum_rust::identity::full_hash(&messages[i][..messages[i].len() - 32])).collect();
             assert_eq!(dropped.invalid_stamp_ids, expected);
             assert_eq!(dropped.too_short, 0);
+
+            // With claims: a dropped message past the first four is hashed
+            // only while a claim is open. Ten dropped messages; a claim
+            // naming the first is taken by it, so nothing past the four
+            // named is hashed; one naming the last keeps the walk hashing to
+            // it; one naming nothing keeps it hashing to the end.
+            let dropped_ten: Vec<Vec<u8>> = (0..10u8).map(|i| [&[0x5E; 16][..], &[i; 200][..]].concat()).collect();
+            let id_of = |m: &Vec<u8>| reticulum_rust::identity::full_hash(&m[..m.len() - 32]);
+            let claims_naming = |ids: &[Vec<u8>]| -> BatchClaims {
+                let extension = Value::Map(vec![(
+                    Value::String(DISTRO_SYNC_KEY.into()),
+                    Value::Array(ids.iter().map(|id| claim_value(&id[..16], &[0x77; 64], &[0x78; 64])).collect()),
+                )]);
+                BatchClaims::of(Some(decode_sync_extension(&extension, dropped_ten.len())), false)
+            };
+            for (case, ids, hashes, not_checked, open) in [
+                ("the first", vec![id_of(&dropped_ten[0])], 4, 1, 0),
+                ("the last", vec![id_of(&dropped_ten[9])], 10, 1, 0),
+                ("nothing", vec![vec![0xAA; 32]], 10, 0, 1),
+            ] {
+                let mut claims = claims_naming(&ids);
+                let before = hashed();
+                let dropped = dropped_messages(&dropped_ten, &[], &mut claims);
+                assert_eq!(hashed() - before, hashes, "a claim naming {case}");
+                assert_eq!((dropped.invalid_stamp, dropped.invalid_stamp_ids.len()), (10, 4), "{case}");
+                assert_eq!((claims.not_checked, claims.claims.by_id.len()), (not_checked, open), "{case}");
+            }
+        }
+
+        /// A claim whose message was dropped as too short for LXMF is not
+        /// checked either, and a batch of such messages with a claim each
+        /// writes 3 lines, as a batch of bad stamps does.
+        #[test]
+        fn a_claim_for_a_message_too_short_for_lxmf_is_not_checked() {
+            let rig = Rig::new("short_claims", 0);
+            let short: Vec<Vec<u8>> = (0..3u8).map(|i| vec![0x50 + i; 100]).collect();
+            let claims: Vec<Value> = short
+                .iter()
+                .map(|m| claim_value(&reticulum_rust::identity::full_hash(&m[..m.len() - 32])[..16], &[0x77; 64], &[0x78; 64]))
+                .collect();
+            let before = verifications();
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&short, Some(claims)));
+            assert_eq!(verifications(), before);
+            let lines = mark.lines();
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            assert!(text(&lines[0]).contains("dropped, after the link proved the upload: 3 too short to be an LXMF message"), "{}", lines[0]);
+            assert!(lines[1].ends_with(": 0 accepted, 0 refused, 0 malformed, 0 duplicate, 3 not checked, 0 unmatched, 0 ignored"), "{}", lines[1]);
+            assert!(text(&lines[2]).starts_with("[lxmf.prop] processed 3 msgs: 0 stored,"), "{}", lines[2]);
         }
 
         // ── Pins ────────────────────────────────────────────────────────
@@ -5836,7 +6033,7 @@ mod tests {
             let ingest = &source[source.find("if delivery.is_distro(dest_hash) {").unwrap()..];
             let ingest = &ingest[..ingest.find("continue;").unwrap()];
             assert!(ingest.contains("let first_sight = delivery.ingest_distro_blob(dest_hash, lxmf_data, &mut stored);"));
-            assert!(ingest.contains("if first_sight {\n                    delivery.distro_fanout(dest_hash, lxmf_data, wake);"));
+            assert!(ingest.contains("let fanned = first_sight.then(|| delivery.distro_fanout(dest_hash, lxmf_data, wake));"));
         }
     }
 

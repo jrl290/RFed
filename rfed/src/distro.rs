@@ -62,7 +62,7 @@ use reticulum_rust::identity::Identity;
 use reticulum_rust::packet::{Packet, ANNOUNCE, NONE, HEADER_1, FLAG_SET, FLAG_UNSET};
 use reticulum_rust::{hexrep, log, LOG_DEBUG, LOG_ERROR, LOG_NOTICE, LOG_WARNING};
 
-pub use crate::handoff::{defer_then_wake, OnUnconfirmed, Unconfirmed};
+pub use crate::handoff::{DistroHandOff, HandOffOutcome, Unconfirmed};
 use crate::notify::HookRegistry;
 use crate::link_session::LinkSessionRegistry;
 use crate::stream_registry::{OnUnproven, PropagationStreamRegistry};
@@ -579,8 +579,10 @@ fn unconfirmed(entry: &DistroEntry) -> Option<Unconfirmed> {
 }
 
 /// The stream tier's hand-off for `entry`: the caller's `on_unconfirmed`,
-/// when the device's push is never proved.
-fn stream_unproven_hook(on_unconfirmed: &OnUnconfirmed, entry: &DistroEntry) -> Option<OnUnproven> {
+/// when the device's push is never proved. It runs after the fan-out has
+/// returned its counts, so what it comes to is said by its own `[handoff]`
+/// line only.
+fn stream_unproven_hook(on_unconfirmed: &DistroHandOff, entry: &DistroEntry) -> Option<OnUnproven> {
     let hook = Arc::clone(on_unconfirmed);
     let device = unconfirmed(entry)?;
     let label = hexrep(&entry.device_lxmf_hash, false);
@@ -603,8 +605,9 @@ fn stream_unproven_hook(on_unconfirmed: &OnUnconfirmed, entry: &DistroEntry) -> 
 /// [`crate::handoff::distro_hand_off`]), which queues the blob for
 /// `/rfed/pull` and pushes the device, or for a blob with an accepted §17.13
 /// sync proof queues it without a push; its `[handoff]` line says which.
-/// Returns how many devices were handed off here and now; the live tiers'
-/// hand-offs come later.
+/// Returns what it did with each device, counted ([`DistroFanout`]): the
+/// hand-offs made here and now, and the live pushes, whose own hand-offs, if
+/// any, come later.
 ///
 /// A delivery is confirmed only by the rfed.link response (Link.md "The
 /// response is the delivery proof") or the stream's link proof
@@ -626,8 +629,8 @@ pub fn distro_fanout(
     hook_registry: &HookRegistry,
     propagation_streams: Option<&Arc<Mutex<PropagationStreamRegistry>>>,
     link_sessions: Option<&Arc<Mutex<LinkSessionRegistry>>>,
-    on_unconfirmed: OnUnconfirmed,
-) -> usize {
+    on_unconfirmed: DistroHandOff,
+) -> DistroFanout {
     if devices.is_empty() {
         log(
             format!(
@@ -638,7 +641,7 @@ pub fn distro_fanout(
             false,
             false,
         );
-        return 0;
+        return DistroFanout::default();
     }
 
     log(
@@ -653,7 +656,7 @@ pub fn distro_fanout(
         false,
     );
 
-    let mut handed_off = 0usize;
+    let mut fanned = DistroFanout { devices: devices.len(), ..DistroFanout::default() };
 
     for entry in devices {
         // Both keys of the hand-off. Registration verified the device's key,
@@ -668,7 +671,9 @@ pub fn distro_fanout(
             if let Ok(mut registry) = sessions.lock() {
                 let on_failed: Option<Arc<dyn Fn() + Send + Sync>> = device.clone().map(|device| {
                     let hook = Arc::clone(&on_unconfirmed);
-                    let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || hook(device.clone()));
+                    let on_failed: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                        hook(device.clone());
+                    });
                     on_failed
                 });
                 let result = registry.dispatch_lxmf(&entry.device_lxmf_hash, lxmf_blob, on_failed);
@@ -684,6 +689,7 @@ pub fn distro_fanout(
                         false,
                     );
                     hook_registry.on_deliver(&entry.device_lxmf_hash, lxmf_blob);
+                    fanned.pushed_live += 1;
                     continue;
                 }
             }
@@ -708,6 +714,7 @@ pub fn distro_fanout(
                         false,
                     );
                     hook_registry.on_deliver(&entry.device_lxmf_hash, lxmf_blob);
+                    fanned.pushed_live += 1;
                     continue;
                 }
                 if result.had_sessions() {
@@ -736,22 +743,79 @@ pub fn distro_fanout(
                     false,
                     false,
                 );
-                handed_off += 1;
-                on_unconfirmed(device);
+                fanned.count(on_unconfirmed(device));
             }
-            None => log(
-                format!(
-                    "[distro] device {} has an invalid key and no live session — cannot queue (no identity hash); blob NOT delivered to this device",
-                    hexrep(&entry.device_lxmf_hash, false),
-                ),
-                LOG_WARNING,
-                false,
-                false,
-            ),
+            None => {
+                log(
+                    format!(
+                        "[distro] device {} has an invalid key and no live session — cannot queue (no identity hash); blob NOT delivered to this device",
+                        hexrep(&entry.device_lxmf_hash, false),
+                    ),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
+                fanned.unkeyed += 1;
+            }
         }
     }
 
-    handed_off
+    fanned
+}
+
+/// What [`distro_fanout`] did with the devices of one blob, counted when it
+/// returns, for the summary lines written after it (James, 2026-10-10: real
+/// counts). Each count is true when it is read. A live push is counted as
+/// pushed, not delivered: its proof (the rfed.link response, the stream's
+/// link proof) is still to come, and a push left unproven is handed off
+/// later, on a thread of its own; only that hand-off's own `[handoff]` line
+/// says what it came to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DistroFanout {
+    /// The devices fanned out to: the distro's registrations, snapshotted.
+    pub devices: usize,
+    /// Pushed live, on the device's rfed.link session or its
+    /// propagation.stream, its proof still to come.
+    pub pushed_live: usize,
+    /// With no live session, and handed off here and now.
+    pub handed_off: usize,
+    /// Of those handed off, the ones whose blob was queued for `/rfed/pull`.
+    pub queued: usize,
+    /// Of those handed off, the ones a wake left for.
+    pub woken: usize,
+    /// For each woken device a §17.13 sync hand-off pushed after all, why
+    /// (its "woken anyway" bound, or "deferred queue poisoned"), in fan-out
+    /// order. Empty for a fan-out whose hand-offs push by kind.
+    pub woken_because: Vec<String>,
+    /// With an invalid key and no live session: not delivered, not queued,
+    /// not woken.
+    pub unkeyed: usize,
+}
+
+impl DistroFanout {
+    fn count(&mut self, handed: HandOffOutcome) {
+        self.handed_off += 1;
+        self.queued += usize::from(handed.queued);
+        if handed.woken {
+            self.woken += 1;
+            self.woken_because.extend(handed.pushed_because);
+        }
+    }
+
+    /// The hand-offs as the summary lines count them: "<q> queued, <w>
+    /// woken", with why each was woken when a sync hand-off pushed after
+    /// all ("(64 un-pulled; queue at 3072 of 4096)"), then "<n> NOT queued"
+    /// for the hand-offs whose blob could not be queued, when there are any.
+    pub fn hand_offs_said(&self) -> String {
+        let mut said = format!("{} queued, {} woken", self.queued, self.woken);
+        if !self.woken_because.is_empty() {
+            said.push_str(&format!(" ({})", self.woken_because.join("; ")));
+        }
+        if self.handed_off > self.queued {
+            said.push_str(&format!(", {} NOT queued", self.handed_off - self.queued));
+        }
+        said
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -823,10 +887,13 @@ mod tests {
 
     // ── Every device the fan-out cannot confirm is handed off ───────────
 
-    fn recording_hand_off() -> (OnUnconfirmed, Arc<Mutex<Vec<Unconfirmed>>>) {
+    fn recording_hand_off() -> (DistroHandOff, Arc<Mutex<Vec<Unconfirmed>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&seen);
-        let hook: OnUnconfirmed = Arc::new(move |device| record.lock().unwrap().push(device));
+        let hook: DistroHandOff = Arc::new(move |device| {
+            record.lock().unwrap().push(device);
+            HandOffOutcome { queued: true, woken: true, pushed_because: None }
+        });
         (hook, seen)
     }
 
@@ -866,10 +933,14 @@ mod tests {
         let (identity, entry, _) = real_device(&distro);
         let (on_unconfirmed, seen) = recording_hand_off();
 
-        let handed_off =
+        let fanned =
             distro_fanout(&distro, &[0xAB; 40], &[entry.clone()], &HookRegistry::new(), None, None, on_unconfirmed);
 
-        assert_eq!(handed_off, 1);
+        assert_eq!(
+            fanned,
+            DistroFanout { devices: 1, handed_off: 1, queued: 1, woken: 1, ..DistroFanout::default() },
+            "counted as its hand-off said",
+        );
         assert_eq!(seen.lock().unwrap().as_slice(), &[expected_hand_off(&identity, &entry)]);
     }
 
@@ -880,9 +951,10 @@ mod tests {
         let bad = DistroEntry { device_pubkey: vec![0; 3], ..entry };
         let (on_unconfirmed, seen) = recording_hand_off();
 
-        let handed_off = distro_fanout(&distro, &[0xAB; 40], &[bad], &HookRegistry::new(), None, None, on_unconfirmed);
+        let fanned = distro_fanout(&distro, &[0xAB; 40], &[bad], &HookRegistry::new(), None, None, on_unconfirmed);
 
-        assert_eq!(handed_off, 0, "no identity hash, no queue to put it in");
+        assert_eq!(fanned.handed_off, 0, "no identity hash, no queue to put it in");
+        assert_eq!((fanned.devices, fanned.unkeyed), (1, 1), "counted as not delivered");
         assert!(seen.lock().unwrap().is_empty());
     }
 
@@ -1042,6 +1114,7 @@ mod tests {
 
     use super::*;
     use crate::deferred_queue::DeferredQueue;
+    use crate::handoff::defer_then_wake;
     use crate::notify::rns::fake::FakeStack;
     use crate::notify::rns::RelayStack;
     use crate::notify::NotifyRegistry;
