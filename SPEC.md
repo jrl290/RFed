@@ -3764,6 +3764,11 @@ own is decided by its packet source, never by `GROUP_SENDER` alone:
   that device acting as its own listed entry (a device from before this
   section, in a list that names it). Its post is stored as the user's own,
   SENT, with no notification.
+- A group message whose packet source is another device of D and whose LXMF
+  signature is not validated (the source's key is not known, `SOURCE_UNKNOWN`,
+  or the signature is invalid) is dropped with a log line, on every path, in
+  every group and whatever its action. A device of D is never another member,
+  and only a validly signed message from it is the user's own.
 - The user's own posts otherwise reach a device only from its own send or from
   a `post` group sync.
 
@@ -3786,6 +3791,19 @@ message in this order, and the first that matches decides:
    and timestamp, then the identity transfer (§17.9), the sent copy (§17.11),
    the delivery-notification test and the direct-message path.
 
+**Repeated keys.** A fields map may hold a key more than once, and so may the
+Retichat field `0xD1`. Every device reads them alike: a group entry
+(`0xA0`–`0xA8`, the field `0xD1` itself, and keys 1–9 inside it) is read from
+the **first** entry with its key, even when that entry is not of the entry's
+type, and `fields[0xFB]` from the **last**. A reader that decodes the map into
+a dictionary keeps the last of each key, so it reads the group entries from
+the message's bytes instead. An ext value of a type the reader does not know
+is skipped; it never makes the map unreadable. (The Python reference has no
+rule here: RNS's umsgpack refuses a map that repeats a key, and LXMF.py drops
+the message whole.) LXMF-rust `tests/distro_group_sync_vectors.json`
+(`group_entries`, `variants`, `rejects`, `invite_members`) pins each case, and
+every client runs it.
+
 A group message and a group sync are a repeat only when their LXMF message
 hash is one already seen; the device keys them by it (`grp:<hash>`,
 `gsync:<hash>`) **before** the seen key of source and timestamp, as §17.12
@@ -3801,7 +3819,9 @@ the packet's own source and its signature. On every path, and in every group:
 - a group message whose LXMF signature is invalid is dropped with a log line,
   whatever its action; it is never held or notified;
 - one whose `GROUP_SENDER` names one of the user's own addresses while its
-  packet source is not one of them is dropped (above).
+  packet source is not one of them is dropped (above);
+- one whose packet source is another device of D and whose signature is not
+  validated is dropped (above).
 
 Then an `invite` counts only from an inviter allowlisted on the receiving
 device when its privacy filter is on, and must list D. `accept`, `leave`,
@@ -3915,7 +3935,9 @@ last element of every op is `left`. Receivers ignore elements after it.
 - `name`: the group's name, UTF-8 str (receivers accept bin), possibly empty.
 - `members`: a str, the group's `GROUP_MEMBERS` csv exactly as the invite
   carried it (for `create`, as the device wrote it into its invite chunks),
-  read with the invite's own parser. It must name D.
+  read with the invite's own parser. The csv is split on the code point `,`
+  (U+002C), never on grapheme clusters: a combining mark after a comma does
+  not join it, and one before an entry is part of that entry. It must name D.
 - `keys`: an array of str, `GROUP_MEMBER_KEYS` entries (`<hash>:<base64 key>`)
   for the listed members whose keys the sending device holds, in any order,
   possibly empty. A receiver binds each as it binds an invite chunk's (the
