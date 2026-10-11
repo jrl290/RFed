@@ -3806,7 +3806,15 @@ group id: a message that carries one is classified by its group id. A sent
 copy (§17.11) and an identity transfer (§17.9) are still recognised by their
 markers before the group id, as every client does. Where the refusal of a
 malformed group id stands against those two, and so the full order of the
-direct path, is not yet ruled (open for James, 2026-10-11).
+direct path, is not yet ruled (open for James, 2026-10-11). Every client
+reads these fields as Android and iOS do: a field is found only under a msgpack
+integer key, of any width (a uint 64 `0xA0` is `0xA0`); a float key, even an
+integral one, is no field (`160.0` is not `0xA0`, and `1.0` inside `0xD1` is not
+key 1), so a message whose only group id sits under one is a direct message. A
+marker (`fields[0xFB]`), a transfer's key (`fields[0xFC]`) and a sent copy's
+recipient and sender (`fields[0xFC]`, `fields[0xFD]`) are read only from a str
+or a bin; a value of any other type is none, so a `0xFC` of `5` is no key and a
+message carrying it beside a group id is a group message, not a transfer.
 
 **Repeated keys.** A message whose payload holds a map, at any depth, that
 repeats a key is refused whole, as Python LXMF refuses it: LXMF 1.1.1 reads the
