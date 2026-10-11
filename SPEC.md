@@ -2270,8 +2270,10 @@ device still keeps C until the propagation node proves it has it:
   message or a §17.11 sent copy is kept until the propagation node proves
   it, an upload that is not proved is followed by another when the
   propagation link next comes up, an event and never a timer, and only the
-  newest action per channel is ever owed. The exception covers those two
-  distro messages only, not DMs, links or path requests. James's rulings of
+  newest action per channel is ever owed. The exception covers those
+  distro messages only (the §17.11 sent copy, this membership message and,
+  since James extended it on 2026-10-10, the §17.14 group sync), not DMs,
+  links or path requests. James's rulings of
   the same day, written under it in §3, are its bounds, and every client
   keeps them. This section numbers them in §3's order: the first is what
   "comes up" is, the second that a failure alone never sends an upload
@@ -3729,59 +3731,120 @@ bbae30c, Retichat-android 8456878, Retichat-js 6d0cf8b).
 
 **The user's address in a group.** The user acts in each group as the address
 the creator's fixed list names: D when it names D (on every device of D), the
-device when it names only the device (on that device only), D when it names
-both. A group created on a device that holds D is created as D: the creator's
-list entry is D, the recorded creator is D, and the invite chunks are signed
-by D with D's key in D's chunk. Groups that already list a device address stay
-on that device; nothing is migrated. In a group where the user is D, every
-envelope goes out with LXMF source D, signed by D's key, `GROUP_SENDER` = D,
-and an `accept` or `leave` carries `"<D>:" + base64(D's 64-byte public key)`
-as its sender's key. A device that no longer holds the D a group lists cannot
-act in it, says so to the user, and never sends from the device address
-instead. In such a group the user's own addresses are D, the device and the
-other devices of D that this device has learned from the `fields[0xFD]` of a
-D-signed sync (§17.11, §17.12, this section): none is ever a send target, an
-allowlisted contact or another member.
+device when it names only the device (on that device only). When it names both,
+the user acts as D in a group admitted after this section, and as the device in
+a group the device already held before it (nothing is migrated). Pending or
+joined is read from that entry alone. A group created on a device that holds D
+is created as D: the creator's list entry is D, the recorded creator is D, and
+the invite chunks are signed by D with D's key in D's chunk. Groups that
+already list a device address stay on that device; nothing is migrated. In a
+group where the user is D, every envelope goes out with LXMF source D, signed
+by D's key, `GROUP_SENDER` = D, and an `accept` or `leave` carries `"<D>:" +
+base64(D's 64-byte public key)` as its sender's key. The signer is taken at
+send time from the distro the device holds, and only when its `lxmf.delivery`
+hash is the group's own address. A device that no longer holds the D a group
+lists, or has not loaded it yet, cannot act in it: it says so to the user,
+never sends from the device address or as another distro instead, and offers
+only a delete from that device, which sends nothing.
+
+In a group whose list names a distro the device holds or the group was joined
+as, the user's own addresses are that distro, the device, and the other
+devices of that distro that this device has learned from the `fields[0xFD]` of
+a D-signed sync (§17.11, §17.12, this section). None is ever a send target, an
+allowlisted contact or another member. Whether a group message is the user's
+own is decided by its packet source, never by `GROUP_SENDER` alone:
+
+- A group message whose `GROUP_SENDER` names one of the user's own addresses
+  while its packet source is not one of them is dropped with a log line, on
+  every path and in every group. Otherwise any member could make a post appear
+  as the user's on every device.
+- A group message whose packet source is D is the user's own echo: sends never
+  go to oneself, so it is unexpected, and it is dropped with a log line.
+- A validly signed group message whose packet source is another device of D is
+  that device acting as its own listed entry (a device from before this
+  section, in a list that names it). Its post is stored as the user's own,
+  SENT, with no notification.
+- The user's own posts otherwise reach a device only from its own send or from
+  a `post` group sync.
 
 **Group messages through the distro.** A message a device unwraps from a
 distro fan-out blob (§17.3) whose fields carry a group id (Group.md "Field
-Keys", either form) is a group message, handled exactly as one that reached the
-device directly. A device classifies every unwrapped message in this order,
-and the first that matches decides:
+Keys", either form, of any type) and whose `fields[0xFB]` is not a distro
+marker is a group message, handled exactly as one that reached the device
+directly. The distro markers are exactly `"rfed.distro.transfer"`,
+`"rfed.distro.sent"`, `"rfed.distro.channel"` and `"rfed.distro.group"`; any
+other `fields[0xFB]` value is not one. A device classifies every unwrapped
+message in this order, and the first that matches decides:
 
-1. the distro markers in `fields[0xFB]`: an identity transfer (§17.9), a sent
-   copy (§17.11), a membership message (§17.12), a group sync (below);
-2. a group message: the fields carry a group id and no distro
-   `fields[0xFB]`. A message that carries a distro marker is decided by step 1
-   whatever else it carries; its group entries are not read;
-3. everything else, as before: the seen key of source and timestamp, the
-   delivery-notification test and the direct-message path.
+1. a membership message (§17.12) or a group sync (below), by `fields[0xFB]`,
+   each keyed by its LXMF message hash;
+2. a group message, keyed by its LXMF message hash. A group id that is not 32
+   hex characters is dropped here with a log line, never passed on to the
+   direct-message path. A message that carries a distro marker is never a group
+   message, whatever else it carries; its group entries are not read;
+3. everything else, unchanged and in its current order: the seen key of source
+   and timestamp, then the identity transfer (§17.9), the sent copy (§17.11),
+   the delivery-notification test and the direct-message path.
 
 A group message and a group sync are a repeat only when their LXMF message
 hash is one already seen; the device keys them by it (`grp:<hash>`,
 `gsync:<hash>`) **before** the seen key of source and timestamp, as §17.12
 keys a membership message. Without it, the chunks of one invite that a web
 client packs in the same millisecond share that key, and all but the first are
-dropped. A group message passes the same admission as on the direct path,
-decided on the packet's own source and its signature: an `invite` counts only
-from an inviter allowlisted on the receiving device when its privacy filter is
-on, and must list D; `accept`, `leave`, `status` and regular messages follow
-Group.md's rules. It is never stored as a direct message, never makes a contact
-or a hidden contact, and never posts a direct-message notification. A
-`relay_req` that arrives this way is not acted on (every device of D would
-relay it) and is dropped with a log line; no Retichat client sends one. A
-group message whose source is D is the user's own echo and is dropped with a
-log line.
+dropped. A key is recorded only when the message is kept (applied or stored),
+never when it is dropped or held; a device whose seen store records as it
+checks forgets the key again in those cases.
 
-A group message that the rules would drop only because the group is not joined
-on this device yet (held pending, or not held, and not left) is **held**
-instead: the blob as received, persisted, at most 64 blobs and 256 KiB per
-device, the oldest dropped first with a log line, a blob over 64 KiB never
-held. When the group becomes joined on this device, its held blobs go through
-this classification again, in arrival order; when it is left, or the device
-gives up D, they are forgotten. That is the ordering of DESIGN_PRINCIPLES.md
-§5 (the message depends on the group being joined), not a retry. The same
-holds for a `post` group sync.
+A group message passes the same admission as on the direct path, decided on
+the packet's own source and its signature. On every path, and in every group:
+
+- a group message whose LXMF signature is invalid is dropped with a log line,
+  whatever its action; it is never held or notified;
+- one whose `GROUP_SENDER` names one of the user's own addresses while its
+  packet source is not one of them is dropped (above).
+
+Then an `invite` counts only from an inviter allowlisted on the receiving
+device when its privacy filter is on, and must list D. `accept`, `leave`,
+`status` and regular messages follow Group.md's rules: a regular message is
+kept for a group the device holds, pending or joined, from any source, and is
+shown as its `GROUP_SENDER` only when a current member of a joined group
+relays it with a valid signature. It is never stored as a direct message, never
+makes a visible or allowlisted contact, and never posts a direct-message
+notification. Its sender gets only the hidden row a group message on the
+direct path makes, which holds the sender's display name (LXMF-rust
+DISPLAY_NAMES.md §5.2). A dropped or held message makes no row. A `relay_req`
+that arrives this way is not acted on (every device of D would relay it) and is
+dropped with a log line; no Retichat client sends one.
+
+A group message is **held** instead of dropped only when the group not being
+joined on this device yet is the sole reason the rules would drop it:
+
+- it is not an `invite` or a `relay_req`;
+- the group is held pending there, or not held there; it is not left there;
+  and its id is not one whose `invite` to D this device's privacy filter
+  dropped (a persisted set of at most 64 ids, oldest forgotten first, so the
+  filter spends nothing more on that group);
+- its signature is not invalid, and its packet source is not one of the user's
+  own addresses;
+- the rules, read as if the group were joined, would keep it. For a pending
+  group that means a listed source, about itself, and a `status` from the
+  recorded creator, proven where the rule asks for proof. For a group not held
+  there, membership cannot be checked, so only a message whose signature is
+  validated is held.
+
+The device keeps the blob as received, persisted with the group id, its source,
+and its LXMF hash together with its signature (a copy with another signature
+never shadows one held). The bounds are counts and bytes, never a clock: 64
+blobs and 256 KiB per device; 16 per group; 8 per LXMF source other than D;
+for groups not held there, 16 in all, never evicting one of a group held
+pending; and no blob over 64 KiB. Past a bound, the oldest blob of the source
+that holds the most within it goes, and every eviction or refusal is logged.
+A held blob is never recorded as seen. When the group becomes joined on this
+device, its held blobs go through this classification again in arrival order,
+each judged as a new arrival. When the group is left, or the device gives up D,
+they are forgotten, with a log line counting them. That is the ordering of
+DESIGN_PRINCIPLES.md §5 (the message depends on the group being joined), not a
+retry. The same holds for a `post` group sync.
 
 **The unwrap.** `lxmf_rust::distro::unwrap_blob` returns, besides the keys of
 §17.11 and §17.12, the message's LXMF hash, its packed bytes (the blob's first
@@ -3797,9 +3860,11 @@ packed copy it answers with. The unwrap JSON of `retichat_distro_unwrap` and
 | Key | Type | Value |
 |---|---|---|
 | `hash` | string | The LXMF message hash, 64 lowercase hex |
+| `has_group_id` | bool | True when the fields carry a group id entry in either form, of any type, and `fields[0xFB]` is not a distro marker. This decides step 2 above |
 | `group_id` | string or null | The group id (Group.md reader rule), 32 lowercase hex; null when absent, malformed, or when `fields[0xFB]` is a distro marker |
 | `group_action` | string or null | The group action, as sent |
-| `group_sync` | object or null | Set exactly when `fields[0xFB]` is `"rfed.distro.group"`: `by` (`fields[0xFD]` lowercased, `""` when absent), `problem` (null, or why rule 4 below fails), and `op`, `group_id`, `at_ms`, `name`, `members`, `keys`, `creator`, `text` (null when absent or when `problem` is set) |
+| `group_name` | string or null | The group name (Group.md reader rule), for a notification of an `invite` |
+| `group_sync` | object or null | Set exactly when `fields[0xFB]` is `"rfed.distro.group"`: `by` (`fields[0xFD]` lowercased, `""` when absent), `problem` (null, or why rule 4 below fails), and `op`, `group_id`, `at_ms`, `name`, `members`, `keys`, `creator`, `text`, `left` (null when absent or when `problem` is set) |
 | `sender_key` | string or null | The key an `accept` or `leave` carries for its own sender, when it binds, 128 lowercase hex |
 | `packed` | string or null | The packed message of an `accept` or `leave` of at most the receipt's limit, base64 with padding |
 
@@ -3817,8 +3882,9 @@ group where the user is D:
 - each post the user sends: `post`, once per post, not per member or attempt.
 
 Nothing else sends one: not applying a received G, not a `status` answer, not
-restoring at start, not a group whose user address is the device, and not a
-device that does not hold the D the group lists.
+restoring at start, not a group whose user address is the device, not a
+device that does not hold the D the group lists, and not a delete from a device
+that no longer holds it.
 
 | | Group sync G |
 |---|---|
@@ -3836,15 +3902,15 @@ device that does not hold the D the group lists.
 (written lowercase, compared lowercased); `at_ms` the time of the user's action
 in milliseconds since the epoch, a msgpack integer from 0 to 2^53 − 1 in any
 integer encoding, read by its value, under every rule of §17.12 "`at_ms` on the
-wire" (the web writes int 64 `0xd3`, rmpv and umsgpack uint 64 `0xcf`).
-Receivers ignore elements after the last one defined for the op.
+wire" (the web writes int 64 `0xd3`, rmpv and umsgpack uint 64 `0xcf`). The
+last element of every op is `left`. Receivers ignore elements after it.
 
 | op | `fields[0xFC]` |
 |---|---|
-| `create` | `["create", group_id, at_ms, name, members, keys]`: the creator is D |
-| `accept` | `["accept", group_id, at_ms, name, members, keys, creator]` |
-| `leave` | `["leave", group_id, at_ms]` |
-| `post` | `["post", group_id, at_ms, text]`: `at_ms` is the post's own time as the sending device stored it |
+| `create` | `["create", group_id, at_ms, name, members, keys, left]`: the creator is D |
+| `accept` | `["accept", group_id, at_ms, name, members, keys, creator, left]` |
+| `leave` | `["leave", group_id, at_ms, left]` |
+| `post` | `["post", group_id, at_ms, text, left]`: `at_ms` is the post's own time as the sending device stored it |
 
 - `name`: the group's name, UTF-8 str (receivers accept bin), possibly empty.
 - `members`: a str, the group's `GROUP_MEMBERS` csv exactly as the invite
@@ -3860,30 +3926,53 @@ Receivers ignore elements after the last one defined for the op.
 - `text`: the post's content unchanged, UTF-8 str (receivers accept bin). Text
   only, as §17.11: attachments are **not** copied. An attachment-only post
   copies an empty text, which a sibling shows as it shows such a §17.11 copy.
+- `left`: an array of at most 32 str of 32 hex characters, the ids of the
+  groups the sending device holds as left by D (the user's own leaves as D,
+  and every leave it applied from a G or from another G's `left`), most recent
+  first, possibly empty. A device keeps that list per D, the oldest forgotten
+  past 32. It exists because a leave G can be lost before an offline device
+  collects it: a device's queue at RFed is bounded (256 blobs by default) and
+  evicts its oldest entry when full (§7), and anyone can send to D. With `left` on every G, the
+  next G from any device of D closes the group on a device that missed the
+  leave, with no catch-up exchange and no timer.
 
 So a sibling can hold the group from an `accept` or `create` alone, without the
 invite: its own privacy filter may have dropped the invite, it may have been
 offline longer than RFed keeps it, or the sync may arrive first. A `leave` is
 about 220 bytes packed and a `create` or `accept` about 150 bytes per member;
-G is never split, and every proven upload is a Resource (§17.13 "The upload").
+`left` adds about 34 bytes per id. G is never split, and every proven upload
+is a Resource (§17.13 "The upload").
 
 *On the sending device.* G is packed and signed by D, encrypted to D and sealed
-for §17.13 once, when the user acts, in the same step that records the action
-on the device, and kept until the propagation node proves it. Every rule of
+for §17.13 once, and kept until the propagation node proves it. A `create`,
+`accept` or `leave` G is made when the user acts, in the same step that records
+the action on the device, as §17.12 makes C. A `post` G is made as §17.11
+makes a sent copy: once per post, only after the post was submitted to the
+members (a held send when it is released and the first member envelope is
+accepted; a post to a group with no other accepted member when it is stored),
+and never for a send that throws, since that post never left. Every rule of
 §17.12 "On the sending device" applies to G as written there for the membership
-message, under the same decided exception of DESIGN_PRINCIPLES.md §3 (extended
-by James on 2026-10-10 from two kinds to three), with two differences, the ones
-§17.11 makes for a sent copy:
+message, under the decided exception of DESIGN_PRINCIPLES.md §3, which James
+extended on 2026-10-10 from two kinds to three (the §3 paragraph names the
+group sync). There are two differences, the ones §17.11 makes for a sent copy:
 
 - Each G is owed on its own, under its own LXMF message hash; no later G
   replaces it. None needs to: the receive rules give the same result in
   whatever order the Gs arrive.
-- Giving up D does not drop it (proposed with this section; James to confirm
-  with the §3 text). G reports an act the user already made as D toward the
-  members, so the siblings must learn it whatever this device does next. It is
-  already packed and signed as D, so it stays owed to D, is uploaded to D on
-  later comings-up, and is never re-addressed, sent under another distro or
-  packed again; the device keeps D's public key with it.
+- Giving up D: **pending James** (DESIGN_PRINCIPLES.md §3, the bullet on a
+  device that forgets or replaces its distro, which still names only the
+  membership messages and the sent copies). Proposed: giving up D does not drop
+  G. G reports an act the user already made as D toward the members, so the
+  siblings must learn it whatever this device does next. It is already packed
+  and signed as D, so it would stay owed to D, be uploaded to D on later
+  comings-up, and never be re-addressed, sent under another distro or packed
+  again; the device keeps D's public key with it.
+
+A client keeps its owed Gs where no build from before this section can
+overwrite them. On the web, where an older cached build can run on the same
+origin, they live under a storage key of their own (`distro_outbox_group_v1`),
+because an older build rewrites the shared outbox key without the entries it
+cannot read.
 
 *Receiving.* A device unwraps a fan-out blob with its distro key (§17.3). A
 message whose `fields[0xFB]` is `"rfed.distro.group"` is a group sync. It is a
@@ -3905,23 +3994,52 @@ ends the check.
    integer from 0 to 2^53 − 1; for `create` and `accept`, `name` a str or bin,
    `members` a str whose list parses and names D, `keys` an array of str; for
    `accept`, `creator` 32 hex characters, listed, not D; for `post`, `text` a
-   str or bin. Anything else is dropped with a log line.
-5. **Apply,** by the group's state on this device, as below. Applying G never
+   str or bin; for every op, `left` an array of at most 32 str of 32 hex
+   characters. Anything else is dropped with a log line.
+5. **Own address.** A G for a group this device holds with the device, not D,
+   as the user's address (a group held before this section) is ignored with a
+   log line; its `left` is still applied.
+6. **Apply,** by the group's state on this device, as below. Applying G never
    sends anything to the members and never sends a G, so nothing loops. It
-   asks nothing of the user: no notification, no alert, no prompt.
+   asks nothing of the user: no notification, no alert, no prompt. G is
+   recorded as seen once applied; a held `post` G is not, and its replay is
+   judged as a new arrival.
+
+"Held from G" below means: the list `members`; the recorded creator D for
+`create`, `creator` (accepted) for `accept`; the user D (accepted, joined);
+every other member invited; `keys` bound and remembered; the members passing
+the privacy filter by association, as creating the group or accepting it on the
+device would let them pass (Group.md "The privacy filter"), the user's own
+addresses excluded; then its held messages, in arrival order.
 
 | G | Group not held | Held, pending | Held, joined | Held, left or declined |
 |---|---|---|---|---|
-| `create` | held, joined: the list, the recorded creator D, the user D, every other member invited, `keys` bound and remembered; then its held messages | ignored and logged | nothing | nothing |
-| `accept` | held, joined: the list, the recorded creator `creator` (accepted), the user D accepted, every other member invited, `keys` bound and remembered, the members passing the privacy filter by association; then its held messages | joined, as the user's own accept on this device would make it, without sending: its held messages after | nothing | nothing: a leave is final, and an accept never reopens it |
+| `create` | held from G | the pending invite held there is discarded without sending anything (logged with its inviter), then held from G | nothing | nothing |
+| `accept` | held from G | when the pending invite's recorded creator and member list are G's: joined, as the user's own accept on this device would make it, without sending, its held messages after; otherwise the pending invite is discarded without sending anything (logged), then held from G | nothing | nothing: a leave is final, and an accept never reopens it |
 | `leave` | the group id recorded as left, so a later invite, `create` or `accept` for it is ignored | declined, as the user's own decline on this device would, without sending | left, as the user's own leave on this device would, without sending | nothing |
 | `post` | held (above) | held (above) | stored as the user's own outgoing post in the group: sender D, state SENT (as §17.11 rule 5: never DELIVERED, never sending or failed), timestamp `at_ms`, the text, no notification, its id G's LXMF hash | dropped |
 
+The user's own sync outranks anyone else's invite for its group id. A
+co-member learns the id from its own invite chunk and can send its own invite
+for it to D; a device whose filter admits that co-member but not the real
+creator holds that invite. Joining it would record the wrong creator, let the
+co-member's list through the filter, and send the user's posts to that list.
+Discarding it sends nothing: a decline would be a final leave as D.
+
+"As the user's own decline or leave on this device would" includes removing
+the conversation, as every client's local decline, leave and delete does. A
+leave on one device therefore removes the group, with its messages, from every
+device of D.
+
+After the op, each id in `left` other than G's own group id is applied as a
+`leave` G for that id when the group is held there as D, recorded as left when
+it is not held, and ignored when the device holds it as the device. Each id
+applied or already left joins the device's own `left` list for D.
+
 Every device of D therefore ends in the same state in whatever order the Gs
-arrive: a left group stays left, a joined one stays joined until a leave, and
-two siblings that accept and leave concurrently both end left, as the members
-do. A device whose conversation was deleted keeps it deleted; the others keep
-theirs as a left group until the user deletes it there.
+arrive: a left group stays left (and removed), a joined one stays joined until
+a leave, and two siblings that accept and leave concurrently both end left, as
+the members do.
 
 **Which device answers.** When the group's creator is D, every device of D
 that holds the group answers each `accept` it receives that carries its
@@ -3941,24 +4059,43 @@ any other.
 
 *A device that is offline.* As §17.12 for C: a G that carries an accepted
 §17.13 proof is handed off without a wake, within the bounds of §17.3, and is
-applied when the device next collects its backlog. An iOS notification service extension does not apply G
-(the app does, when it next runs) and shows no notification for G or for a
-group control message; it shows a group post only for a group the app holds
-as joined.
+applied when the device next collects its backlog. An iOS notification service
+extension does not apply G or any group message (the app does, when it next
+runs). It shows nothing for G, for a forged group message, for one from or
+naming the user's own addresses, or for a group control message other than an
+`invite`. It shows an `invite` to D only when the inviter passes the app's
+privacy filter (shared with the extension), and a group post only for a group
+the app holds as joined, from an accepted member, with a valid signature,
+threaded under the group. The app does not notify again for a message the
+extension showed.
 
 *Not covered.* G can be lost in the ways §17.12 "Not covered" lists for C,
-except that giving up D does not lose it (above). A device that imports D after
-an action, or misses G in RFed's queue, does not learn it; no catch-up exchange
-is defined. A held message evicted by the bounds is lost, with a log line.
+and giving up D may lose it if James decides so (above). A device that imports
+D after an action, or misses G in RFed's queue, does not learn it. A missed
+leave is repaired by `left` on the next G any device of D sends; a missed
+`create`, `accept` or `post` is not, and no catch-up exchange is defined. A
+device whose own filter dropped the invite keeps nothing for that group, so a
+member's `accept` or the creator's `status` that reached it before the accept
+G is lost there. A held message evicted or refused by the bounds is lost, with
+a log line.
 
 *Older clients.* G has empty content, an empty ticket and no attachment, the
 form §17.12 "Older clients" analyses for C, so every client that drops C drops
 G: Retichat-android from 076f310, Retichat-ios from 24c64a4 (and its NSE from
 a6ac519), Retichat-js from adee619. A web build before adee619 shows it as an
-empty incoming message from D. An older device of the user keeps showing group
-messages that reach it through D as before, a placeholder or a blank direct
-message, and acts in groups as its device address, which a group that lists D
-does not count, until it is updated.
+empty incoming message from D. An older device of the user acts in groups as
+its device address, which a group that lists D does not count, and files every
+group message that reaches it through D as a direct message, until it is
+updated. That traffic grows with this section. Before it, only invites and
+co-members' `accept`s and `leave`s reached D, because D never became an
+accepted member. Once any updated device of D accepts or creates a group as D,
+members send their posts to D and the creator answers D with `status`es. An
+older device then shows each member's post as a readable direct message in the
+poster's 1:1 chat, with a notification, and a reply typed there goes to the
+poster alone (Retichat-android 0.1.10 `handleDirectMessage`, Retichat-ios main
+`storeIncomingDirect`, Retichat-js 6d0cf8b `MsgStore.add`). Statuses and other
+control messages show as placeholders or blank direct messages. Users update
+every device before using groups as D.
 
 *Privacy.* `fields[0xFD]` reveals which device acted, to holders of D only, as
 in §17.11. A group's member list and keys, and the user's posts, sit encrypted
@@ -3968,8 +4105,8 @@ to D in RFed's BlobStore and deferred queues, as every distro blob does.
 
 | Part | Where | Status (2026-10-10) |
 |---|---|---|
-| Spec | RFed-spec Group.md "Distro holders"; this section; DESIGN_PRINCIPLES.md §3 (text proposed in GROUPS-DISTRO-DESIGN.md §16, awaiting James) | written 2026-10-10 on branches `group-distro`, not merged |
-| Shared Rust | LXMF-rust `distro`: `DistroMessage` hash, packed, group id and action, group sync; `set_group_sync_fields`, `read_group_sync`, `to_json_with_receipt`; `name_ledger::is_own_devices_message`; golden vector `tests/distro_group_sync_vectors.json` made with the Python reference | not started |
+| Spec | RFed-spec Group.md "Distro holders"; this section; DESIGN_PRINCIPLES.md §3 (the three-kind paragraph applied 2026-10-10 under James's ruling; the distro-given-up bullet awaiting James, GROUPS-DISTRO-DESIGN.md §16) | written 2026-10-10 on branches `group-distro`, revised after review the same day, not merged |
+| Shared Rust | LXMF-rust `distro`: `DistroMessage` hash, packed, `has_group_id`, group id, action and name, group sync with `left`; `set_group_sync_fields`, `read_group_sync`, `to_json_with_receipt`; `name_ledger::is_own_devices_message`; golden vector `tests/distro_group_sync_vectors.json` made with the Python reference | not started |
 | Phone bridges | Retichat-ios `rust/retichat-ffi`, Retichat-android `rust/retichat-jni`: `group_status::receipt_parts` on the distro unwrap; `retichat_message_set_distro_group_sync` / `nativeMessageSetDistroGroupSync` | not started |
 | iOS | Retichat-ios (off distro-sync bbae30c) | not started |
 | Android | Retichat-android (release-0.1.11, held for it) | not started |
