@@ -3959,14 +3959,13 @@ group sync). There are two differences, the ones §17.11 makes for a sent copy:
 - Each G is owed on its own, under its own LXMF message hash; no later G
   replaces it. None needs to: the receive rules give the same result in
   whatever order the Gs arrive.
-- Giving up D: **pending James** (DESIGN_PRINCIPLES.md §3, the bullet on a
-  device that forgets or replaces its distro, which still names only the
-  membership messages and the sent copies). Proposed: giving up D does not drop
-  G. G reports an act the user already made as D toward the members, so the
-  siblings must learn it whatever this device does next. It is already packed
-  and signed as D, so it would stay owed to D, be uploaded to D on later
-  comings-up, and never be re-addressed, sent under another distro or packed
-  again; the device keeps D's public key with it.
+- Giving up D does not drop G (James, 2026-10-10; DESIGN_PRINCIPLES.md §3,
+  the bullet on a device that forgets or replaces its distro). G reports an
+  act the user already made as D toward the members, so the siblings must
+  learn it whatever this device does next. It is already packed and signed as
+  D, so it stays owed to D, is uploaded to D on later comings-up, and is never
+  re-addressed, sent under another distro or packed again; the device keeps
+  D's public key with it.
 
 A client keeps its owed Gs where no build from before this section can
 overwrite them. On the web, where an older cached build can run on the same
