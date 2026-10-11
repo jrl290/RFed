@@ -3791,18 +3791,30 @@ message in this order, and the first that matches decides:
    and timestamp, then the identity transfer (§17.9), the sent copy (§17.11),
    the delivery-notification test and the direct-message path.
 
-**Repeated keys.** A fields map may hold a key more than once, and so may the
-Retichat field `0xD1`. Every device reads them alike: a group entry
-(`0xA0`–`0xA8`, the field `0xD1` itself, and keys 1–9 inside it) is read from
-the **first** entry with its key, even when that entry is not of the entry's
-type, and `fields[0xFB]` from the **last**. A reader that decodes the map into
-a dictionary keeps the last of each key, so it reads the group entries from
-the message's bytes instead. An ext value of a type the reader does not know
-is skipped; it never makes the map unreadable. (The Python reference has no
-rule here: RNS's umsgpack refuses a map that repeats a key, and LXMF.py drops
-the message whole.) LXMF-rust `tests/distro_group_sync_vectors.json`
-(`group_entries`, `variants`, `rejects`, `invite_members`) pins each case, and
-every client runs it.
+On the direct path too, a group id is read as on the distro path: a str of 32
+hex characters, compared and stored lowercased; a message with any other
+`GROUP_ID` (another length, not hex, a bin, an int, nil) is refused with a log
+line, never a direct message or a group. On the direct path a distro marker
+means nothing: the message is classified by its group id.
+
+**Repeated keys.** A message whose payload holds a map, at any depth, that
+repeats a key is refused whole, as Python LXMF refuses it: LXMF 1.1.1 reads the
+payload with RNS's umsgpack, which raises `DuplicateKeyException`, and
+`LXMRouter` drops the message (James, 2026-10-11: parity). Every client refuses
+it so, on the direct path and on the distro path, with a log line and before it
+reads any field: it is never shown, stored or applied, and no reader of the
+group entries, a group sync or a membership message (§17.12) ever sees such a
+map. Two keys are one key when Python's equality says so: an integer, float or
+boolean of one numeric value, whatever its encoding (`1`, `1.0` and `true` are
+one key); a str by its code points and a bin by its bytes, never a str and a
+bin; nil; an ext by its type and data, a timestamp ext by its instant to the
+microsecond. NaN is no key's equal, and an array key is never compared
+(umsgpack skips the check for it). An ext value of a type the reader does not
+know is skipped; it never makes the map unreadable. LXMF-rust
+`tests/distro_group_sync_vectors.json` pins each case: `refused` and
+`key_equality`, each checked against the reference by the generator, beside
+`group_entries`, `variants`, `rejects` and `invite_members`. Every client runs
+it.
 
 A group message and a group sync are a repeat only when their LXMF message
 hash is one already seen; the device keys them by it (`grp:<hash>`,
