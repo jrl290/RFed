@@ -133,10 +133,11 @@ Layer 1' (Reticulum transport — fanout hop, one per subscriber):
    remember nothing (LXMF-rust/DISPLAY_NAMES.md §2.3).
    **Then the payload (MUST, before step 6).** Decode the msgpack payload
    that follows `source_hash` and the signature. A payload that cannot be
-   read, that is not an array, or that holds a map, at any depth, that
-   repeats a key (§17.14 "Repeated keys": refused whole, as Python LXMF
-   refuses it, with a log line) is rejected too, and nothing is remembered:
-   only a post that is kept leaves its sender's key behind.
+   read, that is not an array, that holds a map, at any depth, that
+   repeats a key or has a key Python cannot hash, or that nests past depth
+   493 (§17.14 "Repeated keys", "Unhashable keys", "Nesting": refused whole,
+   as Python LXMF refuses it, with a log line) is rejected too, and nothing
+   is remembered: only a post that is kept leaves its sender's key behind.
 6. Call `Identity::remember_destination(source_hash, sender_identity_pub, None)`
    to populate Reticulum's known-destinations cache.
 7. Prepend the channel's `lxmf.delivery` destination hash to the
@@ -3748,10 +3749,18 @@ group where the user is D, every envelope goes out with LXMF source D, signed
 by D's key, `GROUP_SENDER` = D, and an `accept` or `leave` carries `"<D>:" +
 base64(D's 64-byte public key)` as its sender's key. The signer is taken at
 send time from the distro the device holds, and only when its `lxmf.delivery`
-hash is the group's own address. A device that no longer holds the D a group
-lists, or has not loaded it yet, cannot act in it: it says so to the user,
-never sends from the device address or as another distro instead, and offers
-only a delete from that device, which sends nothing.
+hash is the group's own address; nothing is ever sent from the device address
+or as another distro instead. While the app is starting and D is not usable
+yet, a post in a group where the user is D waits as a direct message waits at
+start-up: it is sent when the start finishes, or shown failed as a direct
+message fails if D cannot sign it then (an ordering, DESIGN_PRINCIPLES.md §5,
+not a retry); accept, decline, leave, delete and create are not offered until
+the start finishes, and nothing is shown about it (James, 2026-10-11). A device
+that no longer holds the D a group lists (a former distro) cannot act in it:
+it shows the one text GROUPS-DISTRO-DESIGN.md §8.7 gives, naming D by its first
+8 hex characters and "…", and offers only a delete from that device, which
+sends nothing. A post refused after Send shows no notice; its draft stays in
+the composer.
 
 In a group whose list names a distro the device holds or the group was joined
 as, the user's own addresses are that distro, the device, and the other
@@ -3802,13 +3811,21 @@ hex characters, compared and stored lowercased; a message with any other
 `GROUP_ID` (another length, not hex, a bin, an int, nil) is refused with a log
 line, never a direct message or a group. On the direct path the
 `rfed.distro.channel` and `rfed.distro.group` markers mean nothing beside a
-group id: a message that carries one is classified by its group id. A sent
-copy (§17.11) and an identity transfer (§17.9) are still recognised by their
-markers before the group id, as every client does. Where the refusal of a
-malformed group id stands against those two, and so the full order of the
-direct path, is not yet ruled (open for James, 2026-10-11). Every client
-reads these fields as Android and iOS do: a field is found only under a msgpack
-integer key, of any width (a uint 64 `0xA0` is `0xA0`); a float key, even an
+group id: a message that carries one is classified by its group id. A device
+classifies every message that reaches it directly in this order, and the first
+that matches decides (decided 2026-10-11 for James):
+
+1. a message whose `GROUP_ID` is malformed (above) is refused with a log line,
+   whatever else it carries, a distro marker included;
+2. a sent copy (§17.11), by its marker;
+3. an identity transfer (§17.9), by its marker;
+4. a group message, by its group id;
+5. a direct message.
+
+iOS and the web classify so; Android, which recognises the sent copy and the
+transfer before it refuses a malformed group id, follows in its own round.
+Every client reads these fields as Android and iOS do: a field is found only
+under a msgpack integer key, of any width (a uint 64 `0xA0` is `0xA0`); a float key, even an
 integral one, is no field (`160.0` is not `0xA0`, and `1.0` inside `0xD1` is not
 key 1), so a message whose only group id sits under one is a direct message. A
 marker (`fields[0xFB]`), a transfer's key (`fields[0xFC]`) and a sent copy's
@@ -3829,17 +3846,50 @@ boolean of one numeric value, whatever its encoding (`1`, `1.0` and `true` are
 one key); a str by its code points and a bin by its bytes, never a str and a
 bin; nil; an ext by its type and data, a timestamp ext by its instant to the
 microsecond. NaN is no key's equal, and an array key is never compared
-(umsgpack skips the check for it). umsgpack refuses two more payloads whole,
-for other reasons, and this rule does not cover them; neither is ruled yet
-(open for James, 2026-10-11): a map, or an array that holds a map, used as a
-key (`UnhashableKeyException`), and a payload nested past Python's recursion
-limit (`RecursionError`, from about 496 arrays nested in a field, fewer under
-`LXMRouter`'s stack). An ext value of a type the reader does not
-know is skipped; it never makes the map unreadable. LXMF-rust
-`tests/distro_group_sync_vectors.json` pins each case: `refused` and
-`key_equality`, each checked against the reference by the generator, beside
-`group_entries`, `variants`, `rejects` and `invite_members`. Every client runs
-it.
+(umsgpack skips the check for it). An ext value of a type the reader does not
+know is skipped; it never makes the map unreadable.
+
+**Unhashable keys.** A message whose payload holds a map, at any depth, with a
+key Python cannot hash is refused whole the same way, on the same paths and
+with the same log line (decided 2026-10-11 for James: parity). umsgpack raises
+`UnhashableKeyException` for a map used as a key, and for an array used as a
+key that holds a map at any depth (it turns the array into a tuple, which
+Python cannot hash then); LXMF drops the message. An array key that holds no
+map is read. Where a payload gives more than one reason, the refusal names the
+first umsgpack meets in reading order: a key is read whole before it is judged
+(a repeat inside a map key comes first); a map key is refused before its value
+is read; an array key's value is read before the key is hashed (a repeat inside
+that value comes first).
+
+**Nesting.** A message whose payload holds any value (an array, a map, a key or
+a scalar) deeper than 493 is refused whole the same way, on the same paths and
+with the same log line (decided 2026-10-11 for James: parity, one limit). The
+payload is at depth 0, its fields map at 1 and a field's value at 2, so a field
+holds at most 492 nested arrays or maps whose innermost is empty, or 491 whose
+innermost holds anything. The limit follows Python's measured delivery-path
+depth: umsgpack reads two Python frames a level and raises `RecursionError`
+past the recursion limit (1000), which `LXMRouter.lxmf_delivery` catches and
+drops the message. Measured end to end over local TCP between three processes
+(CPython 3.13.5, RNS 1.5.2, LXMF 1.1.1; LXMF-rust
+`tests/delivery_nesting_probe.py`, 2026-10-11): a propagated message, unpacked
+in the 10th frame of its thread (`message_get_response` → `lxmf_propagation` →
+`lxmf_delivery` → `unpack_from_bytes`), is read exactly to depth 493, whatever
+the innermost value; that is the one limit. A direct delivery over a link as a
+Resource is unpacked in the 7th frame and reads one or two levels more; a node
+answer that comes as a Resource adds a frame, and there Python reads a str or a
+bin one level less (emulated: the `str_at_the_limit` vector, read under the
+limit, is refused there). A reader whose decoder stops short of a payload
+refuses it as too deep, never as unreadable (LXMF-rust's rmpv reads about 510
+levels, past the limit, then stops).
+
+LXMF-rust `tests/distro_group_sync_vectors.json` pins each case: `refused`
+(each with the reference's `reason`: `repeated_key`, `unhashable_key`),
+`key_equality`, and `nesting` (`nesting_max_depth` 493; arrays, maps, an int, a
+str and a key at the limit and one past it, refused with `reason`
+`too_deep`, and 600 arrays, far past it), each checked against the reference
+by the generator, beside `group_entries`, `variants`, `rejects` and
+`invite_members`. Every client runs it; the web, whose decoder has no limit of
+its own, follows `nesting_max_depth`.
 
 A group message and a group sync are a repeat only when their LXMF message
 hash is one already seen; the device keys them by it (`grp:<hash>`,
