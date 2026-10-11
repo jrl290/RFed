@@ -131,6 +131,12 @@ Layer 1' (Reticulum transport — fanout hop, one per subscriber):
    (`truncated_hash(name_hash("lxmf.delivery") || truncated_hash(sender_identity_pub))`)
    and compare it with `source_hash`. On mismatch reject the post and
    remember nothing (LXMF-rust/DISPLAY_NAMES.md §2.3).
+   **Then the payload (MUST, before step 6).** Decode the msgpack payload
+   that follows `source_hash` and the signature. A payload that cannot be
+   read, that is not an array, or that holds a map, at any depth, that
+   repeats a key (§17.14 "Repeated keys": refused whole, as Python LXMF
+   refuses it, with a log line) is rejected too, and nothing is remembered:
+   only a post that is kept leaves its sender's key behind.
 6. Call `Identity::remember_destination(source_hash, sender_identity_pub, None)`
    to populate Reticulum's known-destinations cache.
 7. Prepend the channel's `lxmf.delivery` destination hash to the
@@ -3794,22 +3800,33 @@ message in this order, and the first that matches decides:
 On the direct path too, a group id is read as on the distro path: a str of 32
 hex characters, compared and stored lowercased; a message with any other
 `GROUP_ID` (another length, not hex, a bin, an int, nil) is refused with a log
-line, never a direct message or a group. On the direct path a distro marker
-means nothing: the message is classified by its group id.
+line, never a direct message or a group. On the direct path the
+`rfed.distro.channel` and `rfed.distro.group` markers mean nothing beside a
+group id: a message that carries one is classified by its group id. A sent
+copy (§17.11) and an identity transfer (§17.9) are still recognised by their
+markers before the group id, as every client does. Where the refusal of a
+malformed group id stands against those two, and so the full order of the
+direct path, is not yet ruled (open for James, 2026-10-11).
 
 **Repeated keys.** A message whose payload holds a map, at any depth, that
 repeats a key is refused whole, as Python LXMF refuses it: LXMF 1.1.1 reads the
 payload with RNS's umsgpack, which raises `DuplicateKeyException`, and
 `LXMRouter` drops the message (James, 2026-10-11: parity). Every client refuses
-it so, on the direct path and on the distro path, with a log line and before it
-reads any field: it is never shown, stored or applied, and no reader of the
-group entries, a group sync or a membership message (§17.12) ever sees such a
-map. Two keys are one key when Python's equality says so: an integer, float or
+it so, on the direct path, on the distro path and in a channel post ("Subscriber
+decode", step 5: before the sender's key is remembered), with a log line and
+before it reads any field: it is never shown, stored or applied, and no reader
+of the group entries, a group sync or a membership message (§17.12) ever sees
+such a map. Two keys are one key when Python's equality says so: an integer, float or
 boolean of one numeric value, whatever its encoding (`1`, `1.0` and `true` are
 one key); a str by its code points and a bin by its bytes, never a str and a
 bin; nil; an ext by its type and data, a timestamp ext by its instant to the
 microsecond. NaN is no key's equal, and an array key is never compared
-(umsgpack skips the check for it). An ext value of a type the reader does not
+(umsgpack skips the check for it). umsgpack refuses two more payloads whole,
+for other reasons, and this rule does not cover them; neither is ruled yet
+(open for James, 2026-10-11): a map, or an array that holds a map, used as a
+key (`UnhashableKeyException`), and a payload nested past Python's recursion
+limit (`RecursionError`, from about 496 arrays nested in a field, fewer under
+`LXMRouter`'s stack). An ext value of a type the reader does not
 know is skipped; it never makes the map unreadable. LXMF-rust
 `tests/distro_group_sync_vectors.json` pins each case: `refused` and
 `key_equality`, each checked against the reference by the generator, beside
