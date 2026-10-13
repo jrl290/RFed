@@ -5385,6 +5385,88 @@ mod destination_wiring_tests {
         }
     }
 
+    /// The blobs of a pull response `[[[routing, blob], …], more_pending]`.
+    fn page_of(data: &[u8]) -> (Vec<Vec<u8>>, bool) {
+        let value = rmpv::decode::read_value(&mut &data[..]).expect("a msgpack response");
+        let outer = value.as_array().expect("[entries, more_pending]");
+        let blobs = outer[0]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry.as_array().expect("[routing, blob]")[1].as_slice().expect("bin blob").to_vec())
+            .collect();
+        (blobs, outer[1].as_bool().expect("more_pending"))
+    }
+
+    /// Wait for the settling thread `pull_answer` starts.
+    fn wait_for(
+        queue: &std::sync::Mutex<crate::deferred_queue::DeferredQueue>,
+        what: &str,
+        done: impl Fn(&crate::deferred_queue::DeferredQueue) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done(&queue.lock().unwrap()) {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// `pull_answer` holds what it hands out until the requester's proof
+    /// settles it (PULL-PROOF-DESIGN.md). Not proved, the same page comes on
+    /// the next pull, in its order, with a NOTICE; proved, it is gone from the
+    /// queue and from the store. A pull with nothing left holds nothing and
+    /// goes plain.
+    #[test]
+    fn a_pull_answer_keeps_its_page_until_the_proof() {
+        use super::{pull_answer, ProvenAnswer};
+        use crate::deferred_queue::DeferredQueue;
+        use std::sync::{Arc, Mutex};
+
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let path = std::env::temp_dir().join(format!("rfed_pull_answer_{unique}.rmp"));
+        crate::store_db::remove_store_files(&path);
+        let queue = Arc::new(Mutex::new(DeferredQueue::load(path.clone())));
+        let subscriber: Vec<u8> = (0..16u8).map(|i| 0xA7 ^ i).collect();
+        let routing = vec![0xD7; 16];
+        for i in 0..3u8 {
+            queue.lock().unwrap().enqueue(subscriber.clone(), routing.clone(), vec![i; 40], 256);
+        }
+        let pull = || {
+            let mut deferred = queue.lock().unwrap();
+            pull_answer(&queue, &mut deferred, &subscriber, |_| true, 2, "pull-answer test")
+        };
+        let proven = |answer: ProvenAnswer| match answer {
+            ProvenAnswer::Proven { data, concluded } => (page_of(&data), concluded),
+            _ => panic!("a page is held until its proof, so it goes as a proven answer"),
+        };
+
+        let mark = crate::test_log::mark();
+        let (first, concluded) = proven(pull());
+        assert_eq!(first, (vec![vec![0u8; 40], vec![1u8; 40]], true));
+        assert_eq!(queue.lock().unwrap().total_len(), 3, "a held page is still stored");
+        concluded(false);
+        wait_for(&queue, "the page not proved comes back", |q| q.count_matching(&subscriber, &routing) == 3);
+        let notice = format!("page of 2 blob(s) for {} not proved", reticulum_rust::hexrep(&subscriber, false));
+        assert_eq!(mark.any_thread_containing(&notice).len(), 1, "one NOTICE for the page put back");
+
+        let (again, concluded) = proven(pull());
+        assert_eq!(again, first, "the same page, in its order");
+        concluded(true);
+        wait_for(&queue, "the proved page is deleted", |q| q.total_len() == 1);
+        assert_eq!(DeferredQueue::load(path.clone()).total_len(), 1, "its rows are gone from the store");
+
+        let (last, concluded) = proven(pull());
+        assert_eq!(last, (vec![vec![2u8; 40]], false));
+        concluded(true);
+        wait_for(&queue, "the last page is deleted", |q| q.total_len() == 0);
+
+        match pull() {
+            ProvenAnswer::Plain(data) => assert_eq!(page_of(&data), (vec![], false)),
+            _ => panic!("an empty page holds nothing and goes plain"),
+        }
+        crate::store_db::remove_store_files(&path);
+    }
+
     #[test]
     fn channel_publish_accepts_oversized_sends_as_resources() {
         let source = std::fs::read_to_string(concat!(

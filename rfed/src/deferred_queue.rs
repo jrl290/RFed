@@ -907,19 +907,26 @@ mod tests {
         assert!(q.enqueue(sub.clone(), chan.clone(), vec![9], 1024).queued());
     }
 
-    /// Expiry leaves a held page alone, rows and all, until it settles. Not
-    /// proved, it comes back and then expires counted like any other entry.
+    /// Expiry leaves a held page alone, rows and all, until it settles, even
+    /// while another device's entries expire beside it. Not proved, it comes
+    /// back and then expires counted like any other entry.
     #[test]
     fn expiry_keeps_the_rows_of_a_held_page() {
         let mut q = fresh_queue();
         let device = vec![0x79u8; 16];
+        let other = vec![0x7Au8; 16];
         let distro = vec![0xD9u8; 16];
         enqueue_n(&mut q, &device, &distro, 2);
+        enqueue_n(&mut q, &other, &distro, 1);
         let (page, taken) = take(&mut q, &device, 25);
         assert_eq!(taken.len(), 2);
 
-        assert!(q.evict_expired(-10.0).is_empty(), "a held page is not in its bucket");
-        assert_eq!(rows(&q), 2, "its rows are kept");
+        assert_eq!(
+            q.evict_expired(-10.0),
+            vec![Expired { subscriber_hash: other.clone(), routing_hash: distro.clone(), count: 1 }],
+            "only what is in a bucket expires; a held page is out of its bucket"
+        );
+        assert_eq!(rows(&q), 2, "the held page's rows are kept");
 
         q.settle_page(page, false);
         assert_eq!(
