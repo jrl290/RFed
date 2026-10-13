@@ -409,13 +409,31 @@ multi-hop routed).
 | `/rfed/pull` | Subscriber | `msgpack nil` (packed `None`, `0xc0` — a request with no data is still one msgpack value; zero bytes is malformed and unparseable). Caller authenticated by link identity | `msgpack [ [[bin(16) channel_hash, bin blob], …], bool more_pending ]` |
 
 **PULL paging** (user-initiated; mirrors chat-history "Load earlier
-messages"): each call drains at most one page (`deferred_pull_batch_limit`
-or `DEFAULT_PULL_PAGE_SIZE = 25`) and returns `more_pending = true` when
-additional entries remain for the caller. The client offers another
-page-load action while `more_pending` is true and stops once it is false.
-Drain is destructive on the server side — once a page has been returned
-those blobs are gone from this node and will only re-arrive via fanout
-from another session or sync from the origin.
+messages"): each call takes at most one page and returns
+`more_pending = true` when additional entries remain for the caller. The
+client offers another page-load action while `more_pending` is true and
+stops once it is false. A page holds at most `deferred_pull_batch_limit`
+entries (default `DEFAULT_PULL_PAGE_SIZE = 25`) and, after its first, only
+as many as keep the packed response within one Resource segment
+(`MAX_EFFICIENT_SIZE`, 1 MiB − 1, less 64 bytes for the envelope). An entry
+that does not fit ends the page, so nothing behind it overtakes it; a
+single larger entry goes alone.
+
+**A pulled page is kept until it is proven** (2026-10-12; the workspace's
+PULL-PROOF-DESIGN.md). A page with entries is answered as a response
+Resource, the form RNS uses for a response over the link MDU, whatever its
+size, so the requester's Reticulum stack proves it once it has the whole
+page. Until then rfed holds the page out of the caller's queue, still
+stored and still counted toward the global limit. When the requester proves
+it, the page is deleted. When the transfer fails (refused, cancelled, timed
+out, or the link closed), the page goes back to the front of the caller's
+queue in its order, for the next pull; rfed never re-sends it on its own.
+A restart while a page is held keeps it too, so that page comes again:
+delivery is at least once, and a client drops a message it already holds.
+Two pulls from one identity at once take disjoint pages. An empty page and
+the error responses below are ordinary responses: there is nothing to keep.
+The wire format is unchanged. Until 2026-10-12 each pull deleted its page
+before answering, and a transfer that failed lost it.
 
 **PULL error responses.** PULL is the one rfed request family authenticated
 by the caller's **link identity** rather than a signed payload, which exposes
@@ -941,8 +959,9 @@ distro registered here).
 1. **Subscriber comes online** — delivery destination announces; node
    drains deferred queue and sends each blob.
 2. **PULL request** — subscriber explicitly requests pending blobs via
-   `/rfed/pull` (or `/channel/pull`, `/distro/pull` on `rfed.link`); queue is
-   drained and returned as a msgpack array.
+   `/rfed/pull` (or `/channel/pull`, `/distro/pull` on `rfed.link`); one
+   page is returned as a msgpack array and deleted once the requester proves
+   it (§ PULL paging above).
 3. **Periodic eviction** — entries older than 7 days are pruned hourly.
 
 ---

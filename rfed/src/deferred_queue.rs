@@ -196,10 +196,22 @@ pub fn expiry_lines(
 
 // ── DeferredQueue ─────────────────────────────────────────────────────────────
 
+/// A page a pull holds (PULL-PROOF-DESIGN.md): out of its bucket, its rows
+/// kept, until [`DeferredQueue::settle_page`] says whether the requester
+/// proved it.
+struct HeldPage {
+    subscriber_hash: Vec<u8>,
+    blobs: Vec<PendingBlob>,
+}
+
 /// In-memory queue with disk backing; keyed by subscriber destination hash.
 pub struct DeferredQueue {
     /// `subscriber_hash → ordered list of pending blobs`.
     queue: HashMap<Vec<u8>, VecDeque<PendingBlob>>,
+    /// Pages handed to a pull and not yet proved, by page id.
+    held: HashMap<u64, HeldPage>,
+    /// The next page id; 0 is never one (an empty page holds nothing).
+    next_page: u64,
     db: Option<rusqlite::Connection>,
     /// Maximum total entries across all subscribers.
     pub global_limit: usize,
@@ -274,6 +286,8 @@ impl DeferredQueue {
 
         DeferredQueue {
             queue,
+            held: HashMap::new(),
+            next_page: 1,
             db,
             global_limit: 4096,
         }
@@ -405,9 +419,11 @@ impl DeferredQueue {
         removed
     }
 
-    /// Total number of entries across all subscribers.
+    /// Total number of entries across all subscribers, the held pages'
+    /// included: they are still stored.
     pub fn total_len(&self) -> usize {
-        self.queue.values().map(|v| v.len()).sum()
+        self.queue.values().map(|v| v.len()).sum::<usize>()
+            + self.held.values().map(|page| page.blobs.len()).sum::<usize>()
     }
 
     /// Drain at most `max` pending blobs for `subscriber_hash`.
@@ -511,6 +527,85 @@ impl DeferredQueue {
             .unwrap_or(false)
     }
 
+    /// Take one page for a pull from `subscriber_hash` (PULL-PROOF-DESIGN.md):
+    /// its blobs whose routing hash satisfies `wanted`, in queue order, at
+    /// most `max` of them and, after the first, only while their `cost`s stay
+    /// within `budget`. A blob that does not fit ends the page, so no later
+    /// blob overtakes it. The page leaves the bucket but keeps its rows: it is
+    /// held until [`Self::settle_page`], and a restart before then reloads it.
+    /// Returns the page's id, 0 for an empty page (which holds nothing), and
+    /// a copy of its blobs for the response.
+    pub fn take_page(
+        &mut self,
+        subscriber_hash: &[u8],
+        wanted: impl Fn(&[u8]) -> bool,
+        max: usize,
+        budget: usize,
+        cost: impl Fn(&PendingBlob) -> usize,
+    ) -> (u64, Vec<PendingBlob>) {
+        let mut taken: Vec<PendingBlob> = Vec::new();
+
+        let drop_bucket = {
+            let bucket = match self.queue.get_mut(subscriber_hash) {
+                Some(b) => b,
+                None => return (0, Vec::new()),
+            };
+
+            let mut kept = VecDeque::with_capacity(bucket.len());
+            let mut spent = 0usize;
+            let mut full = false;
+            while let Some(entry) = bucket.pop_front() {
+                if !full && taken.len() < max && wanted(&entry.channel_hash) {
+                    let entry_cost = cost(&entry);
+                    if taken.is_empty() || spent + entry_cost <= budget {
+                        spent += entry_cost;
+                        taken.push(entry);
+                        continue;
+                    }
+                    full = true;
+                }
+                kept.push_back(entry);
+            }
+
+            *bucket = kept;
+            bucket.is_empty()
+        };
+
+        if drop_bucket {
+            self.queue.remove(subscriber_hash);
+        }
+        if taken.is_empty() {
+            return (0, Vec::new());
+        }
+        let id = self.next_page;
+        self.next_page += 1;
+        let copy = taken.clone();
+        self.held.insert(id, HeldPage { subscriber_hash: subscriber_hash.to_vec(), blobs: taken });
+        (id, copy)
+    }
+
+    /// Settle a page [`Self::take_page`] held. Proved, its rows are deleted.
+    /// Not proved, its blobs go back to the front of their bucket in their
+    /// order, for the subscriber's next pull: rfed never sends them again on
+    /// its own (DESIGN_PRINCIPLES §3, an event and never a timer). Nothing is
+    /// evicted to make room, so the bucket can stand over its per-subscriber
+    /// limit by the pages that came back until the subscriber pulls. Returns
+    /// the subscriber and how many blobs the page held, for the caller's log
+    /// line, or `None` when no such page is held.
+    pub fn settle_page(&mut self, id: u64, proved: bool) -> Option<(Vec<u8>, usize)> {
+        let page = self.held.remove(&id)?;
+        let count = page.blobs.len();
+        if proved {
+            self.delete_rows(&page.blobs, "deferred pull proved");
+        } else {
+            let bucket = self.queue.entry(page.subscriber_hash.clone()).or_default();
+            for blob in page.blobs.into_iter().rev() {
+                bucket.push_front(blob);
+            }
+        }
+        Some((page.subscriber_hash, count))
+    }
+
     /// Flush expired entries older than `max_age_secs`.  Call periodically
     /// to prevent indefinite accumulation for gone-forever subscribers.
     ///
@@ -521,20 +616,31 @@ impl DeferredQueue {
     pub fn evict_expired(&mut self, max_age_secs: f64) -> Vec<Expired> {
         let threshold = now() - max_age_secs;
         let mut counts: std::collections::BTreeMap<(Vec<u8>, Vec<u8>), usize> = Default::default();
+        let mut evicted_ids: Vec<i64> = Vec::new();
         for (subscriber_hash, bucket) in self.queue.iter_mut() {
             bucket.retain(|e| {
                 let keep = e.enqueued_at >= threshold;
                 if !keep {
                     *counts.entry((subscriber_hash.clone(), e.channel_hash.clone())).or_default() += 1;
+                    evicted_ids.push(e.id);
                 }
                 keep
             });
         }
         // Remove now-empty buckets.
         self.queue.retain(|_, v| !v.is_empty());
-        if !counts.is_empty() {
-            crate::store_db::write(self.db.as_ref(), "deferred expiry", |c| {
-                c.execute("DELETE FROM deferred WHERE enqueued_at < ?1", [threshold]).map(|_| ())
+        // The evicted rows by id, not every row past the age: a page a pull
+        // holds is out of its bucket, and its rows stay until it settles
+        // (PULL-PROOF-DESIGN.md). Deleted by age, a page not proved and then a
+        // restart would lose its blobs without a line; kept, it comes back and
+        // expires here, counted.
+        if !evicted_ids.is_empty() {
+            crate::store_db::write_all(self.db.as_ref(), "deferred expiry", |c| {
+                let mut stmt = c.prepare_cached("DELETE FROM deferred WHERE id = ?1")?;
+                for id in evicted_ids.iter().filter(|id| **id != 0) {
+                    stmt.execute([*id])?;
+                }
+                Ok(())
             });
         }
         counts
@@ -556,6 +662,16 @@ impl DeferredQueue {
 //   * Drain is destructive; bytes returned to one PULL caller cannot be
 //     re-served to a subsequent PULL on the same subscriber.
 //   * An empty/missing bucket yields `Vec::new()` and `has_pending=false`.
+//
+// The pulls themselves no longer drain (PULL-PROOF-DESIGN.md, 2026-10-12):
+//
+//   * `take_page` takes a page out of the bucket and holds it, rows kept;
+//     `settle_page` deletes them once the requester proved the page, or puts
+//     the page back at the front of the bucket, in order.
+//   * A page stays within its byte budget but always carries one blob, and
+//     no later blob overtakes one that did not fit.
+//   * Held blobs still count toward the global limit, survive a restart, and
+//     keep their rows through expiry.
 
 #[cfg(test)]
 mod tests {
@@ -614,13 +730,203 @@ mod tests {
     }
 
     #[test]
-    fn the_distro_pull_handler_drains_only_distro_blobs() {
+    fn the_distro_pull_handler_takes_only_distro_blobs() {
         let source = include_str!("destinations.rs");
         let start = source.find("let pull_distro_cb = Arc::new(").expect("pull_distro_cb");
         let body = &source[start..start + source[start..].find("});").expect("end of pull_distro_cb")];
         assert!(!body.contains("drain_batch("), "a whole-bucket drain hands channel blobs to the distro clients");
-        assert!(body.contains("drain_matching_batch(&subscriber_hash, is_distro, page_size)"));
+        assert!(body.contains("pull_answer(&guard.deferred_queue, &mut deferred, &subscriber_hash, is_distro, page_size"));
         assert!(body.contains("registered_distro_hashes()"));
+    }
+
+    // ── Pages held until proven (PULL-PROOF-DESIGN.md) ─────────────────────
+
+    fn blobs(page: &[PendingBlob]) -> Vec<Vec<u8>> {
+        page.iter().map(|p| p.blob.clone()).collect()
+    }
+
+    fn rows(q: &DeferredQueue) -> i64 {
+        q.db.as_ref()
+            .expect("the test queue is stored")
+            .query_row("SELECT COUNT(*) FROM deferred", [], |r| r.get(0))
+            .expect("count rows")
+    }
+
+    fn take(q: &mut DeferredQueue, sub: &[u8], max: usize) -> (u64, Vec<PendingBlob>) {
+        q.take_page(sub, |_| true, max, usize::MAX, |_| 1)
+    }
+
+    #[test]
+    fn a_proved_page_is_deleted_and_one_not_proved_comes_back_first() {
+        let mut q = fresh_queue();
+        let sub = vec![0x71u8; 16];
+        let chan = vec![0xC7u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 5);
+
+        let (page, taken) = take(&mut q, &sub, 3);
+        assert_ne!(page, 0);
+        assert_eq!(blobs(&taken), vec![vec![0], vec![1], vec![2]]);
+        assert!(q.has_pending(&sub), "two are left for the next page");
+        assert_eq!(q.total_len(), 5, "a held page is still stored");
+        assert_eq!(rows(&q), 5, "and keeps its rows");
+
+        assert_eq!(q.settle_page(page, false), Some((sub.clone(), 3)));
+        let (page, again) = take(&mut q, &sub, 25);
+        assert_eq!(
+            blobs(&again),
+            vec![vec![0], vec![1], vec![2], vec![3], vec![4]],
+            "the page not proved comes first, in its order"
+        );
+
+        assert_eq!(q.settle_page(page, true), Some((sub.clone(), 5)));
+        assert_eq!(q.total_len(), 0);
+        assert_eq!(rows(&q), 0, "proved, its rows are gone");
+        assert!(!q.has_pending(&sub));
+        assert_eq!(q.settle_page(page, true), None, "a page settles once");
+    }
+
+    #[test]
+    fn an_empty_page_holds_nothing() {
+        let mut q = fresh_queue();
+        let sub = vec![0x72u8; 16];
+        assert_eq!(take(&mut q, &sub, 25).0, 0, "nothing queued");
+        enqueue_n(&mut q, &sub, &[0xC7u8; 16], 1);
+        assert_eq!(take(&mut q, &sub, 0).0, 0, "max 0 takes nothing");
+        let (page, taken) = q.take_page(&sub, |_| false, 25, usize::MAX, |_| 1);
+        assert_eq!((page, taken.len()), (0, 0), "nothing wanted");
+        assert!(q.has_pending(&sub));
+        assert_eq!(q.settle_page(0, false), None);
+    }
+
+    #[test]
+    fn a_held_page_comes_again_after_a_restart() {
+        let p = tmp_path();
+        crate::store_db::remove_store_files(&p);
+        let sub = vec![0x73u8; 16];
+        let chan = vec![0xC7u8; 16];
+        {
+            let mut q = DeferredQueue::load(p.clone());
+            enqueue_n(&mut q, &sub, &chan, 4);
+            let (_page, taken) = take(&mut q, &sub, 2);
+            assert_eq!(taken.len(), 2);
+        }
+        let mut q = DeferredQueue::load(p.clone());
+        let (_page, all) = take(&mut q, &sub, 25);
+        assert_eq!(blobs(&all), vec![vec![0], vec![1], vec![2], vec![3]], "at least once, in order");
+        drop(q);
+        crate::store_db::remove_store_files(&p);
+    }
+
+    #[test]
+    fn a_page_keeps_to_its_byte_budget_but_always_carries_one_blob() {
+        let mut q = fresh_queue();
+        let sub = vec![0x74u8; 16];
+        let chan = vec![0xC7u8; 16];
+        let cost = |pb: &PendingBlob| pb.blob.len();
+        for size in [600usize, 600, 10, 2000, 10] {
+            q.enqueue(sub.clone(), chan.clone(), vec![0xAB; size], 1024);
+        }
+        let sizes = |page: &[PendingBlob]| page.iter().map(|p| p.blob.len()).collect::<Vec<_>>();
+
+        let (_, page) = q.take_page(&sub, |_| true, 25, 1000, cost);
+        assert_eq!(sizes(&page), vec![600], "the second 600 does not fit, and the 10 behind it waits its turn");
+        let (_, page) = q.take_page(&sub, |_| true, 25, 1000, cost);
+        assert_eq!(sizes(&page), vec![600, 10], "the next page starts where that one stopped");
+        let (_, page) = q.take_page(&sub, |_| true, 25, 1000, cost);
+        assert_eq!(sizes(&page), vec![2000], "a blob over the budget goes alone");
+        let (_, page) = q.take_page(&sub, |_| true, 25, 1000, cost);
+        assert_eq!(sizes(&page), vec![10]);
+        assert!(!q.has_pending(&sub));
+    }
+
+    #[test]
+    fn a_page_keeps_to_its_count() {
+        let mut q = fresh_queue();
+        let sub = vec![0x75u8; 16];
+        enqueue_n(&mut q, &sub, &[0xC7u8; 16], 30);
+        assert_eq!(take(&mut q, &sub, 25).1.len(), 25);
+        assert_eq!(take(&mut q, &sub, 25).1.len(), 5);
+    }
+
+    /// The iOS app and its notification extension can pull at once: each
+    /// takes its own page. One not proved comes back ahead of what is left.
+    #[test]
+    fn two_pulls_at_once_take_disjoint_pages() {
+        let mut q = fresh_queue();
+        let sub = vec![0x76u8; 16];
+        enqueue_n(&mut q, &sub, &[0xC7u8; 16], 6);
+        let (first, a) = take(&mut q, &sub, 2);
+        let (second, b) = take(&mut q, &sub, 2);
+        assert_eq!(blobs(&a), vec![vec![0], vec![1]]);
+        assert_eq!(blobs(&b), vec![vec![2], vec![3]]);
+        assert_ne!(first, second);
+
+        q.settle_page(second, true);
+        q.settle_page(first, false);
+        let (_, rest) = take(&mut q, &sub, 25);
+        assert_eq!(blobs(&rest), vec![vec![0], vec![1], vec![4], vec![5]]);
+    }
+
+    /// The distro pull's page leaves the identity's channel blobs where they
+    /// were, and one not proved goes back among them in its old place.
+    #[test]
+    fn a_distro_page_not_proved_goes_back_ahead_of_the_channel_blobs() {
+        let mut q = fresh_queue();
+        let identity = vec![0x77u8; 16];
+        let channel = vec![0xC1u8; 16];
+        let distro = vec![0xD1u8; 16];
+        q.enqueue(identity.clone(), distro.clone(), b"distro-1".to_vec(), 1024);
+        q.enqueue(identity.clone(), channel.clone(), b"channel-1".to_vec(), 1024);
+        q.enqueue(identity.clone(), distro.clone(), b"distro-2".to_vec(), 1024);
+
+        let is_distro = |routing: &[u8]| routing == distro.as_slice();
+        let (page, taken) = q.take_page(&identity, is_distro, 25, usize::MAX, |_| 1);
+        assert_eq!(blobs(&taken), vec![b"distro-1".to_vec(), b"distro-2".to_vec()]);
+        assert!(!q.has_pending_matching(&identity, is_distro), "more_pending is false");
+        assert!(q.has_pending_channel(&identity, &channel));
+
+        q.settle_page(page, false);
+        let (_, all) = take(&mut q, &identity, 25);
+        assert_eq!(blobs(&all), vec![b"distro-1".to_vec(), b"distro-2".to_vec(), b"channel-1".to_vec()]);
+    }
+
+    #[test]
+    fn held_blobs_count_toward_the_global_limit() {
+        let mut q = fresh_queue();
+        q.global_limit = 3;
+        let sub = vec![0x78u8; 16];
+        let chan = vec![0xC7u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 3);
+        let (page, _) = take(&mut q, &sub, 2);
+        assert_eq!(
+            q.enqueue(sub.clone(), chan.clone(), vec![9], 1024),
+            EnqueueOutcome::RefusedGlobalLimit,
+            "the held page is still stored"
+        );
+        q.settle_page(page, true);
+        assert!(q.enqueue(sub.clone(), chan.clone(), vec![9], 1024).queued());
+    }
+
+    /// Expiry leaves a held page alone, rows and all, until it settles. Not
+    /// proved, it comes back and then expires counted like any other entry.
+    #[test]
+    fn expiry_keeps_the_rows_of_a_held_page() {
+        let mut q = fresh_queue();
+        let device = vec![0x79u8; 16];
+        let distro = vec![0xD9u8; 16];
+        enqueue_n(&mut q, &device, &distro, 2);
+        let (page, taken) = take(&mut q, &device, 25);
+        assert_eq!(taken.len(), 2);
+
+        assert!(q.evict_expired(-10.0).is_empty(), "a held page is not in its bucket");
+        assert_eq!(rows(&q), 2, "its rows are kept");
+
+        q.settle_page(page, false);
+        assert_eq!(
+            q.evict_expired(-10.0),
+            vec![Expired { subscriber_hash: device.clone(), routing_hash: distro.clone(), count: 2 }]
+        );
+        assert_eq!(rows(&q), 0);
     }
 
     #[test]

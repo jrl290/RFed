@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use app_links::{self as rns_app_links, AppLinks};
-use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
+use reticulum_rust::destination::{Destination, DestinationType, ProvenAnswer, ALLOW_ALL};
 use reticulum_rust::identity::{self, Identity};
 use reticulum_rust::link::{Link, LinkHandle, RequestReceipt, MODE_AES256_CBC};
 use reticulum_rust::lxstamper::LXStamper;
@@ -180,6 +180,78 @@ fn decode_channel_pull_request(data: &[u8]) -> Result<Vec<u8>, String> {
         ));
     }
     Ok(channel_hash)
+}
+
+/// The most a pull page's packed response holds (PULL-PROOF-DESIGN.md): one
+/// Resource segment, so a page never needs splitting. LXMF's delivery limit
+/// (1,000,000 B of packed message) keeps any Retichat message inside it; a
+/// larger blob goes alone. The 64 bytes cover the page's envelope and the
+/// request layer's `[bin(16) request_id, …]` around it.
+const PULL_PAGE_MAX_BYTES: usize = reticulum_rust::resource::Resource::MAX_EFFICIENT_SIZE - 64;
+
+/// What one blob adds to a pull page: its `[bin channel_hash, bin blob]`.
+fn pull_entry_cost(pb: &PendingBlob) -> usize {
+    fn bin_len(n: usize) -> usize {
+        n + if n < 0x100 { 2 } else if n < 0x1_0000 { 3 } else { 5 }
+    }
+    1 + bin_len(pb.channel_hash.len()) + bin_len(pb.blob.len())
+}
+
+/// Answer one pull from `subscriber_hash` (PULL-PROOF-DESIGN.md): take a page
+/// of the blobs `wanted` accepts, at most `page_size` of them and one Resource
+/// segment's worth, and hold it until the requester proves the response. The
+/// page goes as a Resource whatever its size, so that proof is seen; proved,
+/// its blobs are gone from the queue, otherwise they are back at its front for
+/// the next pull. An empty page holds nothing and goes plain. `what` names the
+/// pull in the log.
+fn pull_answer(
+    queue: &Arc<Mutex<DeferredQueue>>,
+    deferred: &mut DeferredQueue,
+    subscriber_hash: &[u8],
+    wanted: impl Fn(&[u8]) -> bool,
+    page_size: usize,
+    what: &'static str,
+) -> ProvenAnswer {
+    let (page, blobs) = deferred.take_page(subscriber_hash, &wanted, page_size, PULL_PAGE_MAX_BYTES, pull_entry_cost);
+    let more_pending = deferred.has_pending_matching(subscriber_hash, &wanted);
+    let data = encode_pull_response(blobs, more_pending);
+    if page == 0 {
+        return ProvenAnswer::Plain(data);
+    }
+    let queue = Arc::clone(queue);
+    let subscriber = hexrep(subscriber_hash, false);
+    ProvenAnswer::Proven {
+        data,
+        concluded: Arc::new(move |proved: bool| {
+            // On its own thread: the Resource's callback can run on the link's
+            // actor, which must never wait for this lock.
+            let queue = Arc::clone(&queue);
+            let subscriber = subscriber.clone();
+            std::thread::spawn(move || {
+                let settled = match queue.lock() {
+                    Ok(mut q) => q.settle_page(page, proved),
+                    Err(_) => {
+                        log(format!("[rfed] {what}: queue lock poisoned — page {page} for {subscriber} not settled"), LOG_ERROR, false, false);
+                        return;
+                    }
+                };
+                match settled {
+                    Some((_, count)) if proved => log(
+                        format!("[rfed] {what}: page of {count} blob(s) for {subscriber} proved"),
+                        LOG_DEBUG, false, false,
+                    ),
+                    Some((_, count)) => log(
+                        format!("[rfed] {what}: page of {count} blob(s) for {subscriber} not proved — back at the front of its queue for the next pull"),
+                        LOG_NOTICE, false, false,
+                    ),
+                    None => log(
+                        format!("[rfed] {what}: page {page} for {subscriber} settled twice"),
+                        LOG_WARNING, false, false,
+                    ),
+                }
+            });
+        }),
+    }
 }
 
 fn encode_pull_response(pending: Vec<PendingBlob>, more_pending: bool) -> Vec<u8> {
@@ -3506,20 +3578,20 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
     let pull_node = Arc::clone(node);
     let channel_pull_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
-                                         caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+                                         caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> ProvenAnswer {
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
             // Reference behaviour, never silence — see ERROR_NO_IDENTITY.
             None => {
                 log("[rfed] channel.pull from unidentified link — answering ERROR_NO_IDENTITY".to_string(), LOG_WARNING, false, false);
-                return crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY);
+                return ProvenAnswer::Plain(crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY));
             }
         };
         let channel_hash = match decode_channel_pull_request(data) {
             Ok(hash) => hash,
             Err(e) => {
                 log(format!("[rfed] channel.pull: {e} — answering ERROR_INVALID_DATA"), LOG_WARNING, false, false);
-                return crate::lxmf_propagation::encode_error(ERROR_INVALID_DATA);
+                return ProvenAnswer::Plain(crate::lxmf_propagation::encode_error(ERROR_INVALID_DATA));
             }
         };
 
@@ -3535,9 +3607,14 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 .deferred_pull_batch_limit
                 .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                let pending = deferred.drain_channel_batch(&subscriber_hash, &channel_hash, page_size);
-                let more_pending = deferred.has_pending_channel(&subscriber_hash, &channel_hash);
-                return encode_pull_response(pending, more_pending);
+                return pull_answer(
+                    &guard.deferred_queue,
+                    &mut deferred,
+                    &subscriber_hash,
+                    |routing| routing == channel_hash.as_slice(),
+                    page_size,
+                    "channel.pull",
+                );
             }
         }
         // Poisoned lock: process state is broken. Log it — silence here cost
@@ -3545,7 +3622,7 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         // the reference defines no code for internal failure, and a client
         // timeout is honest about a node in this condition.
         log("[rfed] pull: node lock poisoned — no response sent".to_string(), LOG_ERROR, false, false);
-        Vec::new()
+        ProvenAnswer::None
     });
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
@@ -3571,8 +3648,8 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     guard.channel_unsubscribe_dest.register_request_handler(
         UNSUBSCRIBE_PATH.to_string(), Some(unsubscribe_cb.clone()), ALLOW_ALL, None, false,
     )?;
-    guard.channel_pull_dest.register_request_handler(
-        PULL_PATH.to_string(), Some(channel_pull_cb.clone()), ALLOW_ALL, None, false,
+    guard.channel_pull_dest.register_proven_request_handler(
+        PULL_PATH.to_string(), channel_pull_cb.clone(), ALLOW_ALL, None, false,
     )?;
 
     // ── Same handlers on rfed.link (RFed-spec/Link.md) ──────────────
@@ -3588,8 +3665,8 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     guard.link_dest.register_request_handler(
         link_paths::CHANNEL_UNSUBSCRIBE.to_string(), Some(unsubscribe_cb), ALLOW_ALL, None, false,
     )?;
-    guard.link_dest.register_request_handler(
-        link_paths::CHANNEL_PULL.to_string(), Some(channel_pull_cb), ALLOW_ALL, None, false,
+    guard.link_dest.register_proven_request_handler(
+        link_paths::CHANNEL_PULL.to_string(), channel_pull_cb, ALLOW_ALL, None, false,
     )?;
     guard.link_dest.register_request_handler(
         link_paths::CHANNEL_PUBLISH.to_string(), Some(publish_cb), ALLOW_ALL, None, false,
@@ -3609,15 +3686,16 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // request's authenticated caller.
     //
     // **User-initiated paging** (mirrors the chat-history "Load earlier
-    // messages" UX): each PULL drains at most one page of pending inner blobs
+    // messages" UX): each PULL takes at most one page of pending inner blobs
     // for the caller and returns a `more_pending` flag so the client knows
     // whether to offer another page.  Page size = policy
-    // `deferred_pull_batch_limit` if set, else `DEFAULT_PULL_PAGE_SIZE`.
+    // `deferred_pull_batch_limit` if set, else `DEFAULT_PULL_PAGE_SIZE`, and
+    // never more than one Resource segment (`PULL_PAGE_MAX_BYTES`).
     //
-    // Draining is atomic from the caller's perspective: the returned blobs are
-    // removed before the response is sent.  If the client crashes before
-    // processing the bytes, those blobs are gone from this node and can only
-    // be recovered via fanout from another session or sync from the origin.
+    // A page is kept until the requester proves it (`pull_answer`,
+    // PULL-PROOF-DESIGN.md). Until 2026-10-12 its blobs were removed before
+    // the response was sent, so any transfer that failed lost them: a page
+    // over ~3 MiB the web refuses, a dropped link, a client that crashed.
     //
     // Wire format (response): msgpack 2-fixarray
     //     [ Array([ [bin(16) channel_hash, bin(*) blob], ... ]),
@@ -3626,13 +3704,13 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // the 2-element envelope.  Uses rmpv so Python receives proper bytes.
     let pull_node = Arc::clone(node);
     let pull_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
-                                  caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+                                  caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> ProvenAnswer {
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
             // Reference behaviour, never silence — see ERROR_NO_IDENTITY.
             None => {
                 log("[rfed] delivery pull from unidentified link — answering ERROR_NO_IDENTITY".to_string(), LOG_WARNING, false, false);
-                return crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY);
+                return ProvenAnswer::Plain(crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY));
             }
         };
         if let Ok(guard) = pull_node.lock() {
@@ -3641,9 +3719,7 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 .deferred_pull_batch_limit
                 .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
-                let pending = deferred.drain_batch(&subscriber_hash, page_size);
-                let more_pending = deferred.has_pending(&subscriber_hash);
-                return encode_pull_response(pending, more_pending);
+                return pull_answer(&guard.deferred_queue, &mut deferred, &subscriber_hash, |_| true, page_size, "delivery pull");
             }
         }
         // Poisoned lock: process state is broken. Log it — silence here cost
@@ -3651,12 +3727,12 @@ fn wire_delivery_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         // the reference defines no code for internal failure, and a client
         // timeout is honest about a node in this condition.
         log("[rfed] pull: node lock poisoned — no response sent".to_string(), LOG_ERROR, false, false);
-        Vec::new()
+        ProvenAnswer::None
     });
 
     let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
-    guard.delivery_dest.register_request_handler(
-        PULL_PATH.to_string(), Some(pull_cb), ALLOW_ALL, None, false,
+    guard.delivery_dest.register_proven_request_handler(
+        PULL_PATH.to_string(), pull_cb, ALLOW_ALL, None, false,
     )?;
     Transport::register_destination(guard.delivery_dest.clone());
     Ok(())
@@ -4246,13 +4322,13 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     // This avoids rmap.world dropping rapid successive link requests.
     let pull_distro_node = Arc::clone(node);
     let pull_distro_cb = Arc::new(move |_path: &str, _data: &[u8], _req_id: &[u8],
-                                        caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> Vec<u8> {
+                                        caller: Option<&Identity>, _link: Option<&LinkHandle>, _timeout: f64| -> ProvenAnswer {
         let subscriber_hash = match caller.and_then(|id| id.hash.clone()) {
             Some(h) => h,
             // Reference behaviour, never silence — see ERROR_NO_IDENTITY.
             None => {
                 log("[rfed] distro pull from unidentified link — answering ERROR_NO_IDENTITY".to_string(), LOG_WARNING, false, false);
-                return crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY);
+                return ProvenAnswer::Plain(crate::lxmf_propagation::encode_error(ERROR_NO_IDENTITY));
             }
         };
         if let Ok(guard) = pull_distro_node.lock() {
@@ -4272,9 +4348,7 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 .unwrap_or_default();
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
                 let is_distro = |routing: &[u8]| distros.contains(routing);
-                let pending = deferred.drain_matching_batch(&subscriber_hash, is_distro, page_size);
-                let more_pending = deferred.has_pending_matching(&subscriber_hash, is_distro);
-                return encode_pull_response(pending, more_pending);
+                return pull_answer(&guard.deferred_queue, &mut deferred, &subscriber_hash, is_distro, page_size, "distro pull");
             }
         }
         // Poisoned lock: process state is broken. Log it — silence here cost
@@ -4282,7 +4356,7 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
         // the reference defines no code for internal failure, and a client
         // timeout is honest about a node in this condition.
         log("[rfed] pull: node lock poisoned — no response sent".to_string(), LOG_ERROR, false, false);
-        Vec::new()
+        ProvenAnswer::None
     });
 
     // ── ANNOUNCE (pre-signed, replayed on the distro's behalf) ─────────
@@ -4391,8 +4465,8 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     guard.distro_register_dest.register_request_handler(
         DISTRO_ANNOUNCE_PATH.to_string(), Some(announce_cb.clone()), ALLOW_ALL, None, false,
     )?;
-    guard.distro_register_dest.register_request_handler(
-        PULL_PATH.to_string(), Some(pull_distro_cb.clone()), ALLOW_ALL, None, false,
+    guard.distro_register_dest.register_proven_request_handler(
+        PULL_PATH.to_string(), pull_distro_cb.clone(), ALLOW_ALL, None, false,
     )?;
     guard.distro_unregister_dest.register_request_handler(
         DISTRO_UNREGISTER_PATH.to_string(), Some(unregister_cb.clone()), ALLOW_ALL, None, false,
@@ -4410,8 +4484,8 @@ fn wire_distro_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
     guard.link_dest.register_request_handler(
         link_paths::DISTRO_ANNOUNCE.to_string(), Some(announce_cb), ALLOW_ALL, None, false,
     )?;
-    guard.link_dest.register_request_handler(
-        link_paths::DISTRO_PULL.to_string(), Some(pull_distro_cb), ALLOW_ALL, None, false,
+    guard.link_dest.register_proven_request_handler(
+        link_paths::DISTRO_PULL.to_string(), pull_distro_cb, ALLOW_ALL, None, false,
     )?;
     guard.link_dest.register_request_handler(
         link_paths::DISTRO_UNREGISTER.to_string(), Some(unregister_cb), ALLOW_ALL, None, false,
@@ -5254,25 +5328,61 @@ mod destination_wiring_tests {
         let delivery_fragment = &source[wire_delivery_start..wire_notify_start];
 
         assert!(
-            channel_fragment.contains("guard.channel_pull_dest.register_request_handler("),
+            channel_fragment.contains("guard.channel_pull_dest.register_proven_request_handler("),
             "rfed.channel.pull must keep a request handler wired"
         );
-        // Matches `Some(channel_pull_cb)` and `Some(channel_pull_cb.clone())` —
-        // the same callback is now also registered on rfed.link, which needs
-        // its own clone. What matters is that the channel-scoped handler is
-        // still the one wired here.
+        // Matches `channel_pull_cb` and `channel_pull_cb.clone()` — the same
+        // callback is also registered on rfed.link, which needs its own clone.
+        // What matters is that the channel-scoped handler is still the one
+        // wired here.
         assert!(
-            channel_fragment.contains("PULL_PATH.to_string(), Some(channel_pull_cb"),
+            channel_fragment.contains("PULL_PATH.to_string(), channel_pull_cb"),
             "rfed.channel.pull must serve /rfed/pull via the new handler"
         );
         assert!(
-            delivery_fragment.contains("guard.delivery_dest.register_request_handler("),
+            delivery_fragment.contains("guard.delivery_dest.register_proven_request_handler("),
             "legacy rfed.delivery pull must remain wired for compatibility"
         );
         assert!(
-            delivery_fragment.contains("PULL_PATH.to_string(), Some(pull_cb)"),
+            delivery_fragment.contains("PULL_PATH.to_string(), pull_cb,"),
             "legacy rfed.delivery must continue serving /rfed/pull"
         );
+    }
+
+    /// Every pull keeps its page until the requester proves it
+    /// (PULL-PROOF-DESIGN.md). Until 2026-10-12 each handler drained the page
+    /// before answering, so a transfer that failed lost it. A handler that
+    /// goes back to `drain_*`, or is registered as a plain request handler
+    /// (whose answer nobody proves), has regressed.
+    #[test]
+    fn pull_handlers_keep_their_page_until_proven() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs");
+
+        for (cb, registrations) in [
+            ("channel_pull_cb", 2),
+            ("pull_cb", 1),
+            ("pull_distro_cb", 2),
+        ] {
+            let start = source
+                .find(&format!("let {cb} = Arc::new"))
+                .unwrap_or_else(|| panic!("{cb} present"));
+            let body = &source[start..start + source[start..].find("});").expect("end of handler")];
+            assert!(body.contains("-> ProvenAnswer"), "{cb} must answer a ProvenAnswer");
+            assert!(body.contains("pull_answer("), "{cb} must take its page with pull_answer");
+            assert!(!body.contains("drain_"), "{cb} must not drain before the page is proven");
+
+            for plain in [format!("Some({cb})"), format!("Some({cb}.clone())")] {
+                assert!(!source.contains(&plain), "{cb} registered as a plain handler: {plain}");
+            }
+            // `to_string(), ` keeps `pull_cb` from also counting `channel_pull_cb`.
+            let wired = source.matches(&format!("to_string(), {cb}.clone(), ALLOW_ALL")).count()
+                + source.matches(&format!("to_string(), {cb}, ALLOW_ALL")).count();
+            assert_eq!(wired, registrations, "{cb} registrations");
+        }
     }
 
     #[test]
