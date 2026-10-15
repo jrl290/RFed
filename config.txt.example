@@ -47,6 +47,18 @@
   lxmf_propagation             = yes
   lxmf_propagation_autopeer    = yes
 
+  # How other propagation nodes may sync to this one, as LXMF lxmd's
+  # [propagation] settings of the same names (SPEC.md §10, Inbound peer
+  # sync); the values shown are the defaults. from_static_only takes syncs
+  # from [peering] propagation_peers only, and announces that the node is not
+  # open to peering. While a sync batch's stamps are being validated, or
+  # max_inbound_syncs syncs are coming in, other nodes are told to try again
+  # later; static peers skip both checks unless bypass is off.
+  # lxmf_propagation_from_static_only               = no
+  # lxmf_propagation_sequential_validation          = yes
+  # lxmf_propagation_static_peers_bypass_sequential = yes
+  # lxmf_propagation_max_inbound_syncs              = 3
+
 
 [storage]
 

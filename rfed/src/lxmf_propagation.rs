@@ -107,7 +107,9 @@ pub const SYNC_BACKOFF_STEP_SECS: f64 = 12.0 * 60.0;
 /// of the fastest waiting peers, plus as many peers of unknown speed.
 pub const FASTEST_N_RANDOM_POOL: usize = 2;
 /// LXMRouter.PN_STAMP_THROTTLE: a peer that answers an offer with
-/// ERROR_THROTTLED is not offered anything again for this long.
+/// ERROR_THROTTLED is not offered anything again for this long; and a node
+/// whose sync transfer carried invalid stamps has its offers answered
+/// ERROR_THROTTLED for this long (`InboundSyncs::throttled_peers`).
 pub const PN_STAMP_THROTTLE_SECS: f64 = 180.0;
 /// Largest peer sync Resource rfed sends: one Resource segment.
 ///
@@ -130,7 +132,14 @@ pub const MAX_OFFER_IDS: usize = 500;
 const ERROR_NO_IDENTITY: u8 = 0xF0;
 const ERROR_NO_ACCESS: u8 = 0xF1;
 const ERROR_INVALID_KEY: u8 = 0xF3;
+const ERROR_INVALID_DATA: u8 = 0xF4;
 const ERROR_THROTTLED: u8 = 0xF6;
+
+/// LXMRouter.OFFER_ACCEPTED / OFFER_TRANSFERRING / OFFER_VALIDATING: where an
+/// inbound sync link stands in `InboundSyncs::accepted_offer_links`.
+const OFFER_ACCEPTED: u8 = 0x01;
+const OFFER_TRANSFERRING: u8 = 0x02;
+const OFFER_VALIDATING: u8 = 0x03;
 
 /// The backlog — every message already stored when this node started — is
 /// held back from outbound peer sync for this long after start. A restart
@@ -510,6 +519,144 @@ impl IdQueue {
 ///
 /// Stores messages, peers with other propagation nodes, handles OFFER/GET,
 /// and fires notify wake-ups for registered destinations.
+// ── Inbound sync state ───────────────────────────────────────────────────────
+
+/// What LXMF 1.1.1's LXMRouter keeps about the syncs other propagation nodes
+/// make to this one, under the same names. It has a lock of its own
+/// (`lock_inbound`): the offer handler takes it under the node lock — node
+/// first, then this, never the other way round — and the Resource and link
+/// callbacks and ingest take it alone, so none of them waits on the node.
+#[derive(Default)]
+pub struct InboundSyncs {
+    /// LXMRouter.throttled_peers: the `lxmf.propagation` hash of a node whose
+    /// sync transfer carried messages with invalid stamps, and until when its
+    /// offers are answered ERROR_THROTTLED (PN_STAMP_THROTTLE_SECS after the
+    /// transfer). An expired entry goes when that node next offers, or at the
+    /// next sync tick (LXMRouter.clean_throttled_peers).
+    pub throttled_peers: HashMap<Vec<u8>, f64>,
+    /// LXMRouter.validated_peer_links: the links on which an offer presented a
+    /// valid peering key. A transfer of more than one message is taken only
+    /// on such a link. An entry goes when its link closes; the reference
+    /// keeps them, but a closed link carries nothing more.
+    pub validated_peer_links: HashSet<Vec<u8>>,
+    /// LXMRouter.accepted_offer_links: link → OFFER_ACCEPTED (an offer of
+    /// which only some messages were wanted), OFFER_TRANSFERRING (its
+    /// Resource advertised) or OFFER_VALIDATING (an identified sender's batch
+    /// being validated). The last two count against `max_inbound_syncs`.
+    /// An entry goes when its Resource concludes or its link closes, except
+    /// OFFER_VALIDATING, which goes when the validation ends, as in the
+    /// reference (`ValidationMark`).
+    pub accepted_offer_links: HashMap<Vec<u8>, u8>,
+    /// LXMRouter.validating_pn_stamps_from: the `lxmf.propagation` hash of each
+    /// node whose batch's stamps are being validated, and since when. While
+    /// it is not empty, offers are answered ERROR_THROTTLED
+    /// (`sequential_validation`).
+    pub validating_pn_stamps_from: HashMap<Vec<u8>, f64>,
+}
+
+impl InboundSyncs {
+    /// LXMRouter.propagation_resources_transferring: the links whose accepted
+    /// offer is past OFFER_ACCEPTED.
+    pub fn resources_transferring(&self) -> usize {
+        self.accepted_offer_links.values().filter(|state| **state > OFFER_ACCEPTED).count()
+    }
+
+    /// Forget a link: it is closed. A batch it delivered may still be
+    /// validating; that entry is the validation's to clear.
+    fn forget_link(&mut self, link_id: &[u8]) {
+        self.validated_peer_links.remove(link_id);
+        if self.accepted_offer_links.get(link_id) != Some(&OFFER_VALIDATING) {
+            self.accepted_offer_links.remove(link_id);
+        }
+    }
+}
+
+/// The `lxmf.propagation` destination hash of an identity: how the reference
+/// names a sending node (`RNS.Destination(remote_identity, …, APP_NAME,
+/// "propagation").hash`) in its peers, static peers, throttle and
+/// validation tables.
+fn propagation_hash(identity: &Identity) -> Vec<u8> {
+    Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(identity))
+}
+
+/// The inbound sync state, whatever a panicking holder left behind: each of
+/// its maps is consistent after every single change, so a poisoned lock is no
+/// reason to stop taking syncs.
+fn lock_inbound(inbound: &Mutex<InboundSyncs>) -> std::sync::MutexGuard<'_, InboundSyncs> {
+    inbound.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// An offer's link can close while the offer is being answered. Its close
+/// callback forgets the link, but only what was recorded before it ran: an
+/// entry the offer records after that would stay for good. So once the
+/// answer is ready, outside the node lock, this asks the link's actor a
+/// question — any question: it is answered only after every message the
+/// actor took before it — and then reads the link's status, which the actor
+/// publishes as soon as it has handled a close, before its next message. A
+/// link still open now has its close (and its callback, which will find the
+/// entries) still to come; a closed one is forgotten here.
+fn forget_link_if_closed(inbound: &Mutex<InboundSyncs>, link: &LinkHandle) {
+    let _ = link.remote_identity();
+    if !link.is_alive() {
+        lock_inbound(inbound).forget_link(&link.link_id());
+    }
+}
+
+/// How a propagation upload reached this node. The reference takes the two
+/// apart: LXMRouter.propagation_packet for a link packet,
+/// LXMRouter.propagation_resource_concluded for a Resource.
+pub(crate) enum Upload<'a> {
+    /// A link packet, a client's upload: no peering-key gate, no busy
+    /// accounting, no throttle.
+    Packet,
+    /// A concluded Resource, with what its advertisement recorded while the
+    /// link was up (`inbound_resource_callbacks`): the identity its sender
+    /// proved on the link, and whether an offer on that link presented a
+    /// valid peering key.
+    Resource { sender: Option<&'a Identity>, peering_key_valid: bool, link: &'a LinkHandle },
+}
+
+/// What a Resource's advertisement recorded for its conclusion
+/// (`inbound_resource_callbacks`).
+#[derive(Clone, Default)]
+struct AdvertisedSender {
+    /// The identity its sender proved on the link; `None` for a client that
+    /// never identified.
+    identity: Option<Identity>,
+    /// Whether an offer on its link presented a valid peering key.
+    peering_key_valid: bool,
+}
+
+/// Marks an identified sender's batch as being validated, as
+/// LXMRouter.propagation_resource_concluded does around
+/// `LXStamper.validate_pn_stamps`, and unmarks it when dropped — the
+/// reference's `finally`, so a panic in validation cannot leave the node
+/// answering every offer "throttled" for good.
+struct ValidationMark {
+    inbound: Arc<Mutex<InboundSyncs>>,
+    sender_hash: Vec<u8>,
+    link_id: Vec<u8>,
+}
+
+impl ValidationMark {
+    fn new(inbound: Arc<Mutex<InboundSyncs>>, sender_hash: Vec<u8>, link_id: Vec<u8>) -> Self {
+        {
+            let mut state = lock_inbound(&inbound);
+            state.accepted_offer_links.insert(link_id.clone(), OFFER_VALIDATING);
+            state.validating_pn_stamps_from.insert(sender_hash.clone(), now());
+        }
+        ValidationMark { inbound, sender_hash, link_id }
+    }
+}
+
+impl Drop for ValidationMark {
+    fn drop(&mut self) {
+        let mut state = lock_inbound(&self.inbound);
+        state.validating_pn_stamps_from.remove(&self.sender_hash);
+        state.accepted_offer_links.remove(&self.link_id);
+    }
+}
+
 pub struct LxmfPropagationNode {
     /// The `lxmf.propagation` RNS destination (inbound).
     pub destination: Destination,
@@ -544,8 +691,20 @@ pub struct LxmfPropagationNode {
     pub storage_limit_bytes: u64,
     pub node_name: String,
     pub autopeer: bool,
+    /// LXMRouter.from_static_only (`config::PropagationInbound`).
     pub from_static_only: bool,
+    /// LXMRouter.propagation_sequential_validation.
+    pub sequential_validation: bool,
+    /// LXMRouter.propagation_static_peer_sequential: static peers are held to
+    /// the busy checks as well (lxmd `static_peers_bypass_sequential = no`).
+    pub static_sequential: bool,
+    /// LXMRouter.propagation_max_inbound_syncs.
+    pub max_inbound_syncs: u32,
     pub static_peers: Vec<Vec<u8>>,
+
+    // ── Inbound syncs ─────────────────────────────────────────────────
+    /// What the reference keeps about other nodes' syncs to this one.
+    pub inbound: Arc<Mutex<InboundSyncs>>,
 
     // ── Message store ─────────────────────────────────────────────────
     /// Path to the messagestore directory.
@@ -662,8 +821,12 @@ impl LxmfPropagationNode {
             storage_limit_bytes: config.storage_limit_bytes,
             node_name: config.display_name.clone(),
             autopeer: config.lxmf_propagation_autopeer,
-            from_static_only: !config.lxmf_propagation_autopeer,
+            from_static_only: config.lxmf_propagation_inbound.from_static_only,
+            sequential_validation: config.lxmf_propagation_inbound.sequential_validation,
+            static_sequential: !config.lxmf_propagation_inbound.static_peers_bypass_sequential,
+            max_inbound_syncs: config.lxmf_propagation_inbound.max_inbound_syncs,
             static_peers: config.lxmf_propagation_peers.clone(),
+            inbound: Arc::new(Mutex::new(InboundSyncs::default())),
             messagestore_path,
             entries: HashMap::new(),
             peers: HashMap::new(),
@@ -722,13 +885,20 @@ impl LxmfPropagationNode {
 
         // Register request handlers
         let weak_offer = Arc::downgrade(arc);
+        let offer_inbound = guard.inbound.clone();
         guard.destination.register_request_handler(
             OFFER_PATH.to_string(),
-            Some(Arc::new(move |path, data, request_id, remote_identity, _link, requested_at| {
+            Some(Arc::new(move |path, data, request_id, remote_identity, link, requested_at| {
                 if let Some(arc) = weak_offer.upgrade() {
-                    if let Some(mut node) = lock_node(&arc, "/offer") {
-                        return node.handle_offer(path, data, request_id, remote_identity, requested_at);
+                    let answer = match lock_node(&arc, "/offer") {
+                        Some(mut node) => node.handle_offer(path, data, request_id, remote_identity, link, requested_at),
+                        None => return Vec::new(),
+                    };
+                    // Outside the node lock: it waits on the link's actor.
+                    if let Some(link) = link {
+                        forget_link_if_closed(&offer_inbound, link);
                     }
+                    return answer;
                 }
                 Vec::new()
             })),
@@ -791,9 +961,13 @@ impl LxmfPropagationNode {
 
         log(
             format!(
-                "[lxmf.prop] enabled: {} messages indexed, {} peers",
+                "[lxmf.prop] enabled: {} messages indexed, {} peers; inbound: from_static_only={} sequential_validation={} static_peers_bypass_sequential={} max_inbound_syncs={}",
                 guard.entries.len(),
                 guard.peers.len(),
+                guard.from_static_only,
+                guard.sequential_validation,
+                !guard.static_sequential,
+                guard.max_inbound_syncs,
             ),
             LOG_NOTICE, false, false,
         );
@@ -829,10 +1003,16 @@ impl LxmfPropagationNode {
         // its KB by 1024 once more and announced MB, truncated: a default
         // rfed announced a 0 KB per-message limit, so every peer, Python or
         // rfed, marked every message for it handled without sending it.
+        // [2], the node state: LXMF 1.1.1 `node_state = self.propagation_node
+        // and not self.from_static_only`. A node that takes syncs only from
+        // its static peers says it is not open to peering: an autopeering
+        // node does not peer with it, and unpeers it if it had (LXMF
+        // Handlers.py, `propagation_enabled == False`). Static peers peer
+        // whatever the flag says.
         let announce_data = Value::Array(vec![
             Value::Boolean(false),
             Value::Integer(ts.into()),
-            Value::Boolean(true),
+            Value::Boolean(!self.from_static_only),
             Value::Integer(transfer_limit_kb.into()),
             Value::Integer(sync_limit_kb.into()),
             stamp_costs,
@@ -1304,7 +1484,7 @@ impl LxmfPropagationNode {
                 // A client PUT: no sending peer, as LXMRouter.propagation_packet.
                 let _ = packet;
                 if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                    LxmfPropagationNode::ingest_propagation_batch(&arc, data, None);
+                    LxmfPropagationNode::ingest_propagation_batch(&arc, data, Upload::Packet);
                 }
             }
         })));
@@ -1316,8 +1496,18 @@ impl LxmfPropagationNode {
         link.set_resource_strategy(reticulum_rust::link::ACCEPT_APP);
 
         let (_, sync_limit_kb) = self.announced_limits_kb();
-        let (advertised, concluded) = Self::inbound_resource_callbacks(self.self_handle.clone(), sync_limit_kb);
+        let static_only = self.from_static_only.then(|| self.static_peers.clone());
+        let (advertised, concluded) = Self::inbound_resource_callbacks(
+            self.self_handle.clone(), sync_limit_kb, self.inbound.clone(), static_only,
+        );
         link.set_resource_callbacks(Some(advertised), None, Some(concluded));
+
+        // What an offer or a transfer recorded for this link is of no use
+        // once it is closed (`InboundSyncs::forget_link`).
+        let inbound = self.inbound.clone();
+        link.set_link_closed_callback(Some(Arc::new(move |closed: LinkHandle| {
+            lock_inbound(&inbound).forget_link(&closed.link_id());
+        })));
     }
 
     /// The Resource callbacks of an inbound link. Resource-advertised: the
@@ -1359,18 +1549,68 @@ impl LxmfPropagationNode {
     /// peer identified before it offered (LXMPeer.link_established), long
     /// before that. The remote-identified callback would not do: the actor
     /// spawns it and moves on, so nothing orders it before the conclusion.
+    ///
+    /// The same holds for whether an offer on the link presented a valid
+    /// peering key (`InboundSyncs::validated_peer_links`), which decides
+    /// whether the batch may hold more than one message: the reference reads
+    /// it at the conclusion, rfed when the Resource is advertised, after the
+    /// offer was answered and before the link's close can forget it.
+    ///
+    /// From LXMF 1.1.1 as well: with `from_static_only` (`static_only` is
+    /// then our static peers) a Resource from a sender that did not identify,
+    /// or is not a static peer, is refused before its size is looked at; and
+    /// an accepted Resource moves its link's accepted offer to
+    /// OFFER_TRANSFERRING, where it counts against `max_inbound_syncs`. When
+    /// the Resource concludes, however it ends, the accepted offer is done
+    /// with.
     fn inbound_resource_callbacks(
         weak: Option<Weak<Mutex<Self>>>,
         sync_limit_kb: i64,
+        inbound: Arc<Mutex<InboundSyncs>>,
+        static_only: Option<Vec<Vec<u8>>>,
     ) -> (
         reticulum_rust::link::ResourceAcceptCallback,
         Arc<dyn Fn(Arc<Mutex<reticulum_rust::resource::Resource>>) + Send + Sync>,
     ) {
-        let sender: Arc<Mutex<Option<Identity>>> = Arc::new(Mutex::new(None));
+        let recorded: Arc<Mutex<AdvertisedSender>> = Arc::new(Mutex::new(AdvertisedSender::default()));
 
-        let recorded = sender.clone();
+        let record = recorded.clone();
+        let advertised_inbound = inbound.clone();
         let limit_bytes = sync_limit_kb.max(0) as u64 * 1000;
         let advertised = Arc::new(move |advertisement: &reticulum_rust::resource::ResourceAdvertisement| -> bool {
+            let link = advertisement.link.as_ref();
+            let link_str = || link.map(|link| hexrep(&link.link_id(), false)).unwrap_or_else(|| "?".into());
+            let identity = match link.map(LinkHandle::remote_identity) {
+                Some(Ok(identity)) => identity,
+                Some(Err(_)) => {
+                    log(
+                        format!("[lxmf.prop] resource advertised on link {} after the link closed: it cannot be received", link_str()),
+                        LOG_NOTICE, false, false,
+                    );
+                    return true;
+                }
+                None => None,
+            };
+            // LXMRouter.propagation_resource_advertised, `from_static_only`.
+            if let Some(static_peers) = &static_only {
+                match identity.as_ref().map(propagation_hash) {
+                    None => {
+                        log(
+                            format!("[lxmf.prop] rejecting a propagation Resource on link {}: its sender did not identify, and only static peers may sync here", link_str()),
+                            LOG_NOTICE, false, false,
+                        );
+                        return false;
+                    }
+                    Some(hash) if !static_peers.contains(&hash) => {
+                        log(
+                            format!("[lxmf.prop] rejecting a propagation Resource from {}: not in our static peers, and only static peers may sync here", hexrep(&hash, false)),
+                            LOG_NOTICE, false, false,
+                        );
+                        return false;
+                    }
+                    Some(_) => {}
+                }
+            }
             // Until 929a079 rfed announced MB where peers read KB, so none
             // could offer more than a few MB; announcing its real limits, it
             // must hold senders to them.
@@ -1379,52 +1619,54 @@ impl LxmfPropagationNode {
                 log(
                     format!(
                         "[lxmf.prop] rejecting a {size} B propagation Resource on link {}: over our per-sync limit of {limit_bytes} B ({sync_limit_kb} KB announced)",
-                        advertisement.link.as_ref().map(|link| hexrep(&link.link_id(), false)).unwrap_or_else(|| "?".into()),
+                        link_str(),
                     ),
                     LOG_NOTICE, false, false,
                 );
                 return false;
             }
-            if let Some(link) = &advertisement.link {
-                match link.remote_identity() {
-                    Ok(Some(identity)) => {
-                        if let Ok(mut slot) = recorded.lock() {
-                            *slot = Some(identity);
-                        }
-                    }
-                    // A client that never identified: its batch is a client's.
-                    Ok(None) => {}
-                    Err(_) => log(
-                        format!(
-                            "[lxmf.prop] resource advertised on link {} after the link closed: it cannot be received",
-                            hexrep(&link.link_id(), false),
-                        ),
-                        LOG_NOTICE, false, false,
-                    ),
-                }
-            }
             // Within the limit: accepted.
+            let peering_key_valid = match link {
+                Some(link) => {
+                    let link_id = link.link_id();
+                    let mut state = lock_inbound(&advertised_inbound);
+                    if let Some(stage) = state.accepted_offer_links.get_mut(&link_id) {
+                        *stage = OFFER_TRANSFERRING;
+                    }
+                    identity.is_some() && state.validated_peer_links.contains(&link_id)
+                }
+                None => false,
+            };
+            // A client that never identified: its batch is a client's.
+            *record.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                AdvertisedSender { identity, peering_key_valid };
             true
         });
 
         let concluded = Arc::new(move |resource: Arc<Mutex<reticulum_rust::resource::Resource>>| {
-            let data: Vec<u8> = match resource.lock() {
-                Ok(r) => {
-                    if r.status != reticulum_rust::resource::ResourceStatus::Complete {
-                        return;
-                    }
-                    match r.data.clone() {
-                        Some(d) => d,
-                        None => return,
-                    }
-                }
-                Err(_) => return,
+            let (link, data) = match resource.lock() {
+                Ok(r) => (
+                    r.link.clone(),
+                    if r.status == reticulum_rust::resource::ResourceStatus::Complete { r.data.clone() } else { None },
+                ),
+                Err(poisoned) => (poisoned.into_inner().link.clone(), None),
             };
-            let sender = sender.lock().ok().and_then(|s| s.clone());
-            // NOT under the node lock — see `ingest_propagation_batch`.
-            if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                LxmfPropagationNode::ingest_propagation_batch(&arc, &data, sender.as_ref());
+            if let Some(data) = data {
+                let sender = recorded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+                // NOT under the node lock — see `ingest_propagation_batch`.
+                if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
+                    LxmfPropagationNode::ingest_propagation_batch(
+                        &arc,
+                        &data,
+                        Upload::Resource {
+                            sender: sender.identity.as_ref(),
+                            peering_key_valid: sender.peering_key_valid,
+                            link: &link,
+                        },
+                    );
+                }
             }
+            lock_inbound(&inbound).accepted_offer_links.remove(&link.link_id());
         });
 
         (advertised, concluded)
@@ -1458,14 +1700,27 @@ impl LxmfPropagationNode {
     /// across work whose duration the holder does not control.
     /// `ingest_lock_scope_tests` holds this in place.
     ///
-    /// `sender` is the identity the sender proved on its link, for a sync
-    /// Resource. When its `lxmf.propagation` destination is one of our peers,
-    /// every message in the batch is handled for that peer — it has them —
-    /// and new ones are queued for the other peers only, as
+    /// `upload` says how the batch came. A Resource's sender is the identity
+    /// it proved on its link. When its `lxmf.propagation` destination is one
+    /// of our peers, every message in the batch is handled for that peer — it
+    /// has them — and new ones are queued for the other peers only, as
     /// LXMRouter.propagation_resource_concluded does (`from_peer=peer`, then
     /// `peer.queue_handled_message` for every validated message, a duplicate
     /// included). Until 2026-09-28 rfed queued each one back to its sender,
     /// and outbound sync offered every inbound batch straight back.
+    ///
+    /// A Resource is also held to the rest of what that function does in
+    /// LXMF 1.1.1. One of more than one message is taken only on a link where
+    /// an offer presented a valid peering key: anyone else's is refused whole
+    /// and its link torn down ("Clients and peers without a valid peering key
+    /// can only deliver 1 message per transfer"). Every Retichat client and
+    /// PHP node uploads one message per transfer. An identified sender's
+    /// batch is marked as validating while its stamps are checked, which
+    /// `handle_offer` reads. And a Resource that carried an invalid stamp has
+    /// its link torn down once the valid messages are stored, and an
+    /// identified sender's offers are answered ERROR_THROTTLED for
+    /// PN_STAMP_THROTTLE_SECS. A packet is a client's upload, held to none of
+    /// these, as LXMRouter.propagation_packet holds it to none.
     ///
     /// A client's batch may carry RFed SPEC §17.13 sync claims. They are
     /// matched after the stamps, only to stamp-valid messages for a distro
@@ -1474,40 +1729,63 @@ impl LxmfPropagationNode {
     /// distro messages: one verdict line for each that carried a claim, and
     /// at most one `[distro-sync]` summary line per batch. A claim whose
     /// message was dropped for its stamp is counted there as not checked.
-    pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8], sender: Option<&Identity>) {
-        let Some(PropagationBatch { messages, claims }) = decode_propagation_batch(data) else { return };
-        if messages.is_empty() {
-            return;
-        }
+    pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8], upload: Upload) {
+        let Some(PropagationBatch { entries, messages, claims }) = decode_propagation_batch(data) else { return };
+        let sender = match &upload {
+            Upload::Resource { sender, .. } => *sender,
+            Upload::Packet => None,
+        };
 
-        let (min_cost, delivery, from_peer) = {
+        let (min_cost, delivery, from_peer, inbound) = {
             let Some(node) = lock_node(arc, "ingest (setup)") else { return };
             (
                 node.stamp_cost.saturating_sub(node.stamp_flexibility),
                 node.delivery_handles(),
                 node.sending_peer(sender),
+                node.inbound.clone(),
             )
         };
-
-        // Validate PN (Propagation Node) stamps on all messages. Stamps below
-        // `min_cost` are rejected; only validated messages proceed.
-        let validated = lx_stamper::validate_pn_stamps(&messages, min_cost);
-        let mut sync_claims = BatchClaims::of(claims, from_peer.is_some());
 
         // Whose batch it was, as the reference's "Received N messages from
         // {remote_str}": a batch treated as a client's says so. (The staging
         // harnesses parse the counts; the origin stays at the end.)
         let origin = match (sender, &from_peer) {
             (_, Some(peer)) => format!("peer {}", hexrep(peer, false)),
-            (Some(identity), None) => format!(
-                "{} (not a peer)",
-                hexrep(
-                    &Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(identity)),
-                    false,
-                ),
-            ),
+            (Some(identity), None) => format!("{} (not a peer)", hexrep(&propagation_hash(identity), false)),
             (None, None) => "a sender with no identity (handled as a client's)".to_string(),
         };
+
+        // The reference counts the entries of `data[1]` as they came.
+        if let Upload::Resource { peering_key_valid: false, link, .. } = &upload {
+            if entries > 1 {
+                link.teardown();
+                log(
+                    format!("[lxmf.prop] received {entries} propagation messages from {origin} without valid peering key presentation: refused, link torn down"),
+                    LOG_WARNING, false, false,
+                );
+                log(
+                    "[lxmf.prop] clients and peers without a valid peering key can only deliver 1 message per transfer",
+                    LOG_WARNING, false, false,
+                );
+                return;
+            }
+        }
+        if messages.is_empty() {
+            return;
+        }
+
+        // Validate PN (Propagation Node) stamps on all messages. Stamps below
+        // `min_cost` are rejected; only validated messages proceed.
+        let validated = {
+            let _validating = match (&upload, sender) {
+                (Upload::Resource { link, .. }, Some(identity)) => {
+                    Some(ValidationMark::new(inbound.clone(), propagation_hash(identity), link.link_id()))
+                }
+                _ => None,
+            };
+            lx_stamper::validate_pn_stamps(&messages, min_cost)
+        };
+        let mut sync_claims = BatchClaims::of(claims, from_peer.is_some());
 
         let mut stored = 0usize;
         let mut streamed = 0usize;
@@ -1596,6 +1874,24 @@ impl LxmfPropagationNode {
             ),
             LOG_NOTICE, false, false,
         );
+
+        if invalid_stamps > 0 {
+            if let Upload::Resource { sender, link, .. } = &upload {
+                link.teardown();
+                if let Some(identity) = sender {
+                    lock_inbound(&inbound)
+                        .throttled_peers
+                        .insert(propagation_hash(identity), now() + PN_STAMP_THROTTLE_SECS);
+                    log(
+                        format!(
+                            "[lxmf.prop] propagation transfer from {origin} contained {invalid_stamps} message{} with invalid stamps, throttled for {PN_STAMP_THROTTLE_SECS:.0}s",
+                            if invalid_stamps == 1 { "" } else { "s" },
+                        ),
+                        LOG_NOTICE, false, false,
+                    );
+                }
+            }
+        }
     }
 
     /// The peer a sync batch came from: the `lxmf.propagation` destination of
@@ -1603,10 +1899,7 @@ impl LxmfPropagationNode {
     /// peers (LXMRouter.propagation_resource_concluded: `remote_hash in
     /// self.peers`). `None` for a client, or a sender that is not a peer.
     fn sending_peer(&self, sender: Option<&Identity>) -> Option<Vec<u8>> {
-        let hash = Destination::hash_from_name_and_identity(
-            &format!("{}.{}", LXMF_APP, PROP_ASPECT),
-            Some(sender?),
-        );
+        let hash = propagation_hash(sender?);
         self.peers.contains_key(&hash).then_some(hash)
     }
 
@@ -1654,6 +1947,9 @@ const NODE_LOCK_WAIT_WARN_SECS: f64 = 1.0;
 /// One decoded propagation upload: its messages, and the §17.13 sync
 /// claims of its third element, if it has one.
 struct PropagationBatch {
+    /// How many entries `data[1]` has, bin or not: what the reference's
+    /// one-message rule counts (`ingest_propagation_batch`).
+    entries: usize,
     /// The bin entries of `data[1]`, each `lxmf_data | stamp`.
     messages: Vec<Vec<u8>>,
     /// `data[2]` read by `lxmf_rust::distro::decode_sync_extension` (RFed
@@ -1703,7 +1999,7 @@ fn decode_propagation_batch(data: &[u8]) -> Option<PropagationBatch> {
             // Bounded by the message count (decode_sync_extension, rule 3),
             // and silent: what the claims came to is logged once per batch.
             let claims = items.get(2).map(|extension| decode_sync_extension(extension, messages.len()));
-            Some(PropagationBatch { messages, claims })
+            Some(PropagationBatch { entries: values.len(), messages, claims })
         }
         _ => {
             log("[lxmf.prop] packet missing message array", LOG_DEBUG, false, false);
@@ -2340,6 +2636,16 @@ impl LxmfPropagationNode {
     //   true             — we want ALL offered messages
     //   [Binary, ...]    — we want only these specific transient_ids
     //   Integer(0xF?)    — error code
+    //
+    // In LXMRouter.offer_request's order: no identity; busy (another node's
+    // batch being validated, or max_inbound_syncs Resources coming in — a
+    // static peer passes both unless static_peers_bypass_sequential = no);
+    // throttled after invalid stamps; not a static peer under
+    // from_static_only; bad data; invalid peering key. A valid key marks the
+    // link as one that may carry a multi-message transfer. An offer of which
+    // only some messages are wanted is recorded as OFFER_ACCEPTED; one wanted
+    // whole is not, as in the reference, so its Resource does not count
+    // against max_inbound_syncs until its stamps are being validated.
 
     fn handle_offer(
         &mut self,
@@ -2347,31 +2653,67 @@ impl LxmfPropagationNode {
         data: &[u8],
         _request_id: &[u8],
         remote_identity: Option<&Identity>,
+        link: Option<&LinkHandle>,
         _requested_at: f64,
     ) -> Vec<u8> {
         let remote_identity = match remote_identity {
             Some(id) => id,
-            None => return encode_error(0xF0), // ERROR_NO_IDENTITY
+            None => return encode_error(ERROR_NO_IDENTITY),
         };
+        let remote_hash = propagation_hash(remote_identity);
+        let remote_str = hexrep(&remote_hash, false);
 
-        if self.from_static_only {
-            let remote_hash = Destination::hash_from_name_and_identity(
-                &format!("{}.{}", LXMF_APP, PROP_ASPECT),
-                Some(remote_identity),
-            );
-            if !self.static_peers.contains(&remote_hash) {
-                return encode_error(0xF1); // ERROR_NO_ACCESS
+        {
+            let mut inbound = lock_inbound(&self.inbound);
+            let bypass_sequential = !self.static_sequential && self.static_peers.contains(&remote_hash);
+            let validating = inbound.validating_pn_stamps_from.len();
+            if !bypass_sequential && self.sequential_validation && validating > 0 {
+                log(
+                    format!("[lxmf.prop] propagation offer from node {remote_str} postponed, already validating {validating} PN stamp batches"),
+                    LOG_NOTICE, false, false,
+                );
+                return encode_error(ERROR_THROTTLED);
             }
+            let transferring = inbound.resources_transferring();
+            if !bypass_sequential && self.max_inbound_syncs > 0 && transferring >= self.max_inbound_syncs as usize {
+                log(
+                    format!(
+                        "[lxmf.prop] propagation offer from node {remote_str} postponed, already receiving {transferring} sync resource{}",
+                        if transferring == 1 { "" } else { "s" },
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                return encode_error(ERROR_THROTTLED);
+            }
+            if let Some(until) = inbound.throttled_peers.get(&remote_hash).copied() {
+                let remaining = until - now();
+                if remaining > 0.0 {
+                    log(
+                        format!("[lxmf.prop] propagation offer from node {remote_str} rejected, throttled for {remaining:.0}s more"),
+                        LOG_NOTICE, false, false,
+                    );
+                    return encode_error(ERROR_THROTTLED);
+                }
+                inbound.throttled_peers.remove(&remote_hash);
+            }
+        }
+
+        if self.from_static_only && !self.static_peers.contains(&remote_hash) {
+            log(
+                format!("[lxmf.prop] rejecting propagation offer from {remote_str}: not in our static peers"),
+                LOG_DEBUG, false, false,
+            );
+            return encode_error(ERROR_NO_ACCESS);
         }
 
         let request = match read_value(&mut Cursor::new(data)) {
             Ok(Value::Array(items)) if items.len() >= 2 => items,
-            _ => return encode_error(0xF4), // ERROR_INVALID_DATA
+            _ => return encode_error(ERROR_INVALID_DATA),
         };
 
         let peering_key = match &request[0] {
             Value::Binary(b) => b.clone(),
-            _ => return encode_error(0xF4),
+            _ => return encode_error(ERROR_INVALID_DATA),
         };
         let offered_ids: Vec<Vec<u8>> = match &request[1] {
             Value::Array(list) => list.iter()
@@ -2385,7 +2727,15 @@ impl LxmfPropagationNode {
         let mut peering_id = self.identity.hash.clone().unwrap_or_default();
         peering_id.extend_from_slice(&remote_identity.hash.clone().unwrap_or_default());
         if !lx_stamper::validate_peering_key(&peering_id, &peering_key, self.peering_cost) {
-            return encode_error(0xF3); // ERROR_INVALID_KEY
+            log(
+                format!("[lxmf.prop] invalid peering key in sync offer from {remote_str}"),
+                LOG_DEBUG, false, false,
+            );
+            return encode_error(ERROR_INVALID_KEY);
+        }
+        let link_id = link.map(LinkHandle::link_id);
+        if let Some(link_id) = &link_id {
+            lock_inbound(&self.inbound).validated_peer_links.insert(link_id.clone());
         }
 
         // Compare offered IDs against our local store; collect the ones we lack.
@@ -2401,6 +2751,9 @@ impl LxmfPropagationNode {
         } else if wanted.len() == offered_ids.len() {
             encode_value(Value::Boolean(true))
         } else {
+            if let Some(link_id) = link_id {
+                lock_inbound(&self.inbound).accepted_offer_links.insert(link_id, OFFER_ACCEPTED);
+            }
             encode_value(Value::Array(wanted))
         }
     }
@@ -2818,6 +3171,10 @@ impl LxmfPropagationNode {
             }
             guard.last_sync_tick = t;
             guard.note_backlog_hold();
+
+            // LXMRouter.clean_throttled_peers, on the same 24 s period
+            // (JOB_PEERSYNC_INTERVAL × PROCESSING_INTERVAL).
+            lock_inbound(&guard.inbound).throttled_peers.retain(|_, until| *until >= t);
 
             // Cull non-static peers we haven't heard from in MAX_UNREACHABLE_SECS.
             // Static peers are never culled — they're operator-configured.
@@ -4724,6 +5081,31 @@ pub(crate) mod test_clock {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    /// rfed's end of an ACTIVE `lxmf.propagation` link, on which `sender`
+    /// identified, if it did (LXMPeer.link_established identifies before it
+    /// offers). Its id is random, so the links of one test are distinct.
+    fn propagation_link(sender: Option<&super::Identity>) -> super::LinkHandle {
+        use super::*;
+        let owner = Destination::new_inbound(
+            Some(Identity::new(true)), DestinationType::Single, "lxmf".into(), vec!["propagation".into()],
+        ).expect("destination");
+        let mut link = Link::new_inbound(owner).expect("link");
+        link.link_id = rand::random::<[u8; 16]>().to_vec();
+        link.state = reticulum_rust::link::STATE_ACTIVE;
+        link.status = reticulum_rust::link::STATE_ACTIVE;
+        *link.remote_identity.lock().unwrap() = sender.cloned();
+        LinkHandle::spawn(link)
+    }
+
+    /// Ingest `data` as a sync Resource from `peer`, on a link where its
+    /// offer presented a valid peering key.
+    fn ingest_synced(node: &Arc<Mutex<super::LxmfPropagationNode>>, data: &[u8], peer: &super::Identity) {
+        let link = propagation_link(Some(peer));
+        super::LxmfPropagationNode::ingest_propagation_batch(
+            node, data, super::Upload::Resource { sender: Some(peer), peering_key_valid: true, link: &link },
+        );
+    }
+
     // ── The propagation node lock: who may hold it, and for how long ──────
     //
     // `/get` and `/offer` wait on the node mutex. In production `/get` waited
@@ -4831,9 +5213,14 @@ mod tests {
         use std::time::Instant;
 
         pub(super) fn test_node(tag: &str) -> Arc<Mutex<LxmfPropagationNode>> {
+            test_node_with(tag, |_| {})
+        }
+
+        /// `test_node`, with `configure` applied to its config first.
+        pub(super) fn test_node_with(tag: &str, configure: impl FnOnce(&mut NodeConfig)) -> Arc<Mutex<LxmfPropagationNode>> {
             let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
             let dir = std::env::temp_dir().join(format!("rfed_prop_{tag}_{unique}"));
-            let config = NodeConfig {
+            let mut config = NodeConfig {
                 config_dir: dir.clone(),
                 rns_config_dir: None,
                 identity_file: dir.join("identity"),
@@ -4858,7 +5245,9 @@ mod tests {
                 lxmf_propagation_enabled: true,
                 lxmf_propagation_autopeer: false,
                 lxmf_propagation_peers: Vec::new(),
+                lxmf_propagation_inbound: crate::config::PropagationInbound::default(),
             };
+            configure(&mut config);
             LxmfPropagationNode::new(
                 Identity::new(true),
                 &config,
@@ -4891,7 +5280,7 @@ mod tests {
             let ingest_flag = ingesting.clone();
             let ingest = std::thread::spawn(move || {
                 let started = Instant::now();
-                LxmfPropagationNode::ingest_propagation_batch(&ingest_node, &batch(64), None);
+                LxmfPropagationNode::ingest_propagation_batch(&ingest_node, &batch(64), Upload::Packet);
                 ingest_flag.store(false, Ordering::SeqCst);
                 started.elapsed()
             });
@@ -5203,6 +5592,7 @@ mod tests {
                 lxmf_propagation_enabled: true,
                 lxmf_propagation_autopeer: false,
                 lxmf_propagation_peers: Vec::new(),
+                lxmf_propagation_inbound: crate::config::PropagationInbound::default(),
             }
         }
 
@@ -5271,7 +5661,7 @@ mod tests {
             }
 
             fn ingest(&self, upload: &[u8]) {
-                LxmfPropagationNode::ingest_propagation_batch(&self.node, upload, None);
+                LxmfPropagationNode::ingest_propagation_batch(&self.node, upload, Upload::Packet);
             }
 
             fn rows(&self, device: &Unconfirmed, distro: &[u8]) -> usize {
@@ -5681,7 +6071,7 @@ mod tests {
             let (sealed, message) = sealed_message(&d, &d_hash, 2);
             let before = verifications();
             let mark = crate::test_log::mark();
-            LxmfPropagationNode::ingest_propagation_batch(&rig.node, &upload(&[message], Some(vec![own_claim(&d, &sealed)])), Some(&peer));
+            super::ingest_synced(&rig.node, &upload(&[message], Some(vec![own_claim(&d, &sealed)])), &peer);
 
             assert_eq!(verifications(), before, "no claim of a peer's batch is verified");
             assert_eq!((rig.rows(&device, &d_hash), rig.wakes()), (1, 1), "a peer's copy wakes, as FedSync's does");
@@ -5935,7 +6325,7 @@ mod tests {
             let peer_prop = Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(&peer));
             rig.node.lock().unwrap().peers.insert(peer_prop.clone(), PropPeer::new(peer_prop));
             let mark = crate::test_log::mark();
-            LxmfPropagationNode::ingest_propagation_batch(&rig.node, &upload(&[message], None), Some(&peer));
+            super::ingest_synced(&rig.node, &upload(&[message], None), &peer);
             assert!(mark.containing("dropped, after the link proved").is_empty());
             assert_eq!(mark.containing("1 bad-stamp").len(), 1);
         }
@@ -6126,6 +6516,550 @@ mod tests {
             !fragment.contains("Link::new_outbound"),
             "RFed propagation peer sync must not construct raw outbound links directly"
         );
+    }
+
+    /// LXMF 1.1.1's inbound side of peer sync, which rfed copies since
+    /// 2026-10-15 (LXMRouter.offer_request, propagation_resource_advertised
+    /// and propagation_resource_concluded, and lxmd's [propagation]
+    /// settings): who may sync here, when an offer is answered "throttled",
+    /// and what one transfer may carry.
+    mod inbound_sync_tests {
+        use super::ingest_lock_scope_tests::{test_node, test_node_with};
+        use super::propagation_link;
+        use super::super::*;
+        use reticulum_rust::link::ResourceAcceptCallback;
+        use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceAdvertisement, ResourceStatus};
+        use std::time::{Duration, Instant};
+
+        type Node = Arc<Mutex<LxmfPropagationNode>>;
+        type Concluded = Arc<dyn Fn(Arc<Mutex<Resource>>) + Send + Sync>;
+
+        /// A node that takes any 32-byte peering key, and any stamp on a
+        /// message long enough to carry one: these tests are about who may
+        /// sync, not about proof of work.
+        fn node(tag: &str) -> Node {
+            let node = test_node(tag);
+            {
+                let mut g = node.lock().unwrap();
+                g.peering_cost = 0;
+                g.stamp_cost = 0;
+                g.stamp_flexibility = 0;
+            }
+            node
+        }
+
+        fn inbound(node: &Node) -> Arc<Mutex<InboundSyncs>> {
+            node.lock().unwrap().inbound.clone()
+        }
+
+        /// What the registered `/offer` callback does: the answer under the
+        /// node lock, then the closed-link check outside it.
+        fn offer_with_key(node: &Node, from: &Identity, link: &LinkHandle, key: Vec<u8>, ids: &[Vec<u8>]) -> Value {
+            let data = encode_value(Value::Array(vec![
+                Value::Binary(key),
+                Value::Array(ids.iter().cloned().map(Value::Binary).collect()),
+            ]));
+            let answer = node.lock().unwrap().handle_offer(OFFER_PATH, &data, &[], Some(from), Some(link), now());
+            forget_link_if_closed(&inbound(node), link);
+            read_value(&mut Cursor::new(&answer)).expect("an msgpack answer")
+        }
+
+        /// An offer with a 32-byte peering key: valid at peering cost 0.
+        fn offer(node: &Node, from: &Identity, link: &LinkHandle, ids: &[Vec<u8>]) -> Value {
+            offer_with_key(node, from, link, vec![0x4B; 32], ids)
+        }
+
+        fn code(error: u8) -> Value {
+            Value::Integer((error as i64).into())
+        }
+
+        fn wanted(ids: &[&Vec<u8>]) -> Value {
+            Value::Array(ids.iter().map(|id| Value::Binary(id.to_vec())).collect())
+        }
+
+        /// A 300 B message (`lxmf | stamp`) and its transient id. Its stamp
+        /// is junk: valid at cost 0, at no real cost.
+        fn message(fill: u8) -> (Vec<u8>, Vec<u8>) {
+            let mut lxmf = vec![fill; 300 - lx_stamper::STAMP_SIZE];
+            lxmf[..16].copy_from_slice(&[0x5E; 16]);
+            let id = reticulum_rust::identity::full_hash(&lxmf);
+            ([lxmf, vec![0x33u8; lx_stamper::STAMP_SIZE]].concat(), id)
+        }
+
+        /// Too short to carry a stamp: LXStamper.validate_pn_stamp drops it
+        /// at any cost, as a message with an invalid stamp.
+        fn short_message() -> Vec<u8> {
+            vec![0x5E; 100]
+        }
+
+        fn batch(messages: Vec<Vec<u8>>) -> Vec<u8> {
+            encode_value(Value::Array(vec![
+                Value::F64(0.0),
+                Value::Array(messages.into_iter().map(Value::Binary).collect()),
+            ]))
+        }
+
+        /// Store `message` by a client's packet, so offers of it are not wanted.
+        fn hold(node: &Node, message: &[u8]) {
+            LxmfPropagationNode::ingest_propagation_batch(node, &batch(vec![message.to_vec()]), Upload::Packet);
+        }
+
+        fn stored(node: &Node, id: &[u8]) -> bool {
+            node.lock().unwrap().entries.contains_key(id)
+        }
+
+        /// The link's actor answers nothing once the link has closed.
+        fn torn_down(link: &LinkHandle) -> bool {
+            link.remote_identity().is_err()
+        }
+
+        fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+            let started = Instant::now();
+            while !done() {
+                assert!(started.elapsed() < Duration::from_secs(5), "waited 5 s for {what}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// The Resource callbacks link_established installs on a link.
+        fn callbacks(node: &Node) -> (ResourceAcceptCallback, Concluded) {
+            let g = node.lock().unwrap();
+            LxmfPropagationNode::inbound_resource_callbacks(
+                g.self_handle.clone(),
+                g.announced_limits_kb().1,
+                g.inbound.clone(),
+                g.from_static_only.then(|| g.static_peers.clone()),
+            )
+        }
+
+        fn advertisement(link: &LinkHandle, size: u64) -> ResourceAdvertisement {
+            ResourceAdvertisement {
+                t: size, d: size, n: 1, h: vec![0xAD; 32], r: vec![0; 4], o: vec![0xAD; 32], i: 1, l: 1,
+                q: None, f: 0, m: Vec::new(), e: true, c: false, s: false, u: false, p: false, x: false,
+                link: Some(link.clone()),
+            }
+        }
+
+        /// A Resource on `link` as the concluded callback gets it.
+        fn resource(link: &LinkHandle, status: ResourceStatus, data: Option<Vec<u8>>) -> Arc<Mutex<Resource>> {
+            let mut resource = Resource::new_internal(
+                None, link.clone(), None, false, AutoCompressOption::Disabled, None, None, None, 1, None, None, false, 0, None,
+            ).expect("resource");
+            resource.status = status;
+            resource.data = data;
+            Arc::new(Mutex::new(resource))
+        }
+
+        // ── The announce, and from_static_only as a setting of its own ──────
+
+        /// LXMRouter: `node_state = self.propagation_node and not
+        /// self.from_static_only`. rfed announced `true` whatever it took.
+        #[test]
+        fn the_announce_says_whether_any_node_may_sync_here() {
+            let node = node("announce_state");
+            let state = |node: &Node| {
+                let app_data = node.lock().unwrap().build_app_data();
+                assert!(lxmf_rust::lxmf::pn_announce_data_is_valid(&app_data));
+                match read_value(&mut Cursor::new(&app_data)).expect("announce") {
+                    Value::Array(items) => items[2].clone(),
+                    other => panic!("announce not an array: {other:?}"),
+                }
+            };
+            assert_eq!(state(&node), Value::Boolean(true));
+            node.lock().unwrap().from_static_only = true;
+            assert_eq!(state(&node), Value::Boolean(false), "static peers only: not open to peering");
+        }
+
+        /// lxmd's from_static_only and autopeer are two settings. rfed took
+        /// syncs from its static peers only whenever autopeer was off.
+        #[test]
+        fn from_static_only_is_a_setting_of_its_own() {
+            for (autopeer, from_static_only) in [(false, false), (true, false), (false, true), (true, true)] {
+                let node = test_node_with("static_only_setting", |config| {
+                    config.lxmf_propagation_autopeer = autopeer;
+                    config.lxmf_propagation_inbound.from_static_only = from_static_only;
+                });
+                let g = node.lock().unwrap();
+                assert_eq!((g.autopeer, g.from_static_only), (autopeer, from_static_only));
+            }
+            let node = test_node_with("busy_settings", |config| {
+                config.lxmf_propagation_inbound = crate::config::PropagationInbound {
+                    from_static_only: false,
+                    sequential_validation: false,
+                    static_peers_bypass_sequential: false,
+                    max_inbound_syncs: 9,
+                };
+            });
+            let g = node.lock().unwrap();
+            assert_eq!((g.sequential_validation, g.static_sequential, g.max_inbound_syncs), (false, true, 9));
+        }
+
+        // ── The offer ───────────────────────────────────────────────────────
+
+        /// LXMRouter.offer_request's answers, and what a valid key records:
+        /// the link may carry a batch; and an offer of which only some
+        /// messages are wanted is OFFER_ACCEPTED. One wanted whole is not
+        /// recorded — the reference's own way, copied: its Resource does not
+        /// count against max_inbound_syncs until its stamps are validated.
+        #[test]
+        fn an_offer_is_answered_as_the_reference_answers_it() {
+            let node = node("offer_answers");
+            let peer = Identity::new(true);
+            let (held, held_id) = message(0x01);
+            hold(&node, &held);
+            let new_id = message(0x02).1;
+
+            let link = propagation_link(None);
+            let answer = node.lock().unwrap().handle_offer(OFFER_PATH, &[0x90], &[], None, Some(&link), now());
+            assert_eq!(answer, encode_error(ERROR_NO_IDENTITY));
+
+            let link = propagation_link(Some(&peer));
+            let not_an_offer = encode_value(Value::Integer(1.into()));
+            let answer = node.lock().unwrap().handle_offer(OFFER_PATH, &not_an_offer, &[], Some(&peer), Some(&link), now());
+            assert_eq!(answer, encode_error(ERROR_INVALID_DATA));
+            assert_eq!(offer_with_key(&node, &peer, &link, vec![0x4B; 5], &[new_id.clone()]), code(ERROR_INVALID_KEY));
+            {
+                let state = inbound(&node);
+                let state = lock_inbound(&state);
+                assert!(state.validated_peer_links.is_empty() && state.accepted_offer_links.is_empty(), "an invalid key records nothing");
+            }
+
+            let none = propagation_link(Some(&peer));
+            assert_eq!(offer(&node, &peer, &none, &[held_id.clone()]), Value::Boolean(false));
+            let all = propagation_link(Some(&peer));
+            assert_eq!(offer(&node, &peer, &all, &[new_id.clone()]), Value::Boolean(true));
+            let some = propagation_link(Some(&peer));
+            assert_eq!(offer(&node, &peer, &some, &[held_id, new_id.clone()]), wanted(&[&new_id]));
+
+            let state = inbound(&node);
+            let state = lock_inbound(&state);
+            for (case, link) in [("none wanted", &none), ("all wanted", &all), ("some wanted", &some)] {
+                assert!(state.validated_peer_links.contains(&link.link_id()), "{case}: a valid key marks the link");
+            }
+            assert_eq!(state.accepted_offer_links.get(&some.link_id()), Some(&OFFER_ACCEPTED));
+            assert_eq!(state.accepted_offer_links.len(), 1, "{:?}", state.accepted_offer_links);
+            assert_eq!(state.resources_transferring(), 0, "accepted is not yet receiving");
+        }
+
+        /// sequential_pn_stamp_validation: while another node's batch is
+        /// being validated, an offer is answered "throttled". A static peer's
+        /// is not, unless static_peers_bypass_sequential is off.
+        #[test]
+        fn an_offer_while_a_batch_is_validated_is_throttled() {
+            let node = node("sequential");
+            let (stranger, static_peer, validating) = (Identity::new(true), Identity::new(true), Identity::new(true));
+            node.lock().unwrap().static_peers.push(propagation_hash(&static_peer));
+            let id = message(0x10).1;
+            lock_inbound(&inbound(&node)).validating_pn_stamps_from.insert(propagation_hash(&validating), now());
+            let from = |who: &Identity| offer(&node, who, &propagation_link(Some(who)), &[id.clone()]);
+
+            let mark = crate::test_log::mark();
+            assert_eq!(from(&stranger), code(ERROR_THROTTLED));
+            assert_eq!(mark.containing("postponed, already validating 1 PN stamp batches").len(), 1);
+            assert_eq!(from(&static_peer), Value::Boolean(true), "a static peer bypasses it");
+            node.lock().unwrap().static_sequential = true;
+            assert_eq!(from(&static_peer), code(ERROR_THROTTLED), "unless bypass is off");
+            node.lock().unwrap().sequential_validation = false;
+            assert_eq!(from(&stranger), Value::Boolean(true), "sequential validation off");
+            node.lock().unwrap().sequential_validation = true;
+            lock_inbound(&inbound(&node)).validating_pn_stamps_from.clear();
+            assert_eq!(from(&stranger), Value::Boolean(true), "nothing being validated");
+        }
+
+        /// The mark is the ingest's own: an identified sender's batch marks
+        /// itself, outside the node lock, while its stamps are checked, and
+        /// unmarks itself when they are done. An offer from another node in
+        /// between is throttled; one after it is not.
+        #[test]
+        fn an_identified_senders_batch_is_marked_while_its_stamps_are_validated() {
+            let node = node("validating_mark");
+            // Real stamp work: every stamp is checked, and every one fails.
+            node.lock().unwrap().stamp_cost = 40;
+            let (sender, other) = (Identity::new(true), Identity::new(true));
+            let link = propagation_link(Some(&sender));
+            let data = batch((0..32u8).map(|n| message(n).0).collect());
+            let ingest = {
+                let (node, sender, link) = (node.clone(), sender.clone(), link.clone());
+                std::thread::spawn(move || {
+                    LxmfPropagationNode::ingest_propagation_batch(
+                        &node, &data, Upload::Resource { sender: Some(&sender), peering_key_valid: true, link: &link },
+                    )
+                })
+            };
+            let state = inbound(&node);
+            let sender_hash = propagation_hash(&sender);
+            wait_until("the batch to be marked", || {
+                lock_inbound(&state).validating_pn_stamps_from.contains_key(&sender_hash) || ingest.is_finished()
+            });
+            assert!(!ingest.is_finished(), "the batch was seen while its stamps were being validated");
+            assert_eq!(lock_inbound(&state).accepted_offer_links.get(&link.link_id()), Some(&OFFER_VALIDATING));
+            let id = message(0xF0).1;
+            assert_eq!(offer(&node, &other, &propagation_link(Some(&other)), &[id.clone()]), code(ERROR_THROTTLED));
+
+            ingest.join().unwrap();
+            {
+                let state = lock_inbound(&state);
+                assert!(state.validating_pn_stamps_from.is_empty(), "unmarked when its stamps are done");
+                assert!(state.accepted_offer_links.is_empty());
+            }
+            assert_eq!(offer(&node, &other, &propagation_link(Some(&other)), &[id]), Value::Boolean(true));
+        }
+
+        /// max_inbound_syncs counts the sync Resources being received: at the
+        /// limit an offer is answered "throttled", a static peer's not unless
+        /// static_peers_bypass_sequential is off. An accepted offer counts
+        /// once its Resource is advertised, and stops when it concludes,
+        /// whatever the outcome.
+        #[test]
+        fn at_max_inbound_syncs_an_offer_is_throttled() {
+            let node = node("max_inbound");
+            {
+                // Only the count is under test here.
+                let mut g = node.lock().unwrap();
+                g.sequential_validation = false;
+                g.max_inbound_syncs = 1;
+            }
+            let (peer, stranger, static_peer) = (Identity::new(true), Identity::new(true), Identity::new(true));
+            node.lock().unwrap().static_peers.push(propagation_hash(&static_peer));
+            let (held, held_id) = message(0x51);
+            hold(&node, &held);
+            let new_id = message(0x52).1;
+            let from = |who: &Identity| offer(&node, who, &propagation_link(Some(who)), &[new_id.clone()]);
+
+            let link = propagation_link(Some(&peer));
+            let (advertised, concluded) = callbacks(&node);
+            assert_eq!(offer(&node, &peer, &link, &[held_id, new_id.clone()]), wanted(&[&new_id]));
+            assert_eq!(from(&stranger), Value::Boolean(true), "an accepted offer is not a sync being received");
+
+            assert!(advertised(&advertisement(&link, 300)));
+            assert_eq!(lock_inbound(&inbound(&node)).accepted_offer_links.get(&link.link_id()), Some(&OFFER_TRANSFERRING));
+            let mark = crate::test_log::mark();
+            assert_eq!(from(&stranger), code(ERROR_THROTTLED));
+            assert_eq!(mark.containing("postponed, already receiving 1 sync resource").len(), 1);
+            assert_eq!(from(&static_peer), Value::Boolean(true), "a static peer bypasses it");
+            node.lock().unwrap().static_sequential = true;
+            assert_eq!(from(&static_peer), code(ERROR_THROTTLED), "unless bypass is off");
+
+            concluded(resource(&link, ResourceStatus::Failed, None));
+            assert!(lock_inbound(&inbound(&node)).accepted_offer_links.is_empty(), "a failed Resource is done with too");
+            assert_eq!(from(&stranger), Value::Boolean(true));
+        }
+
+        /// from_static_only: an offer from a node that is not a static peer
+        /// is answered "no access" — after the throttle, which the reference
+        /// checks first — and a Resource from one, or from a sender that
+        /// never identified, is refused at its advertisement.
+        #[test]
+        fn from_static_only_takes_syncs_from_static_peers_only() {
+            let node = node("static_only");
+            let (stranger, static_peer) = (Identity::new(true), Identity::new(true));
+            {
+                let mut g = node.lock().unwrap();
+                g.from_static_only = true;
+                g.static_peers.push(propagation_hash(&static_peer));
+            }
+            let id = message(0x61).1;
+            let from = |who: &Identity| offer(&node, who, &propagation_link(Some(who)), &[id.clone()]);
+            assert_eq!(from(&stranger), code(ERROR_NO_ACCESS));
+            assert_eq!(from(&static_peer), Value::Boolean(true));
+            lock_inbound(&inbound(&node)).throttled_peers.insert(propagation_hash(&stranger), now() + 60.0);
+            assert_eq!(from(&stranger), code(ERROR_THROTTLED), "the throttle is checked first");
+
+            let (advertised, _) = callbacks(&node);
+            let mark = crate::test_log::mark();
+            assert!(!advertised(&advertisement(&propagation_link(Some(&stranger)), 300)), "not a static peer");
+            assert!(!advertised(&advertisement(&propagation_link(None), 300)), "never identified");
+            assert_eq!(mark.containing("only static peers may sync here").len(), 2);
+            assert!(advertised(&advertisement(&propagation_link(Some(&static_peer)), 300)));
+
+            node.lock().unwrap().from_static_only = false;
+            let (advertised, _) = callbacks(&node);
+            assert!(advertised(&advertisement(&propagation_link(Some(&stranger)), 300)), "anyone's, without it");
+        }
+
+        // ── What a transfer may carry ───────────────────────────────────────
+
+        /// "Clients and peers without a valid peering key can only deliver 1
+        /// message per transfer." A Resource of more from anyone else is
+        /// refused whole, and its link torn down. One message is taken from
+        /// anyone; a packet is LXMRouter.propagation_packet's, which has no
+        /// such rule.
+        #[test]
+        fn only_a_link_with_a_valid_peering_key_carries_more_than_one_message() {
+            let node = node("one_message_rule");
+            let sender = Identity::new(true);
+            let (a, a_id) = message(0x31);
+            let (b, b_id) = message(0x32);
+
+            for (who, identity) in [("an identified sender", Some(&sender)), ("a client", None)] {
+                let link = propagation_link(identity);
+                let mark = crate::test_log::mark();
+                LxmfPropagationNode::ingest_propagation_batch(
+                    &node, &batch(vec![a.clone(), b.clone()]),
+                    Upload::Resource { sender: identity, peering_key_valid: false, link: &link },
+                );
+                assert!(!stored(&node, &a_id) && !stored(&node, &b_id), "{who}: nothing taken");
+                assert!(torn_down(&link), "{who}: the link is torn down");
+                assert_eq!(mark.containing("without valid peering key presentation").len(), 1, "{who}");
+                assert_eq!(mark.containing("can only deliver 1 message per transfer").len(), 1, "{who}");
+            }
+            assert!(lock_inbound(&inbound(&node)).throttled_peers.is_empty(), "refused, not throttled");
+
+            let link = propagation_link(None);
+            LxmfPropagationNode::ingest_propagation_batch(
+                &node, &batch(vec![a]), Upload::Resource { sender: None, peering_key_valid: false, link: &link },
+            );
+            assert!(stored(&node, &a_id), "a client's one message is taken");
+            assert!(!torn_down(&link), "and its link stays up");
+
+            let link = propagation_link(Some(&sender));
+            let (c, c_id) = message(0x33);
+            LxmfPropagationNode::ingest_propagation_batch(
+                &node, &batch(vec![b, c]), Upload::Resource { sender: Some(&sender), peering_key_valid: true, link: &link },
+            );
+            assert!(stored(&node, &b_id) && stored(&node, &c_id), "a batch on a link with a valid key is taken");
+            assert!(!torn_down(&link));
+
+            let (d, d_id) = message(0x34);
+            let (e, e_id) = message(0x35);
+            LxmfPropagationNode::ingest_propagation_batch(&node, &batch(vec![d, e]), Upload::Packet);
+            assert!(stored(&node, &d_id) && stored(&node, &e_id), "a packet");
+        }
+
+        /// Through the callbacks link_established installs: the key is the
+        /// one an offer presented on the Resource's own link, read when the
+        /// Resource is advertised — so it still counts when the sender closed
+        /// the link, and its close callback forgot it, before the Resource
+        /// concluded (the proof goes out first). A batch on a link with no
+        /// offer is refused.
+        #[test]
+        fn an_offer_on_its_link_lets_a_resource_carry_a_batch() {
+            let node = node("offer_then_resource");
+            let peer = Identity::new(true);
+            let (held, held_id) = message(0x41);
+            hold(&node, &held);
+            let (a, a_id) = message(0x42);
+            let (b, b_id) = message(0x43);
+            let state = inbound(&node);
+
+            let link = propagation_link(Some(&peer));
+            let (advertised, concluded) = callbacks(&node);
+            assert_eq!(offer(&node, &peer, &link, &[held_id, a_id.clone(), b_id.clone()]), wanted(&[&a_id, &b_id]));
+            assert!(advertised(&advertisement(&link, 600)));
+            // The proof has gone out; the sender closed the link.
+            link.teardown();
+            lock_inbound(&state).forget_link(&link.link_id());
+            concluded(resource(&link, ResourceStatus::Complete, Some(batch(vec![a, b]))));
+            assert!(stored(&node, &a_id) && stored(&node, &b_id), "the batch is taken");
+            assert!(lock_inbound(&state).accepted_offer_links.is_empty());
+
+            let bare = propagation_link(Some(&peer));
+            let (advertised, concluded) = callbacks(&node);
+            let (c, c_id) = message(0x44);
+            let (d, d_id) = message(0x45);
+            assert!(advertised(&advertisement(&bare, 600)));
+            concluded(resource(&bare, ResourceStatus::Complete, Some(batch(vec![c, d]))));
+            assert!(!stored(&node, &c_id) && !stored(&node, &d_id), "no offer on its link: refused");
+            assert!(torn_down(&bare));
+        }
+
+        /// A Resource with an invalid stamp: its valid messages are stored,
+        /// then its link is torn down and its sender's offers are answered
+        /// "throttled" for PN_STAMP_THROTTLE_SECS — that node's only, and
+        /// only when it identified. A client's packet throttles nobody.
+        #[test]
+        fn a_transfer_with_an_invalid_stamp_ends_its_link_and_throttles_its_sender() {
+            let node = node("invalid_stamps");
+            let sender = Identity::new(true);
+            let link = propagation_link(Some(&sender));
+            let (good, good_id) = message(0x21);
+            let mark = crate::test_log::mark();
+            LxmfPropagationNode::ingest_propagation_batch(
+                &node, &batch(vec![good, short_message()]),
+                Upload::Resource { sender: Some(&sender), peering_key_valid: true, link: &link },
+            );
+            assert!(stored(&node, &good_id), "the valid message is kept");
+            assert!(torn_down(&link));
+            let until = lock_inbound(&inbound(&node)).throttled_peers.get(&propagation_hash(&sender)).copied().expect("throttled");
+            assert!((until - now() - PN_STAMP_THROTTLE_SECS).abs() < 5.0);
+            assert_eq!(mark.containing("contained 1 message with invalid stamps, throttled for 180s").len(), 1);
+
+            let id = message(0x22).1;
+            let from = |who: &Identity| offer(&node, who, &propagation_link(Some(who)), &[id.clone()]);
+            let mark = crate::test_log::mark();
+            assert_eq!(from(&sender), code(ERROR_THROTTLED));
+            assert_eq!(mark.containing("rejected, throttled for").len(), 1);
+            assert_eq!(from(&Identity::new(true)), Value::Boolean(true), "only that node");
+            test_clock::advance(PN_STAMP_THROTTLE_SECS + 1.0);
+            assert_eq!(from(&sender), Value::Boolean(true), "the throttle runs out");
+            assert!(lock_inbound(&inbound(&node)).throttled_peers.is_empty(), "and its entry goes");
+
+            let client = propagation_link(None);
+            LxmfPropagationNode::ingest_propagation_batch(
+                &node, &batch(vec![short_message()]), Upload::Resource { sender: None, peering_key_valid: false, link: &client },
+            );
+            assert!(torn_down(&client), "a client's Resource: its link is torn down");
+            LxmfPropagationNode::ingest_propagation_batch(&node, &batch(vec![short_message()]), Upload::Packet);
+            assert!(lock_inbound(&inbound(&node)).throttled_peers.is_empty(), "but no one is throttled");
+        }
+
+        /// LXMRouter.clean_throttled_peers, on the sync tick: an expired
+        /// throttle goes even when its node never offers again.
+        #[test]
+        fn the_sync_tick_drops_expired_throttles() {
+            let node = node("throttle_prune");
+            let state = inbound(&node);
+            {
+                let mut state = lock_inbound(&state);
+                state.throttled_peers.insert(vec![1; 16], now() - 1.0);
+                state.throttled_peers.insert(vec![2; 16], now() + 60.0);
+            }
+            node.lock().unwrap().last_sync_tick = 0.0;
+            LxmfPropagationNode::tick_sync(&node);
+            assert_eq!(lock_inbound(&state).throttled_peers.keys().cloned().collect::<Vec<_>>(), vec![vec![2u8; 16]]);
+        }
+
+        // ── A closed link ───────────────────────────────────────────────────
+
+        /// What an offer recorded for a link goes when the link closes:
+        /// through the close callback link_established installs, and, when
+        /// the link closed while the offer was being answered, through the
+        /// check after the answer. A batch still being validated keeps its
+        /// entry until its stamps are done.
+        #[test]
+        fn a_closed_link_is_forgotten() {
+            let node = node("forget_closed");
+            let peer = Identity::new(true);
+            let (held, held_id) = message(0x71);
+            hold(&node, &held);
+            let new_id = message(0x72).1;
+            let state = inbound(&node);
+            let recorded = |link: &LinkHandle| {
+                let state = lock_inbound(&state);
+                (state.validated_peer_links.contains(&link.link_id()), state.accepted_offer_links.get(&link.link_id()).copied())
+            };
+
+            let link = propagation_link(Some(&peer));
+            node.lock().unwrap().link_established(link.clone());
+            assert_eq!(offer(&node, &peer, &link, &[held_id.clone(), new_id.clone()]), wanted(&[&new_id]));
+            assert_eq!(recorded(&link), (true, Some(OFFER_ACCEPTED)));
+            link.teardown();
+            wait_until("the close callback", || recorded(&link) == (false, None));
+
+            let late = propagation_link(Some(&peer));
+            late.teardown();
+            assert!(torn_down(&late));
+            assert_eq!(offer(&node, &peer, &late, &[held_id, new_id.clone()]), wanted(&[&new_id]));
+            assert_eq!(recorded(&late), (false, None), "closed before the answer recorded anything");
+
+            let validating = propagation_link(Some(&peer));
+            let mark = ValidationMark::new(state.clone(), propagation_hash(&peer), validating.link_id());
+            lock_inbound(&state).forget_link(&validating.link_id());
+            assert_eq!(recorded(&validating), (false, Some(OFFER_VALIDATING)), "the validation's to clear");
+            drop(mark);
+            assert_eq!(recorded(&validating), (false, None));
+            assert!(lock_inbound(&state).validating_pn_stamps_from.is_empty());
+        }
     }
 
     /// Outbound peer sync (LXMPeer / LXMRouter.sync_peers), driven end to end
@@ -7646,7 +8580,7 @@ mod tests {
                 Value::Array(messages.into_iter().map(Value::Binary).collect()),
             ]));
 
-            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(vec![fresh, held_file]), Some(&sender_identity));
+            super::ingest_synced(&h.node, &batch(vec![fresh, held_file]), &sender_identity);
             assert!(h.node.lock().unwrap().entries.contains_key(&fresh_id), "the new message is stored");
             h.peer(&sender, |p| {
                 assert!(!p.unhandled_ids.contains(&fresh_id), "not queued back to the peer that sent it");
@@ -7659,7 +8593,7 @@ mod tests {
 
             // A client PUT: no sending peer, so every peer gets it.
             let (client, client_id) = message(0x79);
-            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(vec![client]), None);
+            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(vec![client]), Upload::Packet);
             assert!(h.peer(&sender, |p| p.unhandled_ids.contains(&client_id)));
             assert!(h.peer(&other, |p| p.unhandled_ids.contains(&client_id)));
         }
@@ -7699,11 +8633,11 @@ mod tests {
             let link = LinkHandle::spawn(link);
 
             // The callbacks link_established installs on that link.
-            let (weak, sync_limit_kb) = {
+            let (weak, sync_limit_kb, inbound) = {
                 let g = h.node.lock().unwrap();
-                (g.self_handle.clone(), g.announced_limits_kb().1)
+                (g.self_handle.clone(), g.announced_limits_kb().1, g.inbound.clone())
             };
-            let (advertised, concluded) = LxmfPropagationNode::inbound_resource_callbacks(weak, sync_limit_kb);
+            let (advertised, concluded) = LxmfPropagationNode::inbound_resource_callbacks(weak, sync_limit_kb, inbound, None);
 
             // The sender advertises its batch; rfed accepts it.
             let advertisement = ResourceAdvertisement {
@@ -7767,7 +8701,8 @@ mod tests {
                     (g.self_handle.clone(), announced)
                 };
                 assert_eq!(announced_kb, h.node.lock().unwrap().announced_limits_kb().1);
-                let (advertised, _) = LxmfPropagationNode::inbound_resource_callbacks(weak, announced_kb);
+                let inbound = h.node.lock().unwrap().inbound.clone();
+                let (advertised, _) = LxmfPropagationNode::inbound_resource_callbacks(weak, announced_kb, inbound, None);
                 let limit = announced_kb as u64 * 1000;
                 assert!(advertised(&advertisement(limit)), "{tag}: exactly the announced limit is accepted");
                 assert!(!advertised(&advertisement(limit + 1)), "{tag}: one byte over it is refused");

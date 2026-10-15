@@ -22,6 +22,32 @@ pub struct IniNode {
     pub announce_at_start: Option<bool>,
     pub lxmf_propagation: Option<bool>,
     pub lxmf_propagation_autopeer: Option<bool>,
+    /// LXMF 1.1.1 lxmd's `[propagation]` `from_static_only`,
+    /// `sequential_pn_stamp_validation`, `static_peers_bypass_sequential` and
+    /// `max_inbound_syncs` (see `config::PropagationInbound`).
+    pub lxmf_propagation_from_static_only: Option<bool>,
+    pub lxmf_propagation_sequential_validation: Option<bool>,
+    pub lxmf_propagation_static_peers_bypass_sequential: Option<bool>,
+    pub lxmf_propagation_max_inbound_syncs: Option<u64>,
+}
+
+impl IniNode {
+    /// How the propagation node takes syncs: the configured settings, else
+    /// lxmd's defaults, and lxmd's floor of 1 for `max_inbound_syncs`
+    /// (lxmd.py `max(1, ...)`).
+    pub fn propagation_inbound(&self) -> crate::config::PropagationInbound {
+        let defaults = crate::config::PropagationInbound::default();
+        crate::config::PropagationInbound {
+            from_static_only: self.lxmf_propagation_from_static_only.unwrap_or(defaults.from_static_only),
+            sequential_validation: self.lxmf_propagation_sequential_validation
+                .unwrap_or(defaults.sequential_validation),
+            static_peers_bypass_sequential: self.lxmf_propagation_static_peers_bypass_sequential
+                .unwrap_or(defaults.static_peers_bypass_sequential),
+            max_inbound_syncs: self.lxmf_propagation_max_inbound_syncs
+                .map(|n| n.clamp(1, u32::MAX as u64) as u32)
+                .unwrap_or(defaults.max_inbound_syncs),
+        }
+    }
 }
 
 pub struct IniStorage {
@@ -113,6 +139,11 @@ impl IniConfig {
             announce_at_start:             flat_bool(n, "announce_at_start")?,
             lxmf_propagation:              flat_bool(n, "lxmf_propagation")?,
             lxmf_propagation_autopeer:     flat_bool(n, "lxmf_propagation_autopeer")?,
+            lxmf_propagation_from_static_only: flat_bool(n, "lxmf_propagation_from_static_only")?,
+            lxmf_propagation_sequential_validation: flat_bool(n, "lxmf_propagation_sequential_validation")?,
+            lxmf_propagation_static_peers_bypass_sequential:
+                flat_bool(n, "lxmf_propagation_static_peers_bypass_sequential")?,
+            lxmf_propagation_max_inbound_syncs: flat_uint(n, "lxmf_propagation_max_inbound_syncs")?,
         };
 
         // ── [storage] ─────────────────────────────────────────────────
@@ -156,6 +187,10 @@ impl IniConfig {
                 name: None, announce_interval_minutes: None,
                 announce_at_start: None, lxmf_propagation: None,
                 lxmf_propagation_autopeer: None,
+                lxmf_propagation_from_static_only: None,
+                lxmf_propagation_sequential_validation: None,
+                lxmf_propagation_static_peers_bypass_sequential: None,
+                lxmf_propagation_max_inbound_syncs: None,
             },
             storage: IniStorage {
                 limit_mb: None, transfer_limit_mb: None, sync_limit_mb: None,
@@ -279,6 +314,19 @@ pub const SAMPLE_CONFIG: &str = r#"# rfed — Reticulum Federation Node configur
   # announce_at_start            = yes
   # lxmf_propagation             = no
   # lxmf_propagation_autopeer    = no
+
+  # How the propagation node takes syncs from other propagation nodes, as
+  # LXMF lxmd's [propagation] from_static_only, sequential_pn_stamp_validation,
+  # static_peers_bypass_sequential and max_inbound_syncs. from_static_only
+  # takes syncs only from [peering] propagation_peers (and announces that the
+  # node takes none from others); it does not follow autopeer. While one sync
+  # batch's stamps are being validated, or max_inbound_syncs syncs are being
+  # received, other nodes' offers are answered "throttled" and they try again
+  # later; static peers skip both checks unless bypass is off.
+  # lxmf_propagation_from_static_only               = no
+  # lxmf_propagation_sequential_validation          = yes
+  # lxmf_propagation_static_peers_bypass_sequential = yes
+  # lxmf_propagation_max_inbound_syncs              = 3
 
 
 [storage]
@@ -408,5 +456,42 @@ mod tests {
         assert_eq!(IniConfig::empty().storage.channel_sync_limits_bytes(), caps, "no config file: capped");
         let set = IniConfig::parse("[storage]\n  channel_transfer_limit_mb = 5\n  channel_sync_limit_mb = 50\n").unwrap();
         assert_eq!(set.storage.channel_sync_limits_bytes(), (5 * 1024 * 1024, 50 * 1024 * 1024));
+    }
+
+    /// lxmd's `[propagation]` inbound settings, under `[node]`: its defaults
+    /// when unset (from_static_only no, sequential validation yes, static
+    /// peers bypass it yes, 3 inbound syncs), its floor of 1 inbound sync,
+    /// and from_static_only on its own — `lxmf_propagation_autopeer` does not
+    /// set it, as it did until 2026-10-15.
+    #[test]
+    fn the_inbound_sync_settings_read_as_lxmd_reads_them() {
+        use crate::config::PropagationInbound;
+        let defaults = PropagationInbound {
+            from_static_only: false, sequential_validation: true,
+            static_peers_bypass_sequential: true, max_inbound_syncs: 3,
+        };
+        assert_eq!(PropagationInbound::default(), defaults);
+        for (name, text) in [
+            ("config.txt.example", include_str!("../../config.txt.example")),
+            ("rfed-nas.config", include_str!("../../rfed-nas.config")),
+            ("SAMPLE_CONFIG", SAMPLE_CONFIG),
+            ("autopeer off", "[node]\n  lxmf_propagation = yes\n  lxmf_propagation_autopeer = no\n"),
+        ] {
+            let cfg = IniConfig::parse(text).unwrap_or_else(|e| panic!("{name} does not parse: {e}"));
+            assert_eq!(cfg.node.propagation_inbound(), defaults, "{name}");
+        }
+        assert_eq!(IniConfig::empty().node.propagation_inbound(), defaults, "no config file");
+
+        let set = IniConfig::parse(
+            "[node]\n  lxmf_propagation_autopeer = yes\n  lxmf_propagation_from_static_only = yes\n  \
+             lxmf_propagation_sequential_validation = no\n  lxmf_propagation_static_peers_bypass_sequential = no\n  \
+             lxmf_propagation_max_inbound_syncs = 7\n",
+        ).unwrap();
+        assert_eq!(set.node.propagation_inbound(), PropagationInbound {
+            from_static_only: true, sequential_validation: false,
+            static_peers_bypass_sequential: false, max_inbound_syncs: 7,
+        });
+        let zero = IniConfig::parse("[node]\n  lxmf_propagation_max_inbound_syncs = 0\n").unwrap();
+        assert_eq!(zero.node.propagation_inbound().max_inbound_syncs, 1, "lxmd: max(1, n)");
     }
 }

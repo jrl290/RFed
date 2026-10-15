@@ -1250,7 +1250,68 @@ notify-only shim.
   packets with `receiver` and optional `sender` hashes.
 
 `lxmf_propagation_autopeer` controls announce-based discovery, while
-`[peering].propagation_peers` pins static propagation peers.
+`[peering].propagation_peers` pins static propagation peers. Who may sync
+*to* rfed is a separate setting, `lxmf_propagation_from_static_only` (below);
+until 2026-10-15 it followed `lxmf_propagation_autopeer = no`.
+
+### Inbound peer sync
+
+rfed takes syncs from other propagation nodes as LXMF 1.1.1 does
+(`LXMRouter.offer_request`, `propagation_resource_advertised` and
+`propagation_resource_concluded`), with lxmd's `[propagation]` settings
+under `[node]`, prefixed `lxmf_propagation_`, and lxmd's defaults:
+`from_static_only = no`, `sequential_validation = yes`
+(lxmd's `sequential_pn_stamp_validation`),
+`static_peers_bypass_sequential = yes`, `max_inbound_syncs = 3` (at least 1).
+Code in `rfed/src/lxmf_propagation.rs`, `InboundSyncs`.
+
+1. **Offer.** `/offer` is answered, in this order:
+   - no identity on the link: `0xF0`;
+   - busy: `0xF6` (throttled) while any identified sender's batch is having
+     its stamps validated (`sequential_validation`), or while
+     `max_inbound_syncs` sync Resources are being received. A static peer is
+     never busy-throttled, unless `static_peers_bypass_sequential = no`;
+   - the node sent invalid stamps in the last 180 s (step 3): `0xF6`;
+   - `from_static_only = yes` and the node is not in
+     `[peering].propagation_peers`: `0xF1`;
+   - not `[key, [id, ...]]`: `0xF4`; a peering key under rfed's peering
+     cost: `0xF3`;
+   - otherwise the link is marked as one that presented a valid peering
+     key, and the answer is `false`, `true` or `[ids]`, as under Outbound
+     peer sync, step 4. An offer of which only some ids are wanted is
+     recorded as accepted. One wanted whole is not, as in the reference, so
+     its Resource counts against `max_inbound_syncs` only while its stamps
+     are being validated.
+2. **Resource advertised.** With `from_static_only`, a Resource from a
+   sender that did not identify, or is not a static peer, is refused. A
+   Resource over the announced per-sync limit is refused (Announce Metadata,
+   below). An accepted one moves its link's accepted offer to "receiving",
+   where it counts against `max_inbound_syncs`. Whether the link presented a
+   valid peering key is recorded here, for the reason the sender's identity
+   is (Behaviour, step 3).
+3. **Resource concluded.** A transfer of more than one message is taken only
+   on a link that presented a valid peering key. Anyone else's is refused
+   whole and its link torn down: "Clients and peers without a valid peering
+   key can only deliver 1 message per transfer". Every Retichat client and
+   PHP node uploads one message per transfer. An identified sender's batch
+   is marked as being validated while its stamps are checked. The valid
+   messages are stored. Then, if any stamp was invalid, the link is torn
+   down, and an identified sender's offers are answered `0xF6` for 180 s
+   (`PN_STAMP_THROTTLE`). However the Resource ends, its accepted offer is
+   done with. Expired throttles are dropped on the 24 s sync tick.
+4. **Announce.** The node-state flag is `not from_static_only`. A node that
+   takes syncs from its static peers only says it is not open to peering:
+   autopeering nodes do not peer with it, and unpeer it if they had.
+
+rfed forgets what an offer recorded for a link when the link closes; the
+reference keeps its validated links. A closed link carries nothing more.
+
+A client's upload by link packet (`LXMRouter.propagation_packet`) is held to
+none of this. The departure there is tracked separately
+(DISTRO-SYNC-PROOF-DESIGN, open question 5): the reference answers a packet
+carrying an invalid stamp with `ERROR_INVALID_STAMP` and tears the link
+down. rfed stores the valid messages and logs the dropped ones in a WARNING,
+after the link has proved the packet.
 
 ### Outbound peer sync
 
@@ -1464,13 +1525,16 @@ The LXMF propagation destination announces with app_data:
 [
   false,                            // protocol version marker
   unix_timestamp,                   // announce time
-  true,                             // is active propagation node
+  !from_static_only,                // node state: open to peering
   transfer_limit_kb,                // per-message limit, KB of 1000 B
   sync_limit_kb,                    // per-sync limit, KB of 1000 B
   [stamp_cost, flexibility, cost],  // PoW parameters
   {0x01: node_name}                 // metadata map
 ]
 ```
+
+The node state is LXMF 1.1.1's `propagation_node and not from_static_only`
+(Inbound peer sync, step 4). Until 2026-10-15 rfed always announced `true`.
 
 Both limits are integers in the reference's kilobytes of 1000 bytes, as LXMF
 1.1.1 announces them and as every reader (`LXMPeer.sync`, rfed's own offer
@@ -1599,6 +1663,10 @@ announce_interval_minutes    = 360
 announce_at_start            = yes
 lxmf_propagation             = no
 lxmf_propagation_autopeer    = no
+lxmf_propagation_from_static_only               = no   # §10 Inbound peer sync
+lxmf_propagation_sequential_validation          = yes
+lxmf_propagation_static_peers_bypass_sequential = yes
+lxmf_propagation_max_inbound_syncs              = 3
 
 [storage]
 limit_mb          = 2000

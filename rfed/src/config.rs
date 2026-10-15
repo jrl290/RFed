@@ -198,7 +198,51 @@ pub struct NodeConfig {
     pub lxmf_propagation_autopeer: bool,
     /// Explicit propagation peer hashes (16-byte truncated destination hashes).
     pub lxmf_propagation_peers: Vec<Vec<u8>>,
+    /// How the propagation node takes the syncs other propagation nodes
+    /// make to it (`[node] lxmf_propagation_from_static_only` and the
+    /// other `lxmf_propagation_*` keys of `PropagationInbound`).
+    pub lxmf_propagation_inbound: PropagationInbound,
 
+}
+
+// ── PropagationInbound ───────────────────────────────────────────────────────
+
+/// How the `lxmf.propagation` node takes the syncs other propagation nodes
+/// make to it: LXMF 1.1.1 lxmd's `[propagation]` settings of the same
+/// meaning, with its defaults (`LXMRouter.__init__`, `lxmd.py`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PropagationInbound {
+    /// lxmd `from_static_only` (default no). Offers and sync Resources are
+    /// taken only from the static propagation peers
+    /// (`[peering] propagation_peers`), and the announce says the node does
+    /// not take syncs (its node state is false). A setting of its own, as in
+    /// lxmd: autopeer says whom this node syncs to, this whom it takes
+    /// syncs from. Until 2026-10-15 rfed derived it from
+    /// `lxmf_propagation_autopeer = no`.
+    pub from_static_only: bool,
+    /// lxmd `sequential_pn_stamp_validation` (default yes). While the stamps
+    /// of one sync batch are being validated, an offer is answered
+    /// ERROR_THROTTLED, so the offering node tries again later.
+    pub sequential_validation: bool,
+    /// lxmd `static_peers_bypass_sequential` (default yes). A static peer's
+    /// offer skips both busy checks: `sequential_validation` and
+    /// `max_inbound_syncs`.
+    pub static_peers_bypass_sequential: bool,
+    /// lxmd `max_inbound_syncs` (default 3, never below 1). While this many
+    /// sync Resources are being received or validated, an offer is answered
+    /// ERROR_THROTTLED.
+    pub max_inbound_syncs: u32,
+}
+
+impl Default for PropagationInbound {
+    fn default() -> Self {
+        PropagationInbound {
+            from_static_only: false,
+            sequential_validation: true,
+            static_peers_bypass_sequential: true,
+            max_inbound_syncs: 3,
+        }
+    }
 }
 
 impl NodeConfig {
@@ -282,6 +326,7 @@ mod tests {
             lxmf_propagation_enabled: false,
             lxmf_propagation_autopeer: false,
             lxmf_propagation_peers: Vec::new(),
+            lxmf_propagation_inbound: PropagationInbound::default(),
         }
     }
 

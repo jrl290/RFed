@@ -2268,6 +2268,7 @@ mod backup_chain_tests {
             lxmf_propagation_enabled: false,
             lxmf_propagation_autopeer: false,
             lxmf_propagation_peers: Vec::new(),
+            lxmf_propagation_inbound: crate::config::PropagationInbound::default(),
         }
     }
 
@@ -5970,6 +5971,7 @@ mod announce_order_tests {
             lxmf_propagation_enabled: propagation,
             lxmf_propagation_autopeer: false,
             lxmf_propagation_peers: Vec::new(),
+            lxmf_propagation_inbound: crate::config::PropagationInbound::default(),
         }
     }
 

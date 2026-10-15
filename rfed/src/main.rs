@@ -555,6 +555,8 @@ fn main() -> Result<(), String> {
         cfg.node.lxmf_propagation.unwrap_or(false);
     let lxmf_propagation_autopeer: bool =
         cfg.node.lxmf_propagation_autopeer.unwrap_or(false);
+    // lxmd's [propagation] settings of the same meaning.
+    let lxmf_propagation_inbound = cfg.node.propagation_inbound();
 
     let mut lxmf_propagation_peers: Vec<Vec<u8>> = Vec::new();
     for hex_str in &cfg.peering.propagation_peers {
@@ -719,6 +721,7 @@ fn main() -> Result<(), String> {
         lxmf_propagation_enabled,
         lxmf_propagation_autopeer,
         lxmf_propagation_peers,
+        lxmf_propagation_inbound,
     };
 
     // ── Federation Node ──────────────────────────────────────────────
