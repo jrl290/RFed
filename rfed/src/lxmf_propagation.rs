@@ -111,6 +111,12 @@ pub const FASTEST_N_RANDOM_POOL: usize = 2;
 /// whose sync transfer carried invalid stamps has its offers answered
 /// ERROR_THROTTLED for this long (`InboundSyncs::throttled_peers`).
 pub const PN_STAMP_THROTTLE_SECS: f64 = 180.0;
+/// LXMRouter.P_LINK_MAX_INACTIVITY: an inbound sync link that has carried
+/// no data for longer than this is torn down (`clean_links`).
+pub const P_LINK_MAX_INACTIVITY_SECS: u64 = 180;
+/// How often `clean_links` looks: the reference runs LXMRouter.clean_links
+/// every JOB_LINKS_INTERVAL (1) job of PROCESSING_INTERVAL (4 s).
+pub const LINKS_CLEAN_INTERVAL_SECS: f64 = 4.0;
 /// Largest peer sync Resource rfed sends: one Resource segment.
 ///
 /// The reference packs any batch up to the peer's sync limit (10 MB by
@@ -552,6 +558,24 @@ pub struct InboundSyncs {
     /// it is not empty, offers are answered ERROR_THROTTLED
     /// (`sequential_validation`).
     pub validating_pn_stamps_from: HashMap<Vec<u8>, f64>,
+    /// LXMRouter.active_propagation_links, but only the links an `/offer`
+    /// came in on: a peer's sync links, by link id. `clean_links` tears one
+    /// down once it has carried no data for P_LINK_MAX_INACTIVITY_SECS. The
+    /// reference does that to every inbound propagation link. A client's
+    /// link is left alone: a phone holds its link to its propagation node
+    /// open to upload and pull (app-links), the reference has no such
+    /// clients, and closing their links would only make each idle phone
+    /// link again every three minutes. An entry goes when its link closes.
+    pub sync_links: HashMap<Vec<u8>, SyncLink>,
+}
+
+/// An inbound sync link (`InboundSyncs::sync_links`).
+#[derive(Clone)]
+pub struct SyncLink {
+    pub link: LinkHandle,
+    /// The `lxmf.propagation` hash of the node that offered on it, once one
+    /// offered identified.
+    pub node: Option<Vec<u8>>,
 }
 
 impl InboundSyncs {
@@ -565,6 +589,7 @@ impl InboundSyncs {
     /// validating; that entry is the validation's to clear.
     fn forget_link(&mut self, link_id: &[u8]) {
         self.validated_peer_links.remove(link_id);
+        self.sync_links.remove(link_id);
         if self.accepted_offer_links.get(link_id) != Some(&OFFER_VALIDATING) {
             self.accepted_offer_links.remove(link_id);
         }
@@ -600,6 +625,23 @@ fn forget_link_if_closed(inbound: &Mutex<InboundSyncs>, link: &LinkHandle) {
     if !link.is_alive() {
         lock_inbound(inbound).forget_link(&link.link_id());
     }
+}
+
+/// What the `/offer` handler does once its answer is ready, outside the node
+/// lock, whatever the answer: the link is a sync link now, which
+/// `clean_links` closes once idle (`InboundSyncs::sync_links`), and if it
+/// closed while the offer was being answered, it is forgotten
+/// (`forget_link_if_closed`).
+fn after_offer(inbound: &Mutex<InboundSyncs>, link: &LinkHandle, remote_identity: Option<&Identity>) {
+    {
+        let mut inbound = lock_inbound(inbound);
+        let entry = inbound.sync_links.entry(link.link_id())
+            .or_insert_with(|| SyncLink { link: link.clone(), node: None });
+        if let Some(identity) = remote_identity {
+            entry.node = Some(propagation_hash(identity));
+        }
+    }
+    forget_link_if_closed(inbound, link);
 }
 
 /// How a propagation upload reached this node. The reference takes the two
@@ -732,6 +774,8 @@ pub struct LxmfPropagationNode {
 
     // ── Sync timing ───────────────────────────────────────────────────
     pub last_sync_tick: f64,
+    /// When `clean_links` last looked at the inbound sync links.
+    pub last_links_clean: f64,
     /// When this node started (unix seconds). Everything stored before this
     /// is backlog and waits STARTUP_BACKLOG_HOLD_SECS; see `sync_pool`.
     pub started_at: f64,
@@ -835,6 +879,7 @@ impl LxmfPropagationNode {
             messages_received: 0,
             messages_served: 0,
             last_sync_tick: 0.0,
+            last_links_clean: 0.0,
             started_at: now(),
             fresh_since_start: Vec::new(),
             backlog_hold_logged: false,
@@ -896,7 +941,7 @@ impl LxmfPropagationNode {
                     };
                     // Outside the node lock: it waits on the link's actor.
                     if let Some(link) = link {
-                        forget_link_if_closed(&offer_inbound, link);
+                        after_offer(&offer_inbound, link, remote_identity);
                     }
                     return answer;
                 }
@@ -3155,6 +3200,55 @@ impl LxmfPropagationNode {
         (equal.max(per_tick).ceil() as u64).max(1)
     }
 
+    // ── Idle sync links (LXMRouter.clean_links) ──────────────────────────
+
+    /// Called from the main event loop. Every LINKS_CLEAN_INTERVAL_SECS, as
+    /// LXMRouter.clean_links: an inbound sync link that has carried no data
+    /// for P_LINK_MAX_INACTIVITY_SECS is torn down, and a closed one is
+    /// forgotten. Reference peers rely on this. An LXMPeer answered
+    /// ERROR_THROTTLED holds its link and offers nothing more until the link
+    /// closes: it stays in RESPONSE_RECEIVED, and only an IDLE peer is
+    /// synced. One answered ERROR_NO_ACCESS unpeers and leaves its link
+    /// open. Neither closes its own link, and its keepalives keep it up.
+    /// Only the links an offer came in on (`InboundSyncs::sync_links`). The
+    /// links' actors are asked outside every lock.
+    pub fn clean_links(arc: &Arc<Mutex<Self>>) {
+        let inbound = {
+            let Some(mut guard) = lock_node(arc, "clean_links") else { return };
+            let t = now();
+            if t - guard.last_links_clean < LINKS_CLEAN_INTERVAL_SECS {
+                return;
+            }
+            guard.last_links_clean = t;
+            guard.inbound.clone()
+        };
+        let links: Vec<SyncLink> = lock_inbound(&inbound).sync_links.values().cloned().collect();
+        let mut gone = Vec::new();
+        for SyncLink { link, node } in links {
+            let idle = if link.is_alive() { link.no_data_for().ok() } else { None };
+            match idle {
+                None => gone.push(link.link_id()),
+                Some(secs) if secs > P_LINK_MAX_INACTIVITY_SECS => {
+                    let from = node.as_deref().map(|hash| format!("node {}", hexrep(hash, false)))
+                        .unwrap_or_else(|| "an unidentified sender".into());
+                    log(
+                        format!("[lxmf.prop] sync link {} from {from} carried no data for {secs}s: torn down", hexrep(&link.link_id(), false)),
+                        LOG_NOTICE, false, false,
+                    );
+                    link.teardown();
+                    gone.push(link.link_id());
+                }
+                Some(_) => {}
+            }
+        }
+        if !gone.is_empty() {
+            let mut inbound = lock_inbound(&inbound);
+            for link_id in &gone {
+                inbound.forget_link(link_id);
+            }
+        }
+    }
+
     // ── Choosing a peer (LXMRouter.sync_peers) ───────────────────────────
 
     /// Called from the main event loop. Every PEER_SYNC_INTERVAL_SECS: cull
@@ -5085,6 +5179,11 @@ mod tests {
     /// identified, if it did (LXMPeer.link_established identifies before it
     /// offers). Its id is random, so the links of one test are distinct.
     fn propagation_link(sender: Option<&super::Identity>) -> super::LinkHandle {
+        propagation_link_idle(sender, 0)
+    }
+
+    /// The same link, last carrying data `idle` seconds ago.
+    fn propagation_link_idle(sender: Option<&super::Identity>, idle: u64) -> super::LinkHandle {
         use super::*;
         let owner = Destination::new_inbound(
             Some(Identity::new(true)), DestinationType::Single, "lxmf".into(), vec!["propagation".into()],
@@ -5093,6 +5192,7 @@ mod tests {
         link.link_id = rand::random::<[u8; 16]>().to_vec();
         link.state = reticulum_rust::link::STATE_ACTIVE;
         link.status = reticulum_rust::link::STATE_ACTIVE;
+        link.last_data = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - idle;
         *link.remote_identity.lock().unwrap() = sender.cloned();
         LinkHandle::spawn(link)
     }
@@ -6525,7 +6625,7 @@ mod tests {
     /// and what one transfer may carry.
     mod inbound_sync_tests {
         use super::ingest_lock_scope_tests::{test_node, test_node_with};
-        use super::propagation_link;
+        use super::{propagation_link, propagation_link_idle};
         use super::super::*;
         use reticulum_rust::link::ResourceAcceptCallback;
         use reticulum_rust::resource::{AutoCompressOption, Resource, ResourceAdvertisement, ResourceStatus};
@@ -6553,14 +6653,14 @@ mod tests {
         }
 
         /// What the registered `/offer` callback does: the answer under the
-        /// node lock, then the closed-link check outside it.
+        /// node lock, then `after_offer` outside it.
         fn offer_with_key(node: &Node, from: &Identity, link: &LinkHandle, key: Vec<u8>, ids: &[Vec<u8>]) -> Value {
             let data = encode_value(Value::Array(vec![
                 Value::Binary(key),
                 Value::Array(ids.iter().cloned().map(Value::Binary).collect()),
             ]));
             let answer = node.lock().unwrap().handle_offer(OFFER_PATH, &data, &[], Some(from), Some(link), now());
-            forget_link_if_closed(&inbound(node), link);
+            after_offer(&inbound(node), link, Some(from));
             read_value(&mut Cursor::new(&answer)).expect("an msgpack answer")
         }
 
@@ -7043,14 +7143,17 @@ mod tests {
             node.lock().unwrap().link_established(link.clone());
             assert_eq!(offer(&node, &peer, &link, &[held_id.clone(), new_id.clone()]), wanted(&[&new_id]));
             assert_eq!(recorded(&link), (true, Some(OFFER_ACCEPTED)));
+            assert!(lock_inbound(&state).sync_links.contains_key(&link.link_id()), "a sync link now");
             link.teardown();
             wait_until("the close callback", || recorded(&link) == (false, None));
+            assert!(!lock_inbound(&state).sync_links.contains_key(&link.link_id()), "and a sync link no more");
 
             let late = propagation_link(Some(&peer));
             late.teardown();
             assert!(torn_down(&late));
             assert_eq!(offer(&node, &peer, &late, &[held_id, new_id.clone()]), wanted(&[&new_id]));
             assert_eq!(recorded(&late), (false, None), "closed before the answer recorded anything");
+            assert!(!lock_inbound(&state).sync_links.contains_key(&late.link_id()), "not even as a sync link");
 
             let validating = propagation_link(Some(&peer));
             let mark = ValidationMark::new(state.clone(), propagation_hash(&peer), validating.link_id());
@@ -7059,6 +7162,69 @@ mod tests {
             drop(mark);
             assert_eq!(recorded(&validating), (false, None));
             assert!(lock_inbound(&state).validating_pn_stamps_from.is_empty());
+        }
+
+        // ── An idle sync link ───────────────────────────────────────────────
+
+        /// LXMRouter.clean_links, every LINKS_CLEAN_INTERVAL_SECS: a link an
+        /// offer came in on that has carried no data for
+        /// P_LINK_MAX_INACTIVITY_SECS is torn down and forgotten, whatever
+        /// the offer's answer. Answered ERROR_THROTTLED, a reference peer
+        /// waits for exactly that before it offers again: on the staging
+        /// network on 2026-10-15, 13 of 20 nodes answered so never offered
+        /// again. A fresher sync link stays up, and so does a client's link,
+        /// however idle; a closed one is forgotten.
+        #[test]
+        fn an_idle_sync_link_is_torn_down() {
+            let node = node("clean_links");
+            let state = inbound(&node);
+            let peer = Identity::new(true);
+            let ids = [message(0x81).1];
+            let idle_for = P_LINK_MAX_INACTIVITY_SECS + 5;
+
+            lock_inbound(&state).validating_pn_stamps_from.insert(vec![0xEE; 16], now());
+            let throttled = propagation_link_idle(Some(&peer), idle_for);
+            let fresh = propagation_link_idle(Some(&peer), P_LINK_MAX_INACTIVITY_SECS - 30);
+            let closed = propagation_link(Some(&peer));
+            for link in [&throttled, &fresh, &closed] {
+                assert_eq!(offer(&node, &peer, link, &ids), code(ERROR_THROTTLED));
+            }
+            lock_inbound(&state).validating_pn_stamps_from.clear();
+            let synced = propagation_link_idle(Some(&peer), idle_for);
+            assert_eq!(offer(&node, &peer, &synced, &ids), Value::Boolean(true));
+            let client = propagation_link_idle(None, idle_for);
+            closed.teardown();
+            wait_until("the closed link's actor to end", || torn_down(&closed));
+
+            let ids_of = |links: &[&LinkHandle]| {
+                let mut ids: Vec<Vec<u8>> = links.iter().map(|link| link.link_id()).collect();
+                ids.sort();
+                ids
+            };
+            let sync_links = || {
+                let mut ids: Vec<Vec<u8>> = lock_inbound(&state).sync_links.keys().cloned().collect();
+                ids.sort();
+                ids
+            };
+            assert_eq!(sync_links(), ids_of(&[&throttled, &fresh, &closed, &synced]), "the links an offer came in on");
+            assert_eq!(lock_inbound(&state).sync_links[&throttled.link_id()].node, Some(propagation_hash(&peer)));
+            assert!(lock_inbound(&state).validated_peer_links.contains(&synced.link_id()));
+
+            let mark = crate::test_log::mark();
+            node.lock().unwrap().last_links_clean = now();
+            LxmfPropagationNode::clean_links(&node);
+            assert_eq!(sync_links().len(), 4, "not again within LINKS_CLEAN_INTERVAL_SECS");
+            assert!(throttled.is_alive());
+
+            node.lock().unwrap().last_links_clean = now() - LINKS_CLEAN_INTERVAL_SECS;
+            LxmfPropagationNode::clean_links(&node);
+            wait_until("the idle sync links to close", || torn_down(&throttled) && torn_down(&synced));
+            assert_eq!(sync_links(), ids_of(&[&fresh]));
+            assert!(!lock_inbound(&state).validated_peer_links.contains(&synced.link_id()), "what its offer recorded goes too");
+            assert!(fresh.is_alive() && client.is_alive(), "a fresher sync link and a client's link stay up");
+            let lines = mark.containing("carried no data for");
+            assert_eq!(lines.len(), 2, "a line for each link torn down, none for the closed one: {lines:?}");
+            assert!(lines.iter().all(|line| line.contains(&hexrep(&propagation_hash(&peer), false))), "naming the node: {lines:?}");
         }
     }
 

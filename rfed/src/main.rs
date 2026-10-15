@@ -916,6 +916,12 @@ fn main() -> Result<(), String> {
             lxmf_propagation::LxmfPropagationNode::tick_sync(prop);
         }
 
+        // Close idle inbound sync links (LXMRouter.clean_links)
+        enter("propagation.clean_links");
+        if let Some(ref prop) = lxmf_prop_arc {
+            lxmf_propagation::LxmfPropagationNode::clean_links(prop);
+        }
+
         // Backup delivery: forward pending registrations + check owner failover.
         enter("backup_delivery+status");
         if last_backup_tick.elapsed() >= backup_tick_interval {

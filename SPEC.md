@@ -1302,9 +1302,23 @@ Code in `rfed/src/lxmf_propagation.rs`, `InboundSyncs`.
 4. **Announce.** The node-state flag is `not from_static_only`. A node that
    takes syncs from its static peers only says it is not open to peering:
    autopeering nodes do not peer with it, and unpeer it if they had.
+5. **Idle sync links.** Every 4 s (`LXMRouter.clean_links`), a link an offer
+   came in on that has carried no data for 180 s (`P_LINK_MAX_INACTIVITY`)
+   is torn down. Keepalives are not data. Reference peers depend on this.
+   Answered `0xF6`, an LXMPeer keeps its link and offers nothing more until
+   that link closes. Answered `0xF1`, it unpeers and leaves the link open.
+   It closes neither link itself. The reference closes every idle inbound
+   propagation link. rfed leaves clients' links alone: a Retichat phone holds
+   its link to its propagation node open to upload and pull (app-links), and
+   closing it would only make each idle phone link again every three
+   minutes. This needs a Reticulum-rust whose `no_data_for` leaves
+   keepalives out, as RNS does (branch `link-data-clock`, 2026-10-15). With
+   an older one, a link its peer keeps alive is never idle. On the staging
+   network, 13 of 20 reference nodes answered `0xF6` never offered again.
 
-rfed forgets what an offer recorded for a link when the link closes; the
-reference keeps its validated links. A closed link carries nothing more.
+rfed forgets what an offer recorded for a link when the link closes or is
+closed for idleness; the reference keeps its validated links. A closed link
+carries nothing more.
 
 A client's upload by link packet (`LXMRouter.propagation_packet`) is held to
 none of this. The departure there is tracked separately
