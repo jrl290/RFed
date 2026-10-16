@@ -95,6 +95,15 @@ pub const DEFAULT_TRANSFER_LIMIT_KB: f64 = 256.0;
 pub const DEFAULT_SYNC_LIMIT_KB: f64 = 10240.0;
 /// Message expiry: 7 days.  Matches BlobStore TTL.
 pub const MESSAGE_EXPIRY_SECS: f64 = 7.0 * 24.0 * 3600.0;
+/// LXMRouter.MESSAGE_EXPIRY*6.0, 180 days: how long a message stored here is
+/// remembered once it has left the store (`LocallyProcessed`). Six times the
+/// reference's own 30-day message expiry, not rfed's 7 days above: reference
+/// nodes hold a message for 30 days, and may send it again in that time.
+pub const LOCALLY_PROCESSED_EXPIRY_SECS: f64 = 6.0 * 30.0 * 24.0 * 3600.0;
+/// How often `clean_transient_id_caches` looks: the reference runs it every
+/// JOB_TRANSIENT_INTERVAL (60) jobs of PROCESSING_INTERVAL (4 s), and once at
+/// startup.
+pub const TRANSIENT_ID_CLEAN_INTERVAL_SECS: f64 = 240.0;
 /// How often one peer is chosen to start a sync: the reference runs
 /// `LXMRouter.sync_peers` every JOB_PEERSYNC_INTERVAL (6) jobs of
 /// PROCESSING_INTERVAL (4 s), i.e. every 24 s. This was 6 s — the job count
@@ -565,6 +574,189 @@ impl PropagationEntries {
                 *count = 0;
             }
         }
+    }
+}
+
+// ── Locally processed messages ────────────────────────────────────────────────
+
+/// LXMRouter.locally_processed_transient_ids: the id of every message stored
+/// here in the last LOCALLY_PROCESSED_EXPIRY_SECS, with when it was received.
+/// `store_message` stores no message whose id is here, though the message has
+/// left the store: collected by its recipient (GET "haves"), expired, or over
+/// the storage limit. Saved in LXMF's own file, `locally_processed`.
+///
+/// At the NAS's ~20,000 messages a day (2026-10-15) that is ~3.6M ids. A
+/// HashMap of them took 164 MiB at 3.4M and doubles to 328 MiB past 3.67M.
+/// Here an id takes 36 bytes: the newest ids in a map, each day before in a
+/// run sorted by id, each received time to the second. Cleaning touches only
+/// the runs it expires records from. A lookup searches every run: ~130 µs
+/// for an id that is in none of 180 runs of 20,000 (2026-10-15, this Mac).
+#[derive(Default)]
+pub struct LocallyProcessed {
+    /// The ids recorded since the last run was sealed.
+    recent: HashMap<TransientId, u32>,
+    /// The oldest received time in `recent`.
+    recent_oldest: Option<u32>,
+    /// The sealed runs, oldest first.
+    runs: Vec<ProcessedRun>,
+}
+
+/// Records sorted by id, and the span of their received times.
+struct ProcessedRun {
+    records: Vec<(TransientId, u32)>,
+    oldest: u32,
+    newest: u32,
+}
+
+/// A received time as the records keep it: in whole seconds.
+fn whole_seconds(t: f64) -> u32 {
+    t.clamp(0.0, u32::MAX as f64) as u32
+}
+
+impl ProcessedRun {
+    fn new(mut records: Vec<(TransientId, u32)>) -> Option<Self> {
+        records.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        records.dedup_by(|a, b| a.0 == b.0);
+        let oldest = records.iter().map(|r| r.1).min()?;
+        let newest = records.iter().map(|r| r.1).max()?;
+        Some(ProcessedRun { records, oldest, newest })
+    }
+
+    fn contains(&self, id: &TransientId) -> bool {
+        self.records.binary_search_by(|(k, _)| k.cmp(id)).is_ok()
+    }
+
+    fn covers(&self, received: u32) -> bool {
+        (self.oldest..=self.newest).contains(&received)
+    }
+}
+
+impl LocallyProcessed {
+    /// `recent` is sealed into a run once its oldest record is this old.
+    const RUN_SECS: f64 = 86_400.0;
+
+    pub fn len(&self) -> usize {
+        self.recent.len() + self.runs.iter().map(|run| run.records.len()).sum::<usize>()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn contains(&self, transient_id: &[u8]) -> bool {
+        let Ok(id) = <&TransientId>::try_from(transient_id) else { return false };
+        self.recent.contains_key(id) || self.runs.iter().any(|run| run.contains(id))
+    }
+
+    /// `contains`, searching first the runs that cover `received`: a stored
+    /// message's record is there.
+    fn contains_received_at(&self, id: &TransientId, received: u32) -> bool {
+        self.recent.contains_key(id)
+            || self.runs.iter().any(|run| run.covers(received) && run.contains(id))
+            || self.runs.iter().any(|run| !run.covers(received) && run.contains(id))
+    }
+
+    /// Record an id that `contains` does not hold, received at `received`.
+    pub fn record(&mut self, transient_id: TransientId, received: f64) {
+        let received = whole_seconds(received);
+        self.recent.insert(transient_id, received);
+        self.recent_oldest = Some(self.recent_oldest.map_or(received, |oldest| oldest.min(received)));
+    }
+
+    /// LXMRouter.clean_transient_id_caches: drop every record received more
+    /// than LOCALLY_PROCESSED_EXPIRY_SECS before `now`. Then `recent` is
+    /// sealed into a run once its oldest record is a day old. Returns how
+    /// many records were dropped.
+    pub fn clean(&mut self, now: f64) -> usize {
+        let expired = |received: u32| now > received as f64 + LOCALLY_PROCESSED_EXPIRY_SECS;
+        let before = self.len();
+        if self.recent_oldest.is_some_and(|oldest| expired(oldest)) {
+            self.recent.retain(|_, received| !expired(*received));
+            self.recent_oldest = self.recent.values().copied().min();
+        }
+        self.runs.retain_mut(|run| {
+            if !expired(run.oldest) {
+                return true;
+            }
+            if expired(run.newest) {
+                return false;
+            }
+            run.records.retain(|(_, received)| !expired(*received));
+            run.oldest = run.records.iter().map(|r| r.1).min().unwrap_or(run.newest);
+            true
+        });
+        let dropped = before - self.len();
+        if self.recent_oldest.is_some_and(|oldest| now >= oldest as f64 + Self::RUN_SECS) {
+            let records: Vec<(TransientId, u32)> = std::mem::take(&mut self.recent).into_iter().collect();
+            self.recent_oldest = None;
+            self.runs.extend(ProcessedRun::new(records));
+        }
+        dropped
+    }
+
+    /// LXMF's `locally_processed`, as LXMRouter.save_locally_processed_transient_ids
+    /// writes it: a msgpack map of each id (bin) to when it was received (float).
+    fn write_to<W: Write>(&self, out: &mut W) -> io::Result<()> {
+        rmp::encode::write_map_len(out, self.len() as u32).map_err(write_error)?;
+        let sealed = self.runs.iter().flat_map(|run| run.records.iter().map(|(id, received)| (id, *received)));
+        for (id, received) in sealed.chain(self.recent.iter().map(|(id, received)| (id, *received))) {
+            rmp::encode::write_bin(out, id).map_err(write_error)?;
+            rmp::encode::write_f64(out, received as f64).map_err(write_error)?;
+        }
+        Ok(())
+    }
+
+    /// Read a file `write_to` or LXMF wrote, and how many of its records were
+    /// skipped: those that are not a 32-byte id and a time. The file is read
+    /// twice, first to count each day's records, then into runs of exactly
+    /// that size, so that loading holds no more than the runs do. A file that
+    /// does not read is dropped whole, as the reference drops it.
+    fn read_from(path: &Path) -> io::Result<(Self, usize)> {
+        let mut days: HashMap<u32, usize> = HashMap::new();
+        let skipped = Self::read_records(path, |_, received| *days.entry(received / 86_400).or_default() += 1)?;
+        let mut by_day: HashMap<u32, Vec<(TransientId, u32)>> =
+            days.into_iter().map(|(day, count)| (day, Vec::with_capacity(count))).collect();
+        Self::read_records(path, |id, received| {
+            if let Some(run) = by_day.get_mut(&(received / 86_400)) {
+                run.push((id, received));
+            }
+        })?;
+        let mut runs: Vec<ProcessedRun> = by_day.into_values().filter_map(ProcessedRun::new).collect();
+        runs.sort_by_key(|run| run.oldest);
+        Ok((LocallyProcessed { runs, ..Default::default() }, skipped))
+    }
+
+    /// Hand `each` every record of the file at `path`; how many were skipped.
+    fn read_records(path: &Path, mut each: impl FnMut(TransientId, u32)) -> io::Result<usize> {
+        let mut rd = io::BufReader::new(fs::File::open(path)?);
+        let Head::Map(count) = read_head(&mut rd)? else {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "the file does not hold a map"));
+        };
+        let mut skipped = 0;
+        for _ in 0..count {
+            let id = match read_head(&mut rd)? {
+                Head::Bin(32) => {
+                    let mut id = [0u8; 32];
+                    rd.read_exact(&mut id)?;
+                    Some(id)
+                }
+                other => {
+                    skip_rest(other, &mut rd)?;
+                    None
+                }
+            };
+            let received = match read_any(&mut rd)? {
+                Value::F64(t) => Some(t),
+                Value::F32(t) => Some(t as f64),
+                Value::Integer(n) => n.as_f64(),
+                _ => None,
+            };
+            match (id, received) {
+                (Some(id), Some(t)) => each(id, whole_seconds(t)),
+                _ => skipped += 1,
+            }
+        }
+        Ok(skipped)
     }
 }
 
@@ -1040,6 +1232,8 @@ pub struct LxmfPropagationNode {
     pub messagestore_path: PathBuf,
     /// Every stored message, with the peers it is handled and unhandled for.
     pub entries: PropagationEntries,
+    /// Every message stored here in the last 180 days, held or not.
+    pub locally_processed: LocallyProcessed,
 
     // ── Peer tracking ─────────────────────────────────────────────────
     pub peers: HashMap<Vec<u8>, PropPeer>,
@@ -1070,6 +1264,8 @@ pub struct LxmfPropagationNode {
     pub last_sync_tick: f64,
     /// When `clean_links` last looked at the inbound sync links.
     pub last_links_clean: f64,
+    /// When `clean_transient_id_caches` last cleaned `locally_processed`.
+    pub last_transient_clean: f64,
     /// When this node started (unix seconds). Everything stored before this
     /// is backlog and waits STARTUP_BACKLOG_HOLD_SECS; see `sync_pool`.
     pub started_at: f64,
@@ -1167,6 +1363,7 @@ impl LxmfPropagationNode {
             inbound: Arc::new(Mutex::new(InboundSyncs::default())),
             messagestore_path,
             entries: PropagationEntries::default(),
+            locally_processed: LocallyProcessed::default(),
             peers: HashMap::new(),
             departed_slots: HashMap::new(),
             in_flight_keys: HashSet::new(),
@@ -1175,6 +1372,7 @@ impl LxmfPropagationNode {
             messages_served: 0,
             last_sync_tick: 0.0,
             last_links_clean: 0.0,
+            last_transient_clean: 0.0,
             started_at: now(),
             fresh_since_start: Vec::new(),
             backlog_hold_logged: false,
@@ -1207,6 +1405,10 @@ impl LxmfPropagationNode {
 
         // Load peers
         guard.load_peers();
+
+        // The messages processed before, held or not: read before any
+        // upload can be taken (DESIGN_PRINCIPLES.md §5).
+        guard.load_locally_processed();
 
         // Activate static peers
         for static_peer in guard.static_peers.clone() {
@@ -1701,7 +1903,8 @@ impl LxmfPropagationNode {
     /// Store an incoming LXMF message on disk and index it in memory.
     ///
     /// Returns the transient_id (full SHA-256 hash of lxmf_data) if the
-    /// message was stored, or `None` if it's a duplicate or too short.
+    /// message was stored, or `None` if it's a duplicate, was stored here
+    /// before (`locally_processed`), is too short, or could not be written.
     ///
     /// `from_peer` — if the message came from a sync peer, that peer's
     /// destination hash is passed so we skip queueing it back to them.
@@ -1718,8 +1921,10 @@ impl LxmfPropagationNode {
 
         let transient_id: TransientId = reticulum_rust::identity::full_hash(lxmf_data).try_into().ok()?;
 
-        // Dedup
-        if self.entries.contains_key(&transient_id) {
+        // LXMRouter.lxmf_propagation stores a message only when its id is in
+        // neither propagation_entries nor locally_processed_transient_ids, so
+        // a message that has left the store is not stored again.
+        if self.entries.contains_key(&transient_id) || self.locally_processed.contains(&transient_id) {
             return None;
         }
 
@@ -1741,6 +1946,10 @@ impl LxmfPropagationNode {
             return None;
         }
 
+        // Recorded once stored. The reference records it before the write,
+        // so a message whose write failed is refused for 180 days; here a
+        // later copy is stored.
+        self.locally_processed.record(transient_id, received);
         self.entries.insert(transient_id, PropagationEntry::new(destination_hash, received, file_data.len(), stamp_value));
 
         // Queue for all peers except the one that sent it to us —
@@ -2200,9 +2409,16 @@ impl LxmfPropagationNode {
                 }
                 None => return,
             };
-            if was_stored {
-                stored += 1;
+            if !was_stored {
+                // Its recipient was pushed or woken for it when it was
+                // stored. LXMRouter.lxmf_propagation delivers nothing for a
+                // message it holds or has processed, and the distro fan-out
+                // above goes on first sight only. Until 2026-10-15 every
+                // copy pushed or woke again: a client's second upload, each
+                // peer's sync, and copies of messages already collected.
+                continue;
             }
+            stored += 1;
 
             match delivery.dispatch_live_or_notify(lxmf_data, "") {
                 LiveDispatchOutcome::Streamed => streamed += 1,
@@ -3571,6 +3787,26 @@ impl LxmfPropagationNode {
             for link_id in &gone {
                 inbound.forget_link(link_id);
             }
+        }
+    }
+
+    /// Called from the main event loop. Every TRANSIENT_ID_CLEAN_INTERVAL_SECS,
+    /// as LXMRouter.clean_transient_id_caches: a message received longer than
+    /// LOCALLY_PROCESSED_EXPIRY_SECS ago is no longer remembered, and is
+    /// stored if it comes again.
+    pub fn clean_transient_id_caches(arc: &Arc<Mutex<Self>>) {
+        let Some(mut guard) = lock_node(arc, "clean_transient_id_caches") else { return };
+        let t = now();
+        if t - guard.last_transient_clean < TRANSIENT_ID_CLEAN_INTERVAL_SECS {
+            return;
+        }
+        guard.last_transient_clean = t;
+        let dropped = guard.locally_processed.clean(t);
+        if dropped > 0 {
+            log(
+                format!("[lxmf.prop] cleaned {dropped} ids from the locally processed cache"),
+                LOG_DEBUG, false, false,
+            );
         }
     }
 
@@ -4969,6 +5205,83 @@ impl LxmfPropagationNode {
         }
     }
 
+    /// Save the locally processed ids as LXMRouter.exit_handler does
+    /// (save_locally_processed_transient_ids): only when there are any, to a
+    /// temporary file that then replaces `locally_processed`.
+    pub fn save_locally_processed(&self) {
+        if self.locally_processed.is_empty() {
+            return;
+        }
+        let started = now();
+        let path = self.storage_path.join("locally_processed");
+        let temp_path = self.storage_path.join(format!("locally_processed.tmp.{started}"));
+        let written = fs::File::create(&temp_path).and_then(|file| {
+            let mut out = io::BufWriter::new(file);
+            self.locally_processed.write_to(&mut out)?;
+            out.into_inner().map_err(io::IntoInnerError::into_error)?;
+            Ok(())
+        });
+        match written.and_then(|()| fs::rename(&temp_path, &path)) {
+            Ok(()) => log(
+                format!(
+                    "[lxmf.prop] saved {} locally processed ids to storage in {:.2}s",
+                    self.locally_processed.len(), now() - started,
+                ),
+                LOG_NOTICE, false, false,
+            ),
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path);
+                log(format!("[lxmf.prop] could not save the locally processed ids to storage: {e}"), LOG_ERROR, false, false);
+            }
+        }
+    }
+
+    /// Read the locally processed ids as LXMRouter does at startup, then
+    /// clean them. A stored message the file does not name is recorded with
+    /// its received time: the reference records each as it stores it and
+    /// saves only at exit, so the file misses whatever was stored after the
+    /// last clean exit, and every message stored before rfed kept the file.
+    /// Called after the messagestore is indexed.
+    fn load_locally_processed(&mut self) {
+        let started = now();
+        let path = self.storage_path.join("locally_processed");
+        if path.is_file() {
+            match LocallyProcessed::read_from(&path) {
+                Ok((loaded, skipped)) => {
+                    self.locally_processed = loaded;
+                    if skipped > 0 {
+                        log(
+                            format!("[lxmf.prop] skipped {skipped} unreadable records of the locally processed ids"),
+                            LOG_WARNING, false, false,
+                        );
+                    }
+                }
+                Err(e) => log(
+                    format!("[lxmf.prop] could not load the locally processed ids from storage: {e}"),
+                    LOG_ERROR, false, false,
+                ),
+            }
+        }
+        let read = self.locally_processed.len();
+        let mut recorded = 0;
+        for (transient_id, entry) in self.entries.iter() {
+            if !self.locally_processed.contains_received_at(transient_id, whole_seconds(entry.received)) {
+                self.locally_processed.record(*transient_id, entry.received);
+                recorded += 1;
+            }
+        }
+        let t = now();
+        let expired = self.locally_processed.clean(t);
+        self.last_transient_clean = t;
+        log(
+            format!(
+                "[lxmf.prop] {} locally processed ids: {read} read, {recorded} recorded from the store, {expired} expired, in {:.2}s",
+                self.locally_processed.len(), now() - started,
+            ),
+            LOG_NOTICE, false, false,
+        );
+    }
+
     fn write_peers_file(&self, path: &Path) -> io::Result<()> {
         let mut out = io::BufWriter::new(fs::File::create(path)?);
         rmp::encode::write_array_len(&mut out, self.peers.len() as u32).map_err(write_error)?;
@@ -5124,6 +5437,7 @@ impl LxmfPropagationNode {
     /// Save all propagation node state. Called during shutdown.
     pub fn save_all(&self) {
         self.save_peers();
+        self.save_locally_processed();
         self.save_stats();
         log("[lxmf.prop] state persisted", LOG_NOTICE, false, false);
     }
@@ -7342,6 +7656,43 @@ mod tests {
             assert!(text(&lines[2]).starts_with("[lxmf.prop] processed 3 msgs: 0 stored,"), "{}", lines[2]);
         }
 
+        /// A message's recipient is pushed once, when the message is stored
+        /// here: a copy of a message held or processed here delivers nothing
+        /// (LXMRouter.lxmf_propagation). Until 2026-10-15 every copy pushed
+        /// again: the sender's second upload, a peer's sync, and copies of a
+        /// message the recipient had collected.
+        #[test]
+        fn a_recipient_is_pushed_once_however_many_copies_come() {
+            let rig = Rig::new("pushed_once", 0);
+            let client = Identity::new(true);
+            let recipient = Destination::hash_from_name_and_identity("lxmf.delivery", Some(&client));
+            let link = live_link();
+            rig.sessions.lock().unwrap().configure_delivery(link.clone(), recipient.clone());
+            let lxmf = [&recipient[..], &[0x41; 200][..]].concat();
+            let id = reticulum_rust::identity::full_hash(&lxmf);
+            let message = [&lxmf[..], &[0x42; 32][..]].concat();
+            let peer = Identity::new(true);
+            let mark = crate::test_log::mark();
+            let pushes = || mark.containing("[lxmf.prop] rfed.link pushed recipient ").len();
+
+            rig.ingest(&upload(&[message.clone()], None));
+            assert_eq!(pushes(), 1, "pushed as it is stored: {:?}", mark.lines());
+            rig.ingest(&upload(&[message.clone()], None));
+            super::ingest_synced(&rig.node, &upload(&[message.clone()], None), &peer);
+            assert_eq!(pushes(), 1, "a copy of a message held here pushes nothing: {:?}", mark.lines());
+
+            let haves = encode_value(Value::Array(vec![Value::Nil, Value::Array(vec![Value::Binary(id)])]));
+            rig.node.lock().unwrap().handle_get("", &haves, &[], Some(&client), 0.0);
+            rig.ingest(&upload(&[message.clone()], None));
+            super::ingest_synced(&rig.node, &upload(&[message], None), &peer);
+            assert_eq!(pushes(), 1, "nor does a copy of one its recipient collected: {:?}", mark.lines());
+
+            let processed = mark.containing("[lxmf.prop] processed 1 msgs: ");
+            assert_eq!(processed.len(), 5, "{processed:?}");
+            assert!(processed[0].contains(": 1 stored, 1 streamed, 0 notified, "), "{}", processed[0]);
+            assert!(processed[1..].iter().all(|l| l.contains(": 0 stored, 0 streamed, 0 notified, ")), "{processed:?}");
+        }
+
         // ── Pins ────────────────────────────────────────────────────────
 
         /// The staging harnesses parse the processed line; it is unchanged.
@@ -7694,6 +8045,417 @@ mod tests {
             assert_eq!(g.entries.get(&early).unwrap().stamp_value, 7);
             assert!(g.entries.get(&late).unwrap().other_name.is_none(), "rfed's own name is not kept");
             assert!(g.entries.get(&early).unwrap().other_name.is_some());
+        }
+    }
+
+    /// LXMF 1.1.1's locally processed transient ids (LXMRouter.__init__,
+    /// lxmf_propagation, clean_transient_id_caches and
+    /// save_locally_processed_transient_ids), as rfed keeps them: the newest
+    /// in a map, each day before in a run sorted by id.
+    mod locally_processed_tests {
+        use super::ingest_lock_scope_tests::test_node_with;
+        use super::super::*;
+
+        /// A file LXMF 1.1.1 wrote: tests/fixtures/lxmf_locally_processed_fixture.py.
+        const LXMF_LOCALLY_PROCESSED: &[u8] = include_bytes!("../tests/fixtures/lxmf_1_1_1_locally_processed.bin");
+
+        const T0: f64 = 1_760_000_000.0;
+        const DAY: f64 = 86_400.0;
+
+        fn id(n: u8) -> TransientId {
+            [n; 32]
+        }
+
+        fn temp_path(tag: &str) -> PathBuf {
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            std::env::temp_dir().join(format!("rfed_locally_processed_{tag}_{unique}"))
+        }
+
+        /// `file` read as a `locally_processed` file, and its skipped records.
+        fn read_file(file: &[u8], tag: &str) -> io::Result<(LocallyProcessed, usize)> {
+            let path = temp_path(tag);
+            fs::write(&path, file).unwrap();
+            let read = LocallyProcessed::read_from(&path);
+            fs::remove_file(&path).unwrap();
+            read
+        }
+
+        /// What `write_to` saves, decoded: each id and its received time, by id.
+        fn saved(processed: &LocallyProcessed) -> Vec<(Vec<u8>, f64)> {
+            let mut file = Vec::new();
+            processed.write_to(&mut file).unwrap();
+            let Value::Map(pairs) = read_value(&mut &file[..]).unwrap() else { panic!("a map") };
+            let mut records: Vec<(Vec<u8>, f64)> = pairs
+                .into_iter()
+                .map(|pair| match pair {
+                    (Value::Binary(id), Value::F64(received)) => (id, received),
+                    other => panic!("an id (bin) to a time (float): {other:?}"),
+                })
+                .collect();
+            records.sort_by(|a, b| a.0.cmp(&b.0));
+            records
+        }
+
+        fn run_ids(run: &ProcessedRun) -> Vec<u8> {
+            run.records.iter().map(|(id, _)| id[0]).collect()
+        }
+
+        /// LXMRouter.clean_transient_id_caches drops an id once `time.time()
+        /// > timestamp + MESSAGE_EXPIRY*6.0`: held through 180 days, gone the
+        /// second after, whether among the newest or sealed in a run.
+        #[test]
+        fn an_id_is_held_for_180_days_after_it_was_received() {
+            let mut processed = LocallyProcessed::default();
+            processed.record(id(1), T0);
+            assert_eq!(processed.clean(T0 + LOCALLY_PROCESSED_EXPIRY_SECS), 0);
+            assert!(processed.contains(&id(1)));
+            assert_eq!(processed.runs.len(), 1, "sealed into a run by then");
+            assert_eq!(processed.clean(T0 + LOCALLY_PROCESSED_EXPIRY_SECS + 1.0), 1);
+            assert!(!processed.contains(&id(1)));
+            assert!(processed.is_empty() && processed.runs.is_empty());
+
+            processed.record(id(2), T0);
+            assert_eq!(processed.clean(T0 + LOCALLY_PROCESSED_EXPIRY_SECS + 1.0), 1, "expired before it was sealed");
+            assert!(!processed.contains(&id(2)));
+            assert!(processed.is_empty());
+        }
+
+        /// The newest ids are sealed into a run sorted by id once the oldest
+        /// of them is a day old.
+        #[test]
+        fn the_newest_ids_are_sealed_into_a_run_a_day_after_the_oldest() {
+            let mut processed = LocallyProcessed::default();
+            for (n, after) in [(3u8, 0.0), (1, 10.0), (2, 20.0)] {
+                processed.record(id(n), T0 + after);
+            }
+            processed.clean(T0 + LocallyProcessed::RUN_SECS - 1.0);
+            assert!(processed.runs.is_empty(), "the oldest is not a day old");
+            processed.clean(T0 + LocallyProcessed::RUN_SECS);
+            assert!(processed.recent.is_empty());
+            assert_eq!(processed.runs.len(), 1);
+            assert_eq!(run_ids(&processed.runs[0]), vec![1, 2, 3], "sorted by id");
+            assert_eq!((processed.runs[0].oldest, processed.runs[0].newest), (T0 as u32, T0 as u32 + 20));
+
+            processed.record(id(4), T0 + LocallyProcessed::RUN_SECS);
+            assert_eq!((processed.recent.len(), processed.len()), (1, 4));
+            assert!((1..=4).all(|n| processed.contains(&id(n))));
+            assert!(!processed.contains(&id(5)));
+            assert!(!processed.contains(&[1u8; 16]), "nor anything that is not 32 bytes");
+        }
+
+        /// Expiry that reaches into a run takes the records it reaches and
+        /// leaves the rest; the run goes with its newest.
+        #[test]
+        fn a_run_is_trimmed_as_its_records_expire_and_goes_with_its_newest() {
+            let mut processed = LocallyProcessed::default();
+            for (n, after) in [(1u8, 0.0), (2, 50.0), (3, 100.0)] {
+                processed.record(id(n), T0 + after);
+            }
+            processed.clean(T0 + LocallyProcessed::RUN_SECS);
+            assert_eq!(processed.runs.len(), 1);
+            assert_eq!(processed.clean(T0 + 50.0 + LOCALLY_PROCESSED_EXPIRY_SECS), 1);
+            assert!(!processed.contains(&id(1)));
+            assert!(processed.contains(&id(2)) && processed.contains(&id(3)));
+            assert_eq!(processed.runs[0].oldest, T0 as u32 + 50);
+            assert_eq!(processed.clean(T0 + 100.0 + LOCALLY_PROCESSED_EXPIRY_SECS + 1.0), 2);
+            assert!(processed.is_empty() && processed.runs.is_empty());
+        }
+
+        /// Saved as LXMRouter.save_locally_processed_transient_ids saves it:
+        /// a msgpack map of each id (bin 32) to when it was received (float
+        /// 64), here to the second. Read back the same.
+        #[test]
+        fn saves_the_file_as_lxmf_does_and_reads_it_back() {
+            let mut processed = LocallyProcessed::default();
+            processed.record(id(1), T0 + 0.75);
+            processed.record(id(2), T0 + 100.0);
+            processed.clean(T0 + LocallyProcessed::RUN_SECS);
+            processed.record(id(3), T0 + LocallyProcessed::RUN_SECS + 5.0);
+            let records = vec![
+                (id(1).to_vec(), T0),
+                (id(2).to_vec(), T0 + 100.0),
+                (id(3).to_vec(), T0 + LocallyProcessed::RUN_SECS + 5.0),
+            ];
+            assert_eq!(saved(&processed), records, "a run and the newest");
+
+            let mut file = Vec::new();
+            processed.write_to(&mut file).unwrap();
+            assert_eq!((file[0], file[1], file[2], file[35]), (0x83, 0xc4, 0x20, 0xcb), "map, bin 32, float 64");
+            assert_eq!(file.len(), 1 + 3 * (2 + 32 + 9));
+            let (read, skipped) = read_file(&file, "round_trip").unwrap();
+            assert_eq!(skipped, 0);
+            assert_eq!(saved(&read), records);
+            assert!((1..=3).all(|n| read.contains(&id(n))));
+        }
+
+        /// Past 65,535 ids the map's length takes 32 bits (0xdf), as
+        /// umsgpack writes it, and every id reads back.
+        #[test]
+        fn a_file_of_many_ids_reads_back_whole() {
+            let tid = |n: u32| {
+                let mut tid = [0u8; 32];
+                tid[..4].copy_from_slice(&n.to_be_bytes());
+                tid
+            };
+            let mut processed = LocallyProcessed::default();
+            for n in 0..70_000u32 {
+                processed.record(tid(n), T0 + (n % 3) as f64 * DAY);
+            }
+            let mut file = Vec::new();
+            processed.write_to(&mut file).unwrap();
+            assert_eq!(&file[..5], &[0xdf, 0x00, 0x01, 0x11, 0x70]);
+            let (read, skipped) = read_file(&file, "many").unwrap();
+            assert_eq!((read.len(), skipped, read.runs.len()), (70_000, 0, 3));
+            assert!((0..70_000u32).all(|n| read.contains(&tid(n))));
+            assert!(!read.contains(&tid(70_000)));
+        }
+
+        /// tests/fixtures/lxmf_locally_processed_fixture.py ran
+        /// LXMRouter.save_locally_processed_transient_ids on three ids
+        /// received on three days.
+        #[test]
+        fn reads_the_file_lxmf_writes() {
+            let (read, skipped) = read_file(LXMF_LOCALLY_PROCESSED, "lxmf").unwrap();
+            assert_eq!(skipped, 0);
+            assert_eq!(
+                saved(&read),
+                vec![
+                    (vec![0x11; 32], 1_760_000_000.0),
+                    (vec![0x22; 32], 1_760_086_400.0),
+                    (vec![0x33; 32], 1_760_172_800.0),
+                ],
+                "each received time to the second",
+            );
+            assert_eq!(read.runs.len(), 3, "a run a day");
+        }
+
+        /// A day's records make one run sorted by id, in whatever order the
+        /// file holds them; the runs go oldest first.
+        #[test]
+        fn records_in_any_order_make_one_run_a_day() {
+            let records = [(5u8, T0 + DAY + 7.0), (1, T0 + 3.0), (4, T0 + DAY), (2, T0 + 1.0), (3, T0 + DAY + 2.0)];
+            let file = encode_value(Value::Map(
+                records.iter().map(|(n, received)| (Value::Binary(id(*n).to_vec()), Value::F64(*received))).collect(),
+            ));
+            let (read, _) = read_file(&file, "order").unwrap();
+            assert_eq!(read.runs.len(), 2);
+            assert_eq!((run_ids(&read.runs[0]), run_ids(&read.runs[1])), (vec![1, 2], vec![3, 4, 5]));
+            assert_eq!((read.runs[0].oldest, read.runs[0].newest), (T0 as u32 + 1, T0 as u32 + 3));
+            assert_eq!((read.runs[1].oldest, read.runs[1].newest), ((T0 + DAY) as u32, (T0 + DAY) as u32 + 7));
+        }
+
+        /// A record that is not a 32-byte id and a time is skipped and the
+        /// rest read (an integer is a time). A file that is not a map, or
+        /// ends early, is dropped whole, as LXMRouter.__init__ drops one it
+        /// cannot unpack.
+        #[test]
+        fn a_bad_record_is_skipped_and_a_bad_file_dropped_whole() {
+            let file = encode_value(Value::Map(vec![
+                (Value::Binary(id(1).to_vec()), Value::F64(T0)),
+                (Value::Binary(vec![2; 16]), Value::F64(T0)),
+                (Value::Binary(id(3).to_vec()), Value::String("then".into())),
+                (Value::Binary(id(4).to_vec()), Value::Integer((T0 as i64 + 4).into())),
+                (Value::Array(vec![Value::Binary(id(5).to_vec())]), Value::F64(T0)),
+                (Value::Binary(id(6).to_vec()), Value::F32(1.0e9)),
+            ]));
+            let (read, skipped) = read_file(&file, "bad_records").unwrap();
+            assert_eq!(skipped, 3);
+            assert_eq!(saved(&read), vec![(id(1).to_vec(), T0), (id(4).to_vec(), T0 + 4.0), (id(6).to_vec(), 1.0e9)]);
+
+            for (what, file) in [
+                ("an array", encode_value(Value::Array(vec![Value::Binary(id(1).to_vec()), Value::F64(T0)]))),
+                ("cut short", file[..file.len() - 4].to_vec()),
+                ("empty", Vec::new()),
+            ] {
+                assert!(read_file(&file, "bad_file").is_err(), "{what}");
+            }
+        }
+
+        // ── On the node ─────────────────────────────────────────────────
+
+        /// A node on `dir` started as `enable` starts one: the messagestore
+        /// indexed, the peers file read, then the locally processed ids.
+        fn started(dir: &Path) -> Arc<Mutex<LxmfPropagationNode>> {
+            let dir = dir.to_path_buf();
+            let node = test_node_with("locally_processed", |config| config.config_dir = dir);
+            {
+                let mut g = node.lock().unwrap();
+                g.index_messagestore();
+                g.load_peers();
+                g.load_locally_processed();
+            }
+            node
+        }
+
+        fn processed_path(dir: &Path) -> PathBuf {
+            dir.join("lxmf_propagation").join("locally_processed")
+        }
+
+        /// A client, and a message to it (300 bytes with its stamp) and its id.
+        fn client_message(fill: u8) -> (Identity, Vec<u8>, Vec<u8>) {
+            let client = Identity::new(true);
+            let mut lxmf = vec![fill; 300 - lx_stamper::STAMP_SIZE];
+            lxmf[..16].copy_from_slice(&Destination::hash_from_name_and_identity("lxmf.delivery", Some(&client)));
+            let tid = reticulum_rust::identity::full_hash(&lxmf);
+            (client, lxmf, tid)
+        }
+
+        fn store(node: &Arc<Mutex<LxmfPropagationNode>>, lxmf: &[u8]) -> bool {
+            node.lock().unwrap().store_message(lxmf, 0, Some(&[0x33; lx_stamper::STAMP_SIZE]), None).is_some()
+        }
+
+        /// The client has the message and says so (GET "haves"), which takes
+        /// it out of the store.
+        fn collect(node: &Arc<Mutex<LxmfPropagationNode>>, client: &Identity, tid: &[u8]) {
+            let haves = encode_value(Value::Array(vec![Value::Nil, Value::Array(vec![Value::Binary(tid.to_vec())])]));
+            let mut g = node.lock().unwrap();
+            g.handle_get("", &haves, &[], Some(client), 0.0);
+            assert!(!g.entries.contains_key(tid), "collected");
+        }
+
+        /// The line a start logs, once it has read the ids.
+        fn start_line(mark: &crate::test_log::Mark) -> String {
+            let lines = mark.containing(" locally processed ids: ");
+            assert_eq!(lines.len(), 1, "{:?}", mark.lines());
+            lines[0].clone()
+        }
+
+        /// rfed saves the ids at exit (`save_all`, as LXMRouter.exit_handler
+        /// saves them) and the next start reads them: a message collected
+        /// before a restart is not stored after it.
+        #[test]
+        fn a_restart_remembers_a_collected_message() {
+            let dir = temp_path("restart");
+            let node = started(&dir);
+            node.lock().unwrap().save_all();
+            assert!(!processed_path(&dir).exists(), "no ids, no file");
+            let (client, lxmf, tid) = client_message(0x61);
+            assert!(store(&node, &lxmf));
+            collect(&node, &client, &tid);
+            let mark = crate::test_log::mark();
+            node.lock().unwrap().save_all();
+            assert_eq!(mark.containing("[lxmf.prop] saved 1 locally processed ids to storage in ").len(), 1, "{:?}", mark.lines());
+            assert!(processed_path(&dir).is_file());
+            drop(node);
+
+            let mark = crate::test_log::mark();
+            let node = started(&dir);
+            let line = start_line(&mark);
+            assert!(line.contains("[lxmf.prop] 1 locally processed ids: 1 read, 0 recorded from the store, 0 expired, in "), "{line}");
+            assert!(!store(&node, &lxmf), "not stored again");
+        }
+
+        /// The reference saves the ids at exit only, so a node that was
+        /// killed misses those stored since it last saved, and one that ran
+        /// before rfed kept the file misses every one. A start records each
+        /// stored message the file does not name, at its received time.
+        #[test]
+        fn a_start_records_each_stored_message_the_file_misses() {
+            let dir = temp_path("seed");
+            let (_, a, a_tid) = client_message(0x62);
+            let (client_b, b, b_tid) = client_message(0x63);
+            let node = started(&dir);
+            assert!(store(&node, &a));
+            let a_received = node.lock().unwrap().entries.get(&a_tid).unwrap().received;
+            drop(node); // killed, with no file
+
+            let mark = crate::test_log::mark();
+            let node = started(&dir);
+            let line = start_line(&mark);
+            assert!(line.contains("[lxmf.prop] 1 locally processed ids: 0 read, 1 recorded from the store, 0 expired, in "), "{line}");
+            assert_eq!(saved(&node.lock().unwrap().locally_processed), vec![(a_tid.clone(), a_received.floor())]);
+            node.lock().unwrap().save_locally_processed();
+            assert!(store(&node, &b));
+            drop(node); // killed again, the file naming `a` only
+
+            let mark = crate::test_log::mark();
+            let node = started(&dir);
+            let line = start_line(&mark);
+            assert!(line.contains("[lxmf.prop] 2 locally processed ids: 1 read, 1 recorded from the store, 0 expired, in "), "{line}");
+            collect(&node, &client_b, &b_tid);
+            assert!(!store(&node, &b), "the message stored after the last save is not stored again");
+        }
+
+        /// A start cleans the ids it read, as LXMRouter.__init__ runs
+        /// clean_transient_id_caches: one received over 180 days ago is gone.
+        #[test]
+        fn a_start_forgets_ids_received_over_180_days_ago() {
+            let dir = temp_path("start_clean");
+            drop(started(&dir));
+            let file = encode_value(Value::Map(vec![
+                (Value::Binary(id(1).to_vec()), Value::F64(now() - LOCALLY_PROCESSED_EXPIRY_SECS - 60.0)),
+                (Value::Binary(id(2).to_vec()), Value::F64(now())),
+            ]));
+            fs::write(processed_path(&dir), file).unwrap();
+            let mark = crate::test_log::mark();
+            let node = started(&dir);
+            let line = start_line(&mark);
+            assert!(line.contains("[lxmf.prop] 1 locally processed ids: 2 read, 0 recorded from the store, 1 expired, in "), "{line}");
+            let g = node.lock().unwrap();
+            assert!(!g.locally_processed.contains(&id(1)) && g.locally_processed.contains(&id(2)));
+        }
+
+        /// The reference records an id before it writes the message, so one
+        /// whose write failed is refused for 180 days. rfed records it once
+        /// the message is written: a later copy is stored.
+        #[test]
+        fn a_message_that_could_not_be_written_is_stored_when_it_comes_again() {
+            let dir = temp_path("write_failed");
+            let node = started(&dir);
+            let (_, lxmf, tid) = client_message(0x64);
+            let messagestore = node.lock().unwrap().messagestore_path.clone();
+            node.lock().unwrap().messagestore_path = dir.join("missing");
+            assert!(!store(&node, &lxmf), "not written");
+            assert!(!node.lock().unwrap().locally_processed.contains(&tid));
+            node.lock().unwrap().messagestore_path = messagestore;
+            assert!(store(&node, &lxmf), "stored when it comes again");
+            assert!(node.lock().unwrap().locally_processed.contains(&tid));
+        }
+
+        /// 180 days after it was received a collected message is forgotten,
+        /// on the main loop's clean (LXMRouter.clean_transient_id_caches,
+        /// every 240 s), and stored if it comes again.
+        #[test]
+        fn a_message_is_stored_again_180_days_after_it_first_was() {
+            let dir = temp_path("expiry");
+            let node = started(&dir);
+            let (client, lxmf, tid) = client_message(0x65);
+            assert!(store(&node, &lxmf));
+            collect(&node, &client, &tid);
+            test_clock::advance(LOCALLY_PROCESSED_EXPIRY_SECS + 1.0);
+            // Last cleaned 239 s ago: not due yet.
+            node.lock().unwrap().last_transient_clean = now() - TRANSIENT_ID_CLEAN_INTERVAL_SECS + 1.0;
+            LxmfPropagationNode::clean_transient_id_caches(&node);
+            assert!(node.lock().unwrap().locally_processed.contains(&tid), "not cleaned before it is due");
+            assert!(!store(&node, &lxmf));
+            test_clock::advance(1.0);
+            LxmfPropagationNode::clean_transient_id_caches(&node);
+            assert!(!node.lock().unwrap().locally_processed.contains(&tid), "forgotten");
+            assert!(store(&node, &lxmf), "stored again");
+        }
+
+        /// `enable` reads the ids after indexing the store, whose messages
+        /// it records, and before it can take any upload: the request
+        /// handlers, the link callback and the destination come after
+        /// (DESIGN_PRINCIPLES.md §5).
+        #[test]
+        fn enable_reads_the_ids_before_it_can_take_an_upload() {
+            let source = include_str!("lxmf_propagation.rs");
+            let start = source.find("    pub fn enable(arc: &Arc<Mutex<Self>>) -> Result<(), String> {\n").expect("enable");
+            let body = &source[start..start + source[start..].find("\n    }\n").expect("its end")];
+            let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("enable has {needle}"));
+            let load = at("guard.load_locally_processed();");
+            assert!(at("guard.index_messagestore();") < load);
+            assert!(load < at("guard.destination.register_request_handler("));
+            assert!(load < at("guard.destination.set_link_established_callback("));
+            assert!(load < at("Transport::register_destination("));
+        }
+
+        /// The main loop cleans the ids, as LXMRouter.jobs does.
+        #[test]
+        fn the_main_loop_cleans_the_ids() {
+            let main = include_str!("main.rs");
+            assert!(main.contains("lxmf_propagation::LxmfPropagationNode::clean_transient_id_caches(prop);"));
         }
     }
 

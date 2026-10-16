@@ -1232,12 +1232,13 @@ notify-only shim.
 2. rfed validates the propagation-node stamp against the configured
   cost/flexibility.
 3. rfed stores the LXMF message on disk, indexes it, and queues it for
-  eligible propagation peers. A sync Resource from a peer (the sender's
-  identity on the link maps to a peer's `lxmf.propagation` hash) is handled
-  for that peer, every message in it including ones rfed already held, and is
-  queued for the other peers only (LXMF 1.1.1
-  `propagation_resource_concluded`, `from_peer`). A client's PUT goes to
-  every peer. The reference reads the identity off the link when the
+  eligible propagation peers, unless it holds the message or has stored it
+  in the last 180 days (Locally processed messages, below). A sync Resource
+  from a peer (the sender's identity on the link maps to a peer's
+  `lxmf.propagation` hash) is handled for that peer, every message in it
+  including ones rfed already held, and is queued for the other peers only
+  (LXMF 1.1.1 `propagation_resource_concluded`, `from_peer`). A client's PUT
+  goes to every peer. The reference reads the identity off the link when the
   Resource concludes; rfed records it when the Resource is advertised,
   because by the time the Resource concludes the proof has gone out and the
   sender may already have closed the link, which rfed can then no longer
@@ -1247,7 +1248,12 @@ notify-only shim.
   peers exchange OFFER / GET sync with LXMF-rust `lxmd` instances and other
   rfed nodes.
 5. If the recipient has notify relays registered, rfed also dispatches wake
-  packets with `receiver` and optional `sender` hashes.
+  packets with `receiver` and optional `sender` hashes. It wakes the
+  recipient, or pushes the message on the recipient's live session, only
+  when it stores the message: a copy it does not store (step 3) wakes and
+  pushes nothing, as the reference delivers nothing for one. Until
+  2026-10-15 every copy woke or pushed again: a client's second upload, each
+  peer's sync, and copies of a message already collected.
 
 `lxmf_propagation_autopeer` controls announce-based discovery, while
 `[peering].propagation_peers` pins static propagation peers. Who may sync
@@ -1587,6 +1593,57 @@ Departures from the reference, each for a reason:
   re-offer of what it may already hold; a node that does not start serves
   nobody.
 
+### Locally processed messages
+
+rfed remembers the transient id of every message it has stored in the last
+180 days, and when it was received, whether it still holds the message or
+not, as LXMF 1.1.1 does (`LXMRouter.locally_processed_transient_ids`,
+`MESSAGE_EXPIRY * 6`). A message whose id it remembers is not stored again:
+not after its recipient has collected it (a GET "haves" takes the message
+out of the store and leaves its id), nor after it has expired or gone over
+the storage limit. `/offer` still wants every id rfed does not hold, as
+`offer_request` does, and the copy is dropped when it arrives. Until
+2026-10-15 rfed checked only the store, so each peer that still held a
+collected message offered it back, and rfed stored it again, queued it to
+every other peer and woke its recipient for it. Code in
+`rfed/src/lxmf_propagation.rs`, `LocallyProcessed`.
+
+The store keeps a message 7 days (`MESSAGE_EXPIRY_SECS`; the reference keeps
+it 30), the ids 180 days. They are kept in LXMF's file,
+`lxmf_propagation/locally_processed`: a msgpack map of each id (bin 32) to
+the time it was received (float). It is read at start and cleaned at once,
+cleaned every 240 s (`clean_transient_id_caches`), and saved at exit only,
+when there are ids, to `locally_processed.tmp.<time>` and renamed into place
+(`save_locally_processed_transient_ids`). Each reads the file the other
+wrote. A file that does not read is dropped whole, as the reference drops
+it; a record that is not a 32-byte id and a time is skipped, with a
+warning. An rfed from before 2026-10-15 ignores the file.
+
+At the NAS's ~20,000 messages a day (2026-10-15) that is ~3.6 M ids. A hash
+map of them took 164 MiB at 3.4 M on this Mac and doubles to 328 MiB past
+3.67 M; the reference's dict took 449 MiB at 3.4 M. rfed holds the ids
+recorded in the last day in a map, and each day before in a run sorted by
+id: 36 bytes an id, ~124 MiB at 3.6 M. A lookup searches every run, ~130 µs
+for an id that is in none of 180 runs of 20,000. The file takes 43 bytes an
+id, ~148 MiB; one of 139 MiB saved in 1.3 s and loaded in 0.9 s.
+
+Where rfed departs:
+
+- **Recorded once written.** The reference records an id before it writes
+  the message, so a message whose write failed is refused for 180 days. rfed
+  records it once the write has succeeded, and a later copy is stored.
+- **Recorded from the store at start.** The reference saves the ids at exit
+  only, so after a crash it has lost those of the messages stored since its
+  last clean exit, and stores those messages again once they have left the
+  store. At start rfed records each stored message the file does not name,
+  at its received time: those, and every message stored by an rfed that kept
+  no file.
+- **To the second.** A received time is kept in whole seconds, so an id may
+  be forgotten up to a second sooner than the reference would forget it.
+
+Distro messages go to the BlobStore instead (§17), whose index decides first
+sight (`ingest_distro_blob`); they are not recorded here.
+
 ### Announce Metadata
 
 The LXMF propagation destination announces with app_data:
@@ -1799,6 +1856,7 @@ All persisted to `<config_dir>/`:
 | `blobs/<ch_hex>/<id_hex>` | raw bytes | Stored inner blobs (written as `<id_hex>.tmp`, then renamed) |
 | `lxmf_propagation/messagestore/<message_id_hex>` | raw bytes | Stored LXMF propagated messages (when enabled) |
 | `lxmf_propagation/peers` | msgpack, LXMF 1.1.1's | Propagation peers and the messages each has handled and not (§10, Propagation entries and the peers file) |
+| `lxmf_propagation/locally_processed` | msgpack, LXMF 1.1.1's | Id of each message stored in the last 180 days, and when it was received (§10, Locally processed messages) |
 | `lxmf_propagation/node_stats` | msgpack map | Propagation message counters |
 
 The SQLite stores run in WAL mode (each has `-wal` and `-shm` files beside

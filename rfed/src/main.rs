@@ -923,6 +923,12 @@ fn main() -> Result<(), String> {
             lxmf_propagation::LxmfPropagationNode::clean_links(prop);
         }
 
+        // Forget processed messages after 180 days (LXMRouter.clean_transient_id_caches)
+        enter("propagation.clean_transient_id_caches");
+        if let Some(ref prop) = lxmf_prop_arc {
+            lxmf_propagation::LxmfPropagationNode::clean_transient_id_caches(prop);
+        }
+
         // Backup delivery: forward pending registrations + check owner failover.
         enter("backup_delivery+status");
         if last_backup_tick.elapsed() >= backup_tick_interval {
