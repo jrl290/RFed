@@ -47,10 +47,10 @@
 //! least recently served chosen. See "Outbound peer sync" below and SPEC.md
 //! §10.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Cursor;
-use std::path::PathBuf;
+use std::io::{self, Cursor, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -215,14 +215,357 @@ enum LiveDispatchOutcome {
 
 // ── PropagationEntry ──────────────────────────────────────────────────────────
 
-/// In-memory index entry for a stored LXMF message.
-#[derive(Clone)]
+/// A message's transient id: the SHA-256 of its LXMF data.
+pub type TransientId = [u8; 32];
+
+/// LXMRouter.propagation_entries[transient_id]: a stored message, as the
+/// reference's list [destination hash, file, received, size, handled peers,
+/// unhandled peers, stamp value].
+#[derive(Clone, Debug)]
 pub struct PropagationEntry {
-    pub destination_hash: Vec<u8>,
-    pub filepath: String,
+    /// [0]: the first DESTINATION_LENGTH bytes of the message.
+    pub destination_hash: [u8; DESTINATION_LENGTH],
+    /// [2]: when it was received, in unix seconds.
     pub received: f64,
+    /// [3]: its stored size, the message with its stamp.
     pub size: usize,
+    /// [6]
     pub stamp_value: u32,
+    /// [4]: the peers it is handled for. They have it, or will never be
+    /// offered it.
+    pub handled_peers: PeerSet,
+    /// [5]: the peers it is still to be offered to.
+    pub unhandled_peers: PeerSet,
+    /// [1] is `<transient id hex>_<received>_<stamp value>` in the
+    /// messagestore, as rfed names a message's file (`file_name`). A file
+    /// named otherwise keeps its name here.
+    other_name: Option<Box<str>>,
+}
+
+impl PropagationEntry {
+    pub fn new(destination_hash: [u8; DESTINATION_LENGTH], received: f64, size: usize, stamp_value: u32) -> Self {
+        PropagationEntry {
+            destination_hash,
+            received,
+            size,
+            stamp_value,
+            handled_peers: PeerSet::default(),
+            unhandled_peers: PeerSet::default(),
+            other_name: None,
+        }
+    }
+
+    /// The name of the message's file in the messagestore.
+    pub fn file_name(&self, transient_id: &[u8]) -> String {
+        match &self.other_name {
+            Some(name) => name.to_string(),
+            None => message_file_name(transient_id, self.received, self.stamp_value),
+        }
+    }
+}
+
+/// How rfed names a stored message's file: the reference's
+/// `<transient id hex>_<received>_<stamp value>`.
+fn message_file_name(transient_id: &[u8], received: f64, stamp_value: u32) -> String {
+    format!("{}_{}_{}", hexrep(transient_id, false), received, stamp_value)
+}
+
+/// A set of peers, by the slot each holds (`PropPeer::slot`): the lists of
+/// peer hashes in a reference entry's [4] and [5]. One word while every slot
+/// is below 64, which holds for MAX_PEERS peers and a few static ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PeerSet {
+    Word(u64),
+    Words(Box<Vec<u64>>),
+}
+
+impl Default for PeerSet {
+    fn default() -> Self {
+        PeerSet::Word(0)
+    }
+}
+
+impl PeerSet {
+    fn words(&self) -> &[u64] {
+        match self {
+            PeerSet::Word(word) => std::slice::from_ref(word),
+            PeerSet::Words(words) => words,
+        }
+    }
+
+    pub fn contains(&self, slot: usize) -> bool {
+        self.words().get(slot / 64).map_or(false, |word| word & (1 << (slot % 64)) != 0)
+    }
+
+    /// Add `slot`. Whether it was not in the set.
+    pub fn insert(&mut self, slot: usize) -> bool {
+        if self.contains(slot) {
+            return false;
+        }
+        let (at, bit) = (slot / 64, 1u64 << (slot % 64));
+        match self {
+            PeerSet::Word(word) if at == 0 => *word |= bit,
+            PeerSet::Word(word) => {
+                let mut words = vec![0u64; at + 1];
+                words[0] = *word;
+                words[at] = bit;
+                *self = PeerSet::Words(Box::new(words));
+            }
+            PeerSet::Words(words) => {
+                if words.len() <= at {
+                    words.resize(at + 1, 0);
+                }
+                words[at] |= bit;
+            }
+        }
+        true
+    }
+
+    /// Take `slot` out. Whether it was in the set.
+    pub fn remove(&mut self, slot: usize) -> bool {
+        if !self.contains(slot) {
+            return false;
+        }
+        let bit = 1u64 << (slot % 64);
+        match self {
+            PeerSet::Word(word) => *word &= !bit,
+            PeerSet::Words(words) => words[slot / 64] &= !bit,
+        }
+        true
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.words().iter().all(|word| *word == 0)
+    }
+
+    /// The slots in the set, lowest first.
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words().iter().enumerate().flat_map(|(at, &word)| {
+            (0..64usize).filter(move |bit| word & (1 << bit) != 0).map(move |bit| at * 64 + bit)
+        })
+    }
+}
+
+/// LXMRouter.propagation_entries: every stored message, in the order it was
+/// stored (at startup, in the order received), with the peers it is handled
+/// and unhandled for. A peer's handled and unhandled messages are read off
+/// it, as LXMPeer.handled_messages and unhandled_messages are, so a message
+/// that leaves the store leaves every peer with it.
+///
+/// Each peer used to keep its own lists, ordered maps holding a copy of every
+/// id: 184 B for each (message, peer) pair, 155 of rfed's 184 MiB with 44,000
+/// messages and 20 peers (2026-10-15). A pair is two bits here.
+#[derive(Default)]
+pub struct PropagationEntries {
+    /// The entries in order, `None` where one was removed (until `compact`).
+    rows: Vec<Option<(TransientId, PropagationEntry)>>,
+    /// The row of every stored message.
+    index: HashMap<TransientId, u32>,
+    /// How many entries each peer slot is handled and unhandled for
+    /// (LXMPeer._hm_count and _um_count, kept exact).
+    handled_counts: Vec<usize>,
+    unhandled_counts: Vec<usize>,
+}
+
+impl PropagationEntries {
+    pub fn with_capacity(capacity: usize) -> Self {
+        PropagationEntries {
+            rows: Vec::with_capacity(capacity),
+            index: HashMap::with_capacity(capacity),
+            ..Default::default()
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.index.len()
+    }
+
+    fn row_of(&self, transient_id: &[u8]) -> Option<usize> {
+        let transient_id: &TransientId = transient_id.try_into().ok()?;
+        self.index.get(transient_id).map(|&row| row as usize)
+    }
+
+    pub fn contains_key(&self, transient_id: &[u8]) -> bool {
+        self.row_of(transient_id).is_some()
+    }
+
+    pub fn get(&self, transient_id: &[u8]) -> Option<&PropagationEntry> {
+        let row = self.row_of(transient_id)?;
+        self.rows[row].as_ref().map(|(_, entry)| entry)
+    }
+
+    /// The stored messages, in order.
+    pub fn iter(&self) -> impl Iterator<Item = (&TransientId, &PropagationEntry)> {
+        self.rows.iter().flatten().map(|(transient_id, entry)| (transient_id, entry))
+    }
+
+    /// Store `entry` last. Nothing changes, and false is returned, if the
+    /// message is stored already.
+    pub fn insert(&mut self, transient_id: TransientId, entry: PropagationEntry) -> bool {
+        if self.index.contains_key(&transient_id) {
+            return false;
+        }
+        self.count_peers(&entry, true);
+        self.index.insert(transient_id, self.rows.len() as u32);
+        self.rows.push(Some((transient_id, entry)));
+        true
+    }
+
+    /// Take a message out of the store, and so out of every peer's handled
+    /// and unhandled messages.
+    pub fn remove(&mut self, transient_id: &[u8]) -> Option<PropagationEntry> {
+        let transient_id: &TransientId = transient_id.try_into().ok()?;
+        let row = self.index.remove(transient_id)? as usize;
+        let (_, entry) = self.rows[row].take()?;
+        self.count_peers(&entry, false);
+        let removed = self.rows.len() - self.index.len();
+        if removed > 1024 && removed > self.index.len() {
+            self.compact();
+        }
+        Some(entry)
+    }
+
+    /// Close the gaps removals left, keeping the order.
+    fn compact(&mut self) {
+        self.rows.retain(Option::is_some);
+        for (row, (transient_id, _)) in self.rows.iter().flatten().enumerate() {
+            if let Some(at) = self.index.get_mut(transient_id) {
+                *at = row as u32;
+            }
+        }
+    }
+
+    /// Put the entries in the order received, ties by id: `index_messagestore`
+    /// inserts them in directory order.
+    pub fn sort_by_received(&mut self) {
+        self.rows.retain(Option::is_some);
+        self.rows.sort_unstable_by(|a, b| match (a, b) {
+            (Some((a_id, a)), Some((b_id, b))) => a.received.total_cmp(&b.received).then_with(|| a_id.cmp(b_id)),
+            _ => std::cmp::Ordering::Equal,
+        });
+        self.rows.shrink_to_fit();
+        self.compact();
+    }
+
+    fn count_peers(&mut self, entry: &PropagationEntry, add: bool) {
+        for (set, counts) in [
+            (&entry.handled_peers, &mut self.handled_counts),
+            (&entry.unhandled_peers, &mut self.unhandled_counts),
+        ] {
+            for slot in set.iter() {
+                if counts.len() <= slot {
+                    counts.resize(slot + 1, 0);
+                }
+                if add {
+                    counts[slot] += 1;
+                } else {
+                    counts[slot] -= 1;
+                }
+            }
+        }
+    }
+
+    /// Put the peer in `slot` into, or take it out of, the handled or the
+    /// unhandled peers of a stored message. Whether that changed anything.
+    fn mark(&mut self, slot: usize, transient_id: &[u8], handled: bool, on: bool) -> bool {
+        let Some(row) = self.row_of(transient_id) else { return false };
+        let Some((_, entry)) = self.rows[row].as_mut() else { return false };
+        let (set, counts) = if handled {
+            (&mut entry.handled_peers, &mut self.handled_counts)
+        } else {
+            (&mut entry.unhandled_peers, &mut self.unhandled_counts)
+        };
+        if !(if on { set.insert(slot) } else { set.remove(slot) }) {
+            return false;
+        }
+        if counts.len() <= slot {
+            counts.resize(slot + 1, 0);
+        }
+        if on {
+            counts[slot] += 1;
+        } else {
+            counts[slot] -= 1;
+        }
+        true
+    }
+
+    /// LXMPeer.add_handled_message: only a stored message is recorded.
+    pub fn add_handled_message(&mut self, slot: usize, transient_id: &[u8]) -> bool {
+        self.mark(slot, transient_id, true, true)
+    }
+
+    /// LXMPeer.add_unhandled_message: only a stored message is recorded.
+    pub fn add_unhandled_message(&mut self, slot: usize, transient_id: &[u8]) -> bool {
+        self.mark(slot, transient_id, false, true)
+    }
+
+    /// LXMPeer.remove_unhandled_message.
+    pub fn remove_unhandled_message(&mut self, slot: usize, transient_id: &[u8]) -> bool {
+        self.mark(slot, transient_id, false, false)
+    }
+
+    /// Queue a message for the peer in `slot` unless it is handled for it, as
+    /// LXMPeer.process_queues takes the unhandled queue. Whether it was
+    /// queued.
+    pub fn queue_unhandled(&mut self, slot: usize, transient_id: &[u8]) -> bool {
+        !self.is_handled(slot, transient_id) && self.add_unhandled_message(slot, transient_id)
+    }
+
+    /// The peer in `slot` has the message, or never will: handled and no
+    /// longer unhandled, as LXMPeer.process_queues takes the handled queue.
+    pub fn mark_handled(&mut self, slot: usize, transient_id: &[u8]) {
+        self.remove_unhandled_message(slot, transient_id);
+        self.add_handled_message(slot, transient_id);
+    }
+
+    pub fn is_handled(&self, slot: usize, transient_id: &[u8]) -> bool {
+        self.get(transient_id).map_or(false, |entry| entry.handled_peers.contains(slot))
+    }
+
+    pub fn is_unhandled(&self, slot: usize, transient_id: &[u8]) -> bool {
+        self.get(transient_id).map_or(false, |entry| entry.unhandled_peers.contains(slot))
+    }
+
+    /// LXMPeer.handled_messages, in store order.
+    pub fn handled_messages(&self, slot: usize) -> impl Iterator<Item = (&TransientId, &PropagationEntry)> + Clone {
+        self.rows.iter().flatten()
+            .filter(move |(_, entry)| entry.handled_peers.contains(slot))
+            .map(|(transient_id, entry)| (transient_id, entry))
+    }
+
+    /// LXMPeer.unhandled_messages, in store order.
+    pub fn unhandled_messages(&self, slot: usize) -> impl Iterator<Item = (&TransientId, &PropagationEntry)> + Clone {
+        self.rows.iter().flatten()
+            .filter(move |(_, entry)| entry.unhandled_peers.contains(slot))
+            .map(|(transient_id, entry)| (transient_id, entry))
+    }
+
+    /// LXMPeer.handled_message_count.
+    pub fn handled_message_count(&self, slot: usize) -> usize {
+        self.handled_counts.get(slot).copied().unwrap_or(0)
+    }
+
+    /// LXMPeer.unhandled_message_count.
+    pub fn unhandled_message_count(&self, slot: usize) -> usize {
+        self.unhandled_counts.get(slot).copied().unwrap_or(0)
+    }
+
+    /// Take the peer in `slot` out of every entry, so that the slot can be
+    /// given to another peer.
+    pub fn forget_peer(&mut self, slot: usize) {
+        if self.handled_message_count(slot) == 0 && self.unhandled_message_count(slot) == 0 {
+            return;
+        }
+        for (_, entry) in self.rows.iter_mut().flatten() {
+            entry.handled_peers.remove(slot);
+            entry.unhandled_peers.remove(slot);
+        }
+        for counts in [&mut self.handled_counts, &mut self.unhandled_counts] {
+            if let Some(count) = counts.get_mut(slot) {
+                *count = 0;
+            }
+        }
+    }
 }
 
 // ── PropPeer ──────────────────────────────────────────────────────────────────
@@ -285,10 +628,12 @@ pub struct PropPeer {
     /// fastest-peer pool in `select_sync_peer`.
     pub sync_transfer_rate: f64,
 
-    /// Transient IDs this peer has already received (or declined).
-    pub handled_ids: IdQueue,
-    /// Transient IDs this peer has NOT yet received — drives the OFFER payload.
-    pub unhandled_ids: IdQueue,
+    /// Which of the peer bits of every stored message are this peer's
+    /// (`PropagationEntry::handled_peers` and `unhandled_peers`): its
+    /// handled and unhandled messages are read off the store
+    /// (`PropagationEntries::handled_messages` and `unhandled_messages`).
+    /// Given by `insert_peer`; no two peers hold the same slot.
+    pub slot: usize,
 
     /// The ids in the sync Resource now in flight
     /// (LXMPeer.currently_transferring_messages). They are marked handled
@@ -365,8 +710,7 @@ impl PropPeer {
             throttled_until: 0.0,
             last_sync_attempt: 0.0,
             sync_transfer_rate: 0.0,
-            handled_ids: IdQueue::default(),
-            unhandled_ids: IdQueue::default(),
+            slot: 0,
             transferring: None,
             current_sync_transfer_started: None,
             last_offer: Vec::new(),
@@ -458,65 +802,6 @@ impl PropPeer {
         }
         false
     }
-
-    /// Queue a transient_id for delivery to this peer.  Deduplicates against
-    /// both the unhandled and handled sets.
-    pub fn add_unhandled(&mut self, transient_id: Vec<u8>) {
-        if !self.handled_ids.contains(&transient_id) {
-            self.unhandled_ids.push_unique(transient_id);
-        }
-    }
-
-    /// Move a transient_id from unhandled → handled (peer accepted or declined it).
-    pub fn mark_handled(&mut self, transient_id: &[u8]) {
-        self.unhandled_ids.remove(transient_id);
-        self.handled_ids.push_unique(transient_id.to_vec());
-    }
-}
-
-/// An insertion-ordered set of transient ids with O(log n) insert, remove and
-/// membership.
-///
-/// These were `Vec<Vec<u8>>`, deduplicated with `contains` and pruned with
-/// `retain` — both linear. Every stored message is queued for every peer, so
-/// one store cost `peers x ids` comparisons: measured at 3.6 ms per message
-/// with 20 peers and the production store's ~150,000 messages (release build),
-/// all of it while holding the node lock that `/get` and `/offer` wait on.
-/// Expiry paid the same price per expired message.
-#[derive(Clone, Debug, Default)]
-pub struct IdQueue {
-    order: BTreeMap<u64, Vec<u8>>,
-    index: HashMap<Vec<u8>, u64>,
-    next: u64,
-}
-
-impl IdQueue {
-    /// Append `id` unless it is already present. Returns whether it was added.
-    pub fn push_unique(&mut self, id: Vec<u8>) -> bool {
-        if self.index.contains_key(&id) {
-            return false;
-        }
-        let seq = self.next;
-        self.next += 1;
-        self.index.insert(id.clone(), seq);
-        self.order.insert(seq, id);
-        true
-    }
-
-    pub fn remove(&mut self, id: &[u8]) -> bool {
-        match self.index.remove(id) {
-            Some(seq) => { self.order.remove(&seq); true }
-            None => false,
-        }
-    }
-
-    pub fn contains(&self, id: &[u8]) -> bool { self.index.contains_key(id) }
-    pub fn len(&self) -> usize { self.index.len() }
-    pub fn is_empty(&self) -> bool { self.index.is_empty() }
-
-    /// Ids in the order they were added.
-    pub fn iter(&self) -> impl Iterator<Item = &Vec<u8>> { self.order.values() }
-    pub fn to_vec(&self) -> Vec<Vec<u8>> { self.iter().cloned().collect() }
 }
 
 // ── LxmfPropagationNode ──────────────────────────────────────────────────────
@@ -751,8 +1036,8 @@ pub struct LxmfPropagationNode {
     // ── Message store ─────────────────────────────────────────────────
     /// Path to the messagestore directory.
     pub messagestore_path: PathBuf,
-    /// In-memory index: transient_id → entry.
-    pub entries: HashMap<Vec<u8>, PropagationEntry>,
+    /// Every stored message, with the peers it is handled and unhandled for.
+    pub entries: PropagationEntries,
 
     // ── Peer tracking ─────────────────────────────────────────────────
     pub peers: HashMap<Vec<u8>, PropPeer>,
@@ -781,7 +1066,7 @@ pub struct LxmfPropagationNode {
     pub started_at: f64,
     /// Transient ids received since start, in arrival order. During the
     /// backlog hold these are the only ids offered to peers.
-    pub fresh_since_start: Vec<Vec<u8>>,
+    pub fresh_since_start: Vec<TransientId>,
     pub backlog_hold_logged: bool,
     /// The outbound budget's send record: every sync Resource handed to a
     /// link in the last OUTBOUND_BUDGET_WINDOW_SECS, as (monotonic time,
@@ -872,7 +1157,7 @@ impl LxmfPropagationNode {
             static_peers: config.lxmf_propagation_peers.clone(),
             inbound: Arc::new(Mutex::new(InboundSyncs::default())),
             messagestore_path,
-            entries: HashMap::new(),
+            entries: PropagationEntries::default(),
             peers: HashMap::new(),
             in_flight_keys: HashSet::new(),
             storage_path,
@@ -920,8 +1205,7 @@ impl LxmfPropagationNode {
                     format!("[lxmf.prop] activating static peer {}", hexrep(&static_peer, false)),
                     LOG_NOTICE, false, false,
                 );
-                let peer = PropPeer::new(static_peer.clone());
-                guard.peers.insert(static_peer.clone(), peer);
+                guard.insert_peer(PropPeer::new(static_peer.clone()));
             }
             // Always request path for static peers so announce handler fires
             // and marks them alive with fresh peering data
@@ -1278,7 +1562,7 @@ impl LxmfPropagationNode {
             peer.propagation_transfer_limit = Some(transfer_limit);
             peer.propagation_sync_limit = sync_limit.or(Some(transfer_limit));
             peer.metadata = Some(metadata);
-            self.peers.insert(destination_hash.clone(), peer);
+            self.insert_peer(peer);
             log(
                 format!("[lxmf.prop] peered with {}", hexrep(&destination_hash, false)),
                 LOG_NOTICE, false, false,
@@ -1286,11 +1570,38 @@ impl LxmfPropagationNode {
         }
     }
 
+    /// Add `peer` with a slot of its own (`PropPeer::slot`). A peer of the
+    /// same hash is replaced, and what was handled and unhandled for it is
+    /// forgotten.
+    fn insert_peer(&mut self, mut peer: PropPeer) -> &mut PropPeer {
+        if let Some(old) = self.peers.remove(&peer.destination_hash) {
+            self.entries.forget_peer(old.slot);
+        }
+        peer.slot = self.free_peer_slot();
+        self.peers.entry(peer.destination_hash.clone()).or_insert(peer)
+    }
+
+    /// The lowest slot no peer holds.
+    fn free_peer_slot(&self) -> usize {
+        let mut held = vec![false; self.peers.len() + 1];
+        for peer in self.peers.values() {
+            if let Some(held) = held.get_mut(peer.slot) {
+                *held = true;
+            }
+        }
+        held.iter().position(|held| !held).unwrap_or(self.peers.len())
+    }
+
     fn unpeer(&mut self, destination_hash: &[u8]) {
         // A session in flight ends with the peer: its held link goes, and its
         // callbacks find no peer and are dropped.
         self.sync_io.close_link(destination_hash);
-        self.peers.remove(destination_hash);
+        // rfed forgets what it had handled and unhandled for the peer, so its
+        // slot can go to another; the reference keeps a departed peer's hash in
+        // the entries.
+        if let Some(peer) = self.peers.remove(destination_hash) {
+            self.entries.forget_peer(peer.slot);
+        }
         log(
             format!("[lxmf.prop] unpeered {}", hexrep(destination_hash, false)),
             LOG_NOTICE, false, false,
@@ -1299,9 +1610,14 @@ impl LxmfPropagationNode {
 
     // ── Message store ────────────────────────────────────────────────────────
 
+    /// LXMRouter's indexing of the messagestore: an entry for every file
+    /// named `<transient id hex>_<received>_<stamp value>`, its destination
+    /// hash the file's first DESTINATION_LENGTH bytes. The entries go in the
+    /// order received.
     fn index_messagestore(&mut self) {
-        self.entries.clear();
         let start = now();
+        let files = fs::read_dir(&self.messagestore_path).map(|dir| dir.count()).unwrap_or(0);
+        self.entries = PropagationEntries::with_capacity(files);
 
         let dir_entries = match fs::read_dir(&self.messagestore_path) {
             Ok(entries) => entries,
@@ -1312,13 +1628,12 @@ impl LxmfPropagationNode {
         };
 
         for entry in dir_entries.flatten() {
-            let filename = entry.file_name().to_string_lossy().to_string();
+            let Ok(filename) = entry.file_name().into_string() else { continue };
             let components: Vec<&str> = filename.split('_').collect();
             if components.len() < 3 {
                 continue;
             }
 
-            // Filename format: {transient_id_hex}_{unix_timestamp}_{stamp_value}
             // transient_id = full_hash(lxmf_data) = 32 bytes = 64 hex chars
             let hex_len = 32 * 2;
             if components[0].len() != hex_len {
@@ -1333,34 +1648,26 @@ impl LxmfPropagationNode {
                 Ok(v) => v,
                 _ => continue,
             };
+            let Some(transient_id) = reticulum_rust::decode_hex(components[0])
+                .and_then(|bytes| TransientId::try_from(bytes).ok())
+            else {
+                continue;
+            };
 
-            let filepath = entry.path().to_string_lossy().to_string();
             let msg_size = entry.metadata().map(|m| m.len() as usize).unwrap_or(0);
+            // Only the destination hash is read, as the reference reads it.
+            let mut destination_hash = [0u8; DESTINATION_LENGTH];
+            if fs::File::open(entry.path()).and_then(|mut file| file.read_exact(&mut destination_hash)).is_err() {
+                continue;
+            }
 
-            // Read the first DESTINATION_LENGTH bytes for the dest hash
-            let destination_hash = match fs::read(&filepath) {
-                Ok(data) if data.len() >= DESTINATION_LENGTH => {
-                    data[..DESTINATION_LENGTH].to_vec()
-                }
-                _ => continue,
-            };
-
-            let transient_id = match reticulum_rust::decode_hex(components[0]) {
-                Some(bytes) => bytes,
-                None => continue,
-            };
-
-            self.entries.insert(
-                transient_id,
-                PropagationEntry {
-                    destination_hash,
-                    filepath,
-                    received,
-                    size: msg_size,
-                    stamp_value,
-                },
-            );
+            let mut propagation_entry = PropagationEntry::new(destination_hash, received, msg_size, stamp_value);
+            if filename != message_file_name(&transient_id, received, stamp_value) {
+                propagation_entry.other_name = Some(filename.into_boxed_str());
+            }
+            self.entries.insert(transient_id, propagation_entry);
         }
+        self.entries.sort_by_received();
 
         let elapsed = now() - start;
         log(
@@ -1390,7 +1697,7 @@ impl LxmfPropagationNode {
             return None;
         }
 
-        let transient_id = reticulum_rust::identity::full_hash(lxmf_data);
+        let transient_id: TransientId = reticulum_rust::identity::full_hash(lxmf_data).try_into().ok()?;
 
         // Dedup
         if self.entries.contains_key(&transient_id) {
@@ -1398,7 +1705,7 @@ impl LxmfPropagationNode {
         }
 
         let received = now();
-        let destination_hash = lxmf_data[..DESTINATION_LENGTH].to_vec();
+        let destination_hash: [u8; DESTINATION_LENGTH] = lxmf_data[..DESTINATION_LENGTH].try_into().ok()?;
 
         // Write to disk: lxmf_data + optional stamp appended.
         // The stamp is kept on disk so it can be forwarded to peers during
@@ -1408,36 +1715,23 @@ impl LxmfPropagationNode {
             file_data.extend_from_slice(stamp);
         }
 
-        let filepath = format!(
-            "{}/{}_{}_{}", 
-            self.messagestore_path.display(),
-            hexrep(&transient_id, false),
-            received,
-            stamp_value,
-        );
+        let filepath = self.messagestore_path.join(message_file_name(&transient_id, received, stamp_value));
 
         if let Err(e) = fs::write(&filepath, &file_data) {
             log(format!("[lxmf.prop] cannot write message: {e}"), LOG_ERROR, false, false);
             return None;
         }
 
-        let entry = PropagationEntry {
-            destination_hash: destination_hash.clone(),
-            filepath,
-            received,
-            size: file_data.len(),
-            stamp_value,
-        };
-        self.entries.insert(transient_id.clone(), entry);
+        self.entries.insert(transient_id, PropagationEntry::new(destination_hash, received, file_data.len(), stamp_value));
 
         // Queue for all peers except the one that sent it to us —
         // avoids echoing a message back to its originator.
-        for (peer_hash, peer) in self.peers.iter_mut() {
+        for (peer_hash, peer) in &self.peers {
             if from_peer.map(|fp| fp != peer_hash.as_slice()).unwrap_or(true) {
-                peer.add_unhandled(transient_id.clone());
+                self.entries.queue_unhandled(peer.slot, &transient_id);
             }
         }
-        self.fresh_since_start.push(transient_id.clone());
+        self.fresh_since_start.push(transient_id);
 
         self.messages_received += 1;
 
@@ -1456,24 +1750,25 @@ impl LxmfPropagationNode {
             LOG_DEBUG, false, false,
         );
 
-        Some(transient_id)
+        Some(transient_id.to_vec())
+    }
+
+    /// Where a stored message's file is.
+    fn message_path(&self, transient_id: &[u8], entry: &PropagationEntry) -> String {
+        self.messagestore_path.join(entry.file_name(transient_id)).to_string_lossy().into_owned()
     }
 
     /// Evict expired messages (older than MESSAGE_EXPIRY_SECS).
     pub fn evict_expired(&mut self) {
         let cutoff = now() - MESSAGE_EXPIRY_SECS;
-        let expired: Vec<Vec<u8>> = self.entries.iter()
+        let expired: Vec<TransientId> = self.entries.iter()
             .filter(|(_, e)| e.received < cutoff)
-            .map(|(id, _)| id.clone())
+            .map(|(id, _)| *id)
             .collect();
 
         for transient_id in &expired {
             if let Some(entry) = self.entries.remove(transient_id) {
-                let _ = fs::remove_file(&entry.filepath);
-            }
-            for (_, peer) in self.peers.iter_mut() {
-                peer.handled_ids.remove(transient_id);
-                peer.unhandled_ids.remove(transient_id);
+                let _ = fs::remove_file(self.message_path(transient_id, &entry));
             }
         }
 
@@ -1489,14 +1784,14 @@ impl LxmfPropagationNode {
     /// Uses age-only sorting (O(n log n) but no weight calculation per entry).
     /// Hard cap: stops once we're under the limit.
     pub fn enforce_storage_limit(&mut self) {
-        let total_size: u64 = self.entries.values().map(|e| e.size as u64).sum();
+        let total_size: u64 = self.entries.iter().map(|(_, e)| e.size as u64).sum();
         if total_size <= self.storage_limit_bytes {
             return;
         }
 
         // Sort by age only (oldest first) — no weight calculation
-        let mut by_age: Vec<(Vec<u8>, f64)> = self.entries.iter()
-            .map(|(id, e)| (id.clone(), e.received))
+        let mut by_age: Vec<(TransientId, f64)> = self.entries.iter()
+            .map(|(id, e)| (*id, e.received))
             .collect();
         by_age.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1507,11 +1802,7 @@ impl LxmfPropagationNode {
             }
             if let Some(entry) = self.entries.remove(&transient_id) {
                 current_size = current_size.saturating_sub(entry.size as u64);
-                let _ = fs::remove_file(&entry.filepath);
-            }
-            for (_, peer) in self.peers.iter_mut() {
-                peer.handled_ids.remove(&transient_id);
-                peer.unhandled_ids.remove(&transient_id);
+                let _ = fs::remove_file(self.message_path(&transient_id, &entry));
             }
         }
     }
@@ -2848,13 +3139,13 @@ impl LxmfPropagationNode {
         // Phase 1: Client sends nil/nil to discover what messages are waiting.
         // Return transient_ids sorted by size (smallest first for efficient pulls).
         if wants == Value::Nil && haves == Value::Nil {
-            let mut available: Vec<(Vec<u8>, usize)> = self.entries.iter()
-                .filter(|(_, e)| e.destination_hash == remote_dest.hash)
-                .map(|(tid, e)| (tid.clone(), e.size))
+            let mut available: Vec<(TransientId, usize)> = self.entries.iter()
+                .filter(|(_, e)| e.destination_hash[..] == remote_dest.hash[..])
+                .map(|(tid, e)| (*tid, e.size))
                 .collect();
             available.sort_by_key(|(_, size)| *size);
             let ids: Vec<Value> = available.into_iter()
-                .map(|(id, _)| Value::Binary(id))
+                .map(|(id, _)| Value::Binary(id.to_vec()))
                 .collect();
             return encode_value(Value::Array(ids));
         }
@@ -2866,8 +3157,8 @@ impl LxmfPropagationNode {
             for value in haves_list {
                 if let Value::Binary(tid) = value {
                     if let Some(entry) = self.entries.get(&tid) {
-                        if entry.destination_hash == remote_dest.hash {
-                            let fp = entry.filepath.clone();
+                        if entry.destination_hash[..] == remote_dest.hash[..] {
+                            let fp = self.message_path(&tid, entry);
                             self.entries.remove(&tid);
                             let _ = fs::remove_file(&fp);
                         }
@@ -2886,8 +3177,8 @@ impl LxmfPropagationNode {
             for value in want_list {
                 if let Value::Binary(tid) = value {
                     if let Some(entry) = self.entries.get(&tid) {
-                        if entry.destination_hash == remote_dest.hash {
-                            if let Ok(file_data) = fs::read(&entry.filepath) {
+                        if entry.destination_hash[..] == remote_dest.hash[..] {
+                            if let Ok(file_data) = fs::read(self.message_path(&tid, entry)) {
                                 let lxm_size = file_data.len() as f64;
                                 let next_size = cumulative_size + lxm_size + per_message_overhead;
                                 if client_limit_bytes.map(|limit| next_size <= limit).unwrap_or(true) {
@@ -2936,33 +3227,47 @@ impl LxmfPropagationNode {
     /// The ids this peer may be offered right now: during the backlog hold
     /// only messages received since start that it still lacks; afterwards
     /// everything it still lacks. Cheap during the hold because it walks the
-    /// fresh list, not the peer's (possibly 150k-entry) queue. Sync itself
-    /// calls `sync_pool_for`, holding a borrow of the peer.
+    /// fresh list, not the whole store. Sync itself calls `sync_pool_for`,
+    /// holding a borrow of the peer.
     #[cfg(test)]
-    pub fn sync_pool(&self, peer: &PropPeer) -> Vec<Vec<u8>> {
-        Self::sync_pool_for(self.backlog_held(), &self.fresh_since_start, peer)
+    pub fn sync_pool(&self, peer: &PropPeer) -> Vec<TransientId> {
+        Self::sync_pool_for(self.backlog_held(), &self.fresh_since_start, &self.entries, peer)
+            .into_iter()
+            .map(|(tid, _)| *tid)
+            .collect()
     }
 
     /// `sync_pool` without `&self`, for callers already holding a mutable
-    /// borrow of one peer.
-    pub fn sync_pool_for(backlog_held: bool, fresh_since_start: &[Vec<u8>], peer: &PropPeer) -> Vec<Vec<u8>> {
+    /// borrow of one peer: the messages with their entries, in store order.
+    pub fn sync_pool_for<'a>(
+        backlog_held: bool,
+        fresh_since_start: &'a [TransientId],
+        entries: &'a PropagationEntries,
+        peer: &PropPeer,
+    ) -> Vec<(&'a TransientId, &'a PropagationEntry)> {
         if backlog_held {
             fresh_since_start.iter()
-                .filter(|tid| peer.unhandled_ids.contains(tid))
-                .cloned()
+                .filter_map(|tid| {
+                    entries.get(tid).filter(|entry| entry.unhandled_peers.contains(peer.slot)).map(|entry| (tid, entry))
+                })
                 .collect()
         } else {
-            peer.unhandled_ids.to_vec()
+            entries.unhandled_messages(peer.slot).collect()
         }
     }
 
     /// `!sync_pool_for(..).is_empty()` without building the pool: this runs
     /// for every peer on every sync tick.
-    pub fn has_sync_candidates(backlog_held: bool, fresh_since_start: &[Vec<u8>], peer: &PropPeer) -> bool {
+    pub fn has_sync_candidates(
+        backlog_held: bool,
+        fresh_since_start: &[TransientId],
+        entries: &PropagationEntries,
+        peer: &PropPeer,
+    ) -> bool {
         if backlog_held {
-            fresh_since_start.iter().any(|tid| peer.unhandled_ids.contains(tid))
+            fresh_since_start.iter().any(|tid| entries.is_unhandled(peer.slot, tid))
         } else {
-            !peer.unhandled_ids.is_empty()
+            entries.unhandled_message_count(peer.slot) > 0
         }
     }
 
@@ -3144,22 +3449,22 @@ impl LxmfPropagationNode {
     /// something it may be offered. Alive ("waiting" in the reference) or
     /// not ("unresponsive", its backoff run out): while the budget binds,
     /// both take their turn (see "Sharing the budget").
-    fn contends_for_sync(peer: &PropPeer, t: f64, backlog_held: bool, fresh: &[Vec<u8>]) -> bool {
+    fn contends_for_sync(peer: &PropPeer, t: f64, backlog_held: bool, fresh: &[TransientId], entries: &PropagationEntries) -> bool {
         peer.state == PropPeer::IDLE
             && peer.sync_ready()
             && t > peer.throttled_until
             && t > peer.next_sync_attempt
-            && Self::has_sync_candidates(backlog_held, fresh, peer)
+            && Self::has_sync_candidates(backlog_held, fresh, entries, peer)
     }
 
     /// What `peer` would want of the budget next: what it may be offered, up
     /// to one offer (MAX_OFFER_IDS) and to `cap`.
-    fn next_batch_demand(backlog_held: bool, fresh: &[Vec<u8>], peer: &PropPeer, cap: u64) -> u64 {
+    fn next_batch_demand(backlog_held: bool, fresh: &[TransientId], entries: &PropagationEntries, peer: &PropPeer, cap: u64) -> u64 {
         let cap = cap.min(MAX_OFFER_IDS as u64) as usize;
         let lacking = if backlog_held {
-            fresh.iter().filter(|tid| peer.unhandled_ids.contains(tid)).take(cap).count()
+            fresh.iter().filter(|tid| entries.is_unhandled(peer.slot, *tid)).take(cap).count()
         } else {
-            peer.unhandled_ids.len().min(cap)
+            entries.unhandled_message_count(peer.slot).min(cap)
         };
         lacking as u64
     }
@@ -3171,15 +3476,16 @@ impl LxmfPropagationNode {
     fn budget_contention(&self, t: f64, except: &[u8], enough: u64) -> BudgetContention {
         let backlog_held = self.backlog_held();
         let fresh = &self.fresh_since_start;
+        let entries = &self.entries;
         let mut contention = BudgetContention { waiting: 0, demand: 0 };
         for (hash, peer) in &self.peers {
-            if hash.as_slice() == except || !Self::contends_for_sync(peer, t, backlog_held, fresh) {
+            if hash.as_slice() == except || !Self::contends_for_sync(peer, t, backlog_held, fresh, entries) {
                 continue;
             }
             contention.waiting += 1;
             if contention.demand <= enough {
                 let room = enough - contention.demand + 1;
-                contention.demand += Self::next_batch_demand(backlog_held, fresh, peer, room);
+                contention.demand += Self::next_batch_demand(backlog_held, fresh, entries, peer, room);
             }
         }
         contention
@@ -3288,10 +3594,11 @@ impl LxmfPropagationNode {
             }
 
             for (hash, peer) in &guard.peers {
-                if !peer.unhandled_ids.is_empty() || !peer.alive {
+                let unhandled = guard.entries.unhandled_message_count(peer.slot);
+                if unhandled > 0 || !peer.alive {
                     log(
                         format!("[lxmf.prop] tick_sync peer {} alive={} state={} unhandled={} stamp_cost={:?} peer_cost={:?} peering_key_ready={}",
-                            hexrep(hash, false), peer.alive, PropPeer::state_name(peer.state), peer.unhandled_ids.len(),
+                            hexrep(hash, false), peer.alive, PropPeer::state_name(peer.state), unhandled,
                             peer.propagation_stamp_cost, peer.peering_cost, peer.peering_key_ready()),
                         LOG_DEBUG, false, false,
                     );
@@ -3366,11 +3673,12 @@ impl LxmfPropagationNode {
         let allowance = self.outbound_allowance();
         let backlog_held = self.backlog_held();
         let fresh = &self.fresh_since_start;
+        let entries = &self.entries;
         let mut waiting: Vec<(Vec<u8>, f64)> = Vec::new();
         let mut unresponsive: Vec<Vec<u8>> = Vec::new();
         let mut not_ready = 0usize;
         for (hash, peer) in self.peers.iter_mut() {
-            if peer.state != PropPeer::IDLE || !Self::has_sync_candidates(backlog_held, fresh, peer) {
+            if peer.state != PropPeer::IDLE || !Self::has_sync_candidates(backlog_held, fresh, entries, peer) {
                 continue;
             }
             if !peer.sync_ready() {
@@ -3422,7 +3730,7 @@ impl LxmfPropagationNode {
                     break;
                 }
                 if let Some(peer) = self.peers.get(*hash) {
-                    demand += Self::next_batch_demand(backlog_held, fresh, peer, allowance - demand + 1);
+                    demand += Self::next_batch_demand(backlog_held, fresh, entries, peer, allowance - demand + 1);
                 }
             }
             demand > allowance
@@ -3655,15 +3963,10 @@ impl LxmfPropagationNode {
 
     /// Mark `ids` handled for `peer_hash`, for the ids still in the store
     /// (LXMPeer.add_handled_message only records stored ids).
-    fn mark_handled_for(&mut self, peer_hash: &[u8], ids: &[Vec<u8>]) {
-        let entries = &self.entries;
-        if let Some(peer) = self.peers.get_mut(peer_hash) {
+    fn mark_handled_for<T: AsRef<[u8]>>(&mut self, peer_hash: &[u8], ids: &[T]) {
+        if let Some(peer) = self.peers.get(peer_hash) {
             for tid in ids {
-                if entries.contains_key(tid) {
-                    peer.mark_handled(tid);
-                } else {
-                    peer.unhandled_ids.remove(tid);
-                }
+                self.entries.mark_handled(peer.slot, tid.as_ref());
             }
         }
     }
@@ -3702,6 +4005,7 @@ impl LxmfPropagationNode {
         enum Gate { Postpone(String), NothingToSync, Busy, Proceed }
         let (gate, state) = {
             let fresh = &self.fresh_since_start;
+            let entries = &self.entries;
             let Some(peer) = self.peers.get_mut(peer_hash) else {
                 log(format!("[lxmf.prop] sync requested for {peer_str}, which is not a peer"), LOG_DEBUG, false, false);
                 return None;
@@ -3737,7 +4041,7 @@ impl LxmfPropagationNode {
                 Gate::Postpone("since a peering key has not been generated yet".to_string())
             } else if peer.peering_key_refused() {
                 Gate::Postpone("until it announces another peering cost, since it refused our key at this one twice".to_string())
-            } else if !Self::has_sync_candidates(backlog_held, fresh, peer) {
+            } else if !Self::has_sync_candidates(backlog_held, fresh, entries, peer) {
                 Gate::NothingToSync
             } else if peer.transferring.is_some() {
                 Gate::Busy
@@ -3797,6 +4101,7 @@ impl LxmfPropagationNode {
                     );
                     io.close_link(peer_hash);
                 }
+                let unhandled = self.peers.get(peer_hash).map(|peer| self.entries.unhandled_message_count(peer.slot));
                 let peer = self.peers.get_mut(peer_hash)?;
                 peer.sync_backoff += SYNC_BACKOFF_STEP_SECS;
                 peer.next_sync_attempt = t + peer.sync_backoff;
@@ -3810,7 +4115,7 @@ impl LxmfPropagationNode {
                 log(
                     format!(
                         "[lxmf.prop] establishing link for sync to peer {peer_str} ({} unhandled)",
-                        peer.unhandled_ids.len(),
+                        unhandled.unwrap_or(0),
                     ),
                     LOG_NOTICE, false, false,
                 );
@@ -3831,35 +4136,25 @@ impl LxmfPropagationNode {
         let min_accepted_cost = peer.propagation_stamp_cost.unwrap_or(0)
             .saturating_sub(peer.propagation_stamp_flexibility.unwrap_or(0));
 
+        // Every unhandled message is a stored one, its mark kept on its entry,
+        // so the reference's purge of ids no longer stored has nothing to do.
         let mut candidates = Vec::new();
-        let mut purged = Vec::new();
         let mut low_value = Vec::new();
-        for tid in Self::sync_pool_for(backlog_held, fresh, peer) {
-            match entries.get(&tid) {
-                None => purged.push(tid),
-                Some(entry) if entry.stamp_value < min_accepted_cost => low_value.push(tid),
-                Some(entry) => {
-                    // LXMRouter.get_weight: age in 4-day units (at least 1) × size.
-                    let age_weight = ((t - entry.received) / 86400.0 / 4.0).max(1.0);
-                    candidates.push(OfferCandidate {
-                        weight: age_weight * entry.size as f64,
-                        size: entry.size,
-                        tid,
-                    });
-                }
+        for (tid, entry) in Self::sync_pool_for(backlog_held, fresh, entries, peer) {
+            if entry.stamp_value < min_accepted_cost {
+                low_value.push(*tid);
+            } else {
+                // LXMRouter.get_weight: age in 4-day units (at least 1) × size.
+                let age_weight = ((t - entry.received) / 86400.0 / 4.0).max(1.0);
+                candidates.push(OfferCandidate {
+                    weight: age_weight * entry.size as f64,
+                    size: entry.size,
+                    tid: *tid,
+                });
             }
         }
-        for tid in purged.iter().chain(low_value.iter()) {
-            peer.unhandled_ids.remove(tid);
-        }
-        if !purged.is_empty() {
-            log(
-                format!(
-                    "[lxmf.prop] dropped {} unhandled message(s) for peer {peer_str} since they no longer exist in the message store",
-                    purged.len(),
-                ),
-                LOG_DEBUG, false, false,
-            );
+        for tid in &low_value {
+            self.entries.remove_unhandled_message(peer.slot, tid);
         }
         if !low_value.is_empty() {
             log(
@@ -3927,10 +4222,10 @@ impl LxmfPropagationNode {
 
         let allowance = self.outbound_allowance();
         let mut offer: Vec<Vec<u8>> = {
-            let entries = &self.entries;
             let Some(peer) = self.peers.get(peer_hash) else { return };
             plan.offer.into_iter()
-                .filter(|tid| entries.contains_key(tid) && peer.unhandled_ids.contains(tid))
+                .filter(|tid| self.entries.is_unhandled(peer.slot, tid))
+                .map(|tid| tid.to_vec())
                 .collect()
         };
         // What is left of the budget, or, while it binds with other ready
@@ -4214,13 +4509,11 @@ impl LxmfPropagationNode {
         let mut gone = Vec::new();
         for tid in wanted {
             match self.entries.get(&tid) {
-                Some(entry) => files.push((tid, entry.filepath.clone())),
+                Some(entry) => {
+                    let path = self.message_path(&tid, entry);
+                    files.push((tid, path));
+                }
                 None => gone.push(tid),
-            }
-        }
-        if let Some(peer) = self.peers.get_mut(peer_hash) {
-            for tid in &gone {
-                peer.unhandled_ids.remove(tid);
             }
         }
         if !gone.is_empty() {
@@ -4345,14 +4638,10 @@ impl LxmfPropagationNode {
     /// stored again since has a file of its own.
     fn forget_missing_messages(&mut self, missing: &[(Vec<u8>, String)]) {
         for (tid, path) in missing {
-            if !self.entries.get(tid).map(|entry| &entry.filepath == path).unwrap_or(false) {
+            if !self.entries.get(tid).map(|entry| self.message_path(tid, entry) == *path).unwrap_or(false) {
                 continue;
             }
             self.entries.remove(tid);
-            for peer in self.peers.values_mut() {
-                peer.handled_ids.remove(tid);
-                peer.unhandled_ids.remove(tid);
-            }
             log(
                 format!("[lxmf.prop] message {} has no file ({path}); dropped from the message store and every peer's queue", hexrep(tid, false)),
                 LOG_WARNING, false, false,
@@ -4412,6 +4701,7 @@ impl LxmfPropagationNode {
         let held_link = self.sync_io.active_link(peer_hash);
         let (more_to_sync, on_held_link) = {
             let fresh = &self.fresh_since_start;
+            let entries = &self.entries;
             let Some(peer) = self.peers.get_mut(peer_hash) else { return false };
             let mut rate_str = String::new();
             if let Some(started) = started {
@@ -4426,7 +4716,7 @@ impl LxmfPropagationNode {
                 LOG_NOTICE, false, false,
             );
             (
-                Self::has_sync_candidates(backlog_held, fresh, peer),
+                Self::has_sync_candidates(backlog_held, fresh, entries, peer),
                 held_link.is_some() && held_link == peer.link_id,
             )
         };
@@ -4445,7 +4735,7 @@ impl LxmfPropagationNode {
         let (own, turn_sent) = {
             let Some(peer) = self.peers.get(peer_hash) else { return false };
             (
-                Self::next_batch_demand(backlog_held, &self.fresh_since_start, peer, MAX_OFFER_IDS as u64),
+                Self::next_batch_demand(backlog_held, &self.fresh_since_start, &self.entries, peer, MAX_OFFER_IDS as u64),
                 peer.turn_sent,
             )
         };
@@ -4639,94 +4929,151 @@ impl LxmfPropagationNode {
 
     // ── Persistence ──────────────────────────────────────────────────────────
 
-    /// Persist peer state to disk so backoff timers, peering keys, and
-    /// handled/unhandled ID sets survive restarts.
+    /// Save the peers file as LXMF 1.1.1's LXMRouter.exit_handler does,
+    /// written to a temporary file that then replaces it, so that a failed
+    /// save leaves the last one whole. Each peer's record (`write_peer_record`)
+    /// is built alone: rfed used to build the whole file and every record at
+    /// once, 392 MiB with 44,000 messages and 20 peers (2026-10-15).
     pub fn save_peers(&self) {
+        let started = now();
         let peers_path = self.storage_path.join("peers");
-        let mut serialised = Vec::new();
-        for (hash, peer) in &self.peers {
-            let peer_data = PeerState {
-                destination_hash: hash.clone(),
-                alive: peer.alive,
-                last_heard: peer.last_heard,
-                peering_timebase: peer.peering_timebase,
-                propagation_stamp_cost: peer.propagation_stamp_cost,
-                propagation_stamp_flexibility: peer.propagation_stamp_flexibility,
-                peering_cost: peer.peering_cost,
-                propagation_transfer_limit: peer.propagation_transfer_limit,
-                propagation_sync_limit: peer.propagation_sync_limit,
-                peering_key: peer.peering_key.clone(),
-                metadata: peer.metadata.clone(),
-                sync_transfer_rate: peer.sync_transfer_rate,
-                handled_ids: peer.handled_ids.to_vec(),
-                unhandled_ids: peer.unhandled_ids.to_vec(),
-            };
-            if let Ok(bytes) = rmp_serde::to_vec(&peer_data) {
-                serialised.push(bytes);
+        let temp_path = self.storage_path.join(format!("peers.tmp.{started}"));
+        match self.write_peers_file(&temp_path).and_then(|()| fs::rename(&temp_path, &peers_path)) {
+            Ok(()) => log(
+                format!("[lxmf.prop] saved {} peers to storage in {:.2}s", self.peers.len(), now() - started),
+                LOG_NOTICE, false, false,
+            ),
+            Err(e) => {
+                let _ = fs::remove_file(&temp_path);
+                log(format!("[lxmf.prop] could not save peers to storage: {e}"), LOG_ERROR, false, false);
             }
-        }
-        if let Ok(data) = rmp_serde::to_vec(&serialised) {
-            let _ = fs::write(&peers_path, data);
         }
     }
 
-    /// Load persisted peer state from disk.  Rebuilds handled/unhandled sets
-    /// by filtering against the current messagestore (expired messages that
-    /// were evicted while offline are silently dropped from the lists).
-    fn load_peers(&mut self) {
-        let peers_path = self.storage_path.join("peers");
-        let data = match fs::read(&peers_path) {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-        if data.is_empty() {
-            return;
+    fn write_peers_file(&self, path: &Path) -> io::Result<()> {
+        let mut out = io::BufWriter::new(fs::File::create(path)?);
+        rmp::encode::write_array_len(&mut out, self.peers.len() as u32).map_err(write_error)?;
+        let mut record = Vec::new();
+        for peer in self.peers.values() {
+            record.clear();
+            write_peer_record(&mut record, peer, &self.entries)?;
+            rmp::encode::write_bin_len(&mut out, record.len() as u32).map_err(write_error)?;
+            out.write_all(&record)?;
         }
+        out.into_inner().map_err(io::IntoInnerError::into_error)?;
+        Ok(())
+    }
 
-        let serialised: Vec<Vec<u8>> = match rmp_serde::from_slice(&data) {
-            Ok(v) => v,
+    /// Rebuild the peers from the peers file, as LXMRouter does at startup:
+    /// each record as LXMPeer.from_bytes reads it, its handled and unhandled
+    /// ids recorded on the stored messages they name. The file is read one
+    /// record at a time and the ids go straight into the store: reading the
+    /// 74 MB file whole cost 150 MiB more at startup (2026-10-15). rfed's
+    /// earlier file (rmp_serde, `RFED_PEER_FIELDS`) is read as well; the next
+    /// save writes LXMF's.
+    fn load_peers(&mut self) {
+        let started = now();
+        let peers_path = self.storage_path.join("peers");
+        let Ok(file) = fs::File::open(&peers_path) else { return };
+        let mut rd = io::BufReader::new(file);
+        let count = match read_head(&mut rd) {
+            Ok(Head::Array(count)) => count,
+            // An empty file holds no peers, as the reference reads it.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return,
+            Ok(_) => {
+                log("[lxmf.prop] cannot load peers: the peers file does not hold a list", LOG_WARNING, false, false);
+                return;
+            }
             Err(e) => {
                 log(format!("[lxmf.prop] cannot load peers: {e}"), LOG_WARNING, false, false);
                 return;
             }
         };
 
-        for peer_bytes in serialised {
-            let state: PeerState = match rmp_serde::from_slice(&peer_bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
+        let mut rfed_records = 0;
+        for _ in 0..count {
+            // The record's ids are recorded for this slot as they are read.
+            let slot = self.free_peer_slot();
+            let read: io::Result<io::Result<PeerRecord>> = match read_head(&mut rd) {
+                Ok(Head::Bin(len)) => {
+                    let mut bytes = (&mut rd).take(len as u64);
+                    let record = read_peer_record(&mut bytes, &mut self.entries, slot);
+                    drain(&mut bytes).and_then(|()| match bytes.limit() {
+                        0 => Ok(record),
+                        _ => Err(io::ErrorKind::UnexpectedEof.into()),
+                    })
+                }
+                Ok(Head::Array(len)) => {
+                    rfed_records += 1;
+                    let mut bytes = IntBytes { inner: &mut rd, left: len };
+                    let record = read_peer_record(&mut bytes, &mut self.entries, slot);
+                    drain(&mut bytes).map(|()| record)
+                }
+                Ok(other) => skip_rest(other, &mut rd)
+                    .map(|()| Err(io::Error::new(io::ErrorKind::InvalidData, "not a peer record"))),
+                Err(e) => Err(e),
             };
-
-            let mut peer = PropPeer::new(state.destination_hash.clone());
-            peer.alive = state.alive;
-            peer.last_heard = state.last_heard;
-            peer.peering_timebase = state.peering_timebase;
-            peer.propagation_stamp_cost = state.propagation_stamp_cost;
-            peer.propagation_stamp_flexibility = state.propagation_stamp_flexibility;
-            peer.peering_cost = state.peering_cost;
-            peer.propagation_transfer_limit = state.propagation_transfer_limit;
-            peer.propagation_sync_limit = state.propagation_sync_limit;
-            peer.peering_key = state.peering_key;
-            peer.metadata = state.metadata;
-            peer.sync_transfer_rate = state.sync_transfer_rate;
-
-            // Rebuild handled/unhandled based on what's still in the store
-            for tid in state.handled_ids {
-                if self.entries.contains_key(&tid) {
-                    peer.handled_ids.push_unique(tid);
+            let record = match read {
+                Ok(Ok(record)) => record,
+                Ok(Err(e)) => {
+                    self.entries.forget_peer(slot);
+                    log(format!("[lxmf.prop] skipped an unreadable record in the peers file: {e}"), LOG_WARNING, false, false);
+                    continue;
                 }
-            }
-            for tid in state.unhandled_ids {
-                if self.entries.contains_key(&tid) {
-                    peer.unhandled_ids.push_unique(tid);
+                Err(e) => {
+                    self.entries.forget_peer(slot);
+                    log(
+                        format!("[lxmf.prop] stopped loading peers after {} of {count}: {e}", self.peers.len()),
+                        LOG_WARNING, false, false,
+                    );
+                    break;
                 }
+            };
+            let Some(destination_hash) = record.destination_hash.filter(|hash| hash.len() == DESTINATION_LENGTH) else {
+                self.entries.forget_peer(slot);
+                log("[lxmf.prop] skipped a record in the peers file with no destination hash", LOG_WARNING, false, false);
+                continue;
+            };
+            if let Some(old) = self.peers.remove(&destination_hash) {
+                self.entries.forget_peer(old.slot);
             }
 
-            self.peers.insert(state.destination_hash, peer);
+            let mut peer = PropPeer::new(destination_hash.clone());
+            peer.slot = slot;
+            peer.alive = record.alive;
+            peer.last_heard = record.last_heard;
+            peer.peering_timebase = record.peering_timebase;
+            peer.propagation_stamp_cost = record.propagation_stamp_cost;
+            peer.propagation_stamp_flexibility = record.propagation_stamp_flexibility;
+            peer.peering_cost = record.peering_cost;
+            peer.propagation_transfer_limit = record.propagation_transfer_limit;
+            peer.propagation_sync_limit = record.propagation_sync_limit.or(record.propagation_transfer_limit);
+            peer.peering_key = record.peering_key;
+            peer.metadata = record.metadata;
+            peer.sync_transfer_rate = record.sync_transfer_rate;
+            peer.last_sync_attempt = record.last_sync_attempt;
+            log(
+                format!(
+                    "[lxmf.prop] rebuilt peer {} with {} unhandled messages",
+                    hexrep(&destination_hash, false),
+                    self.entries.unhandled_message_count(slot),
+                ),
+                LOG_DEBUG, false, false,
+            );
+            self.peers.insert(destination_hash, peer);
         }
 
         log(
-            format!("[lxmf.prop] loaded {} peers", self.peers.len()),
+            format!(
+                "[lxmf.prop] loaded {} peers in {:.2}s{}",
+                self.peers.len(),
+                now() - started,
+                if rfed_records > 0 {
+                    format!(", {rfed_records} of them from rfed's earlier peers file, saved as LXMF's from now on")
+                } else {
+                    String::new()
+                },
+            ),
             LOG_NOTICE, false, false,
         );
     }
@@ -4975,7 +5322,7 @@ impl PeerSyncIo for AppLinksSyncIo {
 
 /// A message that may go in an offer.
 pub(crate) struct OfferCandidate {
-    pub tid: Vec<u8>,
+    pub tid: TransientId,
     /// Stored size: the message with its stamp.
     pub size: usize,
     /// LXMRouter.get_weight; lighter goes first.
@@ -4986,13 +5333,13 @@ pub(crate) struct OfferCandidate {
 #[derive(Debug, Default)]
 pub(crate) struct OfferPlan {
     /// To offer, lightest first.
-    pub offer: Vec<Vec<u8>>,
+    pub offer: Vec<TransientId>,
     /// Over the peer's per-message transfer limit: marked handled, never sent
     /// (the reference's rule).
-    pub too_big: Vec<Vec<u8>>,
+    pub too_big: Vec<TransientId>,
     /// Too large for any one sync Resource: marked handled, never sent (an
     /// rfed departure, see MAX_SYNC_RESOURCE_BYTES).
-    pub over_resource: Vec<Vec<u8>>,
+    pub over_resource: Vec<TransientId>,
     /// The reference's estimate of the batch size in bytes.
     pub estimated_bytes: f64,
 }
@@ -5111,26 +5458,337 @@ fn pack_sync_batch(timebase: f64, messages: Vec<Vec<u8>>) -> Vec<u8> {
     ]))
 }
 
-// ── Serialisable peer state ──────────────────────────────────────────────────
+// ── The peers file ───────────────────────────────────────────────────────────
+//
+// As LXMF 1.1.1 writes it (LXMRouter.exit_handler): a msgpack array of bin,
+// one per peer, each the map LXMPeer.to_bytes packs, ids as bin. It holds
+// about 34 B per (message, peer). rfed used to write its own (rmp_serde): each
+// peer a positional array (`RFED_PEER_FIELDS`), every byte string an array of
+// ints, 84 B per (message, peer).
 
-/// Subset of `PropPeer` fields that survive serialisation to disk.
-/// Volatile fields (link, state, transferring) are not persisted.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct PeerState {
-    destination_hash: Vec<u8>,
+/// LXMPeer.STRATEGY_PERSISTENT, the reference's default: a peer's sync goes
+/// on while it lacks messages. It is how rfed syncs every peer.
+const SYNC_STRATEGY_PERSISTENT: u64 = 0x02;
+
+/// LXMPeer.to_bytes: `peer` as LXMF 1.1.1 packs it, a map of the reference's
+/// keys in its order, its handled and unhandled ids read off the store. rfed
+/// does not count what it offered to, sent to and received from a peer, nor
+/// time link establishment, so those are 0, as the reference starts them.
+fn write_peer_record(out: &mut Vec<u8>, peer: &PropPeer, entries: &PropagationEntries) -> io::Result<()> {
+    let number = |v: f64| {
+        // The reference holds whole numbers (timebases, limits, zeros) as ints.
+        if v.fract() == 0.0 && v.abs() < 9.0e15 { Value::from(v as i64) } else { Value::F64(v) }
+    };
+    let metadata = peer.metadata.as_deref().and_then(|mut bytes| read_value(&mut bytes).ok());
+    let fields = [
+        ("peering_timebase", number(peer.peering_timebase)),
+        ("alive", Value::Boolean(peer.alive)),
+        ("metadata", metadata.unwrap_or(Value::Nil)),
+        ("last_heard", number(peer.last_heard)),
+        ("sync_strategy", Value::from(SYNC_STRATEGY_PERSISTENT)),
+        (
+            "peering_key",
+            match &peer.peering_key {
+                Some((key, value)) => Value::Array(vec![Value::Binary(key.clone()), Value::from(*value)]),
+                None => Value::Nil,
+            },
+        ),
+        ("destination_hash", Value::Binary(peer.destination_hash.clone())),
+        ("link_establishment_rate", Value::from(0)),
+        ("sync_transfer_rate", number(peer.sync_transfer_rate)),
+        ("propagation_transfer_limit", peer.propagation_transfer_limit.map(number).unwrap_or(Value::Nil)),
+        ("propagation_sync_limit", peer.propagation_sync_limit.map(number).unwrap_or(Value::Nil)),
+        ("propagation_stamp_cost", peer.propagation_stamp_cost.map(Value::from).unwrap_or(Value::Nil)),
+        (
+            "propagation_stamp_cost_flexibility",
+            peer.propagation_stamp_flexibility.map(Value::from).unwrap_or(Value::Nil),
+        ),
+        ("peering_cost", peer.peering_cost.map(Value::from).unwrap_or(Value::Nil)),
+        ("last_sync_attempt", number(peer.last_sync_attempt)),
+        ("offered", Value::from(0)),
+        ("outgoing", Value::from(0)),
+        ("incoming", Value::from(0)),
+        ("rx_bytes", Value::from(0)),
+        ("tx_bytes", Value::from(0)),
+    ];
+    rmp::encode::write_map_len(out, fields.len() as u32 + 2).map_err(write_error)?;
+    for (key, value) in &fields {
+        rmp::encode::write_str(out, key).map_err(write_error)?;
+        write_value(out, value).map_err(write_error)?;
+    }
+    rmp::encode::write_str(out, "handled_ids").map_err(write_error)?;
+    write_ids(out, entries.handled_messages(peer.slot))?;
+    rmp::encode::write_str(out, "unhandled_ids").map_err(write_error)?;
+    write_ids(out, entries.unhandled_messages(peer.slot))
+}
+
+/// An array of ids as bin.
+fn write_ids<'a>(
+    out: &mut Vec<u8>,
+    messages: impl Iterator<Item = (&'a TransientId, &'a PropagationEntry)> + Clone,
+) -> io::Result<()> {
+    rmp::encode::write_array_len(out, messages.clone().count() as u32).map_err(write_error)?;
+    for (transient_id, _) in messages {
+        rmp::encode::write_bin(out, transient_id).map_err(write_error)?;
+    }
+    Ok(())
+}
+
+fn write_error(e: rmp::encode::ValueWriteError<io::Error>) -> io::Error {
+    match e {
+        rmp::encode::ValueWriteError::InvalidMarkerWrite(e) | rmp::encode::ValueWriteError::InvalidDataWrite(e) => e,
+    }
+}
+
+/// What a peer record of the peers file says, besides its ids.
+#[derive(Default)]
+struct PeerRecord {
+    destination_hash: Option<Vec<u8>>,
     alive: bool,
     last_heard: f64,
     peering_timebase: f64,
+    sync_transfer_rate: f64,
+    last_sync_attempt: f64,
+    propagation_transfer_limit: Option<f64>,
+    propagation_sync_limit: Option<f64>,
     propagation_stamp_cost: Option<u32>,
     propagation_stamp_flexibility: Option<u32>,
     peering_cost: Option<u32>,
-    propagation_transfer_limit: Option<f64>,
-    propagation_sync_limit: Option<f64>,
     peering_key: Option<(Vec<u8>, u32)>,
     metadata: Option<Vec<u8>>,
-    sync_transfer_rate: f64,
-    handled_ids: Vec<Vec<u8>>,
-    unhandled_ids: Vec<Vec<u8>>,
+}
+
+/// The fields of rfed's earlier peer record (`PeerState`, which rmp_serde
+/// packed as an array), in their order.
+const RFED_PEER_FIELDS: [&str; 14] = [
+    "destination_hash",
+    "alive",
+    "last_heard",
+    "peering_timebase",
+    "propagation_stamp_cost",
+    "propagation_stamp_flexibility",
+    "peering_cost",
+    "propagation_transfer_limit",
+    "propagation_sync_limit",
+    "peering_key",
+    "metadata",
+    "sync_transfer_rate",
+    "handled_ids",
+    "unhandled_ids",
+];
+
+/// Read one peer record, as LXMPeer.from_bytes does: its handled and
+/// unhandled ids are recorded for `slot` on the messages they name, those no
+/// longer stored passed over.
+fn read_peer_record<R: Read>(rd: &mut R, entries: &mut PropagationEntries, slot: usize) -> io::Result<PeerRecord> {
+    let mut record = PeerRecord::default();
+    match read_head(rd)? {
+        Head::Map(fields) => {
+            for _ in 0..fields {
+                let key = read_any(rd)?;
+                read_peer_field(rd, key.as_str().unwrap_or(""), false, &mut record, entries, slot)?;
+            }
+        }
+        Head::Array(fields) => {
+            for at in 0..fields {
+                let name = RFED_PEER_FIELDS.get(at).copied().unwrap_or("");
+                read_peer_field(rd, name, true, &mut record, entries, slot)?;
+            }
+        }
+        other => {
+            skip_rest(other, rd)?;
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "a peer record is neither a map nor an array"));
+        }
+    }
+    Ok(record)
+}
+
+fn read_peer_field<R: Read>(
+    rd: &mut R,
+    name: &str,
+    rfed_record: bool,
+    record: &mut PeerRecord,
+    entries: &mut PropagationEntries,
+    slot: usize,
+) -> io::Result<()> {
+    if name == "handled_ids" || name == "unhandled_ids" {
+        let head = read_head(rd)?;
+        let Head::Array(count) = head else { return skip_rest(head, rd) };
+        for _ in 0..count {
+            if let Some(transient_id) = read_id(rd)? {
+                if name == "handled_ids" {
+                    entries.add_handled_message(slot, &transient_id);
+                } else {
+                    entries.add_unhandled_message(slot, &transient_id);
+                }
+            }
+        }
+        return Ok(());
+    }
+    let value = read_any(rd)?;
+    match name {
+        "destination_hash" => record.destination_hash = value_bytes(&value),
+        "alive" => record.alive = value.as_bool().unwrap_or(false),
+        "last_heard" => record.last_heard = value.as_f64().unwrap_or(0.0),
+        "peering_timebase" => record.peering_timebase = value.as_f64().unwrap_or(0.0),
+        "sync_transfer_rate" => record.sync_transfer_rate = value.as_f64().unwrap_or(0.0),
+        "last_sync_attempt" => record.last_sync_attempt = value.as_f64().unwrap_or(0.0),
+        "propagation_transfer_limit" => record.propagation_transfer_limit = value.as_f64(),
+        // int(), as LXMPeer.from_bytes reads it.
+        "propagation_sync_limit" => record.propagation_sync_limit = value.as_f64().map(f64::trunc),
+        "propagation_stamp_cost" => record.propagation_stamp_cost = value_u32(&value),
+        "propagation_stamp_cost_flexibility" | "propagation_stamp_flexibility" => {
+            record.propagation_stamp_flexibility = value_u32(&value)
+        }
+        "peering_cost" => record.peering_cost = value_u32(&value),
+        "peering_key" => {
+            record.peering_key = match &value {
+                Value::Array(pair) if pair.len() == 2 => value_bytes(&pair[0]).zip(value_u32(&pair[1])),
+                _ => None,
+            }
+        }
+        // LXMF keeps the metadata itself, rfed's earlier file its msgpack.
+        "metadata" if rfed_record => record.metadata = value_bytes(&value),
+        "metadata" => record.metadata = (!value.is_nil()).then(|| encode_value(value)),
+        // sync_strategy, link_establishment_rate, offered, outgoing, incoming,
+        // rx_bytes, tx_bytes: not kept by rfed.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// One id of a handled_ids or unhandled_ids array: a bin (LXMF) or an array
+/// of ints (rfed's earlier file). `None` for anything else, which is skipped.
+fn read_id<R: Read>(rd: &mut R) -> io::Result<Option<TransientId>> {
+    let mut transient_id = [0u8; 32];
+    match read_head(rd)? {
+        Head::Bin(32) => {
+            rd.read_exact(&mut transient_id)?;
+            Ok(Some(transient_id))
+        }
+        Head::Array(32) => {
+            let mut valid = true;
+            for byte in transient_id.iter_mut() {
+                match read_any(rd)?.as_u64() {
+                    Some(n) if n <= 255 => *byte = n as u8,
+                    _ => valid = false,
+                }
+            }
+            Ok(valid.then_some(transient_id))
+        }
+        other => {
+            skip_rest(other, rd)?;
+            Ok(None)
+        }
+    }
+}
+
+/// A byte string as either file holds one: a bin, or an array of ints.
+fn value_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::Binary(bytes) => Some(bytes.clone()),
+        Value::Array(items) => items.iter().map(|item| item.as_u64().filter(|n| *n <= 255).map(|n| n as u8)).collect(),
+        _ => None,
+    }
+}
+
+/// A number as Python's int() takes it: a float is truncated.
+fn value_u32(value: &Value) -> Option<u32> {
+    match value {
+        Value::Integer(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+        Value::F32(_) | Value::F64(_) => value.as_f64().filter(|v| (0.0..4294967296.0).contains(v)).map(|v| v as u32),
+        _ => None,
+    }
+}
+
+/// How a msgpack value starts: the length of an array, a map or a bin, or
+/// any other marker.
+enum Head {
+    Array(usize),
+    Map(usize),
+    Bin(usize),
+    Other(rmp::Marker),
+}
+
+fn read_head<R: Read>(rd: &mut R) -> io::Result<Head> {
+    use rmp::Marker;
+    let marker = rmp::decode::read_marker(rd).map_err(|e| e.0)?;
+    let mut length = |bytes: usize| -> io::Result<usize> {
+        let mut buf = [0u8; 4];
+        rd.read_exact(&mut buf[4 - bytes..])?;
+        Ok(u32::from_be_bytes(buf) as usize)
+    };
+    Ok(match marker {
+        Marker::FixArray(n) => Head::Array(n as usize),
+        Marker::Array16 => Head::Array(length(2)?),
+        Marker::Array32 => Head::Array(length(4)?),
+        Marker::FixMap(n) => Head::Map(n as usize),
+        Marker::Map16 => Head::Map(length(2)?),
+        Marker::Map32 => Head::Map(length(4)?),
+        Marker::Bin8 => Head::Bin(length(1)?),
+        Marker::Bin16 => Head::Bin(length(2)?),
+        Marker::Bin32 => Head::Bin(length(4)?),
+        other => Head::Other(other),
+    })
+}
+
+/// Pass over the rest of a value `read_head` started.
+fn skip_rest<R: Read>(head: Head, rd: &mut R) -> io::Result<()> {
+    match head {
+        Head::Array(n) => (0..n).try_for_each(|_| read_any(rd).map(drop)),
+        Head::Map(n) => (0..2 * n).try_for_each(|_| read_any(rd).map(drop)),
+        Head::Bin(n) => {
+            let mut bytes = rd.by_ref().take(n as u64);
+            drain(&mut bytes)?;
+            match bytes.limit() {
+                0 => Ok(()),
+                _ => Err(io::ErrorKind::UnexpectedEof.into()),
+            }
+        }
+        Head::Other(marker) => read_any(&mut (&[marker.to_u8()][..]).chain(rd)).map(drop),
+    }
+}
+
+fn read_any<R: Read>(rd: &mut R) -> io::Result<Value> {
+    read_value(rd).map_err(|e| match e {
+        rmpv::decode::Error::InvalidMarkerRead(e) | rmpv::decode::Error::InvalidDataRead(e) => e,
+        other => io::Error::new(io::ErrorKind::InvalidData, other.to_string()),
+    })
+}
+
+/// Read what is left of `rd` and drop it.
+fn drain<R: Read>(rd: &mut R) -> io::Result<()> {
+    io::copy(rd, &mut io::sink()).map(drop)
+}
+
+/// rfed's earlier peers file packed each peer record as an array of ints, one
+/// per byte (rmp_serde's `Vec<u8>`): this reads `left` of them as the bytes
+/// they are.
+struct IntBytes<'a, R> {
+    inner: &'a mut R,
+    left: usize,
+}
+
+impl<R: Read> Read for IntBytes<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() && self.left > 0 {
+            let mut byte = [0u8; 1];
+            self.inner.read_exact(&mut byte)?;
+            if byte[0] == 0xcc {
+                self.inner.read_exact(&mut byte)?;
+            } else if byte[0] > 0x7f {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("a peer record byte packed with marker 0x{:02x}", byte[0]),
+                ));
+            }
+            buf[filled] = byte[0];
+            self.left -= 1;
+            filled += 1;
+        }
+        Ok(filled)
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -5219,30 +5877,32 @@ mod tests {
         use super::super::*;
 
         fn entry(received: f64) -> PropagationEntry {
-            PropagationEntry { destination_hash: vec![0; 16], filepath: String::new(), received, size: 100, stamp_value: 0 }
+            PropagationEntry::new([0; 16], received, 100, 0)
         }
 
         #[test]
         fn backlog_is_held_for_an_hour_but_fresh_messages_sync_at_once() {
             let node = test_node("backlog");
             let mut g = node.lock().unwrap();
-            let old = vec![1u8; 32];
-            let fresh = vec![2u8; 32];
+            let old = [1u8; 32];
+            let fresh = [2u8; 32];
             let t0 = g.started_at;
-            g.entries.insert(old.clone(), entry(t0 - 100.0));
-            g.entries.insert(fresh.clone(), entry(t0 + 1.0));
-            g.fresh_since_start.push(fresh.clone());
-            let mut peer = PropPeer::new(vec![9u8; 16]);
-            peer.add_unhandled(old.clone());
-            peer.add_unhandled(fresh.clone());
+            g.entries.insert(old, entry(t0 - 100.0));
+            g.entries.insert(fresh, entry(t0 + 1.0));
+            g.fresh_since_start.push(fresh);
+            let peer = vec![9u8; 16];
+            let slot = g.insert_peer(PropPeer::new(peer.clone())).slot;
+            g.entries.queue_unhandled(slot, &old);
+            g.entries.queue_unhandled(slot, &fresh);
             assert!(g.backlog_held());
-            assert_eq!(g.sync_pool(&peer), vec![fresh.clone()], "only the fresh message is offered during the hold");
-            let mut backlog_only = PropPeer::new(vec![8u8; 16]);
-            backlog_only.add_unhandled(old.clone());
-            assert!(g.sync_pool(&backlog_only).is_empty(), "a peer lacking only backlog is not synced yet");
+            assert_eq!(g.sync_pool(&g.peers[&peer]), vec![fresh], "only the fresh message is offered during the hold");
+            let backlog_only = vec![8u8; 16];
+            let slot = g.insert_peer(PropPeer::new(backlog_only.clone())).slot;
+            g.entries.queue_unhandled(slot, &old);
+            assert!(g.sync_pool(&g.peers[&backlog_only]).is_empty(), "a peer lacking only backlog is not synced yet");
             g.started_at = now() - STARTUP_BACKLOG_HOLD_SECS - 1.0;
             assert!(!g.backlog_held());
-            let pool = g.sync_pool(&peer);
+            let pool = g.sync_pool(&g.peers[&peer]);
             assert!(pool.contains(&old) && pool.contains(&fresh), "after the hold everything the peer lacks is offered");
         }
 
@@ -5529,58 +6189,166 @@ mod tests {
         }
     }
 
-    mod id_queue_tests {
-        use super::super::IdQueue;
+    mod propagation_entries_tests {
+        use super::super::{PeerSet, PropagationEntries, PropagationEntry, TransientId};
 
-        fn id(n: u8) -> Vec<u8> { vec![n; 32] }
+        fn id(n: u32) -> TransientId {
+            let mut id = [0u8; 32];
+            id[..4].copy_from_slice(&n.to_be_bytes());
+            id
+        }
+
+        fn entry(received: f64) -> PropagationEntry {
+            PropagationEntry::new([0x5E; 16], received, 100, 0)
+        }
+
+        fn order(entries: &PropagationEntries) -> Vec<TransientId> {
+            entries.iter().map(|(tid, _)| *tid).collect()
+        }
 
         #[test]
-        fn keeps_insertion_order_and_refuses_duplicates() {
-            let mut q = IdQueue::default();
-            assert!(q.push_unique(id(3)));
-            assert!(q.push_unique(id(1)));
-            assert!(!q.push_unique(id(3)), "a duplicate is not added");
-            assert!(q.push_unique(id(2)));
-            assert_eq!(q.to_vec(), vec![id(3), id(1), id(2)]);
-            assert_eq!(q.len(), 3);
+        fn keeps_store_order_and_refuses_duplicates() {
+            let mut entries = PropagationEntries::default();
+            assert!(entries.insert(id(3), entry(1.0)));
+            assert!(entries.insert(id(1), entry(2.0)));
+            assert!(!entries.insert(id(3), entry(3.0)), "a duplicate is not stored");
+            assert!(entries.insert(id(2), entry(4.0)));
+            assert_eq!(order(&entries), vec![id(3), id(1), id(2)]);
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries.get(&id(3)).unwrap().received, 1.0, "the first stays");
+            assert!(!entries.contains_key(&[3u8; 16]), "an id of the wrong length is not stored");
         }
 
         #[test]
         fn remove_keeps_the_order_of_the_rest() {
-            let mut q = IdQueue::default();
-            for n in 1..=4 { q.push_unique(id(n)); }
-            assert!(q.remove(&id(2)));
-            assert!(!q.remove(&id(2)), "already gone");
-            assert!(!q.contains(&id(2)));
-            assert_eq!(q.to_vec(), vec![id(1), id(3), id(4)]);
-            // A removed id may come back, and goes to the end.
-            assert!(q.push_unique(id(2)));
-            assert_eq!(q.to_vec(), vec![id(1), id(3), id(4), id(2)]);
+            let mut entries = PropagationEntries::default();
+            for n in 1..=4 { entries.insert(id(n), entry(n as f64)); }
+            assert!(entries.remove(&id(2)).is_some());
+            assert!(entries.remove(&id(2)).is_none(), "already gone");
+            assert!(!entries.contains_key(&id(2)));
+            assert_eq!(order(&entries), vec![id(1), id(3), id(4)]);
+            // A removed message may come back, and goes to the end.
+            assert!(entries.insert(id(2), entry(5.0)));
+            assert_eq!(order(&entries), vec![id(1), id(3), id(4), id(2)]);
         }
 
         #[test]
         fn a_peer_does_not_requeue_what_it_already_handled() {
-            let mut peer = super::super::PropPeer::new(vec![9; 16]);
-            peer.add_unhandled(id(1));
-            peer.mark_handled(&id(1));
-            peer.add_unhandled(id(1));
-            assert!(peer.unhandled_ids.is_empty());
-            assert!(peer.handled_ids.contains(&id(1)));
+            let mut entries = PropagationEntries::default();
+            entries.insert(id(1), entry(1.0));
+            assert!(entries.queue_unhandled(0, &id(1)));
+            entries.mark_handled(0, &id(1));
+            assert!(!entries.queue_unhandled(0, &id(1)));
+            assert_eq!(entries.unhandled_message_count(0), 0);
+            assert!(entries.is_handled(0, &id(1)));
+            assert!(!entries.queue_unhandled(0, &id(9)), "only a stored message is queued");
+            assert_eq!((entries.handled_message_count(0), entries.unhandled_message_count(0)), (1, 0));
         }
 
-        /// The regression this type exists for: queueing one message for every
-        /// peer must not get slower as the queues grow.
+        /// A message a client collected (GET "haves") or that expired leaves
+        /// every peer with it. Each peer's own queues kept its id until a
+        /// restart.
+        #[test]
+        fn a_removed_message_leaves_every_peer() {
+            let mut entries = PropagationEntries::default();
+            entries.insert(id(1), entry(1.0));
+            entries.insert(id(2), entry(2.0));
+            entries.mark_handled(0, &id(1));
+            entries.queue_unhandled(1, &id(1));
+            entries.queue_unhandled(1, &id(2));
+            entries.remove(&id(1));
+            assert_eq!(entries.handled_message_count(0), 0);
+            assert_eq!(entries.handled_messages(0).count(), 0);
+            assert_eq!(entries.unhandled_message_count(1), 1);
+            assert_eq!(entries.unhandled_messages(1).map(|(tid, _)| *tid).collect::<Vec<_>>(), vec![id(2)]);
+        }
+
+        #[test]
+        fn peer_sets_grow_past_64_slots() {
+            let mut set = PeerSet::default();
+            for slot in [130, 3, 64, 63] {
+                assert!(set.insert(slot));
+            }
+            assert!(!set.insert(64), "already in");
+            assert_eq!(set.iter().collect::<Vec<_>>(), vec![3, 63, 64, 130]);
+            assert!(set.remove(64) && !set.contains(64) && set.contains(130));
+            for slot in [3, 63, 130] {
+                assert!(set.remove(slot));
+            }
+            assert!(set.is_empty());
+
+            let mut entries = PropagationEntries::default();
+            entries.insert(id(1), entry(1.0));
+            entries.insert(id(2), entry(2.0));
+            assert!(entries.queue_unhandled(70, &id(2)));
+            assert_eq!(entries.unhandled_message_count(70), 1);
+            assert_eq!(entries.unhandled_messages(70).map(|(tid, _)| *tid).collect::<Vec<_>>(), vec![id(2)]);
+            assert_eq!(entries.unhandled_message_count(3), 0);
+        }
+
+        #[test]
+        fn a_forgotten_peer_leaves_no_mark() {
+            let mut entries = PropagationEntries::default();
+            for n in 0..10 { entries.insert(id(n), entry(n as f64)); }
+            for n in 0..10 {
+                entries.queue_unhandled(2, &id(n));
+                entries.queue_unhandled(5, &id(n));
+            }
+            for n in 0..4 { entries.mark_handled(2, &id(n)); }
+            entries.forget_peer(2);
+            assert_eq!((entries.handled_message_count(2), entries.unhandled_message_count(2)), (0, 0));
+            assert!(entries.iter().all(|(_, e)| !e.handled_peers.contains(2) && !e.unhandled_peers.contains(2)));
+            assert_eq!(entries.unhandled_message_count(5), 10, "other peers keep theirs");
+        }
+
+        #[test]
+        fn compaction_keeps_order_marks_and_lookups() {
+            let mut entries = PropagationEntries::default();
+            for n in 0..3000 {
+                entries.insert(id(n), entry(n as f64));
+                entries.queue_unhandled(0, &id(n));
+                if n % 2 == 0 { entries.mark_handled(1, &id(n)); }
+            }
+            for n in 0..2000 { entries.remove(&id(n)); }
+            assert!(entries.rows.len() < 3000, "the gaps were closed");
+            assert_eq!(order(&entries), (2000..3000).map(id).collect::<Vec<_>>());
+            assert!((2000..3000).all(|n| entries.get(&id(n)).map(|e| e.received) == Some(n as f64)));
+            assert_eq!(entries.unhandled_message_count(0), 1000);
+            assert_eq!(entries.handled_message_count(1), 500);
+            assert_eq!(entries.unhandled_messages(0).count(), 1000);
+        }
+
+        #[test]
+        fn sort_by_received_orders_by_time_then_id() {
+            let mut entries = PropagationEntries::default();
+            for (n, received) in [(4, 3.0), (2, 1.0), (3, 2.0), (1, 1.0)] {
+                entries.insert(id(n), entry(received));
+                entries.queue_unhandled(0, &id(n));
+            }
+            entries.remove(&id(3));
+            entries.sort_by_received();
+            assert_eq!(order(&entries), vec![id(1), id(2), id(4)]);
+            assert!([1, 2, 4].iter().all(|n| entries.is_unhandled(0, &id(*n))));
+            assert_eq!(entries.unhandled_message_count(0), 3);
+        }
+
+        /// Queueing one message for every peer must not get slower as the
+        /// store grows. Each peer's queue was a Vec once: 38 ms per message
+        /// here in a debug build.
         #[test]
         fn queueing_stays_cheap_at_production_scale() {
-            let mut peers: Vec<super::super::PropPeer> =
-                (0..20).map(|i| super::super::PropPeer::new(vec![i as u8; 16])).collect();
-            let wide = |n: u32| { let mut v = vec![0u8; 32]; v[..4].copy_from_slice(&n.to_be_bytes()); v };
-            for p in peers.iter_mut() { for n in 0..150_000u32 { p.add_unhandled(wide(n)); } }
+            let mut entries = PropagationEntries::default();
+            for n in 0..150_000u32 {
+                entries.insert(id(n), entry(n as f64));
+                for slot in 0..20 { entries.queue_unhandled(slot, &id(n)); }
+            }
 
             let started = std::time::Instant::now();
-            for n in 0..200u32 { for p in peers.iter_mut() { p.add_unhandled(wide(150_000 + n)); } }
+            for n in 150_000..150_200u32 {
+                entries.insert(id(n), entry(n as f64));
+                for slot in 0..20 { entries.queue_unhandled(slot, &id(n)); }
+            }
             let per_message_ms = started.elapsed().as_secs_f64() * 1000.0 / 200.0;
-            // The Vec version measured 38 ms per message here in a debug build.
             assert!(per_message_ms < 2.0, "queueing for 20 peers took {per_message_ms:.2} ms per message");
         }
     }
@@ -6167,7 +6935,7 @@ mod tests {
             let device = rig.device(&d_hash);
             let peer = Identity::new(true);
             let peer_prop = Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(&peer));
-            rig.node.lock().unwrap().peers.insert(peer_prop.clone(), PropPeer::new(peer_prop.clone()));
+            rig.node.lock().unwrap().insert_peer(PropPeer::new(peer_prop.clone()));
             let (sealed, message) = sealed_message(&d, &d_hash, 2);
             let before = verifications();
             let mark = crate::test_log::mark();
@@ -6423,7 +7191,7 @@ mod tests {
             // A peer's batch: counted in the processed line only.
             let peer = Identity::new(true);
             let peer_prop = Destination::hash_from_name_and_identity(&format!("{}.{}", LXMF_APP, PROP_ASPECT), Some(&peer));
-            rig.node.lock().unwrap().peers.insert(peer_prop.clone(), PropPeer::new(peer_prop));
+            rig.node.lock().unwrap().insert_peer(PropPeer::new(peer_prop));
             let mark = crate::test_log::mark();
             super::ingest_synced(&rig.node, &upload(&[message], None), &peer);
             assert!(mark.containing("dropped, after the link proved").is_empty());
@@ -6623,6 +7391,293 @@ mod tests {
     /// and propagation_resource_concluded, and lxmd's [propagation]
     /// settings): who may sync here, when an offer is answered "throttled",
     /// and what one transfer may carry.
+    /// The peers file as LXMF 1.1.1 writes and reads it
+    /// (LXMRouter.exit_handler, LXMPeer.to_bytes and from_bytes), and rfed's
+    /// earlier one.
+    mod peers_file_tests {
+        use super::ingest_lock_scope_tests::test_node_with;
+        use super::super::*;
+
+        /// A peers file LXMF 1.1.1 wrote: tests/fixtures/lxmf_peers_fixture.py.
+        const LXMF_PEERS: &[u8] = include_bytes!("../tests/fixtures/lxmf_1_1_1_peers.bin");
+
+        fn config_dir(tag: &str) -> PathBuf {
+            let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+            std::env::temp_dir().join(format!("rfed_peers_file_{tag}_{unique}"))
+        }
+
+        /// The fixture's message `n`: for destination 5e5e..., 300 bytes.
+        fn message(n: u8) -> Vec<u8> {
+            let mut lxmf = vec![n; 300];
+            lxmf[..16].copy_from_slice(&[0x5E; 16]);
+            lxmf
+        }
+
+        /// A node on `dir` with messages 0..`count` stored, and their ids.
+        fn node_on(dir: &Path, count: u8) -> (Arc<Mutex<LxmfPropagationNode>>, Vec<Vec<u8>>) {
+            let dir = dir.to_path_buf();
+            let node = test_node_with("peers_file", |config| config.config_dir = dir);
+            let ids = {
+                let mut g = node.lock().unwrap();
+                (0..count).map(|n| g.store_message(&message(n), 0, None, None).expect("stored")).collect()
+            };
+            (node, ids)
+        }
+
+        /// A node on `dir` started as `enable` starts one: the messagestore
+        /// indexed, then the peers file read.
+        fn restarted(dir: &Path) -> Arc<Mutex<LxmfPropagationNode>> {
+            let dir = dir.to_path_buf();
+            let node = test_node_with("peers_file_restart", |config| config.config_dir = dir);
+            {
+                let mut g = node.lock().unwrap();
+                g.index_messagestore();
+                g.load_peers();
+            }
+            node
+        }
+
+        fn peers_path(dir: &Path) -> PathBuf {
+            dir.join("lxmf_propagation").join("peers")
+        }
+
+        fn handled(g: &LxmfPropagationNode, peer: &[u8]) -> Vec<Vec<u8>> {
+            g.entries.handled_messages(g.peers[peer].slot).map(|(tid, _)| tid.to_vec()).collect()
+        }
+
+        fn unhandled(g: &LxmfPropagationNode, peer: &[u8]) -> Vec<Vec<u8>> {
+            g.entries.unhandled_messages(g.peers[peer].slot).map(|(tid, _)| tid.to_vec()).collect()
+        }
+
+        fn name_metadata(name: &[u8]) -> Vec<u8> {
+            encode_value(Value::Map(vec![(Value::from(PN_META_NAME), Value::Binary(name.to_vec()))]))
+        }
+
+        #[test]
+        fn reads_and_writes_what_lxmf_writes() {
+            let dir = config_dir("lxmf");
+            let (_, ids) = node_on(&dir, 3);
+            fs::write(peers_path(&dir), LXMF_PEERS).unwrap();
+
+            let node = restarted(&dir);
+            let g = node.lock().unwrap();
+            let peer_hash = [0x1Du8; 16];
+            let peer = &g.peers[&peer_hash[..]];
+            assert!(peer.alive);
+            assert_eq!((peer.peering_timebase, peer.last_heard, peer.last_sync_attempt), (1760000000.0, 1760000123.5, 1760000100.25));
+            assert_eq!(peer.metadata, Some(name_metadata(b"lxmf fixture")));
+            assert_eq!(peer.peering_key, Some((vec![0x5A; 32], 18)));
+            assert_eq!(peer.sync_transfer_rate, 1234.5);
+            assert_eq!((peer.propagation_transfer_limit, peer.propagation_sync_limit), (Some(256.0), Some(10240.0)));
+            assert_eq!(
+                (peer.propagation_stamp_cost, peer.propagation_stamp_flexibility, peer.peering_cost),
+                (Some(16), Some(3), Some(18)),
+            );
+            assert_eq!(handled(&g, &peer_hash), ids[..1].to_vec());
+            assert_eq!(unhandled(&g, &peer_hash), ids[1..].to_vec());
+
+            g.save_peers();
+            assert_eq!(fs::read(peers_path(&dir)).unwrap(), LXMF_PEERS, "saved byte for byte as LXMF saves it");
+        }
+
+        #[test]
+        fn a_saved_peers_file_rebuilds_the_peers() {
+            let dir = config_dir("round_trip");
+            let (node, ids) = node_on(&dir, 5);
+            let (a, b) = (vec![0xA1u8; 16], vec![0xB2u8; 16]);
+            {
+                let mut g = node.lock().unwrap();
+                let peer = g.insert_peer(PropPeer::new(a.clone()));
+                peer.alive = true;
+                peer.last_heard = 1760000001.75;
+                peer.peering_timebase = 1760000000.0;
+                peer.propagation_stamp_cost = Some(16);
+                peer.propagation_stamp_flexibility = Some(3);
+                peer.peering_cost = Some(18);
+                peer.propagation_transfer_limit = Some(256.0);
+                peer.propagation_sync_limit = Some(10240.0);
+                peer.peering_key = Some((vec![0x5A; 32], 19));
+                peer.metadata = Some(name_metadata(b"node a"));
+                peer.sync_transfer_rate = 812.5;
+                peer.last_sync_attempt = 1760000002.0;
+                let slot_a = peer.slot;
+                let slot_b = g.insert_peer(PropPeer::new(b.clone())).slot;
+                for tid in &ids {
+                    g.entries.queue_unhandled(slot_a, tid);
+                    g.entries.queue_unhandled(slot_b, tid);
+                }
+                g.entries.mark_handled(slot_a, &ids[0]);
+                g.entries.mark_handled(slot_a, &ids[1]);
+                g.save_peers();
+                // A message whose file goes while the node is down is passed over.
+                let path = g.message_path(&ids[4], g.entries.get(&ids[4]).unwrap());
+                fs::remove_file(path).unwrap();
+            }
+            let saved = fs::read(peers_path(&dir)).unwrap();
+            assert_eq!(saved[0], 0x92, "a list of two peers");
+            assert!((0xc4..=0xc6).contains(&saved[1]), "each a bin, as LXMF writes them");
+            let leftovers: Vec<_> = fs::read_dir(dir.join("lxmf_propagation")).unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("peers.tmp."))
+                .collect();
+            assert!(leftovers.is_empty(), "the temporary file was renamed over the last");
+
+            let node = restarted(&dir);
+            let g = node.lock().unwrap();
+            let peer = &g.peers[&a];
+            assert!(peer.alive);
+            assert_eq!((peer.peering_timebase, peer.last_heard, peer.last_sync_attempt), (1760000000.0, 1760000001.75, 1760000002.0));
+            assert_eq!(
+                (peer.propagation_stamp_cost, peer.propagation_stamp_flexibility, peer.peering_cost),
+                (Some(16), Some(3), Some(18)),
+            );
+            assert_eq!((peer.propagation_transfer_limit, peer.propagation_sync_limit), (Some(256.0), Some(10240.0)));
+            assert_eq!(peer.peering_key, Some((vec![0x5A; 32], 19)));
+            assert_eq!(peer.metadata, Some(name_metadata(b"node a")));
+            assert_eq!(peer.sync_transfer_rate, 812.5);
+            assert_eq!(handled(&g, &a), ids[..2].to_vec());
+            assert_eq!(unhandled(&g, &a), ids[2..4].to_vec());
+            assert_eq!(unhandled(&g, &b), ids[..4].to_vec());
+            assert!(handled(&g, &b).is_empty());
+            assert_ne!(g.peers[&a].slot, g.peers[&b].slot);
+        }
+
+        /// rfed's earlier `PeerState`, which rmp_serde packed as an array
+        /// with every byte string an array of ints.
+        #[derive(serde::Serialize)]
+        struct EarlierPeerState {
+            destination_hash: Vec<u8>,
+            alive: bool,
+            last_heard: f64,
+            peering_timebase: f64,
+            propagation_stamp_cost: Option<u32>,
+            propagation_stamp_flexibility: Option<u32>,
+            peering_cost: Option<u32>,
+            propagation_transfer_limit: Option<f64>,
+            propagation_sync_limit: Option<f64>,
+            peering_key: Option<(Vec<u8>, u32)>,
+            metadata: Option<Vec<u8>>,
+            sync_transfer_rate: f64,
+            handled_ids: Vec<Vec<u8>>,
+            unhandled_ids: Vec<Vec<u8>>,
+        }
+
+        #[test]
+        fn reads_rfed_earlier_peers_file() {
+            let dir = config_dir("earlier");
+            let (_, ids) = node_on(&dir, 4);
+            let full = EarlierPeerState {
+                destination_hash: vec![0xC3; 16],
+                alive: true,
+                last_heard: 1760000050.5,
+                peering_timebase: 1760000000.0,
+                propagation_stamp_cost: Some(16),
+                propagation_stamp_flexibility: Some(3),
+                peering_cost: Some(18),
+                propagation_transfer_limit: Some(256.0),
+                propagation_sync_limit: Some(10240.0),
+                peering_key: Some((vec![0x5A; 32], 20)),
+                metadata: Some(name_metadata(b"node c")),
+                sync_transfer_rate: 99.5,
+                handled_ids: vec![ids[0].clone(), vec![0xEE; 32]],
+                unhandled_ids: ids[1..].to_vec(),
+            };
+            let bare = EarlierPeerState {
+                destination_hash: vec![0xD4; 16],
+                alive: false,
+                last_heard: 0.0,
+                peering_timebase: 0.0,
+                propagation_stamp_cost: None,
+                propagation_stamp_flexibility: None,
+                peering_cost: None,
+                propagation_transfer_limit: None,
+                propagation_sync_limit: None,
+                peering_key: None,
+                metadata: None,
+                sync_transfer_rate: 0.0,
+                handled_ids: Vec::new(),
+                unhandled_ids: vec![ids[3].clone()],
+            };
+            let records = vec![rmp_serde::to_vec(&full).unwrap(), rmp_serde::to_vec(&bare).unwrap()];
+            let file = rmp_serde::to_vec(&records).unwrap();
+            assert_eq!(file[1], 0xdc, "each record an array of ints, as rfed wrote them");
+            fs::write(peers_path(&dir), file).unwrap();
+
+            let node = restarted(&dir);
+            let g = node.lock().unwrap();
+            let c = vec![0xC3u8; 16];
+            let peer = &g.peers[&c];
+            assert!(peer.alive);
+            assert_eq!((peer.peering_timebase, peer.last_heard), (1760000000.0, 1760000050.5));
+            assert_eq!(
+                (peer.propagation_stamp_cost, peer.propagation_stamp_flexibility, peer.peering_cost),
+                (Some(16), Some(3), Some(18)),
+            );
+            assert_eq!((peer.propagation_transfer_limit, peer.propagation_sync_limit), (Some(256.0), Some(10240.0)));
+            assert_eq!(peer.peering_key, Some((vec![0x5A; 32], 20)));
+            assert_eq!(peer.metadata, Some(name_metadata(b"node c")));
+            assert_eq!(peer.sync_transfer_rate, 99.5);
+            assert_eq!(handled(&g, &c), ids[..1].to_vec(), "an id no longer stored is passed over");
+            assert_eq!(unhandled(&g, &c), ids[1..].to_vec());
+            let d = vec![0xD4u8; 16];
+            let peer = &g.peers[&d];
+            assert_eq!((peer.propagation_transfer_limit, peer.propagation_sync_limit, peer.peering_key.clone()), (None, None, None));
+            assert_eq!(unhandled(&g, &d), ids[3..].to_vec());
+
+            g.save_peers();
+            let saved = fs::read(peers_path(&dir)).unwrap();
+            assert!((0xc4..=0xc6).contains(&saved[1]), "saved as LXMF's from now on");
+        }
+
+        #[test]
+        fn an_unreadable_record_is_skipped_and_an_empty_file_holds_no_peers() {
+            let dir = config_dir("unreadable");
+            let _ = node_on(&dir, 3);
+            // [bin [0xc1], the fixture's one record]: 0xc1 is never used in msgpack.
+            let mut file = vec![0x92, 0xc4, 0x01, 0xc1];
+            file.extend_from_slice(&LXMF_PEERS[1..]);
+            fs::write(peers_path(&dir), file).unwrap();
+            let node = restarted(&dir);
+            assert_eq!(node.lock().unwrap().peers.len(), 1, "the readable record is loaded");
+
+            fs::write(peers_path(&dir), b"").unwrap();
+            assert!(restarted(&dir).lock().unwrap().peers.is_empty());
+        }
+
+        /// The index reads the destination hash from each file and puts the
+        /// entries in the order received. A file not named as rfed names one
+        /// keeps its name.
+        #[test]
+        fn indexing_keeps_the_order_received_and_any_file_name() {
+            let dir = config_dir("index");
+            let (node, _) = node_on(&dir, 0);
+            let store = node.lock().unwrap().messagestore_path.clone();
+            let write = |n: u8, tail: &str| {
+                let lxmf = message(n);
+                let tid = reticulum_rust::identity::full_hash(&lxmf);
+                fs::write(store.join(format!("{}_{tail}", hexrep(&tid, false))), &lxmf).unwrap();
+                tid
+            };
+            let late = write(1, "1760000300.5_0");
+            let early = write(2, "1760000100.0_7");
+            let middle = write(3, "1760000200_0_extra");
+            fs::write(store.join("not_a_message"), b"x").unwrap();
+
+            let node = restarted(&dir);
+            let g = node.lock().unwrap();
+            let order: Vec<Vec<u8>> = g.entries.iter().map(|(tid, _)| tid.to_vec()).collect();
+            assert_eq!(order, vec![early.clone(), middle.clone(), late.clone()]);
+            for (tid, n) in [(&late, 1u8), (&early, 2), (&middle, 3)] {
+                let entry = g.entries.get(tid).unwrap();
+                assert_eq!(fs::read(g.message_path(tid, entry)).unwrap(), message(n), "its file is found");
+                assert_eq!((entry.destination_hash, entry.size), ([0x5E; 16], 300));
+            }
+            assert_eq!(g.entries.get(&early).unwrap().stamp_value, 7);
+            assert!(g.entries.get(&late).unwrap().other_name.is_none(), "rfed's own name is not kept");
+            assert!(g.entries.get(&early).unwrap().other_name.is_some());
+        }
+    }
+
     mod inbound_sync_tests {
         use super::ingest_lock_scope_tests::{test_node, test_node_with};
         use super::{propagation_link, propagation_link_idle};
@@ -7428,7 +8483,7 @@ mod tests {
                 if key_ready {
                     peer.peering_key = Some((vec![0x5A; 32], 18));
                 }
-                self.node.lock().unwrap().peers.insert(hash.to_vec(), peer);
+                self.node.lock().unwrap().insert_peer(peer);
             }
 
             /// Store `count` messages of `size` bytes (with their stamp);
@@ -7456,11 +8511,25 @@ mod tests {
             }
 
             fn unhandled(&self, hash: &[u8]) -> usize {
-                self.peer(hash, |p| p.unhandled_ids.len())
+                let g = self.node.lock().unwrap();
+                g.entries.unhandled_message_count(g.peers[hash].slot)
             }
 
             fn handled(&self, hash: &[u8]) -> usize {
-                self.peer(hash, |p| p.handled_ids.len())
+                let g = self.node.lock().unwrap();
+                g.entries.handled_message_count(g.peers[hash].slot)
+            }
+
+            /// Is message `tid` still to be offered to peer `hash`?
+            fn is_unhandled(&self, hash: &[u8], tid: &[u8]) -> bool {
+                let g = self.node.lock().unwrap();
+                g.entries.is_unhandled(g.peers[hash].slot, tid)
+            }
+
+            /// Is message `tid` handled for peer `hash`?
+            fn is_handled(&self, hash: &[u8], tid: &[u8]) -> bool {
+                let g = self.node.lock().unwrap();
+                g.entries.is_handled(g.peers[hash].slot, tid)
             }
         }
 
@@ -8226,10 +9295,34 @@ mod tests {
             );
         }
 
-        fn id(n: usize) -> Vec<u8> {
-            let mut v = vec![0u8; 32];
+        fn id(n: usize) -> TransientId {
+            let mut v = [0u8; 32];
             v[..8].copy_from_slice(&(n as u64).to_be_bytes());
             v
+        }
+
+        /// Each peer holds a slot of its own in the store's peer sets, and a
+        /// peer given an unpeered peer's slot starts clean.
+        #[test]
+        fn a_new_peer_never_inherits_an_unpeered_peers_messages() {
+            let h = Harness::new("peer_slots");
+            let (a, b, c) = ([0xA1u8; 16], [0xB2u8; 16], [0xC3u8; 16]);
+            h.add_peer(&a, true);
+            h.add_peer(&b, true);
+            let ids = h.store(3, 300);
+            assert_eq!((h.unhandled(&a), h.unhandled(&b)), (3, 3));
+            {
+                let mut g = h.node.lock().unwrap();
+                g.mark_handled_for(&a, &ids[..1]);
+                let slot = g.peers[&a[..]].slot;
+                g.unpeer(&a);
+                assert!(g.entries.iter().all(|(_, e)| !e.handled_peers.contains(slot) && !e.unhandled_peers.contains(slot)));
+            }
+            h.add_peer(&c, true);
+            assert_eq!((h.unhandled(&c), h.handled(&c)), (0, 0), "nothing of the unpeered peer's");
+            assert_eq!(h.unhandled(&b), 3);
+            let slots: HashSet<usize> = h.node.lock().unwrap().peers.values().map(|p| p.slot).collect();
+            assert_eq!(slots.len(), 2);
         }
 
         fn candidate(n: usize, size: usize, weight: f64) -> OfferCandidate {
@@ -8511,7 +9604,10 @@ mod tests {
             h.add_peer(&peer, true);
             h.add_peer(&other, true);
             let ids = h.store(2, 300);
-            let path_of = |tid: &Vec<u8>| h.node.lock().unwrap().entries[tid].filepath.clone();
+            let path_of = |tid: &Vec<u8>| {
+                let g = h.node.lock().unwrap();
+                g.message_path(tid, g.entries.get(tid).expect("stored"))
+            };
 
             // One of two wanted files is gone: the other is sent.
             h.start(&peer);
@@ -8523,7 +9619,7 @@ mod tests {
             let (payload, concluded) = h.io.take_resource();
             assert_eq!(decode_propagation_batch(&payload).unwrap().messages.len(), 1, "the readable one is sent");
             assert!(!h.node.lock().unwrap().entries.contains_key(&ids[0]), "the one without a file leaves the store");
-            assert!(!h.peer(&other, |p| p.unhandled_ids.contains(&ids[0])), "and every peer's queue");
+            assert!(!h.is_unhandled(&other, &ids[0]), "and every peer's queue");
             concluded(complete());
             h.pump();
             assert_eq!((h.unhandled(&peer), h.handled(&peer)), (0, 1));
@@ -8732,7 +9828,7 @@ mod tests {
             let held = h.store(1, 300).remove(0);
             let held_file = {
                 let g = h.node.lock().unwrap();
-                fs::read(&g.entries[&held].filepath).expect("stored file")
+                fs::read(g.message_path(&held, g.entries.get(&held).expect("stored"))).expect("stored file")
             };
             let message = |fill: u8| {
                 let mut lxmf = vec![fill; 300 - lx_stamper::STAMP_SIZE];
@@ -8748,20 +9844,16 @@ mod tests {
 
             super::ingest_synced(&h.node, &batch(vec![fresh, held_file]), &sender_identity);
             assert!(h.node.lock().unwrap().entries.contains_key(&fresh_id), "the new message is stored");
-            h.peer(&sender, |p| {
-                assert!(!p.unhandled_ids.contains(&fresh_id), "not queued back to the peer that sent it");
-                assert!(!p.unhandled_ids.contains(&held), "a duplicate it sent is no longer queued for it either");
-                assert!(p.handled_ids.contains(&fresh_id) && p.handled_ids.contains(&held), "both handled for it");
-            });
-            h.peer(&other, |p| {
-                assert!(p.unhandled_ids.contains(&fresh_id) && p.unhandled_ids.contains(&held), "the others still get both");
-            });
+            assert!(!h.is_unhandled(&sender, &fresh_id), "not queued back to the peer that sent it");
+            assert!(!h.is_unhandled(&sender, &held), "a duplicate it sent is no longer queued for it either");
+            assert!(h.is_handled(&sender, &fresh_id) && h.is_handled(&sender, &held), "both handled for it");
+            assert!(h.is_unhandled(&other, &fresh_id) && h.is_unhandled(&other, &held), "the others still get both");
 
             // A client PUT: no sending peer, so every peer gets it.
             let (client, client_id) = message(0x79);
             LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(vec![client]), Upload::Packet);
-            assert!(h.peer(&sender, |p| p.unhandled_ids.contains(&client_id)));
-            assert!(h.peer(&other, |p| p.unhandled_ids.contains(&client_id)));
+            assert!(h.is_unhandled(&sender, &client_id));
+            assert!(h.is_unhandled(&other, &client_id));
         }
 
         /// The sender of a sync Resource is the identity recorded when it
@@ -8833,11 +9925,9 @@ mod tests {
             concluded(Arc::new(Mutex::new(resource)));
 
             assert!(h.node.lock().unwrap().entries.contains_key(&id), "the batch is stored");
-            h.peer(&sender, |p| {
-                assert!(!p.unhandled_ids.contains(&id), "not queued back to the peer that sent it");
-                assert!(p.handled_ids.contains(&id), "handled for it");
-            });
-            h.peer(&other, |p| assert!(p.unhandled_ids.contains(&id), "queued for the other peer"));
+            assert!(!h.is_unhandled(&sender, &id), "not queued back to the peer that sent it");
+            assert!(h.is_handled(&sender, &id), "handled for it");
+            assert!(h.is_unhandled(&other, &id), "queued for the other peer");
         }
 
         /// LXMF 1.1.1 LXMRouter.propagation_resource_advertised: a propagation
