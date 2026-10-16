@@ -1531,6 +1531,62 @@ batch (up to ~1 MiB) held. A running rfed has the fix only if it was built
 against 6e53dea or later: `rfed --build` prints the sibling commits it was
 built from.
 
+### Propagation entries and the peers file
+
+rfed keeps what each peer has handled and not as LXMF 1.1.1 does
+(`LXMRouter.propagation_entries`, `LXMPeer.handled_messages` /
+`unhandled_messages`); code in `rfed/src/lxmf_propagation.rs`,
+`PropagationEntries`.
+
+- **One entry per stored message**, in the order received: its destination
+  hash, received time, size and stamp value, and the peers that have handled
+  it and the peers it is unhandled for (the reference's entry `[4]` and
+  `[5]`). Each peer holds a slot, and those two sets are bits of the slots:
+  up to 64 peers they are two words in the entry, past that a vector. A
+  peer's handled and unhandled messages are the entries carrying its bit, in
+  the order received.
+- **Queueing.** A message stored is unhandled for every peer but the one it
+  came from, unless that peer has handled it (`LXMRouter.process_queues`);
+  a message handled for a peer is no longer unhandled for it. Marks only
+  ever name a stored message, and a message that goes (expiry, the storage
+  limit, collected by GET, its file missing) takes its marks with it.
+- **Unpeering** pops the peer, as `LXMRouter.unpeer` does, and the culling
+  of unreachable peers unpeers. Its marks stay on the messages, out of every
+  other peer's reach, and are its again if it peers again, until those
+  messages go; its slot is held until then.
+- **The peers file** (`lxmf_propagation/peers`) is LXMF 1.1.1's: a msgpack
+  array of bin, each an `LXMPeer.to_bytes` (a map of 22 keys in the
+  reference's order, `handled_ids` and `unhandled_ids` arrays of 32-byte
+  bin, read off the entries). At shutdown it is written a peer at a time to
+  `peers.tmp.<unix time>` and renamed over `peers`, as
+  `LXMRouter.exit_handler` does; at start it is read a record at a time,
+  each field as `LXMPeer.from_bytes` reads it, keeping the ids of stored
+  messages only. A peers file an LXMF propagation node wrote loads in rfed,
+  and rfed's loads in LXMF (`rfed/tests/fixtures/`).
+- **rfed's earlier peers file** (rmp_serde, until 2026-10-15) still loads,
+  and is saved in LXMF's format from then on. An rfed from before cannot
+  read LXMF's: it logs `cannot load peers: invalid type: byte array,
+  expected a sequence`, starts with no peers and overwrites the file at its
+  next save. To roll back, keep a copy of the peers file from before the
+  upgrade.
+
+Memory: an entry is 120 bytes and its id index about 55 more, the same for
+any number of peers up to 64. With 44,000 messages and 20 peers they are
+7.4 MiB, where the per-peer id queues they replaced (2026-10-15) were 155
+MiB, and the peers file 29.9 MB, where rfed's earlier one was 73.9.
+
+Departures from the reference, each for a reason:
+
+- **Counters rfed does not keep** (`link_establishment_rate`, `offered`,
+  `outgoing`, `incoming`, `rx_bytes`, `tx_bytes`) are saved as 0, as the
+  reference starts them; rfed reads them and drops them.
+- **A record that cannot be read is skipped** with a WARNING and the others
+  load; a file that is not a list loads no peers. The reference raises
+  (`enable_propagation`: "Could not enable propagation node"), so lxmd does
+  not start until the file is deleted. Losing one peer's marks costs a
+  re-offer of what it may already hold; a node that does not start serves
+  nobody.
+
 ### Announce Metadata
 
 The LXMF propagation destination announces with app_data:
@@ -1742,7 +1798,7 @@ All persisted to `<config_dir>/`:
 | `peers.rmp` | msgpack | Peer sync state & backoff timers |
 | `blobs/<ch_hex>/<id_hex>` | raw bytes | Stored inner blobs (written as `<id_hex>.tmp`, then renamed) |
 | `lxmf_propagation/messagestore/<message_id_hex>` | raw bytes | Stored LXMF propagated messages (when enabled) |
-| `lxmf_propagation/peers` | msgpack | Propagation peer state and sync backoff |
+| `lxmf_propagation/peers` | msgpack, LXMF 1.1.1's | Propagation peers and the messages each has handled and not (§10, Propagation entries and the peers file) |
 | `lxmf_propagation/node_stats` | msgpack map | Propagation message counters |
 
 The SQLite stores run in WAL mode (each has `-wal` and `-shm` files beside
