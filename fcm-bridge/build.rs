@@ -1,5 +1,3 @@
-include!("../build-stamp.rs");
-
 fn main() {
-    stamp("fcm_bridge");
+    build_stamp::stamp("fcm_bridge");
 }

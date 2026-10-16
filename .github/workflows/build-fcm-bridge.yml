@@ -9,7 +9,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/build-fcm-bridge.yml'
-      - 'build-stamp.rs'
+      - 'build-stamp/**'
   # A sibling repo's CI can ask for a rebuild (same event rfed listens to).
   repository_dispatch:
     types: [sibling-updated]
@@ -34,7 +34,7 @@ jobs:
             --disable-lxmf-reticulum-default-features
 
       # Record exactly which sibling commits this build resolved to, as the
-      # rfed workflow does; build-stamp.rs prefers these over its own git
+      # rfed workflow does; build-stamp prefers these over its own git
       # lookups. Without it the image is unattributable.
       - name: Resolve the sibling commits going into this build
         id: stamp

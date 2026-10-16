@@ -1,5 +1,3 @@
-include!("../build-stamp.rs");
-
 fn main() {
-    stamp("rfed");
+    build_stamp::stamp("rfed");
 }

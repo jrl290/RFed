@@ -99,6 +99,7 @@ version = "0.1.0"
 dependencies = [
  "app_links",
  "base64",
+ "build-stamp",
  "configparser",
  "ed25519-dalek",
  "env_logger",
@@ -205,6 +206,10 @@ checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2",
 ]
+
+[[package]]
+name = "build-stamp"
+version = "0.1.0"
 
 [[package]]
 name = "bumpalo"
@@ -542,6 +547,7 @@ version = "0.1.0"
 dependencies = [
  "app_links",
  "base64",
+ "build-stamp",
  "configparser",
  "ed25519-dalek",
  "env_logger",
@@ -1719,6 +1725,7 @@ version = "0.1.0"
 dependencies = [
  "app_links",
  "base64",
+ "build-stamp",
  "configparser",
  "ctrlc",
  "ed25519-dalek",

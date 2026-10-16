@@ -1,5 +1,3 @@
-include!("../build-stamp.rs");
-
 fn main() {
-    stamp("apns_bridge");
+    build_stamp::stamp("apns_bridge");
 }

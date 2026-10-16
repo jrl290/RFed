@@ -41,3 +41,7 @@ ed25519-dalek = "=1.0.1"
 # ci: pick up reticulum_rust 3163440 transport trace demotions
 
 # ci: pick up reticulum_rust 39d00e7 (stale-recovery assert fix)
+
+[build-dependencies]
+# BUILD_STAMP, printed by `--build`: the commits this binary was built from.
+build-stamp = { path = "../build-stamp" }

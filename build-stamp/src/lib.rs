@@ -137,6 +137,12 @@ fn watch_sources(dir: &Path) {
 
 /// Only paths that exist: cargo treats a missing one as changed, which would
 /// re-run this script on every build.
+///
+/// Absolute, as git and `dir` give them. Printed relative to the package, cargo
+/// would resolve them in whichever checkout it builds, but it would judge a
+/// target dir copied from another checkout by mtimes alone, and a checkout
+/// older than the copy kept the copy's stamp (cargo 1.98.1, 2026-10-16). What
+/// notices a copy is this crate's build.rs.
 fn rerun_if_changed(paths: Vec<PathBuf>) {
     for path in paths.iter().filter(|p| p.exists()) {
         println!("cargo:rerun-if-changed={}", path.display());
@@ -159,13 +165,20 @@ fn component(env_var: &str, dir: &Path) -> String {
 }
 
 /// Shared by every crate in this workspace: rfed, apns-bridge, fcm-bridge.
-/// Each crate's `build.rs` is `include!("../build-stamp.rs"); fn main() {
-/// stamp("<name>") }`. The stamp is exposed as `BUILD_STAMP` and names this
-/// repo's commit under the crate's own name, so a running bridge is as
-/// self-describing as a running rfed — until 2026-09-22 the two bridges had
-/// no stamp at all, and "which Reticulum-rust is the push relay running?"
-/// could only be answered from CI history.
-fn stamp(crate_name: &str) {
+/// Each takes this crate as a build-dependency, and its `build.rs` is `fn
+/// main() { build_stamp::stamp("<name>") }`. The stamp is exposed as
+/// `BUILD_STAMP` and names this repo's commit under the crate's own name, so a
+/// running bridge is as self-describing as a running rfed — until 2026-09-22
+/// the two bridges had no stamp at all, and "which Reticulum-rust is the push
+/// relay running?" could only be answered from CI history.
+///
+/// A crate rather than a file each `build.rs` `include!`s, so that cargo tracks
+/// this code relative to this checkout. rustc named the included file
+/// `rfed/../build-stamp.rs`, outside the package, and cargo recorded it by its
+/// absolute path: in a target dir copied from another checkout the build
+/// scripts stayed compiled from that checkout's copy, and editing this one
+/// recompiled nothing.
+pub fn stamp(crate_name: &str) {
     let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let this_repo = Path::new(&manifest)
         .parent()

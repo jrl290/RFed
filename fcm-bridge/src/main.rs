@@ -30,7 +30,7 @@ use std::process;
 use log::{error, info};
 
 /// Commits of this repo and every sibling this binary was built from
-/// (see build-stamp.rs). Logged at startup and printed by `--build`.
+/// (see build-stamp/src/lib.rs). Logged at startup and printed by `--build`.
 pub const BUILD_STAMP: &str = env!("BUILD_STAMP");
 
 fn main() {
