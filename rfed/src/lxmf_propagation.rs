@@ -9897,6 +9897,109 @@ mod tests {
             assert!(h.is_unhandled(&other, &client_id));
         }
 
+        /// LXMF 1.1.1 LXMRouter.lxmf_propagation stores a message only when
+        /// its transient id is in neither `propagation_entries` nor
+        /// `locally_processed_transient_ids`, and records it in the second as
+        /// it stores it. A client's GET "haves" pops the entry and leaves the
+        /// record (message_get_request), so a message a client has collected
+        /// is never stored, or queued to the peers, again: not when a peer
+        /// that still holds it sends it (offer_request wants any id that is
+        /// not in `propagation_entries`), nor when its sender uploads it again.
+        #[test]
+        fn a_message_a_client_collected_is_not_stored_or_queued_again() {
+            let h = Harness::new("processed_collected");
+            {
+                // Any stamp meets cost 0; the test is about what is stored.
+                let mut g = h.node.lock().unwrap();
+                g.stamp_cost = 0;
+                g.stamp_flexibility = 0;
+            }
+            let peer_identity = Identity::new(true);
+            let peer = Destination::hash_from_name_and_identity("lxmf.propagation", Some(&peer_identity));
+            let other = [0x74u8; 16];
+            h.add_peer(&peer, true);
+            h.add_peer(&other, true);
+
+            let client = Identity::new(true);
+            let mut lxmf = vec![0x7Bu8; 300 - lx_stamper::STAMP_SIZE];
+            lxmf[..16].copy_from_slice(&Destination::hash_from_name_and_identity("lxmf.delivery", Some(&client)));
+            let id = reticulum_rust::identity::full_hash(&lxmf);
+            let stamped = [lxmf, vec![0x33u8; lx_stamper::STAMP_SIZE]].concat();
+            let batch = |message: &[u8]| encode_value(Value::Array(vec![
+                Value::F64(0.0),
+                Value::Array(vec![Value::Binary(message.to_vec())]),
+            ]));
+            let stored = || h.node.lock().unwrap().entries.contains_key(&id);
+
+            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(&stamped), Upload::Packet);
+            assert!(h.is_unhandled(&peer, &id) && h.is_unhandled(&other, &id), "stored and queued for both peers");
+
+            // The recipient has downloaded it and says so.
+            let haves = encode_value(Value::Array(vec![Value::Nil, Value::Array(vec![Value::Binary(id.clone())])]));
+            h.node.lock().unwrap().handle_get("", &haves, &[], Some(&client), 0.0);
+            assert!(!stored(), "collected");
+
+            super::ingest_synced(&h.node, &batch(&stamped), &peer_identity);
+            assert!(!stored(), "a peer's copy of a collected message is not stored again");
+
+            // As LXMessage does when the proof of its upload never came.
+            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(&stamped), Upload::Packet);
+            assert!(!stored(), "nor is the sender's second upload");
+        }
+
+        /// The same for a message the store let go of: expired, or the oldest
+        /// over the storage limit (LXMRouter.clean_message_store pops the
+        /// entry, not the record).
+        #[test]
+        fn a_message_the_store_let_go_of_is_not_stored_again() {
+            let h = Harness::new("processed_evicted");
+            {
+                let mut g = h.node.lock().unwrap();
+                g.stamp_cost = 0;
+                g.stamp_flexibility = 0;
+            }
+            let peer_identity = Identity::new(true);
+            let peer = Destination::hash_from_name_and_identity("lxmf.propagation", Some(&peer_identity));
+            h.add_peer(&peer, true);
+            let message = |fill: u8| {
+                let mut lxmf = vec![fill; 300 - lx_stamper::STAMP_SIZE];
+                lxmf[..16].copy_from_slice(&[0x5E; 16]);
+                let id = reticulum_rust::identity::full_hash(&lxmf);
+                ([lxmf, vec![0x33u8; lx_stamper::STAMP_SIZE]].concat(), id)
+            };
+            let batch = |message: &[u8]| encode_value(Value::Array(vec![
+                Value::F64(0.0),
+                Value::Array(vec![Value::Binary(message.to_vec())]),
+            ]));
+            let stored = |id: &[u8]| h.node.lock().unwrap().entries.contains_key(id);
+            let (expiring, expiring_id) = message(0x7C);
+            let (oldest, oldest_id) = message(0x7D);
+
+            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(&expiring), Upload::Packet);
+            {
+                // Received a whole expiry period ago.
+                let mut g = h.node.lock().unwrap();
+                let mut entry = g.entries.remove(&expiring_id).expect("stored");
+                entry.received -= MESSAGE_EXPIRY_SECS + 60.0;
+                g.entries.insert(expiring_id.clone().try_into().unwrap(), entry);
+                g.evict_expired();
+            }
+            assert!(!stored(&expiring_id), "expired");
+            super::ingest_synced(&h.node, &batch(&expiring), &peer_identity);
+            assert!(!stored(&expiring_id), "a peer's copy of an expired message is not stored again");
+
+            LxmfPropagationNode::ingest_propagation_batch(&h.node, &batch(&oldest), Upload::Packet);
+            {
+                let mut g = h.node.lock().unwrap();
+                g.storage_limit_bytes = 1;
+                g.enforce_storage_limit();
+                g.storage_limit_bytes = 0;
+            }
+            assert!(!stored(&oldest_id), "over the storage limit");
+            super::ingest_synced(&h.node, &batch(&oldest), &peer_identity);
+            assert!(!stored(&oldest_id), "a peer's copy of a message over the limit is not stored again");
+        }
+
         /// The sender of a sync Resource is the identity recorded when it
         /// advertised, while its link was up. rfed asked the link when the
         /// Resource concluded, after Reticulum-rust had sent the proof on
