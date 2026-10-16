@@ -632,7 +632,9 @@ pub struct PropPeer {
     /// (`PropagationEntry::handled_peers` and `unhandled_peers`): its
     /// handled and unhandled messages are read off the store
     /// (`PropagationEntries::handled_messages` and `unhandled_messages`).
-    /// Given by `insert_peer`; no two peers hold the same slot.
+    /// Given by `insert_peer`, or by `load_peers` as it reads the peer's
+    /// record; no two peers hold the same slot, nor does a peer hold one an
+    /// unpeered peer's marks still hold (`departed_slots`).
     pub slot: usize,
 
     /// The ids in the sync Resource now in flight
@@ -1041,6 +1043,13 @@ pub struct LxmfPropagationNode {
 
     // ── Peer tracking ─────────────────────────────────────────────────
     pub peers: HashMap<Vec<u8>, PropPeer>,
+    /// The slots of peers unpeered while stored messages still carry their
+    /// marks, by destination hash. The reference pops an unpeered LXMPeer and
+    /// leaves its hash in the entries until those messages go, and a peer of
+    /// that hash created later finds them there; so its slot is held, and is
+    /// its again if it peers again (`insert_peer`). Not saved: the reference
+    /// saves only its peers, so after a restart the marks are gone there too.
+    departed_slots: HashMap<Vec<u8>, usize>,
 
     /// Dedup guard: peer hashes for which a peering-key PoW thread is
     /// currently in flight.  Without this, tick_sync (every ~6 s) re-spawns
@@ -1159,6 +1168,7 @@ impl LxmfPropagationNode {
             messagestore_path,
             entries: PropagationEntries::default(),
             peers: HashMap::new(),
+            departed_slots: HashMap::new(),
             in_flight_keys: HashSet::new(),
             storage_path,
             messages_received: 0,
@@ -1570,37 +1580,46 @@ impl LxmfPropagationNode {
         }
     }
 
-    /// Add `peer` with a slot of its own (`PropPeer::slot`). A peer of the
-    /// same hash is replaced, and what was handled and unhandled for it is
-    /// forgotten.
+    /// Add `peer` with a slot of its own (`PropPeer::slot`). LXMF finds a
+    /// peer's handled and unhandled messages by its hash, so a peer that
+    /// replaces one of the same hash, or peers again after it was unpeered,
+    /// takes that slot and what was handled and unhandled for it.
     fn insert_peer(&mut self, mut peer: PropPeer) -> &mut PropPeer {
-        if let Some(old) = self.peers.remove(&peer.destination_hash) {
-            self.entries.forget_peer(old.slot);
-        }
-        peer.slot = self.free_peer_slot();
+        let hash = &peer.destination_hash;
+        peer.slot = match self.peers.remove(hash).map(|old| old.slot).or_else(|| self.departed_slots.remove(hash)) {
+            Some(slot) => slot,
+            None => self.free_peer_slot(),
+        };
         self.peers.entry(peer.destination_hash.clone()).or_insert(peer)
     }
 
-    /// The lowest slot no peer holds.
-    fn free_peer_slot(&self) -> usize {
-        let mut held = vec![false; self.peers.len() + 1];
-        for peer in self.peers.values() {
-            if let Some(held) = held.get_mut(peer.slot) {
+    /// The lowest slot held neither by a peer nor by an unpeered peer's
+    /// marks. An unpeered peer whose marked messages have all gone holds
+    /// nothing any more, as nothing names its hash in the reference.
+    fn free_peer_slot(&mut self) -> usize {
+        let entries = &self.entries;
+        self.departed_slots
+            .retain(|_, slot| entries.handled_message_count(*slot) + entries.unhandled_message_count(*slot) > 0);
+        let taken = self.peers.len() + self.departed_slots.len();
+        let mut held = vec![false; taken + 1];
+        for slot in self.peers.values().map(|peer| peer.slot).chain(self.departed_slots.values().copied()) {
+            if let Some(held) = held.get_mut(slot) {
                 *held = true;
             }
         }
-        held.iter().position(|held| !held).unwrap_or(self.peers.len())
+        held.iter().position(|held| !held).unwrap_or(taken)
     }
 
     fn unpeer(&mut self, destination_hash: &[u8]) {
         // A session in flight ends with the peer: its held link goes, and its
         // callbacks find no peer and are dropped.
         self.sync_io.close_link(destination_hash);
-        // rfed forgets what it had handled and unhandled for the peer, so its
-        // slot can go to another; the reference keeps a departed peer's hash in
-        // the entries.
+        // As LXMRouter.unpeer pops the peer: what was handled and unhandled
+        // for it stays on the messages, and is its again if it peers again.
         if let Some(peer) = self.peers.remove(destination_hash) {
-            self.entries.forget_peer(peer.slot);
+            if self.entries.handled_message_count(peer.slot) + self.entries.unhandled_message_count(peer.slot) > 0 {
+                self.departed_slots.insert(peer.destination_hash, peer.slot);
+            }
         }
         log(
             format!("[lxmf.prop] unpeered {}", hexrep(destination_hash, false)),
@@ -9301,28 +9320,49 @@ mod tests {
             v
         }
 
-        /// Each peer holds a slot of its own in the store's peer sets, and a
-        /// peer given an unpeered peer's slot starts clean.
+        /// Each peer holds a slot of its own in the store's peer sets. As
+        /// LXMRouter.unpeer only pops the peer, an unpeered peer's marks stay
+        /// on the messages, out of every other peer's reach, and are its again
+        /// if it peers again; once those messages have gone, its slot is free.
         #[test]
-        fn a_new_peer_never_inherits_an_unpeered_peers_messages() {
+        fn an_unpeered_peer_keeps_its_messages_until_they_go() {
             let h = Harness::new("peer_slots");
-            let (a, b, c) = ([0xA1u8; 16], [0xB2u8; 16], [0xC3u8; 16]);
+            let (a, b, c, d) = ([0xA1u8; 16], [0xB2u8; 16], [0xC3u8; 16], [0xD4u8; 16]);
             h.add_peer(&a, true);
             h.add_peer(&b, true);
             let ids = h.store(3, 300);
             assert_eq!((h.unhandled(&a), h.unhandled(&b)), (3, 3));
-            {
+            let a_slot = {
                 let mut g = h.node.lock().unwrap();
                 g.mark_handled_for(&a, &ids[..1]);
                 let slot = g.peers[&a[..]].slot;
                 g.unpeer(&a);
-                assert!(g.entries.iter().all(|(_, e)| !e.handled_peers.contains(slot) && !e.unhandled_peers.contains(slot)));
-            }
+                slot
+            };
+            // Stored while a is away: queued for the peers there are, as
+            // process_queues queues it.
+            let later = h.store(1, 300);
             h.add_peer(&c, true);
+            assert_ne!(h.peer(&c, |p| p.slot), a_slot);
             assert_eq!((h.unhandled(&c), h.handled(&c)), (0, 0), "nothing of the unpeered peer's");
-            assert_eq!(h.unhandled(&b), 3);
-            let slots: HashSet<usize> = h.node.lock().unwrap().peers.values().map(|p| p.slot).collect();
-            assert_eq!(slots.len(), 2);
+            assert_eq!(h.unhandled(&b), 4);
+
+            h.add_peer(&a, true);
+            assert_eq!(h.peer(&a, |p| p.slot), a_slot);
+            assert_eq!((h.unhandled(&a), h.handled(&a)), (2, 1), "a peers again with what it had");
+            assert!(!h.is_unhandled(&a, &later[0]) && h.is_unhandled(&b, &later[0]));
+
+            {
+                let mut g = h.node.lock().unwrap();
+                g.unpeer(&a);
+                for id in &ids {
+                    g.entries.remove(id);
+                }
+            }
+            h.add_peer(&d, true);
+            assert_eq!(h.peer(&d, |p| p.slot), a_slot, "a's messages are gone, and its slot with them");
+            assert_eq!((h.unhandled(&d), h.handled(&d)), (0, 0));
+            assert_eq!(h.unhandled(&b), 1);
         }
 
         fn candidate(n: usize, size: usize, weight: f64) -> OfferCandidate {
@@ -9435,8 +9475,9 @@ mod tests {
         }
 
         /// Every answer to an offer ends the session as LXMPeer.offer_response
-        /// and SPEC §10 say, and releases the link: 0xF1 unpeers (the one
-        /// answer that discards a peer's queues), 0xF3 discards the key, 0xF6
+        /// and SPEC §10 say, and releases the link: 0xF1 unpeers (its marks
+        /// stay on the messages, as LXMRouter.unpeer leaves them), 0xF3
+        /// discards the key, 0xF6
         /// holds the peer without demoting it, `false` hands every offered
         /// id, and any other code, nil, no data or bytes that are not msgpack
         /// leave every id unhandled.
