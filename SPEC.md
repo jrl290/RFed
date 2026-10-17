@@ -2208,6 +2208,8 @@ with D's key) to a recipient R, where R != D, also sends a copy C:
 | `fields[0xFB]` (FIELD_CUSTOM_TYPE) | `"rfed.distro.sent"` |
 | `fields[0xFC]` (FIELD_CUSTOM_DATA) | R's `lxmf.delivery` address, 32 lowercase hex characters |
 | `fields[0xFD]` (FIELD_CUSTOM_META) | The **sending device's own** `lxmf.delivery` address, 32 lowercase hex characters |
+| `fields[0xD1]` key 12 (`SENT_HASH`) | M's LXMF hash, 64 lowercase hex characters, so a sibling can find M when R reacts to it (REACTIONS-DESIGN.md §5.2, 2026-10-17). Absent from copies made before it |
+| `fields[0x40]` (FIELD_REACTION) | M's own 0x40, unchanged, when M is a reaction (then M's title and content are empty, and so are C's). Absent otherwise |
 | Method | PROPAGATED at once (D is a distro, §17.10), with a §17.13 sync proof; RFed intercepts it on `lxmf.propagation` like any distro message (§17.1) and fans it out to every registered device of D, the sender included, waking none (§17.13). Without an accepted proof (an older sender) an unconfirmed device is woken |
 
 C is made once per message the user sent, not once per delivery attempt or
@@ -2316,7 +2318,13 @@ existing behaviour.
      stored once;
    - the conversation with R is created if it does not exist, with no
      contact request and no stranger filter, since the user wrote to R;
-   - no push or local notification: it is the user's own sent message.
+   - no push or local notification: it is the user's own sent message;
+   - its LXMF hash is `fields[0xD1]` key 12 when that is a str of 64 hex
+     characters (lowercased), and unknown otherwise.
+
+   A copy that carries `fields[0x40]` is not stored: it is the user's own
+   reaction to a message in the conversation with R, applied as
+   REACTIONS-DESIGN.md §3 with reactor D (no message, no notification).
 
 `lxmf_rust::distro::unwrap_blob` reads the marker for both native bridges:
 `DistroMessage.sent_to` is `fields[0xFC]` lowercased, and is set only when
@@ -2334,6 +2342,9 @@ in a conversation with D. That remains so until the client is updated. It is
 not worked around on the sending side or in RFed: RFed never decrypts the
 copy, and suppressing copies to hide it would take the feature away from
 updated siblings.
+Likewise a sibling that predates key 12 and `0x40` (2026-10-17) files the copy
+of a reaction as a sent message with no text, which each client shows with its
+§17.11 placeholder, until it is updated.
 
 **Privacy.** `fields[0xFD]` reveals which device sent M. C is encrypted to D,
 so only holders of the distro key can read it, and they are the user's own
@@ -4232,7 +4243,8 @@ last element of every op is `left`. Receivers ignore elements after it.
 | `create` | `["create", group_id, at_ms, name, members, keys, left]`: the creator is D |
 | `accept` | `["accept", group_id, at_ms, name, members, keys, creator, left]` |
 | `leave` | `["leave", group_id, at_ms, left]` |
-| `post` | `["post", group_id, at_ms, text, left]`: `at_ms` is the post's own time as the sending device stored it |
+| `post` | `["post", group_id, at_ms, text, left, post_id]`: `at_ms` is the post's own time as the sending device stored it. `post_id` comes after `left`, so a device older than it ignores it; a post synced by such a device has none |
+| `react` | `["react", group_id, at_ms, content, left, post_id]`: the user reacted to a post (REACTIONS-DESIGN.md, 2026-10-17). `at_ms` is the reaction's time. The shape of `post`, with `post_id` required. A device older than it does not know the op and drops G (rule 4) |
 
 - `name`: the group's name, UTF-8 str (receivers accept bin), possibly empty.
 - `members`: a str, the group's `GROUP_MEMBERS` csv exactly as the invite
@@ -4250,6 +4262,13 @@ last element of every op is `left`. Receivers ignore elements after it.
 - `text`: the post's content unchanged, UTF-8 str (receivers accept bin). Text
   only, as §17.11: attachments are **not** copied. An attachment-only post
   copies an empty text, which a sibling shows as it shows such a §17.11 copy.
+- `post_id`: a str of 32 hex characters, the post's `GROUP_POST_ID`
+  (RFed-spec Group.md, the same on every copy of the post), written
+  lowercase. In a `post`, a receiver takes it only when it is a str of 32
+  hex and otherwise ignores it, as any element after `left`; in a `react` it
+  is required, and anything else fails rule 4.
+- `content`: the reaction, UTF-8 str (receivers accept bin), at most 64
+  bytes; empty when the user took their reaction back.
 - `left`: an array of at most 32 str of 32 hex characters, the ids of the
   groups the sending device holds as left by D (the user's own leaves as D,
   and every leave it applied from a G or from another G's `left`), most recent
@@ -4274,7 +4293,8 @@ the action on the device, as §17.12 makes C. A `post` G is made as §17.11
 makes a sent copy: once per post, only after the post was submitted to the
 members (a held send when it is released and the first member envelope is
 accepted; a post to a group with no other accepted member when it is stored),
-and never for a send that throws, since that post never left. Every rule of
+and never for a send that throws, since that post never left. A `react` G is
+made as a `post` G, once per reaction (or removal) the user makes. Every rule of
 §17.12 "On the sending device" applies to G as written there for the membership
 message, under the decided exception of DESIGN_PRINCIPLES.md §3, which James
 extended on 2026-10-10 from two kinds to three (the §3 paragraph names the
@@ -4340,7 +4360,8 @@ addresses excluded; then its held messages, in arrival order.
 | `create` | held from G | the pending invite held there is discarded without sending anything (logged with its inviter), then held from G | nothing | nothing |
 | `accept` | held from G | when the pending invite's recorded creator and member list are G's: joined, as the user's own accept on this device would make it, without sending, its held messages after; otherwise the pending invite is discarded without sending anything (logged), then held from G | nothing | nothing: a leave is final, and an accept never reopens it |
 | `leave` | the group id recorded as left, so a later invite, `create` or `accept` for it is ignored | declined, as the user's own decline on this device would, without sending | left, as the user's own leave on this device would, without sending | nothing |
-| `post` | held (above) | held (above) | stored as the user's own outgoing post in the group: sender D, state SENT (as §17.11 rule 5: never DELIVERED, never sending or failed), timestamp `at_ms`, the text, no notification, its id G's LXMF hash | dropped |
+| `post` | held (above) | held (above) | stored as the user's own outgoing post in the group: sender D, state SENT (as §17.11 rule 5: never DELIVERED, never sending or failed), timestamp `at_ms`, the text, no notification, its id G's LXMF hash, its post id `post_id` when G carries one | dropped |
+| `react` | dropped | dropped | applied as the user's own reaction (reactor D, time `at_ms`) to the post the group holds with that post id, under REACTIONS-DESIGN.md §3: a newer reaction replaces an older one, an empty `content` removes it; no message is stored, no notification; dropped with a log line when no such post is held | dropped |
 
 The user's own sync outranks anyone else's invite for its group id. A
 co-member learns the id from its own invite chunk and can send its own invite
