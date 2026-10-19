@@ -40,14 +40,16 @@ pub enum PacketProof {
     Observed,
 }
 
-/// OBSERVED UNTIL THE APPS THAT PROVE ARE ON MOST DEVICES (James, 2026-09-26:
-/// "we will reenable it in a month or so", so about 2026-10-26). Apps prove
-/// rfed.delivery from Retichat-android 21e520b, Retichat-ios fbc2e83 and
-/// Retichat-js 15f9ac5. Against an app that never proves, `Required` hands off
-/// every packet, and the announce flush then sends the queued copy again on
-/// each announce, again and again. To re-enable: set `Required` here and in
-/// `tests::the_packet_proof_is_observed_until_the_apps_are_updated`.
-pub const DELIVERY_PACKET_PROOF: PacketProof = PacketProof::Observed;
+/// REQUIRED (2026-10-19). Observed from 2026-09-26 (James: "we will reenable
+/// it in a month or so") until the apps that prove were released: Retichat-
+/// android from v0.1.7 (21e520b), Retichat-ios from 1.28 (fbc2e83), the web
+/// from 15f9ac5. While observed, a post pushed to a device whose link had
+/// died unnoticed (back from the background, the phone offline meanwhile) was
+/// sent once and never queued, so the device's pull on its return found
+/// nothing (staging stage_android_channel_resume). Against an app that never
+/// proves (iOS before 1.28), `Required` hands off every packet, and the
+/// announce flush sends the queued copy again on each announce.
+pub const DELIVERY_PACKET_PROOF: PacketProof = PacketProof::Required;
 
 /// Tie an `rfed.delivery` packet's receipt to its verdict under `mode`.
 /// `Required`: delivered on the proof, `hand_off` on the receipt timeout.
@@ -413,13 +415,12 @@ fn un_pulled_after(held: usize, outcome: &EnqueueOutcome, distro_hash: &[u8]) ->
 mod tests {
     use super::*;
 
-    /// The intermediary step (James, 2026-09-26): the rfed.delivery packet's
-    /// proof is observed, not required, until the apps that prove are on
-    /// most devices (about 2026-10-26). Re-enabling is a deliberate change
-    /// to this test and to DELIVERY_PACKET_PROOF together.
+    /// The rfed.delivery packet's proof is required (2026-10-19): observed
+    /// from 2026-09-26 until the apps that prove were released. Changing it
+    /// is a deliberate change to this test and to DELIVERY_PACKET_PROOF together.
     #[test]
-    fn the_packet_proof_is_observed_until_the_apps_are_updated() {
-        assert_eq!(DELIVERY_PACKET_PROOF, PacketProof::Observed);
+    fn the_packet_proof_is_required() {
+        assert_eq!(DELIVERY_PACKET_PROOF, PacketProof::Required);
     }
 
     // ── The distro hand-off and its bounds (DISTRO-SYNC-PROOF-DESIGN §6.3) ─
