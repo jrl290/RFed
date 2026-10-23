@@ -51,6 +51,16 @@ pub struct FcmSender {
     token_cache: Mutex<AccessTokenCache>,
 }
 
+/// A wake from rfed, its hashes as lowercase hex (RFed-spec Notify.md
+/// "Wake packet"). `message` is the stored item's transient id, 64 chars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wake {
+    pub receiver: String,
+    pub sender: Option<String>,
+    pub channel: Option<String>,
+    pub message: Option<String>,
+}
+
 pub struct SendResult {
     pub success: bool,
     pub http_code: u16,
@@ -103,9 +113,7 @@ impl FcmSender {
     pub fn send(
         &self,
         fcm_token: &str,
-        receiver_hex: &str,
-        sender_hex: Option<&str>,
-        channel_hex: Option<&str>,
+        wake: &Wake,
     ) -> SendResult {
         let access_token = match self.access_token() {
             Ok(token) => token,
@@ -122,7 +130,7 @@ impl FcmSender {
             "https://fcm.googleapis.com/v1/projects/{}/messages:send",
             self.project_id
         );
-        let body = self.build_payload(fcm_token, receiver_hex, sender_hex, channel_hex);
+        let body = self.build_payload(fcm_token, wake);
 
         let resp = self
             .client
@@ -221,26 +229,11 @@ impl FcmSender {
         Ok(parsed.access_token)
     }
 
-    fn build_payload(
-        &self,
-        fcm_token: &str,
-        receiver_hex: &str,
-        sender_hex: Option<&str>,
-        channel_hex: Option<&str>,
-    ) -> Value {
-        let mut data = Map::new();
-        data.insert("receiver".to_string(), Value::String(receiver_hex.to_string()));
-        if let Some(sender) = sender_hex {
-            data.insert("sender".to_string(), Value::String(sender.to_string()));
-        }
-        if let Some(channel) = channel_hex {
-            data.insert("channel".to_string(), Value::String(channel.to_string()));
-        }
-
+    fn build_payload(&self, fcm_token: &str, wake: &Wake) -> Value {
         json!({
             "message": {
                 "token": fcm_token,
-                "data": data,
+                "data": data_map(wake),
                 "android": {
                     "priority": "HIGH",
                     "restricted_package_name": self.app_package_name,
@@ -249,6 +242,18 @@ impl FcmSender {
             }
         })
     }
+}
+
+/// The push's data map: the wake's hashes as hex, absent ones left out.
+fn data_map(wake: &Wake) -> Map<String, Value> {
+    let mut data = Map::new();
+    data.insert("receiver".to_string(), Value::String(wake.receiver.clone()));
+    for (key, value) in [("sender", &wake.sender), ("channel", &wake.channel), ("message", &wake.message)] {
+        if let Some(value) = value {
+            data.insert(key.to_string(), Value::String(value.clone()));
+        }
+    }
+    data
 }
 
 fn extract_fcm_error(text: &str) -> Option<String> {
@@ -277,4 +282,29 @@ fn extract_fcm_error(text: &str) -> Option<String> {
                 .and_then(|m| m.as_str())
                 .map(|m| m.to_string())
         })
+}
+#[cfg(test)]
+mod tests {
+    use super::{data_map, Wake};
+    use serde_json::{json, Value};
+
+    #[test]
+    fn the_push_names_the_message() {
+        let wake = Wake {
+            receiver: "55".repeat(16),
+            sender: None,
+            channel: None,
+            message: Some("22".repeat(32)),
+        };
+        assert_eq!(
+            Value::Object(data_map(&wake)),
+            json!({ "receiver": "55".repeat(16), "message": "22".repeat(32) }),
+        );
+    }
+
+    #[test]
+    fn a_wake_without_a_message_has_no_message() {
+        let wake = Wake { receiver: "55".repeat(16), sender: None, channel: Some("33".repeat(16)), message: None };
+        assert_eq!(Value::Object(data_map(&wake)), json!({ "receiver": "55".repeat(16), "channel": "33".repeat(16) }));
+    }
 }

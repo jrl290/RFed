@@ -36,6 +36,16 @@ pub struct ApnsSender {
     default_env: ApnsEnv,
 }
 
+/// A wake from rfed, its hashes as lowercase hex (RFed-spec Notify.md
+/// "Wake packet"). `message` is the stored item's transient id, 64 chars.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wake {
+    pub receiver: String,
+    pub sender:   Option<String>,
+    pub channel:  Option<String>,
+    pub message:  Option<String>,
+}
+
 pub struct SendResult {
     pub success:   bool,
     pub http_code: u16,
@@ -100,29 +110,29 @@ impl ApnsSender {
         &self,
         apns_token:   &str,
         env:          ApnsEnv,
-        receiver_hex: &str,
-        sender_hex:   Option<&str>,
-        channel_hex:  Option<&str>,
+        wake:         &Wake,
     ) -> SendResult {
         let ep  = self.endpoint(env);
         let url = format!("{}/3/device/{}", ep.host, apns_token);
-        let body = self.build_payload(receiver_hex, sender_hex, channel_hex);
+        let body = self.build_payload(wake);
 
         let token = {
             let mut jwt = ep.jwt.lock().unwrap_or_else(|e| e.into_inner());
             jwt.get().to_string()
         };
 
-        let resp = ep
+        let mut request = ep
             .client
             .post(&url)
             .header("Authorization", format!("bearer {token}"))
             .header("apns-topic", &self.bundle_id)
             .header("apns-push-type", &self.push_type)
             .header("apns-priority", "10")
-            .header("Content-Type", "application/json")
-            .body(body)
-            .send();
+            .header("Content-Type", "application/json");
+        if let Some(id) = collapse_id(wake) {
+            request = request.header("apns-collapse-id", id);
+        }
+        let resp = request.body(body).send();
 
         match resp {
             Err(e) => SendResult { success: false, http_code: 0, reason: Some(e.to_string()) },
@@ -146,24 +156,63 @@ impl ApnsSender {
         http_code == 410 || (http_code == 400 && reason == Some("BadDeviceToken"))
     }
 
-    fn build_payload(
-        &self,
-        receiver: &str,
-        sender:   Option<&str>,
-        channel:  Option<&str>,
-    ) -> String {
-        let mut rfed = json!({ "receiver": receiver });
-        if let Some(s) = sender  { rfed["sender"]  = json!(s); }
-        if let Some(c) = channel { rfed["channel"] = json!(c); }
-
+    fn build_payload(&self, wake: &Wake) -> String {
         json!({
             "aps": {
                 "alert": { "title": self.alert_title, "body": self.alert_body },
                 "sound": "default",
                 "mutable-content": 1
             },
-            "rfed": rfed
+            "rfed": rfed_dictionary(wake)
         })
         .to_string()
+    }
+}
+
+/// The push's `rfed` dictionary: the wake's hashes as hex, absent ones left out.
+fn rfed_dictionary(wake: &Wake) -> Value {
+    let mut rfed = json!({ "receiver": wake.receiver });
+    if let Some(s) = &wake.sender  { rfed["sender"]  = json!(s); }
+    if let Some(c) = &wake.channel { rfed["channel"] = json!(c); }
+    if let Some(m) = &wake.message { rfed["message"] = json!(m); }
+    rfed
+}
+
+/// The `apns-collapse-id` of the wake's push: its message's transient id, so
+/// APNs shows repeated wakes for one item as one notification. 64 hex chars,
+/// the header's limit.
+fn collapse_id(wake: &Wake) -> Option<&str> {
+    wake.message.as_deref()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collapse_id, rfed_dictionary, Wake};
+    use serde_json::json;
+
+    fn wake(message: Option<&str>) -> Wake {
+        Wake {
+            receiver: "55".repeat(16),
+            sender:   None,
+            channel:  Some("33".repeat(16)),
+            message:  message.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_push_names_the_message() {
+        let message = "22".repeat(32);
+        assert_eq!(
+            rfed_dictionary(&wake(Some(&message))),
+            json!({ "receiver": "55".repeat(16), "channel": "33".repeat(16), "message": message }),
+        );
+        assert_eq!(collapse_id(&wake(Some(&message))), Some(message.as_str()));
+        assert_eq!(message.len(), 64, "apns-collapse-id holds at most 64 bytes");
+    }
+
+    #[test]
+    fn a_wake_without_a_message_has_no_message_and_no_collapse_id() {
+        assert_eq!(rfed_dictionary(&wake(None)), json!({ "receiver": "55".repeat(16), "channel": "33".repeat(16) }));
+        assert_eq!(collapse_id(&wake(None)), None);
     }
 }

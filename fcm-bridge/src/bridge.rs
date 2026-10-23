@@ -28,7 +28,7 @@ use reticulum_rust::transport::Transport;
 
 use crate::config::BridgeConfig;
 use crate::db::TokenDB;
-use crate::fcm::FcmSender;
+use crate::fcm::{FcmSender, Wake};
 
 const RELAY_APP: &str = "rfed";
 const RELAY_ASPECT: &str = "notify";
@@ -273,6 +273,19 @@ fn load_or_create_identity(path_str: &str) -> Result<Identity, String> {
     }
 }
 
+/// The wake in a decoded wake map (RFed-spec Notify.md "Wake packet"), or
+/// `None` without a 16-byte `receiver`. A hash of the wrong length is left
+/// out, and the wake goes on without it.
+fn wake_from_map(map: &[(Value, Value)]) -> Option<Wake> {
+    let field = |key: &str, len: usize| map_get_bin(map, key).filter(|b| b.len() == len).map(hex::encode);
+    Some(Wake {
+        receiver: field("receiver", 16)?,
+        sender: field("sender", 16),
+        channel: field("channel", 16),
+        message: field("message", 32),
+    })
+}
+
 fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
     debug!("[dispatch_wake] inbound packet received, size={} bytes", raw.len());
 
@@ -284,26 +297,21 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
         }
     };
 
-    let receiver = match map_get_bin(&map, "receiver") {
-        Some(b) if b.len() == 16 => b,
-        _ => {
+    let wake = match wake_from_map(&map) {
+        Some(wake) => wake,
+        None => {
             warn!("[dispatch_wake] missing valid 'receiver' key");
             return;
         }
     };
-    let receiver_hex = hex::encode(&receiver);
-    let sender_hex = map_get_bin(&map, "sender")
-        .filter(|b| b.len() == 16)
-        .map(|b| hex::encode(&b));
-    let channel_hex = map_get_bin(&map, "channel")
-        .filter(|b| b.len() == 16)
-        .map(|b| hex::encode(&b));
+    let receiver_hex = wake.receiver.clone();
 
     let n = state.notify_count.fetch_add(1, Ordering::Relaxed) + 1;
     info!(
-        "NOTIFY #{n} received  receiver={receiver_hex} sender={} channel={}",
-        sender_hex.as_deref().unwrap_or("-"),
-        channel_hex.as_deref().unwrap_or("-")
+        "NOTIFY #{n} received  receiver={receiver_hex} sender={} channel={} message={}",
+        wake.sender.as_deref().unwrap_or("-"),
+        wake.channel.as_deref().unwrap_or("-"),
+        wake.message.as_deref().unwrap_or("-")
     );
 
     let fcm_token = match state
@@ -323,12 +331,7 @@ fn dispatch_wake(raw: Vec<u8>, state: &BridgeState) {
         }
     };
 
-    let result = state.fcm.send(
-        &fcm_token,
-        &receiver_hex,
-        sender_hex.as_deref(),
-        channel_hex.as_deref(),
-    );
+    let result = state.fcm.send(&fcm_token, &wake);
 
     if result.success {
         let pushed = state.push_count.fetch_add(1, Ordering::Relaxed) + 1;
@@ -466,7 +469,7 @@ mod tests {
     use reticulum_rust::destination::Destination;
 
     use super::{
-        map_get_bin, parse_msgpack_map, REGISTER_APP, REGISTER_ASPECT, RELAY_APP, RELAY_ASPECT,
+        map_get_bin, parse_msgpack_map, wake_from_map, REGISTER_APP, REGISTER_ASPECT, RELAY_APP, RELAY_ASPECT,
         UNREGISTER_APP, UNREGISTER_ASPECT,
     };
 
@@ -499,6 +502,31 @@ mod tests {
 
         let map = parse_msgpack_map(&payload).expect("parse wake map");
         assert_eq!(map_get_bin(&map, "receiver"), Some(receiver));
+    }
+
+    #[test]
+    fn a_wake_carries_its_message_id_as_hex() {
+        let message = vec![0x22u8; 32];
+        let payload = encode_map(vec![
+            (Value::String("receiver".into()), Value::Binary(vec![0x55; 16])),
+            (Value::String("message".into()), Value::Binary(message.clone())),
+        ]);
+
+        let wake = wake_from_map(&parse_msgpack_map(&payload).unwrap()).expect("a wake");
+        assert_eq!(wake.receiver, hex(&[0x55; 16]));
+        assert_eq!(wake.message, Some(hex(&message)));
+        assert_eq!(wake.sender, None);
+    }
+
+    #[test]
+    fn a_message_id_that_is_not_32_bytes_is_left_out() {
+        let payload = encode_map(vec![
+            (Value::String("receiver".into()), Value::Binary(vec![0x55; 16])),
+            (Value::String("message".into()), Value::Binary(vec![0x22; 16])),
+        ]);
+
+        let wake = wake_from_map(&parse_msgpack_map(&payload).unwrap()).expect("the wake goes on");
+        assert_eq!(wake.message, None);
     }
 
     #[test]
