@@ -2903,15 +2903,17 @@ fn notify_recipient(
         false,
         false,
     );
-    let sender = if lxmf_data.len() >= DESTINATION_LENGTH * 2 {
-        Some(&lxmf_data[DESTINATION_LENGTH..DESTINATION_LENGTH * 2])
-    } else {
-        None
-    };
+    // The message's transient id, as store_message keys it: the device names
+    // what it syncs by the same id. No sender: everything after the
+    // destination hash is ciphertext, and until 2026-10-23 bytes 16..32 of it
+    // were sent as the sender.
+    let message: Option<TransientId> = reticulum_rust::identity::full_hash(lxmf_data).try_into().ok();
     // Every registration gets its wake; `count` drives the whole iterator.
     let sent = regs
         .iter()
-        .filter(|registration| crate::notify::dispatch_notify_via(stack, registration, sender, None).is_sent())
+        .filter(|registration| {
+            crate::notify::dispatch_notify_via(stack, registration, None, message.as_ref()).is_sent()
+        })
         .count();
     sent > 0
 }
@@ -6450,15 +6452,21 @@ mod tests {
         /// A registry holding one apns.relay registration for RECIPIENT, and
         /// that relay's identity as an announce leaves it.
         fn registered(tag: &str) -> (Arc<Mutex<NotifyRegistry>>, Vec<u8>, Identity, std::path::PathBuf) {
+            let (registry, relay_hash, relay, dir) = registered_with_key(tag);
+            let recalled = Identity::from_public_key(&relay.get_public_key().unwrap()).unwrap();
+            (registry, relay_hash, recalled, dir)
+        }
+
+        /// [`registered`], with the relay's private key, to read its wakes.
+        fn registered_with_key(tag: &str) -> (Arc<Mutex<NotifyRegistry>>, Vec<u8>, Identity, std::path::PathBuf) {
             let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
             let dir = std::env::temp_dir().join(format!("rfed_notify_count_{tag}_{unique}"));
             std::fs::create_dir_all(&dir).expect("temp dir");
             let relay = Identity::new(true);
             let relay_hash = Destination::hash(relay.hash.as_deref(), "apns", &["relay"]);
-            let recalled = Identity::from_public_key(&relay.get_public_key().unwrap()).unwrap();
             let mut registry = NotifyRegistry::load(dir.join("notify.rmp"));
             registry.register(RECIPIENT.to_vec(), None, hexrep(&relay_hash, false));
-            (Arc::new(Mutex::new(registry)), relay_hash, recalled, dir)
+            (Arc::new(Mutex::new(registry)), relay_hash, relay, dir)
         }
 
         #[test]
@@ -6487,6 +6495,32 @@ mod tests {
             let live = FakeStack::new(&relay_hash, Some(relay));
             assert!(notify_recipient(&live, &registry, &lxmf_data(), ""), "a wake that left is");
             assert_eq!(live.packets.lock().unwrap().len(), 1);
+
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        /// The wake names the message by its transient id, the id the device
+        /// computes from what it syncs, and names no sender: bytes 16..32 of
+        /// lxmf_data are ciphertext. Until 2026-10-23 they were sent as the
+        /// sender, and no message id was sent (RFed-spec Notify.md).
+        #[test]
+        fn the_wake_names_the_message_by_its_transient_id_and_no_sender() {
+            use crate::notify::rns::fake::{wake_field, wake_map};
+            let (registry, relay_hash, relay, dir) = registered_with_key("message");
+            let stack = FakeStack::new(&relay_hash, Some(relay.clone()));
+
+            assert!(notify_recipient(&stack, &registry, &lxmf_data(), ""));
+
+            let packets = stack.packets.lock().unwrap();
+            let map = wake_map(&packets[0].0, &relay);
+            assert_eq!(wake_field(&map, "receiver"), Some(&RECIPIENT[..]));
+            assert_eq!(
+                wake_field(&map, "message"),
+                Some(&reticulum_rust::identity::full_hash(&lxmf_data())[..]),
+                "the message is named by its transient id",
+            );
+            assert_eq!(wake_field(&map, "sender"), None, "rfed cannot read the sender");
+            assert_eq!(wake_field(&map, "channel"), None);
 
             let _ = std::fs::remove_dir_all(dir);
         }

@@ -939,7 +939,9 @@ fn main() -> Result<(), String> {
                 Err(_) => Vec::new(),
             };
             for (registration, channel_hash) in &wakes {
-                notify::dispatch_notify(registration, None, Some(channel_hash.as_slice()));
+                // No message: the backup node wakes an adopted subscriber
+                // for whatever its owner holds, not for one item.
+                notify::dispatch_notify(registration, Some(channel_hash.as_slice()), None);
             }
             write_status_file(&node, &lxmf_prop_arc, &startup);
             last_backup_tick = Instant::now();

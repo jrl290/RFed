@@ -11,10 +11,14 @@
 //! # Wake packet payload
 //! A msgpack-encoded Map sent to the relay containing:
 //!   - `receiver`: Binary(16) — subscriber destination hash (always present)
-//!   - `sender`:   Binary(16) — publisher destination hash (when available)
 //!   - `channel`:  Binary(16) — channel hash (rfed.channel only, omitted for LXMF)
+//!   - `message`:  Binary(32) — transient id of the stored item the wake is
+//!     for, so the device shows one notification per item (omitted when the
+//!     wake is for no single item)
 //!
-//! No message content is included.
+//! No message content is included, and no `sender`: rfed never knows one in
+//! the clear (RFed-spec Notify.md "Wake packet"). Until 2026-10-23 an LXMF
+//! wake's `sender` was bytes 16..32 of lxmf_data, which are ciphertext.
 //!
 //! # Addressing
 //! The wake goes to exactly the registered relay hash, encrypted to the
@@ -189,8 +193,8 @@ impl RelayStack for LiveStack {
 pub fn dispatch(
     stack: &dyn RelayStack,
     reg: &NotifyRegistration,
-    sender: Option<&[u8]>,
     channel: Option<&[u8]>,
+    message: Option<&[u8; 32]>,
 ) -> WakeOutcome {
     let relay = reg.relay_hash.as_str();
     let sub_hash = reg.subscriber_hash.as_slice();
@@ -247,7 +251,7 @@ pub fn dispatch(
 
     let mut packet = Packet::new(
         Some(destination),
-        encode_wake_payload(sub_hash, sender, channel),
+        encode_wake_payload(sub_hash, channel, message),
         packet::DATA,
         packet::NONE,
         transport::BROADCAST,
@@ -334,8 +338,8 @@ pub fn remember_self_hosted_relay(relay_hash: &[u8], registrant_pubkey: &[u8]) -
 
 fn encode_wake_payload(
     sub_hash: &[u8],
-    sender: Option<&[u8]>,
     channel: Option<&[u8]>,
+    message: Option<&[u8; 32]>,
 ) -> Vec<u8> {
     let mut entries = vec![
         (
@@ -343,16 +347,16 @@ fn encode_wake_payload(
             rmpv::Value::Binary(sub_hash.to_vec()),
         ),
     ];
-    if let Some(s) = sender {
-        entries.push((
-            rmpv::Value::String("sender".into()),
-            rmpv::Value::Binary(s.to_vec()),
-        ));
-    }
     if let Some(c) = channel {
         entries.push((
             rmpv::Value::String("channel".into()),
             rmpv::Value::Binary(c.to_vec()),
+        ));
+    }
+    if let Some(m) = message {
+        entries.push((
+            rmpv::Value::String("message".into()),
+            rmpv::Value::Binary(m.to_vec()),
         ));
     }
     let mut payload = Vec::new();
@@ -445,6 +449,29 @@ pub(crate) mod fake {
             Ok(Some(receipt))
         }
     }
+
+    /// Header 1 packet: flags, hops, destination hash, context, ciphertext.
+    const CIPHERTEXT_AT: usize = 19;
+
+    /// The wake map in packed packet `raw`, decrypted by `relay`, the relay
+    /// it was sent to.
+    pub(crate) fn wake_map(raw: &[u8], relay: &Identity) -> Vec<(rmpv::Value, rmpv::Value)> {
+        let plaintext = relay.clone().decrypt(&raw[CIPHERTEXT_AT..]).expect("the relay decrypts its wake");
+        match rmpv::decode::read_value(&mut std::io::Cursor::new(plaintext)).expect("decode wake payload") {
+            rmpv::Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        }
+    }
+
+    /// The bytes under `key` in a wake map, if it has that key.
+    pub(crate) fn wake_field<'a>(map: &'a [(rmpv::Value, rmpv::Value)], key: &str) -> Option<&'a [u8]> {
+        map.iter()
+            .find(|(candidate, _)| candidate.as_str() == Some(key))
+            .map(|(_, value)| match value {
+                rmpv::Value::Binary(bytes) => bytes.as_slice(),
+                other => panic!("wake field {key} is not bin: {other:?}"),
+            })
+    }
 }
 
 #[cfg(test)]
@@ -464,7 +491,7 @@ mod tests {
     use crate::notify::NotifyRegistration;
 
     const SUBSCRIBER: [u8; 16] = [0x55; 16];
-    const SENDER: [u8; 16] = [0x66; 16];
+    const MESSAGE: [u8; 32] = [0x66; 32];
     /// Header 1 packet: flags, hops, destination hash, context, ciphertext.
     const DEST_HASH_AT: std::ops::Range<usize> = 2..18;
     const CIPHERTEXT_AT: usize = 19;
@@ -516,7 +543,7 @@ mod tests {
         let registered = relay_hash(&relay, app_name, aspect);
         let stack = FakeStack::new(&registered, Some(recalled(&relay)));
 
-        let outcome = dispatch(&stack, &registration(&registered), Some(&SENDER), None);
+        let outcome = dispatch(&stack, &registration(&registered), None, Some(&MESSAGE));
 
         assert_eq!(
             outcome,
@@ -529,6 +556,8 @@ mod tests {
             .decrypt(&raw[CIPHERTEXT_AT..])
             .expect("the relay decrypts its wake");
         assert_receiver_is_subscriber(&plaintext);
+        let map = super::fake::wake_map(&raw, &relay);
+        assert_eq!(super::fake::wake_field(&map, "message"), Some(&MESSAGE[..]), "the wake names its message");
     }
 
     /// apns-bridge hosts only apns.relay: every iOS wake went to rfed.notify
@@ -724,19 +753,34 @@ mod tests {
     #[test]
     fn wake_payload_uses_binary_hash_fields() {
         let receiver = [0x11u8; 16];
-        let sender = [0x22u8; 16];
         let channel = [0x33u8; 16];
+        let message = [0x22u8; 32];
 
-        let payload = encode_wake_payload(&receiver, Some(&sender), Some(&channel));
+        let payload = encode_wake_payload(&receiver, Some(&channel), Some(&message));
         let value = read_value(&mut Cursor::new(payload)).expect("decode wake payload");
         let map = match value {
             Value::Map(map) => map,
             other => panic!("expected map, got {other:?}"),
         };
 
+        assert_eq!(map.len(), 3);
         assert_eq!(map_entry(&map, "receiver"), Some(&Value::Binary(receiver.to_vec())));
-        assert_eq!(map_entry(&map, "sender"), Some(&Value::Binary(sender.to_vec())));
         assert_eq!(map_entry(&map, "channel"), Some(&Value::Binary(channel.to_vec())));
+        assert_eq!(map_entry(&map, "message"), Some(&Value::Binary(message.to_vec())));
+    }
+
+    /// rfed never knows a sender in the clear (RFed-spec Notify.md "Wake
+    /// packet"). Until 2026-10-23 an LXMF wake's `sender` was bytes 16..32 of
+    /// the stored lxmf_data, which are ciphertext.
+    #[test]
+    fn wake_payload_never_names_a_sender() {
+        let payload = encode_wake_payload(&[0x11u8; 16], Some(&[0x33u8; 16]), Some(&[0x22u8; 32]));
+        let value = read_value(&mut Cursor::new(payload)).expect("decode wake payload");
+        let map = match value {
+            Value::Map(map) => map,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert_eq!(map_entry(&map, "sender"), None);
     }
 
     #[test]
@@ -754,5 +798,6 @@ mod tests {
         assert_eq!(map_entry(&map, "receiver"), Some(&Value::Binary(receiver.to_vec())));
         assert_eq!(map_entry(&map, "sender"), None);
         assert_eq!(map_entry(&map, "channel"), None);
+        assert_eq!(map_entry(&map, "message"), None);
     }
 }

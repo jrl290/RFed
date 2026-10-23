@@ -168,6 +168,7 @@ fn queue_then_wake(
     blob: &[u8],
     wake_channel: Option<&[u8]>,
 ) -> DistroHandOff {
+    let message = wake_message(blob, wake_channel);
     let routing_hash = routing_hash.to_vec();
     let blob = blob.to_vec();
     let wake_channel = wake_channel.map(<[u8]>::to_vec);
@@ -180,8 +181,29 @@ fn queue_then_wake(
             }
             Err(_) => Queueing::Poisoned,
         };
-        wake_after_queueing(&*stack, &notify_registry, &recipient, &routing_hash, wake_channel.as_deref(), &queued)
+        wake_after_queueing(
+            &*stack,
+            &notify_registry,
+            &recipient,
+            &routing_hash,
+            wake_channel.as_deref(),
+            message.as_ref(),
+            &queued,
+        )
     })
+}
+
+/// The transient id a wake names its blob by (RFed-spec Notify.md "Wake
+/// packet"), the id the device computes from what it pulls: a channel post's
+/// is SHA-256 of the channel hash and the post, the id its stamp is checked
+/// against (Channel.md "Stamp Contract"); a distro blob, a bare LXMF message
+/// to the distro, has LXMF's, SHA-256 of the blob.
+fn wake_message(blob: &[u8], wake_channel: Option<&[u8]>) -> Option<[u8; 32]> {
+    let id = match wake_channel {
+        Some(channel) => reticulum_rust::identity::full_hash(&[channel, blob].concat()),
+        None => reticulum_rust::identity::full_hash(blob),
+    };
+    id.try_into().ok()
 }
 
 /// What a hand-off's attempt to queue its blob came to.
@@ -236,7 +258,8 @@ fn log_eviction(recipient: &Unconfirmed, routing_hash: &[u8], queued: &Queueing)
 }
 
 /// The push of a hand-off, once its blob is queued (or could not be): wake
-/// `recipient` through its notify registrations for `wake_channel`, then
+/// `recipient` through its notify registrations for `wake_channel`, naming
+/// the blob by `message` ([`wake_message`]), then
 /// write the one `[handoff]` line saying what was queued and who was woken,
 /// and return the same. The line's format is pinned by the staging harnesses
 /// (test-harnesses staging/lib/distro_channels.test.mjs).
@@ -246,6 +269,7 @@ fn wake_after_queueing(
     recipient: &Unconfirmed,
     routing_hash: &[u8],
     wake_channel: Option<&[u8]>,
+    message: Option<&[u8; 32]>,
     queued: &Queueing,
 ) -> HandOffOutcome {
     log_eviction(recipient, routing_hash, queued);
@@ -260,7 +284,7 @@ fn wake_after_queueing(
     };
     let woken = registrations
         .iter()
-        .filter(|registration| dispatch_notify_via(stack, registration, None, wake_channel).is_sent())
+        .filter(|registration| dispatch_notify_via(stack, registration, wake_channel, message).is_sent())
         .count();
     log(
         format!(
@@ -325,6 +349,7 @@ pub fn distro_hand_off(
     if wake == Wake::Push {
         return queue_then_wake(stack, deferred_queue, notify_registry, limit_for, distro_hash, blob, None);
     }
+    let message = wake_message(blob, None);
     let distro_hash = distro_hash.to_vec();
     let blob = blob.to_vec();
     Arc::new(move |device: Unconfirmed| {
@@ -344,7 +369,7 @@ pub fn distro_hand_off(
         let Some((held, total, global_limit, outcome)) = counted else {
             // Nothing could be queued, so a silence would lose the blob: push,
             // and say it was not queued, as `Push` does.
-            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &Queueing::Poisoned);
+            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, message.as_ref(), &Queueing::Poisoned);
             return HandOffOutcome { pushed_because: Some("deferred queue poisoned".to_string()), ..handed };
         };
         let un_pulled = un_pulled_after(held, &outcome, &distro_hash);
@@ -358,7 +383,7 @@ pub fn distro_hand_off(
         let queued = Queueing::Done(outcome);
         if !why.is_empty() {
             let why = why.join(", ");
-            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, &queued);
+            let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, message.as_ref(), &queued);
             // Written after the wake, so it says what the wake came to: a
             // device with no notify registration, or none a wake left
             // through, was not woken, bound or not. Until 2026-10-10 this
@@ -435,6 +460,8 @@ mod tests {
         queue: Arc<Mutex<DeferredQueue>>,
         notify: Arc<Mutex<NotifyRegistry>>,
         relay_hash: Vec<u8>,
+        /// The relay's private key, to read its wakes.
+        relay: Identity,
         stack: Arc<FakeStack>,
     }
 
@@ -451,6 +478,7 @@ mod tests {
                 notify: Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp")))),
                 stack: Arc::new(FakeStack::new(&relay_hash, Some(recalled))),
                 relay_hash,
+                relay,
                 dir,
             }
         }
@@ -476,6 +504,13 @@ mod tests {
 
         fn wakes(&self) -> usize {
             self.stack.packets.lock().unwrap().len()
+        }
+
+        /// The fields of the only wake sent.
+        fn only_wake(&self) -> Vec<(rmpv::Value, rmpv::Value)> {
+            let packets = self.stack.packets.lock().unwrap();
+            assert_eq!(packets.len(), 1, "one wake");
+            crate::notify::rns::fake::wake_map(&packets[0].0, &self.relay)
         }
 
         /// Fill the queue to `total` entries under subscribers no test wakes.
@@ -524,6 +559,58 @@ mod tests {
                 hexrep(&distro, false),
             )),
             "{line}"
+        );
+    }
+
+    /// A distro blob is a bare LXMF message to the distro: its wake names it
+    /// by LXMF's transient id, the hash of the blob, which the device
+    /// computes from what `/distro/pull` returns (RFed-spec Notify.md).
+    #[test]
+    fn a_distro_wake_names_the_blob_by_its_transient_id() {
+        use crate::notify::rns::fake::wake_field;
+        let rig = Rig::new("distro_message");
+        let device = rig.device(0x12);
+
+        rig.hand_off(&[0xD2; 16], b"distro blob", Wake::Push)(device.clone());
+
+        let wake = rig.only_wake();
+        assert_eq!(wake_field(&wake, "receiver"), Some(device.wake_key.as_slice()));
+        assert_eq!(
+            wake_field(&wake, "message"),
+            Some(&reticulum_rust::identity::full_hash(b"distro blob")[..]),
+        );
+        assert_eq!(wake_field(&wake, "channel"), None);
+        assert_eq!(wake_field(&wake, "sender"), None);
+    }
+
+    /// A channel post's wake names it by the transient id its stamp is
+    /// checked against, SHA-256 of channel hash and post (RFed-spec
+    /// Channel.md "Stamp Contract").
+    #[test]
+    fn a_channel_wake_names_the_post_by_its_stamp_transient_id() {
+        use crate::notify::rns::fake::wake_field;
+        let rig = Rig::new("channel_message");
+        let channel = vec![0xC3; 16];
+        let device = Unconfirmed { queue_key: vec![0x13; 16], wake_key: vec![0xEC; 16] };
+        rig.notify.lock().unwrap().register(device.wake_key.clone(), Some(channel.clone()), hexrep(&rig.relay_hash, false));
+        let hand_off = defer_then_wake(
+            Arc::clone(&rig.stack) as Arc<dyn RelayStack + Send + Sync>,
+            Arc::clone(&rig.queue),
+            Arc::clone(&rig.notify),
+            Arc::new(|_| 256),
+            &channel,
+            b"post",
+            Some(&channel),
+        );
+
+        hand_off(device.clone());
+
+        let wake = rig.only_wake();
+        assert_eq!(wake_field(&wake, "receiver"), Some(device.wake_key.as_slice()));
+        assert_eq!(wake_field(&wake, "channel"), Some(channel.as_slice()));
+        assert_eq!(
+            wake_field(&wake, "message"),
+            Some(&reticulum_rust::identity::full_hash(&[&channel[..], b"post"].concat())[..]),
         );
     }
 

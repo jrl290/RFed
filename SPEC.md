@@ -629,13 +629,14 @@ Sent as a msgpack Map:
 ```
 {
   "receiver": bin(16),    // subscriber's lxmf.delivery hash (always present)
-  "sender":   bin(16),    // optional — present when known (e.g. LXMF)
   "channel":  bin(16),    // optional — present for rfed.channel fanout
+  "message":  bin(32),    // optional — transient id of the stored item
 }
 ```
 
-Only destination hashes are included. No message content ever leaves the
-node via the notify path.
+Only hashes are included. No message content ever leaves the node via the
+notify path. RFed-spec Notify.md also defines an optional `sender`; rfed
+never sends it, as it never knows a sender in the clear (§9.3).
 
 ---
 
@@ -1088,11 +1089,15 @@ values.  It contains only destination hashes — never message content.
 | Key | Type | Present | Description |
 |-----|------|---------|-------------|
 | `"receiver"` | `bin(16)` | **Always** | Subscriber's `lxmf.delivery` destination hash: the key its registration and its push token are stored under, for LXMF, channel and distro wakes alike |
-| `"sender"` | `bin(16)` | Optional | Sender's RNS destination hash (LXMF path only) |
 | `"channel"` | `bin(16)` | Optional | Channel hash (rfed.channel fanout path only) |
+| `"message"` | `bin(32)` | Optional | Transient id of the stored item the wake is for: an LXMF message's (direct or distro) is SHA-256 of its `lxmf_data` without the stamp; a channel post's is SHA-256 of `channel_hash \|\| post`, the id its stamp is checked against. Absent for the backup tick's wake, which is for no single item |
 
 The map contains **at most 3 entries**.  Clients must tolerate unknown keys
 in future versions.
+
+There is no `"sender"`. An LXMF message's sender is inside its encryption,
+and a channel post's inside its own. Until 2026-10-23 an LXMF wake carried
+bytes 16..32 of `lxmf_data` as `"sender"`: ciphertext, not a hash.
 
 **Encoding:** `rmpv::Value::Map` (msgpack fixmap or map16).
 
@@ -1104,11 +1109,9 @@ When a blob arrives on `rfed.channel.publish` for a subscribed channel:
 msgpack Map {
   "receiver" → bin(16)   ← subscriber's lxmf.delivery hash
   "channel"  → bin(16)   ← channel hash the blob was published to
+  "message"  → bin(32)   ← SHA-256(channel hash || post)
 }
 ```
-
-`"sender"` is absent because fire-and-forget SEND packets carry no sender
-identity.
 
 #### Example: LXMF Propagation Notification Wake
 
@@ -1117,7 +1120,7 @@ When an LXMF message arrives for a notify-registered destination:
 ```
 msgpack Map {
   "receiver" → bin(16)   ← recipient destination hash
-  "sender"   → bin(16)   ← sender destination hash (from LXMF payload)
+  "message"  → bin(32)   ← SHA-256(lxmf_data), the message's transient id
 }
 ```
 
@@ -1181,7 +1184,8 @@ manages all platform integrations independently.
 ### 9.6 Privacy
 
 - The relay sees only which `subscriber_hash` should be woken, and
-  optionally which `sender` or `channel` triggered the wake.
+  optionally which `channel` and which stored item (`message`, a hash of
+  ciphertext the node holds) triggered the wake.
 - The relay **never** sees message content, channel names, or any
   encrypted payload.
 - The rfed node **never** sees device tokens, APNs certificates, or any
@@ -1248,7 +1252,7 @@ notify-only shim.
   peers exchange OFFER / GET sync with LXMF-rust `lxmd` instances and other
   rfed nodes.
 5. If the recipient has notify relays registered, rfed also dispatches wake
-  packets with `receiver` and optional `sender` hashes. It wakes the
+  packets with `receiver` and the message's transient id. It wakes the
   recipient, or pushes the message on the recipient's live session, only
   when it stores the message: a copy it does not store (step 3) wakes and
   pushes nothing, as the reference delivers nothing for one. Until

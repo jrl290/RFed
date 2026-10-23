@@ -400,32 +400,32 @@ impl Default for HookRegistry {
 /// first.
 pub fn dispatch_notify(
     reg: &NotifyRegistration,
-    sender: Option<&[u8]>,
     channel: Option<&[u8]>,
+    message: Option<&[u8; 32]>,
 ) -> rns::WakeOutcome {
-    dispatch_notify_via(&rns::LiveStack, reg, sender, channel)
+    dispatch_notify_via(&rns::LiveStack, reg, channel, message)
 }
 
 /// [`dispatch_notify`] on the given stack. The tests pass a fake one.
 pub fn dispatch_notify_via(
     stack: &dyn rns::RelayStack,
     reg: &NotifyRegistration,
-    sender: Option<&[u8]>,
     channel: Option<&[u8]>,
+    message: Option<&[u8; 32]>,
 ) -> rns::WakeOutcome {
     log(
         format!(
-            "[notify] dispatch START relay={} subscriber={} sender={} channel={}",
+            "[notify] dispatch START relay={} subscriber={} channel={} message={}",
             &reg.relay_hash,
             hexrep(&reg.subscriber_hash, false),
-            sender.map(|s| hexrep(s, false)).unwrap_or_else(|| "(none)".to_string()),
             channel.map(|c| hexrep(c, false)).unwrap_or_else(|| "(none)".to_string()),
+            message.map(|m| hexrep(m, false)).unwrap_or_else(|| "(none)".to_string()),
         ),
         LOG_DEBUG,
         false,
         false,
     );
-    rns::dispatch(stack, reg, sender, channel)
+    rns::dispatch(stack, reg, channel, message)
 }
 
 #[cfg(test)]

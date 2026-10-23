@@ -5150,7 +5150,7 @@ mod fanout_lock_scope_tests {
             .expect("main.rs takes the backup tick's wakes inside a `let`, so the guard drops at its end");
         let after = &main[tick..];
         let send = after
-            .find("notify::dispatch_notify(registration, None,")
+            .find("notify::dispatch_notify(registration, ")
             .expect("main.rs sends the backup tick's wakes");
         assert!(
             !after[..send].contains("node.lock()"),
