@@ -1290,9 +1290,9 @@ pub struct LxmfPropagationNode {
     /// How outbound peer sync reaches the network: AppLinks-held links in
     /// production (`AppLinksSyncIo`), a recording fake in the unit tests.
     sync_io: Arc<dyn PeerSyncIo>,
-    /// The stack a distro fan-out's hand-off wakes devices through: the
-    /// running Reticulum stack (`LiveStack`) in production, a recording fake
-    /// in the unit tests.
+    /// The stack every wake goes out through, a distro fan-out's hand-off's
+    /// and a direct message's: the running Reticulum stack (`LiveStack`) in
+    /// production, a recording fake in the unit tests.
     relay_stack: Arc<dyn RelayStack + Send + Sync>,
     /// Where network callbacks deliver sync events: the channel of the one
     /// sync worker thread `enable` starts. `None` until then.
@@ -2854,7 +2854,8 @@ struct DeliveryHandles {
     distro_blob_store: Option<Arc<Mutex<crate::blob_store::BlobStore>>>,
     distro_hook_registry: Option<Arc<Mutex<crate::notify::HookRegistry>>>,
     deferred_queue: Option<Arc<Mutex<crate::deferred_queue::DeferredQueue>>>,
-    /// What a distro hand-off wakes through (`LxmfPropagationNode::relay_stack`).
+    /// What every wake goes out through, a distro hand-off's and a direct
+    /// message's (`LxmfPropagationNode::relay_stack`).
     relay_stack: Arc<dyn RelayStack + Send + Sync>,
 }
 
@@ -3043,14 +3044,36 @@ impl DeliveryHandles {
         let dest_hash = &lxmf_data[..DESTINATION_LENGTH];
 
         // ── rfed.link session first (RFed-spec/Link.md) ──────────────
-        // `/lxmf/delivery` on the link the client already has open. No
-        // `on_failed` hook: an unanswered push here still leaves the message in
-        // the messagestore, where the client's next propagation sync finds it.
+        // `/lxmf/delivery` on the link the client already has open. An
+        // unanswered push leaves the message in the messagestore, and its
+        // `on_failed` hook wakes the recipient once, so it syncs. Until 2026-10-23
+        // there was no hook: an iOS app killed with its link still up got no
+        // wake, and a new link it opened got no push, so the message waited
+        // for the app's next sync, which a suspended app may never run.
+        let on_failed: Arc<dyn Fn() + Send + Sync> = {
+            let registry = Arc::clone(&self.registry);
+            let stack = Arc::clone(&self.relay_stack);
+            let data = lxmf_data.to_vec();
+            let suffix = log_suffix.to_string();
+            Arc::new(move || {
+                log(
+                    format!(
+                        "[lxmf.prop] rfed.link push to recipient {} unanswered — notify fallback{}",
+                        hexrep(&data[..DESTINATION_LENGTH], false),
+                        suffix,
+                    ),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                notify_recipient(&*stack, &registry, &data, &suffix);
+            })
+        };
         let link_result = self
             .link_sessions
             .lock()
             .ok()
-            .map(|mut registry| registry.dispatch_lxmf(dest_hash, lxmf_data, None))
+            .map(|mut registry| registry.dispatch_lxmf(dest_hash, lxmf_data, Some(on_failed)))
             .unwrap_or_else(StreamDispatchResult::default);
 
         if link_result.delivered() {
@@ -3090,6 +3113,7 @@ impl DeliveryHandles {
         // An unproven push now wakes it, as a failed one does.
         let wake: OnUnproven = {
             let registry = Arc::clone(&self.registry);
+            let stack = Arc::clone(&self.relay_stack);
             let data = lxmf_data.to_vec();
             let suffix = log_suffix.to_string();
             Arc::new(move || {
@@ -3103,7 +3127,7 @@ impl DeliveryHandles {
                     false,
                     false,
                 );
-                notify_recipient(&LiveStack, &registry, &data, &suffix);
+                notify_recipient(&*stack, &registry, &data, &suffix);
             })
         };
         let stream_result = self
@@ -3141,7 +3165,7 @@ impl DeliveryHandles {
             );
         }
 
-        if notify_recipient(&LiveStack, &self.registry, lxmf_data, log_suffix) {
+        if notify_recipient(&*self.relay_stack, &self.registry, lxmf_data, log_suffix) {
             return LiveDispatchOutcome::Notified;
         }
 
@@ -7410,6 +7434,43 @@ mod tests {
             assert!(lines[0].ends_with("queued for pull, NOT woken (distro sync, 1 of 64 un-pulled)"), "{}", lines[0]);
             assert_eq!(rig.rows(&device, &d_hash), 1, "the unanswered push queues the blob once");
             assert_eq!(rig.wakes(), 0, "and wakes no one: an accepted proof's hand-off");
+        }
+
+        /// A direct message to a recipient with a live rfed.link session gets
+        /// the `/lxmf/delivery` push, and nobody is woken. When the push goes
+        /// unanswered (the link closes before a response), the recipient is
+        /// woken once, through its notify registration, so it syncs. Until
+        /// 2026-10-23 the push had no `on_failed` hook, and an iOS app killed
+        /// with its link up got no wake (staging, the iPad via an RTNode).
+        #[test]
+        fn an_unanswered_rfed_link_push_of_a_direct_message_wakes_the_recipient_once() {
+            let rig = Rig::new("unanswered_direct", 0);
+            let recipient = rand::random::<[u8; 16]>().to_vec();
+            rig.notify.lock().unwrap().register(recipient.clone(), None, hexrep(&rig.relay_hash, false));
+            let link = live_link();
+            rig.sessions.lock().unwrap().configure_delivery(link.clone(), recipient.clone());
+            let message = [&packed_to(&recipient, 9)[..], &[9u8; 32][..]].concat();
+            let mark = crate::test_log::mark();
+            rig.ingest(&upload(&[message], None));
+
+            let pushed = mark.containing("[rfed.link] /lxmf/delivery pushed ");
+            assert_eq!(pushed.len(), 1, "{:?}", mark.lines());
+            assert!(pushed[0].ends_with(&format!("to {}", hexrep(&link.link_id(), false))), "{}", pushed[0]);
+            assert_eq!(rig.wakes(), 0, "pushed live: not woken");
+
+            // The push is never answered: the close fails it, and its
+            // on_failed hook runs on a thread of its own. The wake is the
+            // hook's last act, so the test waits for it before counting.
+            let fallback = format!("[lxmf.prop] rfed.link push to recipient {} unanswered — notify fallback", hexrep(&recipient, false));
+            let mark = crate::test_log::mark();
+            link.teardown();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while rig.wakes() == 0 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(mark.any_thread_containing("[rfed.link] /lxmf/delivery unanswered by ").len(), 1, "{:?}", mark.any_thread_containing("[rfed.link] "));
+            assert_eq!(mark.any_thread_containing(&fallback).len(), 1, "{:?}", mark.any_thread_containing("[lxmf.prop] "));
+            assert_eq!(rig.wakes(), 1, "the recipient is woken once");
         }
 
         // ── Dedup: a message fans out once, on first sight ──────────────
