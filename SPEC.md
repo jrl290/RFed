@@ -4513,7 +4513,7 @@ equals that string. Field `0x0D`, used before 2026-09-24, is LXMF 1.1.1's
 
 ## License
 
-See [LICENSE](rfed/LICENSE).
+See [LICENSE](LICENSE).
 
 ---
 

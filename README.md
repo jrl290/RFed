@@ -431,7 +431,7 @@ All other dependencies are pulled from crates.io automatically by Cargo.
 
 ## License
 
-See [LICENSE](rfed/LICENSE).
+RFed's own design (named channels, explicit subscriptions, double-envelope encryption, notify relays, deferred per-subscriber queuing and backup failover) is James LaFarge's work. Its code also carries mechanisms over from LXMF (see [Built on LXMF](#built-on-lxmf)) and links the Rust ports of Reticulum and LXMF, so it is distributed under the Reticulum License, with Mark Qvist's notice for those parts. See [LICENSE](LICENSE).
 
 ---
 
