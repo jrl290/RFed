@@ -431,7 +431,9 @@ All other dependencies are pulled from crates.io automatically by Cargo.
 
 ## License
 
-RFed's own design (named channels, explicit subscriptions, double-envelope encryption, notify relays, deferred per-subscriber queuing and backup failover) is James LaFarge's work. Its code also carries mechanisms over from LXMF (see [Built on LXMF](#built-on-lxmf)) and links the Rust ports of Reticulum and LXMF, so it is distributed under the Reticulum License, with Mark Qvist's notice for those parts. See [LICENSE](LICENSE).
+RFed is James LaFarge's work and is under the MIT License ([LICENSE](LICENSE)), with one exception. `rfed/src/lxmf_propagation.rs` carries over LXMF's propagation node from Mark Qvist's code (see [Built on LXMF](#built-on-lxmf)) and stays under the Reticulum License ([LICENSE-RETICULUM](LICENSE-RETICULUM)). The rfed program is also built with [Reticulum-rust](https://github.com/jrl290/Reticulum-rust) and [LXMF-rust](https://github.com/jrl290/LXMF-rust), ports of Mark Qvist's Reticulum and LXMF under the same license, so release packages include both license files.
+
+The Reticulum License's conditions: the software may not be used in systems that can purposefully harm people, or to build AI, machine-learning or language-model training datasets. We follow the license as written. When Mark Qvist introduced the AI condition, he explained that it does not restrict which tools a developer uses ([his reply of 17 April 2025](https://github.com/markqvist/Reticulum/discussions/790#discussioncomment-12871253)).
 
 ---
 

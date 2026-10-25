@@ -1,3 +1,7 @@
+// This file carries over the propagation node of Mark Qvist's LXMF. It is
+// under the Reticulum License (LICENSE-RETICULUM at the repository root),
+// not the MIT License that covers the rest of RFed.
+
 //! Full LXMF Propagation Node for RFed.
 //!
 //! RFed is a one-stop-shop Federation services node.  This module implements

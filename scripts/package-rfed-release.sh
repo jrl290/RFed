@@ -88,6 +88,7 @@ install -m 755 "${binary_path}" "${package_dir}/rfed"
 cp "${repo_root}/config.txt.example" "${package_dir}/config.txt.example"
 cp "${repo_root}/README.md" "${package_dir}/README.md"
 cp "${repo_root}/LICENSE" "${package_dir}/LICENSE"
+cp "${repo_root}/LICENSE-RETICULUM" "${package_dir}/LICENSE-RETICULUM"
 
 archive_path="${output_dir}/${package_basename}.tar.gz"
 checksum_path="${archive_path}.sha256"
