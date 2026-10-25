@@ -152,8 +152,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Copy binary into Docker context
-        run: cp target/x86_64-unknown-linux-musl/release/rfed rfed/rfed
+      - name: Copy binary and licenses into Docker context
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/rfed rfed/rfed
+          cp LICENSE LICENSE-RETICULUM rfed/
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5

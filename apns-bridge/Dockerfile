@@ -10,6 +10,11 @@ FROM scratch
 # webpki-roots bundles Mozilla root certs into the binary itself.
 COPY apns_bridge /apns_bridge
 
+# The bridge's license (MIT) and the Reticulum License, which covers the
+# Reticulum-rust code built into the binary. CI copies both into the context
+# next to the binary.
+COPY LICENSE LICENSE-RETICULUM /licenses/
+
 # Config, identity, and token DB are all in /data (mount a named volume here).
 VOLUME ["/data"]
 

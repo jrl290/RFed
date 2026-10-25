@@ -124,8 +124,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Copy binary into Docker context
-        run: cp target/x86_64-unknown-linux-musl/release/fcm_bridge fcm-bridge/fcm_bridge
+      - name: Copy binary and licenses into Docker context
+        run: |
+          cp target/x86_64-unknown-linux-musl/release/fcm_bridge fcm-bridge/fcm_bridge
+          cp LICENSE LICENSE-RETICULUM fcm-bridge/
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5

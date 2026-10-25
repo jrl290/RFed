@@ -41,6 +41,10 @@ __pycache__/
 apns-bridge/apns_bridge
 fcm-bridge/fcm_bridge
 rfed/rfed
+# Copied into the Docker contexts by CI
+rfed/LICENSE*
+apns-bridge/LICENSE*
+fcm-bridge/LICENSE*
 rfed-nas.status
 
 # Local release packaging output
