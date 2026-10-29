@@ -1587,7 +1587,7 @@ impl FedNode {
                 push_subscriptions_to_backup(
                     hash.clone(),
                     pending,
-                    self.self_handle.clone(),
+                    Arc::clone(&self.pending_backup_pushes),
                     self.identity.clone(),
                 );
             } else {
@@ -1655,7 +1655,7 @@ impl FedNode {
                     push_subscriptions_to_backup(
                         hash.clone(),
                         repush,
-                        self.self_handle.clone(),
+                        Arc::clone(&self.pending_backup_pushes),
                         self.identity.clone(),
                     );
                 }
@@ -1885,6 +1885,24 @@ fn teardown_sync(
 
 // ── Backup delivery helpers ───────────────────────────────────────────────────
 
+/// Put pairs back on `pending_backup_pushes` for the next tick. It takes the
+/// queue, not the node: `push_subscriptions_to_backup` runs under the FedNode
+/// guard, from `tick_backup_delivery`, and locking FedNode a second time on
+/// that thread never returns. Production rfed stopped answering that way on
+/// 2026-10-29, when its backup node had no link.
+fn requeue_backup_pairs(
+    queue: &Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>,
+    pairs: Vec<(Vec<u8>, Vec<u8>)>,
+) {
+    if pairs.is_empty() {
+        return;
+    }
+
+    if let Ok(mut q) = queue.lock() {
+        q.extend(pairs);
+    }
+}
+
 /// Open a link to a backup node and send a batch of backup subscription
 /// registrations.  Fire-and-forget: if the path is unavailable, pairs are
 /// re-enqueued for the next `tick_backup_delivery` attempt.
@@ -1894,34 +1912,17 @@ fn teardown_sync(
 ///   2. Open encrypted Link; in link_established callback:
 ///      a. Send a signed BACKUP_PUSH request carrying the subscription pairs.
 ///      b. Tear down the link on response (success or failure).
-fn requeue_backup_pairs(
-    node_weak: &Option<Weak<Mutex<FedNode>>>,
-    pairs: Vec<(Vec<u8>, Vec<u8>)>,
-) {
-    if pairs.is_empty() {
-        return;
-    }
-
-    if let Some(arc) = node_weak.as_ref().and_then(|w| w.upgrade()) {
-        if let Ok(node) = arc.lock() {
-            if let Ok(mut q) = node.pending_backup_pushes.lock() {
-                q.extend(pairs);
-            }
-        }
-    }
-}
-
 fn push_subscriptions_to_backup(
     backup_hash: Vec<u8>,
     pairs: Vec<(Vec<u8>, Vec<u8>)>,
-    node_weak: Option<Weak<Mutex<FedNode>>>,
+    requeue: Arc<Mutex<Vec<(Vec<u8>, Vec<u8>)>>>,
     our_identity: Identity,
 ) {
     AppLinks::open(&backup_hash, APP_NAME, &["node"]);
     if AppLinks::status(&backup_hash) != rns_app_links::APP_LINK_ACTIVE {
         log("[backup] no path to backup node — will retry on next tick",
             LOG_DEBUG, false, false);
-        requeue_backup_pairs(&node_weak, pairs);
+        requeue_backup_pairs(&requeue, pairs);
         return;
     }
 
@@ -1931,7 +1932,7 @@ fn push_subscriptions_to_backup(
         },
         None => {
             Transport::request_path(&backup_hash, None, None, None, None);
-            requeue_backup_pairs(&node_weak, pairs);
+            requeue_backup_pairs(&requeue, pairs);
             return;
         }
     };
@@ -1948,7 +1949,7 @@ fn push_subscriptions_to_backup(
         Err(e) => {
             log(format!("[backup] dest error for backup node: {e}"),
                 LOG_WARNING, false, false);
-            requeue_backup_pairs(&node_weak, pairs);
+            requeue_backup_pairs(&requeue, pairs);
             return;
         }
     };
@@ -1960,7 +1961,7 @@ fn push_subscriptions_to_backup(
         Err(e) => {
             log(format!("[backup] link error to backup node: {e}"),
                 LOG_WARNING, false, false);
-            requeue_backup_pairs(&node_weak, pairs);
+            requeue_backup_pairs(&requeue, pairs);
             return;
         }
     };
@@ -1972,7 +1973,7 @@ fn push_subscriptions_to_backup(
         Err(e) => {
             log(format!("[backup] could not encode backup owner pubkey: {e}"),
                 LOG_WARNING, false, false);
-            requeue_backup_pairs(&node_weak, pairs);
+            requeue_backup_pairs(&requeue, pairs);
             return;
         }
     };
@@ -1992,15 +1993,15 @@ fn push_subscriptions_to_backup(
     // avoiding the old Arc<Mutex<Link>> pattern entirely.
     let payload_for_est = signed_payload.clone();
     let pairs_for_retry = pairs.clone();
-    let node_weak_for_retry = node_weak.clone();
+    let requeue_for_retry = Arc::clone(&requeue);
     handle.set_link_established_callback(Some(Arc::new(move |h: LinkHandle| {
         let pay = payload_for_est.clone();
         let h_ok = h.clone();
         let h_err = h.clone();
         let retry_pairs_ok = pairs_for_retry.clone();
-        let retry_node_ok = node_weak_for_retry.clone();
+        let retry_queue_ok = Arc::clone(&requeue_for_retry);
         let retry_pairs_err = pairs_for_retry.clone();
-        let retry_node_err = node_weak_for_retry.clone();
+        let retry_queue_err = Arc::clone(&requeue_for_retry);
         let ok_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |receipt| {
             let accepted = receipt
                 .response
@@ -2012,13 +2013,13 @@ fn push_subscriptions_to_backup(
                 log("[backup] backup push accepted by peer", LOG_NOTICE, false, false);
             } else {
                 log("[backup] backup push rejected by peer", LOG_WARNING, false, false);
-                requeue_backup_pairs(&retry_node_ok, retry_pairs_ok.clone());
+                requeue_backup_pairs(&retry_queue_ok, retry_pairs_ok.clone());
             }
             h_ok.teardown();
         });
         let err_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |_| {
             log("[backup] backup push rejected by peer", LOG_WARNING, false, false);
-            requeue_backup_pairs(&retry_node_err, retry_pairs_err.clone());
+            requeue_backup_pairs(&retry_queue_err, retry_pairs_err.clone());
             h_err.teardown();
         });
         let result = h.request(
@@ -2026,7 +2027,7 @@ fn push_subscriptions_to_backup(
         );
         if result.is_err() {
             log("[backup] backup push request failed to send", LOG_WARNING, false, false);
-            requeue_backup_pairs(&node_weak_for_retry, pairs_for_retry.clone());
+            requeue_backup_pairs(&requeue_for_retry, pairs_for_retry.clone());
             h.teardown();
         }
     })));
@@ -2787,6 +2788,78 @@ fn requeue_drained(
 /// packet to a Single destination. Above this only a link can carry it.
 pub(crate) fn fits_in_delivery_packet(payload_len: usize) -> bool {
     payload_len <= reticulum_rust::packet::ENCRYPTED_MDU
+}
+
+/// 2026-10-29: production rfed stopped answering at 10:50 EDT and stayed
+/// stopped. `tick_backup_delivery` runs under the FedNode guard. The public
+/// backbones were down, so the backup node had no active link, and the push
+/// put its pairs back by locking FedNode again on the same thread, which
+/// never returns. Every handler that needs FedNode waited behind it.
+#[cfg(test)]
+mod backup_push_lock_tests {
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::Duration;
+
+    use super::announce_order_tests::{config, transport_guard};
+    use super::*;
+
+    /// A push to a backup node with no active link returns, under the guard,
+    /// and leaves its pairs queued for the next tick.
+    #[test]
+    fn a_backup_push_with_no_link_returns_and_keeps_its_pairs() {
+        let _guard = transport_guard();
+        let mut config = config("backup_push_no_link", false);
+        // A designated backup node is chosen even when it isn't heard.
+        config.primary_node = Some(vec![0x51; 16]);
+        let node = Arc::new(Mutex::new(FedNode::new(Identity::new(true), config).expect("node")));
+        // As enable() wires it.
+        node.lock().unwrap().self_handle = Some(Arc::downgrade(&node));
+        let pair = (vec![0x31; 16], vec![0x41; 16]);
+        let queue = Arc::clone(&node.lock().unwrap().pending_backup_pushes);
+        queue.lock().unwrap().push(pair.clone());
+
+        // As main.rs runs it: the whole tick under the guard.
+        let (done, finished) = mpsc::channel();
+        let ticking = Arc::clone(&node);
+        std::thread::spawn(move || {
+            if let Ok(mut guard) = ticking.lock() {
+                let _ = guard.tick_backup_delivery();
+            }
+            let _ = done.send(());
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the backup tick never returned: it waits on the FedNode lock its own thread holds"
+        );
+        assert_eq!(*queue.lock().unwrap(), vec![pair], "the pairs wait for the next tick");
+    }
+
+    /// Nothing a backup push runs may reach FedNode: the push runs under the
+    /// FedNode guard, and std's Mutex never returns to a thread that locks it
+    /// a second time.
+    #[test]
+    fn a_backup_push_cannot_reach_fed_node() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/destinations.rs"
+        ))
+        .expect("read destinations.rs");
+        let start = source
+            .find("fn requeue_backup_pairs(")
+            .expect("requeue_backup_pairs present");
+        let end = source[start..]
+            .find("fn backup_delivery_tick(")
+            .map(|offset| start + offset)
+            .expect("backup_delivery_tick present");
+        let fragment = &source[start..end];
+        for forbidden in ["Mutex<FedNode>", ".upgrade()"] {
+            assert!(
+                !fragment.contains(forbidden),
+                "requeue_backup_pairs and push_subscriptions_to_backup run under the FedNode \
+                 guard and must not reach FedNode; found `{forbidden}`"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
