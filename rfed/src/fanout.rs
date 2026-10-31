@@ -363,6 +363,19 @@ pub fn flush_queued(
             }
         }
     }
+    log(
+        format!(
+            "[deferred] flush to {}: {} by rfed.link, {} by packet, {} too large for a packet, {} not sent",
+            hexrep(subscriber, false),
+            flushed.by_link,
+            flushed.by_packet,
+            flushed.oversized,
+            flushed.not_sent,
+        ),
+        LOG_NOTICE,
+        false,
+        false,
+    );
     if flushed.oversized > 0 {
         log(
             format!(
