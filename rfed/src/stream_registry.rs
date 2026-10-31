@@ -47,6 +47,12 @@ impl StreamDispatchResult {
 /// on a thread of its own, so it holds none of the fan-out's locks.
 pub type OnUnproven = Arc<dyn Fn() + Send + Sync>;
 
+/// What a push does once a proof shows the device has it: the announce flush
+/// deletes the queued entry it sent (crate::deferred_queue::DeferredQueue::
+/// confirm). Runs at most once per push, on the first proof, on time or
+/// late, on a thread of its own, like [`OnUnproven`].
+pub type OnProved = Arc<dyn Fn() + Send + Sync>;
+
 /// One stream push across the matching session's live links (normally one:
 /// there is one stream link per subscriber or delivery hash).
 ///
@@ -67,10 +73,16 @@ pub(crate) struct PushOutcome {
     /// `conclude_one`, before the hook's thread is spawned).
     handed_off: AtomicBool,
     on_unproven: Option<OnUnproven>,
+    on_proved: Option<OnProved>,
 }
 
 impl PushOutcome {
     pub(crate) fn new(label: String, on_unproven: Option<OnUnproven>) -> Arc<Self> {
+        Self::new_with_proved(label, None, on_unproven)
+    }
+
+    /// As [`Self::new`], and `on_proved` runs on the first proof.
+    pub(crate) fn new_with_proved(label: String, on_proved: Option<OnProved>, on_unproven: Option<OnUnproven>) -> Arc<Self> {
         Arc::new(Self {
             label,
             pending: AtomicUsize::new(1),
@@ -78,7 +90,16 @@ impl PushOutcome {
             proved: AtomicBool::new(false),
             handed_off: AtomicBool::new(false),
             on_unproven,
+            on_proved,
         })
+    }
+
+    /// Run `on_proved` on a thread of its own: the proof arrives on an
+    /// interface's inbound thread, and the hook takes the queue's lock.
+    fn spawn_on_proved(&self) {
+        if let Some(hook) = self.on_proved.clone() {
+            std::thread::spawn(move || hook());
+        }
     }
 
     /// A receipt was obtained on one link. Called before that receipt's
@@ -91,10 +112,12 @@ impl PushOutcome {
     /// A link proved its packet: the device holds it. Runs on the thread
     /// that received the proof (an interface's inbound thread), so it touches
     /// atomics and the log only — no registry, queue or Transport — and
-    /// never holds up that interface's traffic.
+    /// never holds up that interface's traffic; `on_proved` gets a thread of
+    /// its own.
     pub(crate) fn proved(&self) {
         if !self.proved.swap(true, Ordering::SeqCst) {
             log(format!("[push] {} proved", self.label), LOG_DEBUG, false, false);
+            self.spawn_on_proved();
         }
         self.conclude_one();
     }
@@ -112,13 +135,16 @@ impl PushOutcome {
     /// the wake) stays, and the client drops the duplicate by its dedupe key.
     /// Same thread rules as [`Self::proved`].
     pub(crate) fn proved_late(&self) {
-        self.proved.store(true, Ordering::SeqCst);
+        let first = !self.proved.swap(true, Ordering::SeqCst);
         let note = if self.handed_off.load(Ordering::SeqCst) {
             "after its hand-off; the device has it and drops the pull copy as a duplicate"
         } else {
             "late, before its hand-off; delivered"
         };
         log(format!("[push] {} proved {note}", self.label), LOG_DEBUG, false, false);
+        if first {
+            self.spawn_on_proved();
+        }
     }
 
     /// The dispatch has tried every matching link.

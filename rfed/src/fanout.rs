@@ -25,6 +25,9 @@
 //!
 //! Tiers 2 and 3 are mutually exclusive per subscriber: a client that has
 //! migrated to `rfed.link` must not also receive the legacy copy.
+//!
+//! [`flush_queued`] is the other way a queued blob reaches a subscriber: the
+//! `rfed.delivery` announce flush, over tier 1 or a packet as above.
 
 
 use std::collections::HashMap;
@@ -36,7 +39,7 @@ use reticulum_rust::packet::{Packet, DATA, NONE, HEADER_1, FLAG_UNSET};
 use reticulum_rust::{log, hexrep, LOG_DEBUG, LOG_NOTICE, LOG_WARNING};
 
 use crate::deferred_queue::DeferredQueue;
-use crate::handoff::{await_packet_proof, OnUnconfirmed, PacketProof, Unconfirmed, DELIVERY_PACKET_PROOF};
+use crate::handoff::{await_packet_proof, wake_for_queued, OnUnconfirmed, PacketProof, Unconfirmed, DELIVERY_PACKET_PROOF};
 use crate::link_session::LinkSessionRegistry;
 use crate::notify::rns::{LiveStack, RelayStack};
 use crate::notify::{HookRegistry, NotifyRegistry};
@@ -86,6 +89,10 @@ pub struct FanoutPlan {
     pub channel_streams: Arc<Mutex<ChannelStreamRegistry>>,
     /// `rfed.link` sessions — tier 1, ahead of `channel_streams`.
     pub link_sessions: Arc<Mutex<LinkSessionRegistry>>,
+    /// The subscribers whose subscription to the channel expired as the plan
+    /// was made (crate::subscription::SubscriptionTable::expire_stale): not
+    /// in `subscribers`, and what they have queued on the channel is dropped.
+    pub expired: Vec<Vec<u8>>,
 }
 
 impl FanoutPlan {
@@ -95,6 +102,7 @@ impl FanoutPlan {
     ///
     /// Callers must not hold the `FedNode` mutex here — see the type's docs.
     pub fn run(&self, channel_dest_hash: &[u8], inner_blob: &[u8]) {
+        self.drop_expired(channel_dest_hash);
         let limits = self.deferred_limits.clone();
         let on_unconfirmed = crate::handoff::defer_then_wake(
             Arc::new(LiveStack),
@@ -125,6 +133,250 @@ impl FanoutPlan {
             DELIVERY_PACKET_PROOF,
         );
     }
+
+    /// Drop what each subscription that expired had queued on the channel,
+    /// and say so: nobody is left to pull it, and it only crowds the queue
+    /// (RFed SPEC §6 "Renewal and expiry").
+    fn drop_expired(&self, channel_dest_hash: &[u8]) {
+        for subscriber in &self.expired {
+            let dropped = self
+                .deferred_queue
+                .lock()
+                .map(|mut queue| queue.drain_channel_batch(subscriber, channel_dest_hash, usize::MAX).len())
+                .unwrap_or(0);
+            log(
+                format!(
+                    "[channel] {}'s subscription to {} expired: not renewed in {} days; {} queued blob(s) dropped",
+                    hexrep(subscriber, false),
+                    hexrep(channel_dest_hash, false),
+                    (crate::subscription::LOCAL_SUBSCRIPTION_LIFETIME_SECS / 86_400.0) as u64,
+                    dropped,
+                ),
+                LOG_NOTICE,
+                false,
+                false,
+            );
+        }
+    }
+}
+
+/// What one announce flush did with the entries it sent copies of.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Flushed {
+    /// Pushed down the subscriber's bound `rfed.link`; its answer confirms.
+    pub by_link: usize,
+    /// Sent as `rfed.delivery` packets with a receipt; the proof confirms.
+    pub by_packet: usize,
+    /// Above the packet MDU, with no `rfed.link` bound for its channel.
+    pub oversized: usize,
+    /// Not transmitted: no interface took the packet, or no destination.
+    pub not_sent: usize,
+}
+
+/// The `rfed.delivery` announce flush (RFed SPEC §7 "Delivery Triggers"):
+/// send `subscriber`, whose announce for `delivery_hash` was just heard,
+/// what it has queued under the routing hashes `wanted` admits. The entries
+/// stay queued, and pullable, while they are sent
+/// ([`DeferredQueue::flush_copies`]): a route's confirmation deletes one,
+/// and one no route confirms waits for the pull, the subscriber pushed to
+/// collect it ([`wake_for_queued`]). One not sent at all waits without a
+/// push: the subscriber has just announced.
+///
+/// Each goes down the subscriber's bound `rfed.link` when it has bound the
+/// channel, as tier 1 of the live fan-out, confirmed by its answer; else as
+/// an `rfed.delivery` packet with a receipt, confirmed by its proof under
+/// [`DELIVERY_PACKET_PROOF`].
+///
+/// Until 2026-10-30 the flush drained the entries, sent packets only, and
+/// queued them again on each receipt timeout. The web client never proves
+/// those packets and pulls 2 s after its announce, so its pull found its
+/// backlog away for the ~30 s the receipts ran, at every announce; on
+/// 2026-10-30 the re-queue met a full queue and eight #public.general posts
+/// were lost.
+#[allow(clippy::too_many_arguments)]
+pub fn flush_queued(
+    stack: Arc<dyn RelayStack + Send + Sync>,
+    deferred_queue: &Arc<Mutex<DeferredQueue>>,
+    notify_registry: &Arc<Mutex<NotifyRegistry>>,
+    link_sessions: &Mutex<LinkSessionRegistry>,
+    hook_registry: &Mutex<HookRegistry>,
+    identity: &Identity,
+    subscriber: &[u8],
+    delivery_hash: &[u8],
+    wanted: impl Fn(&[u8]) -> bool,
+) -> Flushed {
+    let mut flushed = Flushed::default();
+    let copies = match deferred_queue.lock() {
+        Ok(mut queue) => queue.flush_copies(subscriber, wanted),
+        Err(_) => return flushed,
+    };
+    if copies.is_empty() {
+        return flushed;
+    }
+    log(
+        format!(
+            "[deferred] subscriber {} (delivery {}) back online — flushing {} blob(s), each kept queued until confirmed",
+            hexrep(subscriber, false),
+            hexrep(delivery_hash, false),
+            copies.len(),
+        ),
+        LOG_NOTICE,
+        false,
+        false,
+    );
+
+    let dest = match Destination::new_outbound(
+        Some(identity.clone()),
+        DestinationType::Single,
+        APP_NAME.to_string(),
+        vec!["delivery".to_string()],
+    ) {
+        Ok(dest) => Some(dest),
+        Err(e) => {
+            log(
+                format!("[deferred] no delivery destination for {}: {e}", hexrep(subscriber, false)),
+                LOG_WARNING,
+                false,
+                false,
+            );
+            None
+        }
+    };
+    // Queued under the identity hash the pull takes by; woken under the key
+    // its registration is stored under.
+    let recipient = Unconfirmed { queue_key: subscriber.to_vec(), wake_key: crate::notify::notify_key(subscriber) };
+    let hooks = hook_registry.lock().ok();
+    let mut unsent: Vec<u64> = Vec::new();
+    for entry in &copies {
+        let ticket = entry.ticket();
+        let confirmed: Arc<dyn Fn() + Send + Sync> = {
+            let queue = Arc::clone(deferred_queue);
+            let subscriber = subscriber.to_vec();
+            Arc::new(move || {
+                if let Ok(mut queue) = queue.lock() {
+                    queue.confirm(&subscriber, ticket);
+                }
+            })
+        };
+        let unconfirmed: Arc<dyn Fn() + Send + Sync> = {
+            let (stack, queue, notify) = (Arc::clone(&stack), Arc::clone(deferred_queue), Arc::clone(notify_registry));
+            let (recipient, channel, blob) = (recipient.clone(), entry.channel_hash.clone(), entry.blob.clone());
+            Arc::new(move || {
+                let waiting = queue.lock().map(|mut queue| queue.release(&recipient.queue_key, ticket)).unwrap_or(false);
+                if waiting {
+                    wake_for_queued(&*stack, &notify, &recipient, &channel, &blob, Some(&channel));
+                }
+            })
+        };
+        let mut payload = entry.channel_hash.clone();
+        payload.extend_from_slice(&entry.blob);
+
+        // Tier 1 first, as the live fan-out: the link the client keeps open
+        // and answers on. Until 2026-10-30 the flush sent packets only.
+        let linked = link_sessions.lock().ok().and_then(|mut registry| {
+            registry.has_channel_session(subscriber, &entry.channel_hash).then(|| {
+                registry.dispatch_channel(
+                    subscriber,
+                    &entry.channel_hash,
+                    &payload,
+                    Some(Arc::clone(&unconfirmed)),
+                    Some(Arc::clone(&confirmed)),
+                )
+            })
+        });
+        if linked.is_some_and(|result| result.delivered()) {
+            flushed.by_link += 1;
+            if let Some(ref hooks) = hooks {
+                hooks.on_deliver(subscriber, &entry.blob);
+            }
+            continue;
+        }
+
+        // A blob above the packet MDU can never leave as a single DATA
+        // packet: Packet::send fails with "exceeds MTU" every time. Until
+        // 2026-09-23 that failure re-enqueued the blob and every announce
+        // tried the same impossible send again. It waits for the pull.
+        if !crate::destinations::fits_in_delivery_packet(payload.len()) {
+            flushed.oversized += 1;
+            unsent.push(ticket);
+            continue;
+        }
+        let Some(dest) = dest.as_ref() else {
+            flushed.not_sent += 1;
+            unsent.push(ticket);
+            continue;
+        };
+        let mut packet = Packet::new(
+            Some(dest.clone()),
+            payload,
+            DATA,
+            NONE,
+            reticulum_rust::transport::BROADCAST,
+            HEADER_1,
+            None,
+            None,
+            true,
+            FLAG_UNSET,
+        );
+        match stack.send_with_receipt(&mut packet) {
+            Ok(Some(receipt)) => {
+                await_packet_proof(
+                    &receipt,
+                    format!("deferred flush of {} to {}", hexrep(&entry.channel_hash, false), hexrep(subscriber, false)),
+                    DELIVERY_PACKET_PROOF,
+                    Some(confirmed),
+                    unconfirmed,
+                );
+                flushed.by_packet += 1;
+                if let Some(ref hooks) = hooks {
+                    hooks.on_deliver(subscriber, &entry.blob);
+                }
+            }
+            // No usable interface right now: it waits for the pull or the
+            // next announce.
+            Ok(None) => {
+                log(
+                    format!("[deferred] send to {} not transmitted (no usable interface) — left queued", hexrep(subscriber, false)),
+                    LOG_NOTICE,
+                    false,
+                    false,
+                );
+                flushed.not_sent += 1;
+                unsent.push(ticket);
+            }
+            Err(e) => {
+                log(
+                    format!("[deferred] send to {} failed: {e} — left queued", hexrep(subscriber, false)),
+                    LOG_WARNING,
+                    false,
+                    false,
+                );
+                flushed.not_sent += 1;
+                unsent.push(ticket);
+            }
+        }
+    }
+    if !unsent.is_empty() {
+        if let Ok(mut queue) = deferred_queue.lock() {
+            for ticket in &unsent {
+                queue.release(subscriber, *ticket);
+            }
+        }
+    }
+    if flushed.oversized > 0 {
+        log(
+            format!(
+                "[deferred] {} blob(s) for {} exceed the {}-byte packet MDU and no rfed.link is bound for their channel — left queued for /channel/pull",
+                flushed.oversized,
+                hexrep(subscriber, false),
+                reticulum_rust::packet::ENCRYPTED_MDU,
+            ),
+            LOG_NOTICE,
+            false,
+            false,
+        );
+    }
+    flushed
 }
 
 /// Fanout an inner blob to the given subscribers of `channel_dest_hash`, and
@@ -238,7 +490,7 @@ pub fn fanout_blob(
             }
             // The client answers this push; if it never does, the blob is
             // handed off — a route change, not a retry (DESIGN_PRINCIPLES §3).
-            Some(registry.dispatch_channel(sub_hash, channel_dest_hash, &payload, Some(hand_off_later())))
+            Some(registry.dispatch_channel(sub_hash, channel_dest_hash, &payload, Some(hand_off_later()), None))
         });
 
         if let Some(result) = link_result {
@@ -371,6 +623,7 @@ pub fn fanout_blob(
                     &receipt,
                     format!("channel {} packet to subscriber {}", hexrep(channel_dest_hash, false), hexrep(sub_hash, false)),
                     packet_proof,
+                    None,
                     hand_off_later(),
                 );
                 log(
@@ -536,5 +789,221 @@ mod tests {
         assert_eq!(fan_out(&stack, &sub_hash, hook), 1);
         assert_eq!(handed_off.try_recv().expect("handed off"), the_subscriber(&sub_hash));
         assert_eq!(stack.path_requests.lock().unwrap().as_slice(), &[delivery]);
+    }
+
+    // ── The announce flush (flush_queued, 2026-10-30) ─────────────────────
+
+    use reticulum_rust::packet::PacketReceipt;
+
+    const CHANNEL: [u8; 16] = [0xC1; 16];
+
+    struct Flush {
+        dir: std::path::PathBuf,
+        queue: Arc<Mutex<DeferredQueue>>,
+        notify: Arc<Mutex<NotifyRegistry>>,
+        links: Mutex<LinkSessionRegistry>,
+        hooks: Mutex<HookRegistry>,
+    }
+
+    impl Flush {
+        fn new(tag: &str) -> Flush {
+            let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let dir = std::env::temp_dir().join(format!("rfed_flush_{tag}_{unique}"));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            Flush {
+                queue: Arc::new(Mutex::new(DeferredQueue::load(dir.join("deferred.rmp")))),
+                notify: Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp")))),
+                links: Mutex::new(LinkSessionRegistry::default()),
+                hooks: Mutex::new(HookRegistry::new()),
+                dir,
+            }
+        }
+
+        fn queue_blob(&self, sub_hash: &[u8], blob: &[u8]) {
+            self.queue.lock().unwrap().enqueue(sub_hash.to_vec(), CHANNEL.to_vec(), blob.to_vec(), 256);
+        }
+
+        fn run(&self, stack: &Arc<FakeStack>, identity: &Identity, sub_hash: &[u8], delivery: &[u8]) -> Flushed {
+            flush_queued(
+                Arc::clone(stack) as Arc<dyn RelayStack + Send + Sync>,
+                &self.queue,
+                &self.notify,
+                &self.links,
+                &self.hooks,
+                identity,
+                sub_hash,
+                delivery,
+                |_| true,
+            )
+        }
+
+        fn queued(&self, sub_hash: &[u8]) -> usize {
+            self.queue.lock().unwrap().count_matching(sub_hash, &CHANNEL)
+        }
+    }
+
+    impl Drop for Flush {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Wait for a hook's thread to act.
+    fn eventually(what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn prove(receipt: &mut PacketReceipt, identity: &Identity) {
+        let mut proof = receipt.hash.clone();
+        proof.extend_from_slice(&identity.sign(&receipt.hash));
+        assert!(receipt.validate_proof(&proof), "the subscriber's proof validates");
+    }
+
+    /// The `[handoff]` line of a flushed blob nothing confirmed, from any
+    /// thread: the receipt's timeout runs it on one of its own.
+    fn handoff_lines(mark: &crate::test_log::Mark, sub_hash: &[u8]) -> Vec<String> {
+        mark.any_thread_containing(&format!(
+            "[handoff] {} unconfirmed for",
+            hexrep(&crate::notify::notify_key(sub_hash), false)
+        ))
+    }
+
+    /// The web client never proves the flush's packets and pulls 2 s after
+    /// its announce. The flushed blobs stay queued meanwhile, so that pull
+    /// gets them; a proof deletes its blob, and one never proved stays for
+    /// the pull, its subscriber woken. Until 2026-10-30 the flush drained
+    /// them, and the pull found nothing until the receipts timed out.
+    #[test]
+    fn the_flush_keeps_its_blobs_queued_until_a_proof() {
+        let (identity, sub_hash, delivery) = known_subscriber();
+        let stack = Arc::new(FakeStack::new(&delivery, None));
+        let flush = Flush::new("keeps");
+        flush.queue_blob(&sub_hash, b"one");
+        flush.queue_blob(&sub_hash, b"two");
+
+        assert_eq!(flush.run(&stack, &identity, &sub_hash, &delivery), Flushed { by_packet: 2, ..Default::default() });
+        assert_eq!(flush.queued(&sub_hash), 2, "both still queued while their receipts run");
+        let (page, pulled) = flush.queue.lock().unwrap().take_page(&sub_hash, |_| true, 25, usize::MAX, |_| 1);
+        assert_eq!(pulled.len(), 2, "a pull meanwhile gets them");
+        flush.queue.lock().unwrap().settle_page(page, false);
+
+        let mut receipts = stack.receipts.lock().unwrap().clone();
+        prove(&mut receipts[0], &identity);
+        eventually("the proved blob is deleted", || flush.queued(&sub_hash) == 1);
+
+        let mark = crate::test_log::mark();
+        receipts[1].set_timeout(0.0);
+        receipts[1].check_timeout();
+        eventually("the subscriber is woken for the unproven one", || !handoff_lines(&mark, &sub_hash).is_empty());
+        let lines = handoff_lines(&mark, &sub_hash);
+        assert!(lines[0].contains(": queued for pull, woken via 0 of 0"), "{}", lines[0]);
+        assert_eq!(
+            flush.run(&stack, &identity, &sub_hash, &delivery),
+            Flushed { by_packet: 1, ..Default::default() },
+            "out of flight, so the next announce sends it again"
+        );
+        let left = flush.queue.lock().unwrap().drain(&sub_hash);
+        assert_eq!(left.iter().map(|e| e.blob.clone()).collect::<Vec<_>>(), vec![b"two".to_vec()], "it waits for the pull");
+    }
+
+    /// A proof that lands after the receipt timed out still deletes the
+    /// blob: the device has it, so its next pull need not bring it again.
+    #[test]
+    fn a_late_proof_still_deletes_the_blob() {
+        let (identity, sub_hash, delivery) = known_subscriber();
+        let stack = Arc::new(FakeStack::new(&delivery, None));
+        let flush = Flush::new("late");
+        flush.queue_blob(&sub_hash, b"one");
+        flush.run(&stack, &identity, &sub_hash, &delivery);
+
+        let mark = crate::test_log::mark();
+        let mut receipt = stack.receipts.lock().unwrap()[0].clone();
+        receipt.set_timeout(0.0);
+        receipt.check_timeout();
+        eventually("handed off on the timeout", || !handoff_lines(&mark, &sub_hash).is_empty());
+        assert_eq!(flush.queued(&sub_hash), 1);
+        prove(&mut receipt, &identity);
+        eventually("deleted on the late proof", || flush.queued(&sub_hash) == 0);
+    }
+
+    /// An announce while the flush waits for its receipts sends nothing again.
+    #[test]
+    fn an_announce_during_a_flush_sends_nothing_twice() {
+        let (identity, sub_hash, delivery) = known_subscriber();
+        let stack = Arc::new(FakeStack::new(&delivery, None));
+        let flush = Flush::new("twice");
+        flush.queue_blob(&sub_hash, b"one");
+        assert_eq!(flush.run(&stack, &identity, &sub_hash, &delivery).by_packet, 1);
+        assert_eq!(flush.run(&stack, &identity, &sub_hash, &delivery), Flushed::default(), "still in flight");
+        assert_eq!(stack.packets.lock().unwrap().len(), 1);
+    }
+
+    /// A packet no interface took is not in flight: it waits, queued, and
+    /// the next announce sends it. Nobody is pushed: the subscriber has just
+    /// announced.
+    #[test]
+    fn a_blob_not_transmitted_waits_for_the_next_announce() {
+        let (identity, sub_hash, delivery) = known_subscriber();
+        let flush = Flush::new("unsent");
+        flush.queue_blob(&sub_hash, b"one");
+        let mark = crate::test_log::mark();
+        let dead = Arc::new(FakeStack::new(&delivery, None).without_interface());
+        assert_eq!(flush.run(&dead, &identity, &sub_hash, &delivery), Flushed { not_sent: 1, ..Default::default() });
+        assert_eq!(flush.queued(&sub_hash), 1);
+        assert!(handoff_lines(&mark, &sub_hash).is_empty(), "nobody woken");
+        let live = Arc::new(FakeStack::new(&delivery, None));
+        assert_eq!(flush.run(&live, &identity, &sub_hash, &delivery).by_packet, 1, "released, so sent next time");
+    }
+
+    /// A blob above the packet MDU, with no rfed.link bound for its channel,
+    /// is not tried as a packet: it waits for the pull.
+    #[test]
+    fn an_oversized_blob_without_a_link_waits_for_the_pull() {
+        let (identity, sub_hash, delivery) = known_subscriber();
+        let stack = Arc::new(FakeStack::new(&delivery, None));
+        let flush = Flush::new("oversized");
+        flush.queue_blob(&sub_hash, &vec![0x42; reticulum_rust::packet::ENCRYPTED_MDU]);
+        assert_eq!(flush.run(&stack, &identity, &sub_hash, &delivery), Flushed { oversized: 1, ..Default::default() });
+        assert!(stack.packets.lock().unwrap().is_empty());
+        assert_eq!(flush.queued(&sub_hash), 1);
+        assert_eq!(flush.run(&stack, &identity, &sub_hash, &delivery).oversized, 1, "not left in flight");
+    }
+
+    /// A subscription that expired as the plan was made: what it had queued
+    /// on the channel is dropped, and the line says so; its entries for
+    /// other channels stay.
+    #[test]
+    fn a_plan_drops_what_an_expired_subscription_had_queued() {
+        let flush = Flush::new("expired");
+        let gone = vec![0x0A; 16];
+        let elsewhere = vec![0xC2; 16];
+        flush.queue_blob(&gone, b"post");
+        flush.queue.lock().unwrap().enqueue(gone.clone(), elsewhere.clone(), b"another channel's".to_vec(), 256);
+        let plan = FanoutPlan {
+            subscribers: Vec::new(),
+            deferred_limits: HashMap::new(),
+            hook_registry: Arc::new(Mutex::new(HookRegistry::new())),
+            notify_registry: Arc::clone(&flush.notify),
+            deferred_queue: Arc::clone(&flush.queue),
+            channel_streams: Arc::new(Mutex::new(ChannelStreamRegistry::default())),
+            link_sessions: Arc::new(Mutex::new(LinkSessionRegistry::default())),
+            expired: vec![gone.clone()],
+        };
+
+        let mark = crate::test_log::mark();
+        plan.run(&CHANNEL, b"a new post");
+        assert_eq!(flush.queued(&gone), 0);
+        assert_eq!(flush.queue.lock().unwrap().count_matching(&gone, &elsewhere), 1);
+        let lines = mark.containing("subscription to");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with(&format!(
+            "[channel] {}'s subscription to {} expired: not renewed in 30 days; 1 queued blob(s) dropped",
+            hexrep(&gone, false),
+            hexrep(&CHANNEL, false),
+        )), "{}", lines[0]);
     }
 }

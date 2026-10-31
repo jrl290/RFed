@@ -950,14 +950,20 @@ impl FedNode {
     }
 
     /// The plan for every subscription row under `channel_dest_hash`, unjudged:
-    /// only for a hash `judge_routing_hash` found to be a channel's.
+    /// only for a hash `judge_routing_hash` found to be a channel's. A row of
+    /// this node's own that nothing renewed in 30 days expires here, before
+    /// the plan is made (SPEC §6 "Renewal and expiry"): the fan-out is what
+    /// queues for a device that is gone, so the fan-out is where it stops.
     fn channel_rows_plan(&self, channel_dest_hash: &[u8]) -> fanout::FanoutPlan {
-        let subscribers = self
+        let (subscribers, expired) = self
             .subscription_table
             .lock()
-            .map(|t| t.get_subscribers_with_owner(channel_dest_hash))
+            .map(|mut t| {
+                let expired = t.expire_stale(channel_dest_hash, crate::subscription::LOCAL_SUBSCRIPTION_LIFETIME_SECS);
+                (t.get_subscribers_with_owner(channel_dest_hash), expired)
+            })
             .unwrap_or_default();
-        self.fanout_plan(subscribers)
+        fanout::FanoutPlan { expired, ..self.fanout_plan(subscribers) }
     }
 
     fn fanout_plan(&self, subscribers: Vec<(Vec<u8>, Option<Vec<u8>>)>) -> fanout::FanoutPlan {
@@ -977,6 +983,7 @@ impl FedNode {
             deferred_queue: Arc::clone(&self.deferred_queue),
             channel_streams: Arc::clone(&self.channel_streams),
             link_sessions: Arc::clone(&self.link_sessions),
+            expired: Vec::new(),
         }
     }
 
@@ -2319,11 +2326,12 @@ mod backup_chain_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// With the deferred queue at its global limit, the backup tick queues
-    /// nothing and says so as a WARNING; its `[backup] queued` line counts
-    /// only what was queued (until 2026-10-10 it counted every blob it
-    /// offered). The subscriber is still adopted and woken, as before, so it
-    /// drains what is queued for it.
+    /// With the deferred queue at its global limit and every entry held by a
+    /// pull (since 2026-10-30 nothing else stops the limit evicting one), the
+    /// backup tick queues nothing and says so as a WARNING; its `[backup]
+    /// queued` line counts only what was queued (until 2026-10-10 it counted
+    /// every blob it offered). The subscriber is still adopted and woken, as
+    /// before, so it drains what is queued for it.
     #[test]
     fn a_backup_blob_the_global_limit_refuses_is_a_warning_not_counted_queued() {
         let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
@@ -2340,6 +2348,8 @@ mod backup_chain_tests {
             let mut queue = deferred.lock().unwrap();
             queue.global_limit = 1;
             queue.enqueue(vec![0xEE; 16], vec![0xCC; 16], b"someone else's".to_vec(), 256);
+            let (page, _) = queue.take_page(&[0xEE; 16], |_| true, 25, usize::MAX, |_| 1);
+            assert_ne!(page, 0, "a pull holds it");
         }
         let notify = Arc::new(Mutex::new(NotifyRegistry::load(dir.join("notify.rmp"))));
         let distro = Arc::new(Mutex::new(DistroTable::load(dir.join("distro.rmp"))));
@@ -2522,9 +2532,9 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     // subscriber comes online.  Subscribers announce on their rfed.delivery
     // destination so we observe `APP_NAME.delivery` aspects here.
     //
-    // Flow: announce heard → check deferred queue → drain → build outbound
-    //   single dest for this subscriber → send each blob as a DATA packet.
-    //   If dest build fails, re-enqueue for retry on next announce.
+    // Flow: announce heard → copies of its queued channel blobs, each kept
+    //   queued until a route confirms it → down its bound rfed.link, or as a
+    //   DATA packet to its rfed.delivery (fanout::flush_queued).
     let delivery_weak = Arc::downgrade(&node);
     Transport::register_announce_handler(AnnounceHandler {
         aspect_filter: Some(format!("{APP_NAME}.delivery")),
@@ -2542,246 +2552,42 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
                 None => return,
             };
             // Take the collaborators this handler needs and release the FedNode
-            // mutex immediately. The flush below sends one packet per blob —
+            // mutex immediately. The flush below sends one push per blob —
             // network work — and this handler runs on the announce path, so
             // holding the mutex here stalls every request callback exactly the
             // way the channel fan-out did (see FedNode::plan_channel_fanout).
             //
             // NEVER REMOVE the early drop.
-            let (deferred_queue, hook_registry, notify_registry, limit, distros) = match arc.lock() {
+            let (deferred_queue, hook_registry, notify_registry, link_sessions, distros) = match arc.lock() {
                 Ok(guard) => (
                     Arc::clone(&guard.deferred_queue),
                     Arc::clone(&guard.hook_registry),
                     Arc::clone(&guard.notify_registry),
-                    guard.config.policy_for(&sub_id_hash).deferred_queue_limit,
+                    Arc::clone(&guard.link_sessions),
                     guard.distro_table.lock().map(|t| t.registered_distro_hashes()).unwrap_or_default(),
                 ),
                 Err(_) => return,
             };
             // Distro blobs stay queued: they leave only by /rfed/pull, which
-            // the push that queued them asks the device to make. This flush
-            // sends an rfed.delivery packet nothing confirms; until 2026-09-26
-            // it took distro blobs too and counted them delivered.
+            // the push that queued them asks the device to make. Until
+            // 2026-09-26 this flush took distro blobs too and counted them
+            // delivered.
             let not_distro = |routing: &[u8]| !distros.contains(routing);
-
-            // Fast-path: skip the lock chain if nothing is queued.
-            let has_pending = deferred_queue
-                .lock()
-                .ok()
-                .map(|q| q.has_pending_matching(&sub_id_hash, not_distro))
-                .unwrap_or(false);
-            if !has_pending {
-                return;
-            }
-
-            // Drain the queue for this subscriber (keyed by identity hash).
-            let pending = deferred_queue
-                .lock()
-                .ok()
-                .map(|mut q| q.drain_matching_batch(&sub_id_hash, not_distro, usize::MAX))
-                .unwrap_or_default();
-
-            if pending.is_empty() {
-                return;
-            }
-
-            log(
-                format!(
-                    "[deferred] subscriber {} (delivery {}) back online — flushing {} blob(s)",
-                    hexrep(&sub_id_hash, false),
-                    hexrep(dest_hash, false),
-                    pending.len()
-                ),
-                LOG_NOTICE,
-                false,
-                false,
+            fanout::flush_queued(
+                Arc::new(crate::notify::rns::LiveStack),
+                &deferred_queue,
+                &notify_registry,
+                &link_sessions,
+                &hook_registry,
+                identity,
+                &sub_id_hash,
+                dest_hash,
+                not_distro,
             );
-
-            // Build the outbound delivery destination using the now-known identity.
-            let dest_result = reticulum_rust::destination::Destination::new_outbound(
-                Some(identity.clone()),
-                reticulum_rust::destination::DestinationType::Single,
-                APP_NAME.to_string(),
-                vec!["delivery".to_string()],
-            );
-            let dest = match dest_result {
-                Ok(d) => d,
-                Err(e) => {
-                    log(
-                        format!("[deferred] failed to build dest for {}: {e}",
-                            hexrep(&sub_id_hash, false)),
-                        LOG_WARNING,
-                        false,
-                        false,
-                    );
-                    // Re-enqueue everything — we'll try again on next announce.
-                    requeue_drained(
-                        &deferred_queue,
-                        &sub_id_hash,
-                        pending.into_iter().map(|pb| (pb.channel_hash, pb.blob)).collect(),
-                        limit,
-                        "not sent: no delivery destination",
-                    );
-                    return;
-                }
-            };
-
-            let hooks = hook_registry.lock().ok();
-            let mut failed: Vec<&crate::deferred_queue::PendingBlob> = Vec::new();
-            let mut oversized: Vec<&crate::deferred_queue::PendingBlob> = Vec::new();
-            for pb in &pending {
-                // Delivery packet payload: channel_hash(16) | inner_blob
-                // Matches the format expected by the subscriber's onRfedBlob handler.
-                let mut payload = pb.channel_hash.clone();
-                payload.extend_from_slice(&pb.blob);
-                // A blob above the packet MDU can never leave here as a single
-                // DATA packet: Packet::send fails with "exceeds MTU" every time.
-                // Until 2026-09-23 that failure re-enqueued the blob and the
-                // next announce from the subscriber tried again — the same
-                // impossible send, a warning per blob per announce, for ever.
-                // Such blobs belong to the link tiers (`/channel/pull`, or a
-                // bound rfed.link / stream session), so keep them queued and
-                // do not attempt the packet.
-                if !fits_in_delivery_packet(payload.len()) {
-                    oversized.push(pb);
-                    continue;
-                }
-                let mut packet = reticulum_rust::packet::Packet::new(
-                    Some(dest.clone()),
-                    payload,
-                    reticulum_rust::packet::DATA,
-                    reticulum_rust::packet::NONE,
-                    reticulum_rust::transport::BROADCAST,
-                    reticulum_rust::packet::HEADER_1,
-                    None,
-                    None,
-                    true,
-                    reticulum_rust::packet::FLAG_UNSET,
-                );
-                // Drained once sent. With the proof Required, delivered only
-                // on the subscriber's proof: on the RNS receipt timeout the
-                // blob is queued again and the subscriber pushed
-                // (crate::handoff). Observed (DELIVERY_PACKET_PROOF, until the
-                // apps that prove are on most devices): sent once, the proof
-                // only logged, as before 2026-09-26.
-                match crate::notify::rns::RelayStack::send_with_receipt(&crate::notify::rns::LiveStack, &mut packet) {
-                    Ok(Some(receipt)) => {
-                        let limit_for: Arc<dyn Fn(&[u8]) -> usize + Send + Sync> = Arc::new(move |_| limit);
-                        let hand_off = crate::handoff::defer_then_wake(
-                            Arc::new(crate::notify::rns::LiveStack),
-                            Arc::clone(&deferred_queue),
-                            Arc::clone(&notify_registry),
-                            limit_for,
-                            &pb.channel_hash,
-                            &pb.blob,
-                            Some(&pb.channel_hash),
-                        );
-                        // Queued under the identity hash the pull drains by;
-                        // woken under the key its registration is stored under.
-                        let subscriber = crate::handoff::Unconfirmed {
-                            queue_key: sub_id_hash.clone(),
-                            wake_key: crate::notify::notify_key(&sub_id_hash),
-                        };
-                        crate::handoff::await_packet_proof(
-                            &receipt,
-                            format!("deferred flush of {} to {}", hexrep(&pb.channel_hash, false), hexrep(&sub_id_hash, false)),
-                            crate::handoff::DELIVERY_PACKET_PROOF,
-                            Arc::new(move || hand_off(subscriber.clone())),
-                        );
-                        if let Some(ref hooks) = hooks {
-                            hooks.on_deliver(&sub_id_hash, &pb.blob);
-                        }
-                    }
-                    // No usable interface/path right now. Do NOT drop it:
-                    // re-enqueue for the next announce or the pull.
-                    Ok(None) => {
-                        log(
-                            format!("[deferred] send to {} not transmitted (no usable interface) — re-enqueueing",
-                                hexrep(&sub_id_hash, false)),
-                            LOG_NOTICE,
-                            false,
-                            false,
-                        );
-                        failed.push(pb);
-                    }
-                    // Err = hard send error — re-enqueue.
-                    Err(e) => {
-                        log(
-                            format!("[deferred] send to {} failed: {e} — re-enqueueing",
-                                hexrep(&sub_id_hash, false)),
-                            LOG_WARNING,
-                            false,
-                            false,
-                        );
-                        failed.push(pb);
-                    }
-                }
-            }
-            // Re-enqueue the blobs that did not transmit so they survive for the
-            // next announce / path-ready trigger instead of being dropped.
-            let as_entries = |blobs: &[&crate::deferred_queue::PendingBlob]| -> Vec<(Vec<u8>, Vec<u8>)> {
-                blobs.iter().map(|pb| (pb.channel_hash.clone(), pb.blob.clone())).collect()
-            };
-            if !failed.is_empty() {
-                requeue_drained(&deferred_queue, &sub_id_hash, as_entries(&failed), limit, "not transmitted");
-            }
-            // Put back first, then say how many are queued: the queue was
-            // released after the drain, so other hand-offs may have taken the
-            // room (until 2026-10-10 this said "left queued" before the
-            // re-queue, also for blobs the global limit then refused).
-            if !oversized.is_empty() {
-                let kept = requeue_drained(&deferred_queue, &sub_id_hash, as_entries(&oversized), limit, "above the packet MDU");
-                log(
-                    format!(
-                        "[deferred] {} blob(s) for {} exceed the {}-byte packet MDU — {} left queued for /channel/pull or a bound rfed.link",
-                        oversized.len(),
-                        hexrep(&sub_id_hash, false),
-                        reticulum_rust::packet::ENCRYPTED_MDU,
-                        kept,
-                    ),
-                    LOG_NOTICE,
-                    false,
-                    false,
-                );
-            }
         }),
     });
 
     Ok(())
-}
-
-/// Put blobs the announce flush drained back in the deferred queue for
-/// `subscriber`, and say what that lost; returns how many are queued again.
-/// The flush releases the queue between its drain and this, so other
-/// hand-offs may have taken the room: a blob the global limit now refuses is
-/// lost to the pull, and that is a WARNING, as a hand-off's refusal is (RFed
-/// SPEC §7 "Limits"). Logs with the queue released. Until 2026-10-10 the
-/// flush ignored what its re-queue did.
-fn requeue_drained(
-    deferred_queue: &Mutex<crate::deferred_queue::DeferredQueue>,
-    subscriber: &[u8],
-    blobs: Vec<(Vec<u8>, Vec<u8>)>,
-    limit: usize,
-    why: &str,
-) -> usize {
-    let offered = blobs.len();
-    let tally = deferred_queue.lock().ok().map(|mut queue| queue.enqueue_all(subscriber, blobs, limit));
-    let Some(tally) = tally else {
-        log(
-            format!(
-                "[deferred] {offered} blob(s) for {} ({why}) NOT queued again: the deferred queue is poisoned",
-                hexrep(subscriber, false),
-            ),
-            LOG_WARNING,
-            false,
-            false,
-        );
-        return 0;
-    };
-    for (level, line) in tally.loss_lines("[deferred]", subscriber, why) {
-        log(line, level, false, false);
-    }
-    tally.queued
 }
 
 /// Whether a `channel_hash | blob` delivery payload fits one encrypted DATA
@@ -2883,16 +2689,18 @@ mod deferred_flush_size_tests {
     /// failure). The stack reports "left" from the transmitted flag.
     #[test]
     fn fanouts_read_the_transmitted_flag_not_the_receipt() {
-        for (name, src) in [
-            ("destinations.rs", include_str!("destinations.rs")),
-            ("fanout.rs", include_str!("fanout.rs")),
+        // fanout.rs: the live fan-out's tier 3 and, since 2026-10-30, the
+        // announce flush, which destinations.rs held until then.
+        for (name, src, sends) in [
+            ("destinations.rs", include_str!("destinations.rs"), 0),
+            ("fanout.rs", include_str!("fanout.rs"), 2),
         ] {
             // Everything before this test: destinations.rs has test modules above
             // its deferred flush, so a #[cfg(test)] split would drop the code under test.
             let production = src.split("fn fanouts_read_the_transmitted_flag_not_the_receipt").next().unwrap();
             assert_eq!(production.matches("packet.send()").count(), 0, "{name}: no packet without a receipt");
-            assert_eq!(production.matches("send_with_receipt(").count(), 1, "{name}");
-            assert_eq!(production.matches("await_packet_proof(").count(), 1, "{name}: its receipt decides, under the proof mode");
+            assert_eq!(production.matches("send_with_receipt(").count(), sends, "{name}");
+            assert_eq!(production.matches("await_packet_proof(").count(), sends, "{name}: its receipt decides, under the proof mode");
         }
         // Since 2026-09-26 the distro fan-out sends no rfed.delivery packet
         // (distro::tests::the_distro_fanout_sends_no_unconfirmed_packet).
@@ -2901,9 +2709,9 @@ mod deferred_flush_size_tests {
         assert!(live.contains("Ok(if packet.sent { receipt } else { None })"), "and reports it only if the packet left");
     }
 
-    /// The rfed.delivery announce flush sends packets nothing confirms, so it
-    /// takes no distro blob: those leave only by /rfed/pull, after the push
-    /// that queued them. Until 2026-09-26 it drained the whole bucket.
+    /// The rfed.delivery announce flush takes no distro blob: those leave
+    /// only by /rfed/pull, after the push that queued them. Until 2026-09-26
+    /// it drained the whole bucket.
     #[test]
     fn the_announce_flush_leaves_distro_blobs_queued() {
         let source = include_str!("destinations.rs");
@@ -2913,9 +2721,9 @@ mod deferred_flush_size_tests {
         let end = start + source[start..].find("\n    });\n").expect("the flush closes");
         let flush = &source[start..end];
         assert!(flush.contains("registered_distro_hashes()"), "the flush knows the distro hashes");
-        assert!(flush.contains("drain_matching_batch(&sub_id_hash, not_distro"), "and drains only the rest");
-        assert!(flush.contains("has_pending_matching(&sub_id_hash, not_distro)"));
-        assert!(!flush.contains("q.drain(&sub_id_hash)"), "never the whole bucket");
+        assert!(flush.contains("let not_distro = |routing: &[u8]| !distros.contains(routing);"));
+        assert!(flush.contains("fanout::flush_queued("), "and flushes only the rest");
+        assert!(flush.contains("                not_distro,\n            );"), "as what it wants");
     }
 
     /// The deferred flush must consult the size gate before it builds a packet,
@@ -2923,62 +2731,28 @@ mod deferred_flush_size_tests {
     /// #[test] sat on the test above, so this one never ran.)
     #[test]
     fn deferred_flush_gates_on_size_before_building_a_packet() {
-        let source = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/destinations.rs"))
-            .expect("read destinations.rs");
-        let start = source
-            .find("back online — flushing")
-            .expect("deferred flush present");
+        let source = include_str!("fanout.rs");
+        let start = source.find("pub fn flush_queued(").expect("deferred flush present");
         let fragment = &source[start..];
         let gate = fragment.find("fits_in_delivery_packet(payload.len())").expect("size gate present");
-        let packet = fragment.find("reticulum_rust::packet::Packet::new(").expect("packet build present");
+        let packet = fragment.find("Packet::new(").expect("packet build present");
         assert!(gate < packet, "the size gate must run before Packet::new in the deferred flush");
     }
 
-    /// The flush puts back what it drained and could not send, with the
-    /// queue released in between. A blob the global limit then refuses is a
-    /// WARNING, and the count it returns is what is queued again.
+    /// The flush sends copies and never takes an entry out of the queue, so
+    /// it never has to put one back (2026-10-30). Until then it drained the
+    /// bucket and re-queued on each receipt timeout, out of reach of the pull
+    /// meanwhile, and a re-queue the global limit refused was lost.
     #[test]
-    fn a_requeue_the_global_limit_refuses_is_a_warning() {
-        use super::requeue_drained;
-        use crate::deferred_queue::DeferredQueue;
-        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("rfed_requeue_{unique}.rmp"));
-        crate::store_db::remove_store_files(&path);
-        let queue = std::sync::Mutex::new(DeferredQueue::load(path.clone()));
-        queue.lock().unwrap().global_limit = 2;
-        let subscriber = vec![0x5B; 16];
-        let blobs = |n: u8| (0..n).map(|i| (vec![0xC5; 16], vec![i])).collect::<Vec<_>>();
-
-        let mark = crate::test_log::mark();
-        assert_eq!(requeue_drained(&queue, &subscriber, blobs(3), 256, "not transmitted"), 2);
-        let lines = mark.containing("[deferred] ");
-        assert_eq!(lines.len(), 1, "{lines:?}");
-        assert!(lines[0].contains("[Warning]"), "{}", lines[0]);
-        assert!(lines[0].ends_with(&format!(
-            "[deferred] 1 blob(s) for {} (not transmitted) NOT queued: global limit, lost to the pull",
-            reticulum_rust::hexrep(&subscriber, false),
-        )), "{}", lines[0]);
-
-        queue.lock().unwrap().global_limit = 4096;
-        let mark = crate::test_log::mark();
-        assert_eq!(requeue_drained(&queue, &subscriber, blobs(1), 256, "not transmitted"), 1);
-        assert!(mark.containing("[deferred] ").is_empty(), "a re-queue that loses nothing is quiet");
-        crate::store_db::remove_store_files(&path);
-    }
-
-    /// Every enqueue of the announce flush goes through `requeue_drained`,
-    /// whose outcome speaks; none ignores what the queue did.
-    #[test]
-    fn the_announce_flush_requeues_only_through_requeue_drained() {
-        let source = include_str!("destinations.rs");
-        let start = source.find("back online — flushing").expect("the deferred flush");
-        let end = start + source[start..].find("\n    });\n").expect("the flush closes");
+    fn the_announce_flush_never_takes_entries_out_of_the_queue() {
+        let source = include_str!("fanout.rs");
+        let start = source.find("pub fn flush_queued(").expect("the flush");
+        let end = start + source[start..].find("\n}\n").expect("the flush closes");
         let flush = &source[start..end];
-        assert_eq!(flush.matches("requeue_drained(").count(), 3, "the no-destination, unsent and oversized re-queues");
-        assert!(!flush.contains(".enqueue("), "no enqueue of its own");
-        let mdu_line = flush.find("exceed the {}-byte packet MDU").expect("the oversized NOTICE");
-        let oversized_requeue = flush.find("\"above the packet MDU\"").expect("the oversized re-queue");
-        assert!(oversized_requeue < mdu_line, "queued again before it says how many are left queued");
+        assert!(flush.contains(".flush_copies(subscriber, wanted)"));
+        for taker in ["drain", ".enqueue(", "enqueue_all(", "take_page("] {
+            assert!(!flush.contains(taker), "the flush must not {taker}");
+        }
     }
 }
 
@@ -3680,6 +3454,12 @@ fn wire_channel_destination(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 .policy_for(&subscriber_hash)
                 .deferred_pull_batch_limit
                 .unwrap_or(DEFAULT_PULL_PAGE_SIZE);
+            // A pull of the channel renews the subscription (SPEC §6): a
+            // device reading it is no device gone. Released before the queue
+            // is taken.
+            if let Ok(mut subscriptions) = guard.subscription_table.lock() {
+                subscriptions.renew(&subscriber_hash, &channel_hash);
+            }
             if let Ok(mut deferred) = guard.deferred_queue.lock() {
                 return pull_answer(
                     &guard.deferred_queue,
@@ -4010,13 +3790,15 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             Err(_) => return encode_ok_reason(false, Some("internal_error")),
         };
 
+        // Binding a channel renews its subscription (SPEC §6): the apps bind
+        // on every link they open.
         let subscribed = subscriptions
             .lock()
             .ok()
-            .map(|subs| {
+            .map(|mut subs| {
                 channel_hashes
                     .iter()
-                    .all(|channel_hash| subs.is_subscribed(&subscriber_hash, channel_hash))
+                    .all(|channel_hash| subs.renew(&subscriber_hash, channel_hash))
             })
             .unwrap_or(false);
         if !subscribed {
@@ -5257,8 +5039,9 @@ mod fanout_lock_scope_tests {
         assert!(!block.contains(".enqueue("), "no queueing of its own");
     }
 
-    /// The deferred-flush announce handler sends one packet per queued blob.
-    /// It must take its collaborators and let the guard go first.
+    /// The deferred-flush announce handler sends one push per queued blob,
+    /// over the bound rfed.link or as a packet. It must take its
+    /// collaborators and let the guard go first.
     #[test]
     fn deferred_flush_drops_the_guard_before_sending() {
         let source = destinations_source();
@@ -5272,7 +5055,7 @@ mod fanout_lock_scope_tests {
         let fragment = &source[start..end];
 
         assert!(
-            fragment.contains("let (deferred_queue, hook_registry, notify_registry, limit, distros) = match arc.lock()"),
+            fragment.contains("let (deferred_queue, hook_registry, notify_registry, link_sessions, distros) = match arc.lock()"),
             "the deferred flush must snapshot its collaborators and release the \
              FedNode mutex before sending"
         );
@@ -5280,6 +5063,53 @@ mod fanout_lock_scope_tests {
             !fragment.contains("guard.deferred_queue.lock()"),
             "the deferred flush must not reach through a live FedNode guard"
         );
+    }
+}
+
+/// A node's own subscription expires after 30 days without a renewal (SPEC §6
+/// "Renewal and expiry", 2026-10-30), so each request by which a device shows
+/// it still reads a channel must renew it, or a device in use would lose the
+/// channel. The table's own tests cover a repeat subscribe; these hold the
+/// pull, the channel bind and the fan-out plan to their part.
+#[cfg(test)]
+mod subscription_renewal_tests {
+    fn destinations_source() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/destinations.rs"))
+            .expect("read destinations.rs")
+    }
+
+    #[test]
+    fn a_channel_pull_renews_the_subscription_before_taking_the_queue() {
+        let source = destinations_source();
+        let start = source.find("let channel_pull_cb = Arc::new(").expect("channel pull handler present");
+        let handler = &source[start..];
+        let renew = handler
+            .find("subscriptions.renew(&subscriber_hash, &channel_hash);")
+            .expect("the channel pull renews its subscription");
+        let queue = handler.find("guard.deferred_queue.lock()").expect("the pull takes the queue");
+        assert!(renew < queue, "renewed, its lock released, before the queue is taken");
+    }
+
+    #[test]
+    fn binding_a_channel_renews_its_subscription() {
+        let source = destinations_source();
+        let start = source.find("let channel_stream_open = Arc::new(").expect("stream open handler present");
+        let end = start + source[start..].find("if on_rfed_link {").expect("the bind follows its check");
+        let check = &source[start..end];
+        assert!(check.contains("subs.renew(&subscriber_hash, channel_hash)"), "the bind renews each channel");
+        assert!(!check.contains("is_subscribed("), "a check that renews nothing lets a device in use expire");
+    }
+
+    #[test]
+    fn the_channel_fanout_expires_stale_subscriptions_before_it_plans() {
+        let source = destinations_source();
+        let start = source.find("fn channel_rows_plan(").expect("channel_rows_plan present");
+        let end = start + source[start..].find("fn fanout_plan(").expect("fanout_plan follows");
+        let plan = &source[start..end];
+        let expire = plan.find("t.expire_stale(").expect("the plan expires stale subscriptions");
+        let read = plan.find("t.get_subscribers_with_owner(").expect("then reads the subscribers");
+        assert!(expire < read, "an expired subscription is planned for no more");
+        assert!(plan.contains("FanoutPlan { expired,"), "and the plan drops what it had queued");
     }
 }
 

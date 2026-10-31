@@ -230,13 +230,16 @@ impl LinkSessionRegistry {
     }
 
     /// Push a channel blob to every link this subscriber has bound for that
-    /// channel. `payload` is `channel_hash(16) | inner_blob`.
+    /// channel. `payload` is `channel_hash(16) | inner_blob`. `on_acked` runs
+    /// once, on a thread of its own, when the client acknowledges it (the
+    /// announce flush deletes the queued entry it sent).
     pub fn dispatch_channel(
         &mut self,
         subscriber_hash: &[u8],
         channel_hash: &[u8],
         payload: &[u8],
         on_failed: Option<Arc<dyn Fn() + Send + Sync>>,
+        on_acked: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> StreamDispatchResult {
         let matches = self.matching(|session| {
             wants_channel(
@@ -246,7 +249,7 @@ impl LinkSessionRegistry {
                 channel_hash,
             )
         });
-        self.dispatch(matches, paths::DELIVERY, payload, on_failed)
+        self.dispatch(matches, paths::DELIVERY, payload, on_failed, on_acked)
     }
 
     /// Push a packed LXMF message to every link bound to `delivery_hash`.
@@ -258,7 +261,7 @@ impl LinkSessionRegistry {
     ) -> StreamDispatchResult {
         let matches =
             self.matching(|session| session.delivery_hash.as_deref() == Some(delivery_hash));
-        self.dispatch(matches, paths::LXMF_DELIVERY, payload, on_failed)
+        self.dispatch(matches, paths::LXMF_DELIVERY, payload, on_failed, None)
     }
 
     fn matching<F>(&self, predicate: F) -> Vec<(Vec<u8>, LinkHandle)>
@@ -278,6 +281,7 @@ impl LinkSessionRegistry {
         path: &str,
         payload: &[u8],
         on_failed: Option<Arc<dyn Fn() + Send + Sync>>,
+        on_acked: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> StreamDispatchResult {
         let mut result = StreamDispatchResult {
             matched: matches.len(),
@@ -288,24 +292,25 @@ impl LinkSessionRegistry {
         // One subscriber may have more than one link bound. `on_failed` defers
         // the blob, and deferring it once per unanswered link would queue the
         // same message several times — including when a sibling link did
-        // deliver it. First failure wins; the rest are no-ops.
-        let deferred_once = Arc::new(AtomicBool::new(false));
-        let gated_failure = on_failed.map(|hook| {
-            let gate = Arc::clone(&deferred_once);
-            let gated: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        // deliver it. First failure wins; the rest are no-ops. The same for
+        // the acknowledgement.
+        let once = |hook: Arc<dyn Fn() + Send + Sync>| -> Arc<dyn Fn() + Send + Sync> {
+            let gate = Arc::new(AtomicBool::new(false));
+            Arc::new(move || {
                 if !gate.swap(true, Ordering::SeqCst) {
                     hook();
                 }
-            });
-            gated
-        });
+            })
+        };
+        let gated_failure = on_failed.map(once);
+        let gated_ack = on_acked.map(once);
 
         for (link_id, link) in matches {
             if !link.is_alive() {
                 stale_links.push(link_id);
                 continue;
             }
-            if push_request(&link, path, payload, gated_failure.clone()) {
+            if push_request(&link, path, payload, gated_failure.clone(), gated_ack.clone()) {
                 result.sent += 1;
             } else {
                 stale_links.push(link_id);
@@ -327,13 +332,20 @@ impl LinkSessionRegistry {
 ///
 /// Returns `false` when the request could not be dispatched at all (link gone,
 /// payload not encodable), which is the caller's signal to try the next tier.
-/// A dispatched-but-unanswered request is reported through `on_failed`, not
-/// through this return value — by then the fan-out has moved on.
+/// A dispatched request the client does not acknowledge, unanswered or
+/// refused, is reported through `on_failed`, not through this return value —
+/// by then the fan-out has moved on. An acknowledgement runs `on_acked`, on a
+/// thread of its own: the response arrives on the link's inbound thread, and
+/// the hook takes the queue's lock.
+///
+/// Until 2026-10-30 a refusal was logged and nothing else: the push counted
+/// for nothing and went nowhere, neither delivered nor queued for the pull.
 fn push_request(
     link: &LinkHandle,
     path: &str,
     payload: &[u8],
     on_failed: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_acked: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> bool {
     // `LinkHandle::request` re-decodes `data` and embeds it inline in the
     // request array, so the payload has to arrive here already msgpack-encoded.
@@ -352,6 +364,7 @@ fn push_request(
     let link_hex = hexrep(&link.link_id(), false);
     let ack_path = path.to_string();
     let ack_link = link_hex.clone();
+    let refused_hook = on_failed.clone();
     let response_cb: Arc<dyn Fn(RequestReceipt) + Send + Sync> = Arc::new(move |receipt| {
         let acked = receipt
             .response
@@ -365,16 +378,22 @@ fn push_request(
                 false,
                 false,
             );
+            if let Some(hook) = on_acked.clone() {
+                std::thread::spawn(move || hook());
+            }
         } else {
             // The client answered and said no. Never silent — a refused push
             // that looks identical to a delivered one is how a whole class of
             // "message never arrived" reports become undiagnosable.
             log(
-                format!("[rfed.link] {ack_path} REFUSED by {ack_link}"),
+                format!("[rfed.link] {ack_path} REFUSED by {ack_link} — deferring"),
                 LOG_WARNING,
                 false,
                 false,
             );
+            if let Some(hook) = refused_hook.as_ref() {
+                hook();
+            }
         }
     });
 

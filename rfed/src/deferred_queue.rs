@@ -24,7 +24,7 @@
 //! own deferred queue for the subscribers it covers — keeping the semantics
 //! identical to a primary node but fired only when the primary is silent.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -54,6 +54,18 @@ pub struct PendingBlob {
     pub enqueued_at: f64,
     /// Its row in the database (0 when it was not stored).
     id: i64,
+    /// Names the entry while this process runs ([`DeferredQueue::flush_copies`]).
+    /// Not the row id: SQLite gives a deleted last row's id to the next
+    /// insert, and an entry that was not stored has none.
+    ticket: u64,
+}
+
+impl PendingBlob {
+    /// The entry's name for [`DeferredQueue::confirm`] and
+    /// [`DeferredQueue::release`].
+    pub fn ticket(&self) -> u64 {
+        self.ticket
+    }
 }
 
 // ── What a change to the queue came to ────────────────────────────────────────
@@ -72,7 +84,13 @@ pub enum EnqueueOutcome {
     /// its per-subscriber limit. `evicted_routing_hash` is that entry's
     /// routing hash (a channel's hash, or a distro's `lxmf.delivery` hash).
     QueuedEvictingOldest { evicted_routing_hash: Vec<u8> },
-    /// Not queued: the whole queue already holds `global_limit` entries.
+    /// Queued, after the oldest entry of the fullest bucket was evicted to
+    /// keep the whole queue within `global_limit`: `evicted_subscriber`'s
+    /// bucket (it can be this subscriber's own), an entry routed to
+    /// `evicted_routing_hash`.
+    QueuedEvictingFullest { evicted_subscriber: Vec<u8>, evicted_routing_hash: Vec<u8> },
+    /// Not queued: the queue holds `global_limit` entries and all of them
+    /// are in pages a pull holds, which nothing evicts.
     RefusedGlobalLimit,
 }
 
@@ -84,11 +102,10 @@ impl EnqueueOutcome {
 }
 
 /// What a run of enqueues for one subscriber came to
-/// ([`DeferredQueue::enqueue_all`]), for the callers that queue several
-/// blobs at once: the backup node adopting an offline owner's subscriber, and
-/// the announce flush putting back what it could not send. Their drops speak
-/// as a hand-off's do ([`EnqueueTally::loss_lines`], RFed SPEC §7 "Limits").
-/// Until 2026-10-10 they ignored the outcome, and the backup line counted a
+/// ([`DeferredQueue::enqueue_all`]), for the backup node adopting an offline
+/// owner's subscriber, which queues several blobs at once. Its drops speak as
+/// a hand-off's do ([`EnqueueTally::loss_lines`], RFed SPEC §7 "Limits").
+/// Until 2026-10-10 the outcome was ignored, and the backup line counted a
 /// refused blob as queued.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EnqueueTally {
@@ -96,6 +113,9 @@ pub struct EnqueueTally {
     pub queued: usize,
     /// Of those, how many evicted the subscriber's oldest entry to fit.
     pub evicted: usize,
+    /// Of those, how many evicted the oldest entry of the fullest bucket to
+    /// keep the queue within its global limit.
+    pub evicted_fullest: usize,
     /// Refused at the global limit: lost to the pull.
     pub refused: usize,
 }
@@ -109,6 +129,10 @@ impl EnqueueTally {
                 self.queued += 1;
                 self.evicted += 1;
             }
+            EnqueueOutcome::QueuedEvictingFullest { .. } => {
+                self.queued += 1;
+                self.evicted_fullest += 1;
+            }
             EnqueueOutcome::RefusedGlobalLimit => self.refused += 1,
         }
     }
@@ -116,7 +140,7 @@ impl EnqueueTally {
     /// The lines for what the run lost, for the caller to log with every
     /// lock released: a WARNING for the blobs the global limit refused, a
     /// NOTICE for the older entries evicted to make room. `tag` begins each
-    /// line (`[backup]`, `[deferred]`); `why` says what the blobs were.
+    /// line (`[backup]`); `why` says what the blobs were.
     pub fn loss_lines(&self, tag: &str, subscriber_hash: &[u8], why: &str) -> Vec<(i32, String)> {
         let subscriber = reticulum_rust::hexrep(subscriber_hash, false);
         let mut lines = Vec::new();
@@ -135,6 +159,15 @@ impl EnqueueTally {
                 format!(
                     "{tag} {subscriber} bucket full: its {} oldest entry(ies) evicted to queue blob(s) ({why})",
                     self.evicted,
+                ),
+            ));
+        }
+        if self.evicted_fullest > 0 {
+            lines.push((
+                reticulum_rust::LOG_NOTICE,
+                format!(
+                    "{tag} queue full: {} entry(ies), each the oldest of the fullest bucket, evicted to queue blob(s) for {subscriber} ({why})",
+                    self.evicted_fullest,
                 ),
             ));
         }
@@ -212,6 +245,11 @@ pub struct DeferredQueue {
     held: HashMap<u64, HeldPage>,
     /// The next page id; 0 is never one (an empty page holds nothing).
     next_page: u64,
+    /// The next [`PendingBlob::ticket`]; 0 is never one.
+    next_ticket: u64,
+    /// The entries an announce flush sent and has not heard back about, by
+    /// ticket ([`Self::flush_copies`]).
+    in_flight: HashSet<u64>,
     db: Option<rusqlite::Connection>,
     /// Maximum total entries across all subscribers.
     pub global_limit: usize,
@@ -279,15 +317,23 @@ impl DeferredQueue {
                         blob: e.blob,
                         enqueued_at: e.enqueued_at,
                         id: 0,
+                        ticket: 0,
                     });
                 }
             }
+        }
+        let mut next_ticket = 1;
+        for entry in queue.values_mut().flat_map(|bucket| bucket.iter_mut()) {
+            entry.ticket = next_ticket;
+            next_ticket += 1;
         }
 
         DeferredQueue {
             queue,
             held: HashMap::new(),
             next_page: 1,
+            next_ticket,
+            in_flight: HashSet::new(),
             db,
             global_limit: 4096,
         }
@@ -307,6 +353,7 @@ impl DeferredQueue {
                 blob: row.get(3)?,
                 enqueued_at: row.get(4)?,
                 id: row.get(0)?,
+                ticket: 0,
             });
         }
         Ok(())
@@ -329,10 +376,18 @@ impl DeferredQueue {
     /// `NodeConfig::policy_for(subscriber_hash).deferred_queue_limit` so that
     /// VIP subscribers get a larger budget than regular ones.
     ///
-    /// If the queue already holds `global_limit` entries, the blob is refused
-    /// (back-pressure), before any eviction. Otherwise, if the per-subscriber
-    /// limit is hit, the subscriber's *oldest* entry is evicted first. The
-    /// outcome says which: the caller logs it (see [`EnqueueOutcome`]).
+    /// If the subscriber's bucket is at its limit, its *oldest* entry is
+    /// evicted. Otherwise, if the whole queue holds `global_limit` entries,
+    /// the oldest entry of the fullest bucket is (RFed SPEC §7 "Limits"); the
+    /// blob is refused only when every stored entry is in a page a pull
+    /// holds. The outcome says which: the caller logs it (see
+    /// [`EnqueueOutcome`]).
+    ///
+    /// Until 2026-10-30 the global limit refused every new blob, before any
+    /// eviction, so subscribers that had stopped pulling kept everyone
+    /// else's out. On 2026-10-30 production's queue stood at 4096, 82% of it
+    /// week-old #public.general posts for devices that never came back, and
+    /// new posts for live devices were dropped.
     pub fn enqueue(
         &mut self,
         subscriber_hash: Vec<u8>,
@@ -340,22 +395,29 @@ impl DeferredQueue {
         blob: Vec<u8>,
         per_subscriber_limit: usize,
     ) -> EnqueueOutcome {
-        // Global back-pressure check.
-        if self.total_len() >= self.global_limit {
-            return EnqueueOutcome::RefusedGlobalLimit;
-        }
-
-        let enqueued_at = now();
-        let bucket = self.queue.entry(subscriber_hash.clone()).or_default();
-
-        // Per-subscriber overflow: drop oldest.
-        let evicted = if bucket.len() >= per_subscriber_limit {
-            bucket.pop_front()
+        let bucket_full = self
+            .queue
+            .get(&subscriber_hash)
+            .is_some_and(|bucket| !bucket.is_empty() && bucket.len() >= per_subscriber_limit);
+        let (evicted, outcome) = if bucket_full {
+            let old = self.queue.get_mut(&subscriber_hash).and_then(VecDeque::pop_front);
+            let outcome = match &old {
+                Some(old) => EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash: old.channel_hash.clone() },
+                None => EnqueueOutcome::Queued,
+            };
+            (old, outcome)
+        } else if self.total_len() >= self.global_limit {
+            let Some((evicted_subscriber, old)) = self.pop_oldest_of_fullest() else {
+                return EnqueueOutcome::RefusedGlobalLimit;
+            };
+            let evicted_routing_hash = old.channel_hash.clone();
+            (Some(old), EnqueueOutcome::QueuedEvictingFullest { evicted_subscriber, evicted_routing_hash })
         } else {
-            None
+            (None, EnqueueOutcome::Queued)
         };
 
         // The eviction and the new row, together.
+        let enqueued_at = now();
         let mut id = 0;
         crate::store_db::write_all(self.db.as_ref(), "deferred enqueue", |c| {
             if let Some(old) = evicted.as_ref().filter(|old| old.id != 0) {
@@ -365,16 +427,38 @@ impl DeferredQueue {
             Ok(())
         });
 
-        bucket.push_back(PendingBlob {
+        let ticket = self.next_ticket;
+        self.next_ticket += 1;
+        self.queue.entry(subscriber_hash).or_default().push_back(PendingBlob {
             channel_hash,
             blob,
             enqueued_at,
             id,
+            ticket,
         });
-        match evicted {
-            Some(old) => EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash: old.channel_hash },
-            None => EnqueueOutcome::Queued,
+        outcome
+    }
+
+    /// Take the oldest entry of the fullest bucket, for an enqueue at the
+    /// global limit; between buckets of one size, the one whose oldest entry
+    /// is oldest. Pages a pull holds are out of their buckets and stay.
+    /// Returns the bucket's subscriber and the entry, or `None` when every
+    /// bucket is empty.
+    fn pop_oldest_of_fullest(&mut self) -> Option<(Vec<u8>, PendingBlob)> {
+        let fullest = self
+            .queue
+            .iter()
+            .filter_map(|(subscriber, bucket)| bucket.front().map(|oldest| (subscriber, bucket.len(), oldest.enqueued_at)))
+            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.total_cmp(&a.2)))
+            .map(|(subscriber, _, _)| subscriber.clone())?;
+        let (old, emptied) = {
+            let bucket = self.queue.get_mut(&fullest)?;
+            (bucket.pop_front()?, bucket.is_empty())
+        };
+        if emptied {
+            self.queue.remove(&fullest);
         }
+        Some((fullest, old))
     }
 
     /// Enqueue each `(routing_hash, blob)` for `subscriber_hash`, in order,
@@ -606,6 +690,79 @@ impl DeferredQueue {
         Some((page.subscriber_hash, count))
     }
 
+    /// Copies of the entries the announce flush sends `subscriber_hash` (RFed
+    /// SPEC §7 "Delivery Triggers"): those whose routing hash satisfies
+    /// `wanted` and that no earlier flush has in flight, in queue order. Each
+    /// is marked in flight and stays in its bucket, rows and all, so a pull
+    /// meanwhile still gets it. [`Self::confirm`] deletes it once a route
+    /// confirms it; [`Self::release`] ends its flight when none did.
+    ///
+    /// Until 2026-10-30 the flush drained the bucket and queued the blobs
+    /// again when their receipts timed out, about 30 s later. A pull in that
+    /// window found nothing (the web client pulls 2 s after its announce), a
+    /// restart in it lost the blobs, and the re-queue could meet a full
+    /// queue and drop them: eight #public.general posts were lost that way
+    /// on 2026-10-30.
+    pub fn flush_copies(&mut self, subscriber_hash: &[u8], wanted: impl Fn(&[u8]) -> bool) -> Vec<PendingBlob> {
+        let Some(bucket) = self.queue.get(subscriber_hash) else {
+            return Vec::new();
+        };
+        let copies: Vec<PendingBlob> = bucket
+            .iter()
+            .filter(|entry| wanted(&entry.channel_hash) && !self.in_flight.contains(&entry.ticket))
+            .cloned()
+            .collect();
+        self.in_flight.extend(copies.iter().map(PendingBlob::ticket));
+        copies
+    }
+
+    /// A route confirmed `subscriber_hash`'s entry `ticket` (a packet's
+    /// proof, the answer to an rfed.link push): delete it from its bucket, or
+    /// from the page a pull holds it in, so that page does not bring it back
+    /// unproved. Returns whether it was still stored; a pull may have
+    /// delivered it first.
+    pub fn confirm(&mut self, subscriber_hash: &[u8], ticket: u64) -> bool {
+        self.in_flight.remove(&ticket);
+        let (mut removed, emptied) = match self.queue.get_mut(subscriber_hash) {
+            Some(bucket) => {
+                let removed = bucket.iter().position(|entry| entry.ticket == ticket).and_then(|at| bucket.remove(at));
+                (removed, bucket.is_empty())
+            }
+            None => (None, false),
+        };
+        if emptied {
+            self.queue.remove(subscriber_hash);
+        }
+        if removed.is_none() {
+            removed = self
+                .held
+                .values_mut()
+                .filter(|page| page.subscriber_hash == subscriber_hash)
+                .find_map(|page| {
+                    let at = page.blobs.iter().position(|entry| entry.ticket == ticket)?;
+                    Some(page.blobs.remove(at))
+                });
+        }
+        match removed {
+            Some(entry) => {
+                self.delete_rows(std::slice::from_ref(&entry), "deferred flush confirmed");
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// No route confirmed `subscriber_hash`'s entry `ticket`: its flight
+    /// ends, and it stays queued for the pull. Returns whether it is still
+    /// waiting in its bucket, which is when the subscriber should be woken to
+    /// pull it: not while a pull holds it, nor once it has left the queue.
+    pub fn release(&mut self, subscriber_hash: &[u8], ticket: u64) -> bool {
+        self.in_flight.remove(&ticket);
+        self.queue
+            .get(subscriber_hash)
+            .is_some_and(|bucket| bucket.iter().any(|entry| entry.ticket == ticket))
+    }
+
     /// Flush expired entries older than `max_age_secs`.  Call periodically
     /// to prevent indefinite accumulation for gone-forever subscribers.
     ///
@@ -672,6 +829,14 @@ impl DeferredQueue {
 //     no later blob overtakes one that did not fit.
 //   * Held blobs still count toward the global limit, survive a restart, and
 //     keep their rows through expiry.
+//
+// The announce flush no longer drains either (2026-10-30):
+//
+//   * `flush_copies` hands out copies, rows kept, each in flight until
+//     `confirm` deletes it or `release` ends its flight; a later flush skips
+//     what is in flight, and a pull still gets it.
+//   * At the global limit an enqueue evicts the oldest entry of the fullest
+//     bucket instead of refusing the new one.
 
 #[cfg(test)]
 mod tests {
@@ -890,8 +1055,11 @@ mod tests {
         assert_eq!(blobs(&all), vec![b"distro-1".to_vec(), b"distro-2".to_vec(), b"channel-1".to_vec()]);
     }
 
+    /// Held blobs still count toward the global limit, and nothing evicts
+    /// them: at the limit an enqueue takes the oldest entry still in a
+    /// bucket, and is refused only when every stored entry is held.
     #[test]
-    fn held_blobs_count_toward_the_global_limit() {
+    fn held_blobs_count_toward_the_global_limit_and_are_never_evicted() {
         let mut q = fresh_queue();
         q.global_limit = 3;
         let sub = vec![0x78u8; 16];
@@ -900,11 +1068,19 @@ mod tests {
         let (page, _) = take(&mut q, &sub, 2);
         assert_eq!(
             q.enqueue(sub.clone(), chan.clone(), vec![9], 1024),
+            EnqueueOutcome::QueuedEvictingFullest { evicted_subscriber: sub.clone(), evicted_routing_hash: chan.clone() },
+            "the entry left in the bucket goes, not the held page"
+        );
+        assert_eq!(q.total_len(), 3);
+        let (second, _) = take(&mut q, &sub, 1);
+        assert_eq!(
+            q.enqueue(sub.clone(), chan.clone(), vec![10], 1024),
             EnqueueOutcome::RefusedGlobalLimit,
-            "the held page is still stored"
+            "every stored entry is held"
         );
         q.settle_page(page, true);
-        assert!(q.enqueue(sub.clone(), chan.clone(), vec![9], 1024).queued());
+        q.settle_page(second, true);
+        assert!(q.enqueue(sub.clone(), chan.clone(), vec![10], 1024).queued());
     }
 
     /// Expiry leaves a held page alone, rows and all, until it settles, even
@@ -1104,26 +1280,225 @@ mod tests {
 
     // ── Every drop speaks (DISTRO-SYNC-PROOF-DESIGN §6.4) ────────────────
 
-    /// At the global limit the blob is refused, before any eviction, and the
-    /// outcome says so; the hand-off logs it (handoff.rs). Until 2026-10-10
-    /// `enqueue` returned without a word and the hand-off logged "queued".
+    /// At the global limit the oldest entry of the fullest bucket goes, and
+    /// the outcome names whose it was and its routing hash; the hand-off
+    /// logs it (handoff.rs). Until 2026-10-30 the new blob was refused
+    /// instead, so subscribers that never pulled kept everyone else's out.
     #[test]
-    fn an_enqueue_at_the_global_limit_is_refused_and_says_so() {
+    fn an_enqueue_at_the_global_limit_evicts_the_oldest_of_the_fullest_bucket() {
+        let mut q = fresh_queue();
+        q.global_limit = 5;
+        let gone = vec![0x61u8; 16];
+        let live = vec![0x62u8; 16];
+        let newcomer = vec![0x63u8; 16];
+        let chan = vec![0x64u8; 16];
+        let distro = vec![0xD6u8; 16];
+        assert_eq!(q.enqueue(gone.clone(), distro.clone(), vec![0], 1024), EnqueueOutcome::Queued);
+        for i in 1..3u8 {
+            q.enqueue(gone.clone(), chan.clone(), vec![i], 1024);
+        }
+        for i in 3..5u8 {
+            q.enqueue(live.clone(), chan.clone(), vec![i], 1024);
+        }
+
+        let outcome = q.enqueue(newcomer.clone(), chan.clone(), vec![9], 1024);
+        assert_eq!(
+            outcome,
+            EnqueueOutcome::QueuedEvictingFullest { evicted_subscriber: gone.clone(), evicted_routing_hash: distro.clone() }
+        );
+        assert!(outcome.queued());
+        assert_eq!(q.total_len(), 5, "one in, one out");
+        assert_eq!(rows(&q), 5, "the evicted row went with the new one's insert");
+        assert_eq!(blobs(&q.drain(&gone)), vec![vec![1], vec![2]], "the fullest bucket lost its oldest");
+        assert_eq!(blobs(&q.drain(&live)), vec![vec![3], vec![4]], "the others keep theirs");
+        assert_eq!(blobs(&q.drain(&newcomer)), vec![vec![9]]);
+    }
+
+    /// Between buckets of one size, the one whose oldest entry is older
+    /// gives it up, whichever was filled first.
+    #[test]
+    fn between_equally_full_buckets_the_older_entry_goes() {
+        let mut q = fresh_queue();
+        q.global_limit = 4;
+        let first = vec![0x66u8; 16];
+        let second = vec![0x67u8; 16];
+        let chan = vec![0x68u8; 16];
+        enqueue_n(&mut q, &first, &chan, 2);
+        enqueue_n(&mut q, &second, &chan, 2);
+        q.queue.get_mut(&second).unwrap()[0].enqueued_at = 1.0;
+        q.queue.get_mut(&first).unwrap()[0].enqueued_at = 2.0;
+
+        assert_eq!(
+            q.enqueue(vec![0x69; 16], chan.clone(), vec![9], 1024),
+            EnqueueOutcome::QueuedEvictingFullest { evicted_subscriber: second.clone(), evicted_routing_hash: chan.clone() }
+        );
+        assert_eq!(q.drain(&second).len(), 1);
+        assert_eq!(q.drain(&first).len(), 2);
+    }
+
+    /// A subscriber at its own limit gives up its own oldest entry, also at
+    /// the global limit: the queue does not grow, and nobody else's goes.
+    #[test]
+    fn a_full_bucket_at_the_global_limit_evicts_its_own_oldest() {
         let mut q = fresh_queue();
         q.global_limit = 3;
-        let sub = vec![0x61u8; 16];
-        let chan = vec![0x62u8; 16];
-        for i in 0..3u8 {
-            assert_eq!(q.enqueue(sub.clone(), chan.clone(), vec![i], 1024), EnqueueOutcome::Queued);
+        let sub = vec![0x6Au8; 16];
+        let other = vec![0x6Bu8; 16];
+        let chan = vec![0x6Cu8; 16];
+        enqueue_n(&mut q, &other, &chan, 1);
+        enqueue_n(&mut q, &sub, &chan, 2);
+
+        assert_eq!(
+            q.enqueue(sub.clone(), chan.clone(), vec![9], 2),
+            EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash: chan.clone() }
+        );
+        assert_eq!(blobs(&q.drain(&sub)), vec![vec![1], vec![9]]);
+        assert_eq!(q.drain(&other).len(), 1, "nobody else's entry went");
+    }
+
+    #[test]
+    fn a_tally_counts_and_names_evictions_from_the_fullest_bucket() {
+        let mut tally = EnqueueTally::default();
+        tally.add(&EnqueueOutcome::QueuedEvictingFullest { evicted_subscriber: vec![1; 16], evicted_routing_hash: vec![2; 16] });
+        assert_eq!(tally, EnqueueTally { queued: 1, evicted_fullest: 1, ..Default::default() });
+        let lines = tally.loss_lines("[backup]", &[3; 16], "owner offline");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0].0, reticulum_rust::LOG_NOTICE);
+        assert!(
+            lines[0].1.starts_with("[backup] queue full: 1 entry(ies), each the oldest of the fullest bucket, evicted"),
+            "{}",
+            lines[0].1
+        );
+    }
+
+    // ── The announce flush keeps what it sends (2026-10-30) ───────────────
+
+    /// What the flush sends stays queued, and pullable, until a route
+    /// confirms it: confirmed, it is deleted; unconfirmed, it waits for the
+    /// pull, and the subscriber is to be woken for it.
+    #[test]
+    fn a_flushed_entry_stays_queued_until_a_route_confirms_it() {
+        let mut q = fresh_queue();
+        let sub = vec![0x91u8; 16];
+        let chan = vec![0xC9u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 3);
+
+        let sent = q.flush_copies(&sub, |_| true);
+        assert_eq!(blobs(&sent), vec![vec![0], vec![1], vec![2]]);
+        assert_eq!(rows(&q), 3, "copies: every row is kept");
+        assert!(q.has_pending_channel(&sub, &chan), "a pull meanwhile still finds them");
+
+        assert!(q.confirm(&sub, sent[1].ticket()), "the second one's proof");
+        assert_eq!(rows(&q), 2);
+        assert!(q.release(&sub, sent[0].ticket()), "unconfirmed and waiting: wake the subscriber");
+        assert!(q.release(&sub, sent[2].ticket()));
+        let (_, page) = take(&mut q, &sub, 25);
+        assert_eq!(blobs(&page), vec![vec![0], vec![2]], "the pull gets what nothing confirmed, in order");
+    }
+
+    /// An announce while an earlier flush waits for its receipts sends
+    /// nothing twice; what that flush released goes again.
+    #[test]
+    fn a_flush_skips_what_an_earlier_flush_has_in_flight() {
+        let mut q = fresh_queue();
+        let sub = vec![0x92u8; 16];
+        let chan = vec![0xC9u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 2);
+        let first = q.flush_copies(&sub, |_| true);
+        assert_eq!(first.len(), 2);
+        assert!(q.flush_copies(&sub, |_| true).is_empty(), "both still in flight");
+
+        q.enqueue(sub.clone(), chan.clone(), vec![7], 1024);
+        assert_eq!(blobs(&q.flush_copies(&sub, |_| true)), vec![vec![7]], "only the new one");
+        q.release(&sub, first[0].ticket());
+        assert_eq!(blobs(&q.flush_copies(&sub, |_| true)), vec![vec![0]], "the released one goes again");
+    }
+
+    /// The flush takes only what `wanted` admits (no distro blob).
+    #[test]
+    fn a_flush_copies_only_the_wanted_routing_hashes() {
+        let mut q = fresh_queue();
+        let sub = vec![0x93u8; 16];
+        let chan = vec![0xC9u8; 16];
+        let distro = vec![0xD9u8; 16];
+        q.enqueue(sub.clone(), distro.clone(), b"distro".to_vec(), 1024);
+        q.enqueue(sub.clone(), chan.clone(), b"channel".to_vec(), 1024);
+        let sent = q.flush_copies(&sub, |routing| routing != distro.as_slice());
+        assert_eq!(blobs(&sent), vec![b"channel".to_vec()]);
+        assert_eq!(q.total_len(), 2);
+    }
+
+    /// A pull takes a page while the flush waits. The flush's proof deletes
+    /// the entry from the held page, so the page, not proved, does not bring
+    /// it back; the flush's timeout wakes nobody for an entry a pull holds.
+    #[test]
+    fn a_confirmed_entry_leaves_the_page_a_pull_holds() {
+        let mut q = fresh_queue();
+        let sub = vec![0x94u8; 16];
+        let chan = vec![0xC9u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 2);
+        let sent = q.flush_copies(&sub, |_| true);
+        let (page, taken) = take(&mut q, &sub, 25);
+        assert_eq!(taken.len(), 2, "the pull gets both while they are in flight");
+
+        assert!(!q.release(&sub, sent[1].ticket()), "held by a pull: no wake");
+        assert!(q.confirm(&sub, sent[0].ticket()), "deleted from the held page");
+        assert_eq!(rows(&q), 1);
+        q.settle_page(page, false);
+        assert_eq!(blobs(&q.drain(&sub)), vec![vec![1]], "only the unconfirmed one comes back");
+    }
+
+    /// Delivered by the pull first: the flush's late proof and its timeout
+    /// find nothing, and wake nobody.
+    #[test]
+    fn an_entry_the_pull_delivered_is_not_confirmed_or_woken_for_again() {
+        let mut q = fresh_queue();
+        let sub = vec![0x95u8; 16];
+        let chan = vec![0xC9u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 1);
+        let sent = q.flush_copies(&sub, |_| true);
+        let (page, _) = take(&mut q, &sub, 25);
+        q.settle_page(page, true);
+
+        assert!(!q.confirm(&sub, sent[0].ticket()));
+        assert!(!q.release(&sub, sent[0].ticket()));
+        assert_eq!(rows(&q), 0);
+    }
+
+    /// A restart while the flush waits loses nothing: the entries never left.
+    #[test]
+    fn a_restart_during_a_flush_keeps_its_entries() {
+        let path = tmp_path();
+        crate::store_db::remove_store_files(&path);
+        let sub = vec![0x96u8; 16];
+        let chan = vec![0xC9u8; 16];
+        {
+            let mut q = DeferredQueue::load(path.clone());
+            enqueue_n(&mut q, &sub, &chan, 2);
+            assert_eq!(q.flush_copies(&sub, |_| true).len(), 2);
         }
-        let refused = q.enqueue(vec![0x63; 16], chan.clone(), vec![9], 1024);
-        assert_eq!(refused, EnqueueOutcome::RefusedGlobalLimit);
-        assert!(!refused.queued());
-        assert_eq!(q.total_len(), 3, "nothing added");
-        assert!(!q.has_pending(&[0x63; 16]));
-        // A full subscriber at the global limit is refused too: no eviction first.
-        assert_eq!(q.enqueue(sub.clone(), chan.clone(), vec![10], 3), EnqueueOutcome::RefusedGlobalLimit);
-        assert_eq!(q.drain(&sub).iter().map(|p| p.blob[0]).collect::<Vec<_>>(), vec![0, 1, 2], "nothing evicted");
+        let mut q = DeferredQueue::load(path.clone());
+        assert_eq!(q.total_len(), 2);
+        assert_eq!(q.flush_copies(&sub, |_| true).len(), 2, "and the next flush sends them");
+        crate::store_db::remove_store_files(&path);
+    }
+
+    /// SQLite gives a deleted last row's id to the next insert. A confirm
+    /// names its entry by ticket, so it never deletes the newcomer.
+    #[test]
+    fn a_confirm_never_deletes_an_entry_that_reused_a_row_id() {
+        let mut q = fresh_queue();
+        let sub = vec![0x97u8; 16];
+        let chan = vec![0xC9u8; 16];
+        enqueue_n(&mut q, &sub, &chan, 1);
+        let sent = q.flush_copies(&sub, |_| true);
+        let (page, _) = take(&mut q, &sub, 25);
+        q.settle_page(page, true);
+        q.enqueue(sub.clone(), chan.clone(), vec![8], 1024);
+        assert_eq!(q.queue[&sub][0].id, sent[0].id, "the row id came back");
+
+        assert!(!q.confirm(&sub, sent[0].ticket()));
+        assert_eq!(blobs(&q.drain(&sub)), vec![vec![8]], "the newcomer is still queued");
     }
 
     /// Over the per-subscriber limit the oldest entry goes, and the outcome
@@ -1247,9 +1622,10 @@ mod tests {
     }
 
     /// `enqueue_all` tallies each enqueue: queued, queued by evicting the
-    /// subscriber's oldest entry, refused at the global limit. The tally's
-    /// lines say what was lost, a WARNING for a refusal and a NOTICE for an
-    /// eviction, and nothing for a run that lost nothing.
+    /// subscriber's oldest entry or the fullest bucket's, refused at the
+    /// global limit. The tally's lines say what was lost, a WARNING for a
+    /// refusal and a NOTICE for an eviction, and nothing for a run that lost
+    /// nothing.
     #[test]
     fn enqueue_all_tallies_what_became_of_each_blob() {
         let mut q = fresh_queue();
@@ -1258,23 +1634,31 @@ mod tests {
         let blobs = |n: u8| (0..n).map(|i| (vec![0xC1; 16], vec![i])).collect::<Vec<_>>();
 
         let clean = q.enqueue_all(&sub, blobs(2), 3);
-        assert_eq!(clean, EnqueueTally { queued: 2, evicted: 0, refused: 0 });
+        assert_eq!(clean, EnqueueTally { queued: 2, ..Default::default() });
         assert!(clean.loss_lines("[x]", &sub, "why").is_empty());
 
         // Per-subscriber limit 3: the third fits, the fourth evicts the
         // oldest.
         let evicting = q.enqueue_all(&sub, blobs(2), 3);
-        assert_eq!(evicting, EnqueueTally { queued: 2, evicted: 1, refused: 0 });
+        assert_eq!(evicting, EnqueueTally { queued: 2, evicted: 1, ..Default::default() });
         assert_eq!(q.count_matching(&sub, &[0xC1; 16]), 3);
 
         // Another subscriber's blob fills the queue to its global limit of
-        // 4: everything after it is refused.
+        // 4: each one after it evicts the oldest entry of the fullest
+        // bucket, `sub`'s (until 2026-10-30 they were refused).
         let other = vec![0xB2; 16];
         assert_eq!(q.enqueue(other.clone(), vec![0xC2; 16], vec![9], 3), EnqueueOutcome::Queued);
-        let refused = q.enqueue_all(&other, blobs(2), 3);
-        assert_eq!(refused, EnqueueTally { queued: 0, evicted: 0, refused: 2 });
+        let crowding = q.enqueue_all(&other, blobs(2), 3);
+        assert_eq!(crowding, EnqueueTally { queued: 2, evicted_fullest: 2, ..Default::default() });
+        assert_eq!(q.count_matching(&sub, &[0xC1; 16]), 1);
 
-        let run = EnqueueTally { queued: 2, evicted: 1, refused: 1 };
+        // With every entry held by a pull, nothing can be evicted.
+        take(&mut q, &sub, 25);
+        take(&mut q, &other, 25);
+        let refused = q.enqueue_all(&other, blobs(2), 3);
+        assert_eq!(refused, EnqueueTally { refused: 2, ..Default::default() });
+
+        let run = EnqueueTally { queued: 2, evicted: 1, evicted_fullest: 0, refused: 1 };
         let lines = run.loss_lines("[backup]", &sub, "owner offline");
         let sub_hex = reticulum_rust::hexrep(&sub, false);
         assert_eq!(

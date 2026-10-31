@@ -748,7 +748,7 @@ SQLite (`subscriptions.sqlite3`, one row per entry; see §13 Data Files).
 | `channel_hash` | `[u8; 16]` | Channel hash |
 | `added` | `f64` | Unix timestamp |
 | `owner_node_hash` | `Option<[u8; 16]>` | Non-None = backup subscription |
-| `last_refreshed` | `f64` | Backup TTL tracking |
+| `last_refreshed` | `f64` | Last renewal (below); a backup row's last refresh by its owner |
 
 The subscriber is a **device**: clients sign `/rfed/subscribe` with their
 device key, also when they post as a distro (§17.12). The node keeps one row
@@ -845,6 +845,43 @@ ciphertext. Not covered:
 Stale backup entries (not refreshed within `2 × owner_offline_secs`) are
 automatically pruned.
 
+### Renewal and expiry
+
+A node's own subscription (`owner_node_hash = None`) lasts 30 days from its
+last renewal (`subscription::LOCAL_SUBSCRIPTION_LIFETIME_SECS`). Each request
+by which its device shows that it still reads the channel renews it
+(`SubscriptionTable::renew`):
+
+- `/rfed/subscribe` (`/channel/subscribe` on `rfed.link`) for a pair it
+  already holds;
+- `/channel/pull` of that channel;
+- `/channel/stream/open` (`/rfed/channel/stream/open` on the legacy
+  destination) binding it.
+
+Retichat Android, iOS and web subscribe at every start or page load, bind
+their channels on every `rfed.link` they open, and pull each channel they
+read, so a device in use renews far more often than that. A renewal is
+written to disk at most once an hour per subscription.
+
+The channel fan-out expires subscriptions as it plans (`channel_rows_plan`,
+`SubscriptionTable::expire_stale`): a row of this node's own under the
+channel that nothing renewed in 30 days is deleted, the blob is not fanned
+out to its subscriber, and what was queued for that subscriber on the
+channel is dropped, with a NOTICE naming the subscriber, the channel and the
+count (`[channel] … expired: not renewed in 30 days; N queued blob(s)
+dropped`). A device that comes back subscribes again when it starts. A
+backup row is neither renewed nor expired by its subscriber's requests: its
+owner refreshes it, and it is pruned as above.
+
+Until 2026-10-30 nothing renewed a node's own subscription: `last_refreshed`
+stayed its first subscribe, and the fan-out queued for every device ever
+subscribed, gone or not. On 2026-10-30 the buckets of devices long gone held
+the deferred queue at its global limit, and eight #public.general posts for
+a web client in use were lost (§7 "Limits"). Since renewals were not
+recorded before, the first start of a node with this rule restarts the clock
+of each own row once (`PRAGMA user_version` 1 in `subscriptions.sqlite3`):
+none expires before 30 days after the upgrade.
+
 ---
 
 ## 7. Deferred Delivery
@@ -860,7 +897,8 @@ stop at the first one that takes the push:
 
 1. **`rfed.link`** — a `/delivery` (channel) or `/lxmf/delivery` (distro)
    request on the subscriber's bound link. The client's `msgpack bool`
-   response is the proof.
+   response is the proof: `true` confirms the push, and `false` leaves it
+   unconfirmed (below).
 2. **Legacy stream link** (`rfed.channel.stream`, `rfed.propagation.stream`)
    — a link DATA packet sent **with a packet receipt**. The client's link
    proof of that packet is the proof. A client MUST prove every DATA packet
@@ -873,13 +911,11 @@ stop at the first one that takes the push:
    client MUST prove every packet it receives on `rfed.delivery` (PROVE_ALL);
    Retichat Android, iOS and web do since 2026-09-26.
 
-   **Interim (from 2026-09-26, about a month):** the packet's proof is
-   *observed*, not required (`handoff::DELIVERY_PACKET_PROOF`). The packet is
-   sent once and counts as delivered; the node logs `[push] … proved` or
-   `[push] … unproven; sent once`, which shows how many devices run an app
-   that proves. Required against apps that never prove, every packet would be
-   handed off and the announce flush would send the queued copy again on each
-   announce. When most devices prove, the proof becomes required as below.
+   The proof is required since 2026-10-19 (`handoff::DELIVERY_PACKET_PROOF`).
+   From 2026-09-26 it was only *observed*, until the apps that prove were
+   released: the packet was sent once and counted as delivered, and the node
+   logged `[push] … proved` or `[push] … unproven; sent once`. Against an app
+   that never proves, every packet is handed off.
 4. Otherwise the blob is handed off at once.
 
 A push that is **never confirmed** is not lost and is not re-sent on another
@@ -888,20 +924,24 @@ device's by `handoff::distro_hand_off`, §17.3). The blob
 moves to the deferred queue, and then the subscriber is pushed through its
 notify registrations (§9) so that it collects the blob with `/channel/pull`
 or `/rfed/pull`. That is a change of route, not a retry. Tier 1 is
-unconfirmed when the request fails (no response before the request
-timeout, or the link closes first); tiers 2 and 3 when no proof arrives
+unconfirmed when the client answers `false` or the request fails (no
+response before the request timeout, or the link closes first); tiers 2
+and 3 when no proof arrives
 before the receipt concludes — the RNS receipt timeout (for a link packet
 the link's RTT × traffic timeout factor; for a packet to a destination
 6 s plus 6 s per hop) is the failure event, and a link that closes before
 the proof ends there too. The hand-off runs at most once per push per
-subscriber. The `rfed.delivery` announce flush of queued channel blobs sends
-with a receipt too, and, once the packet proof is required, hands off what
-is not proved.
+subscriber. The announce flush of queued channel blobs (Delivery Triggers
+below) uses the same routes and proofs, but keeps each blob queued until
+one confirms it.
 
 Until 2026-09-26 a tier-3 packet counted as delivered once it left, an
 unconfirmed tier-1 or tier-2 push was deferred but no one was pushed, and
 distro fan-out pushed no one at all: a subscriber whose app had died, its
 path still held, lost the message or learnt of it only at its next pull.
+
+Until 2026-10-30 a tier-1 `false` answer was only logged: the push was
+neither delivered nor queued for the pull.
 
 Before 2026-09-24 tier 2 counted a packet the link accepted as delivered. A
 device that died without closing its link (an iOS app killed or suspended,
@@ -942,23 +982,48 @@ propagation sync.
 
 When a per-subscriber limit is exceeded, the oldest entry is evicted, and
 the hand-off that evicted it logs a NOTICE naming the recipient and the
-evicted entry's routing hash. When the global limit is reached, a new entry
-is dropped, and the hand-off that tried to queue it logs a WARNING naming
-the recipient and the routing hash (`DeferredQueue::enqueue` returns
+evicted entry's routing hash. When the global limit is reached, the oldest
+entry of the fullest bucket is evicted to make room (between buckets equally
+full, the one whose oldest entry is older), and the hand-off logs a NOTICE
+naming whose entry went, its routing hash, and the recipient it made room
+for. A new entry is dropped only when every queued entry is in a page a pull
+holds (§2, PULL paging), and the hand-off then logs a WARNING naming the
+recipient and the routing hash (`DeferredQueue::enqueue` returns
 `EnqueueOutcome`; the hand-off's `[handoff]` line reads `NOT queued: global
-limit`). The other callers, which queue several blobs for one subscriber at
-once (a backup node adopting an offline owner's subscriber, and the
-announce flush putting back what it drained and could not send), log the
-same per run: a WARNING `… NOT queued: global limit, lost to the pull` for
-the refused blobs and a NOTICE for the evictions, and count as queued only
-what was (`DeferredQueue::enqueue_all`, `EnqueueTally`). An entry older than 7 days is evicted, and the node logs, per
-recipient and routing hash, how many expired unpulled (a WARNING for a
-distro registered here).
+limit`). A backup node adopting an offline owner's subscriber, which queues
+several blobs for one subscriber at once, logs the same per run: a NOTICE
+for the evictions and a WARNING `… NOT queued: global limit, lost to the
+pull` for any it could not queue, and counts as queued only what was
+(`DeferredQueue::enqueue_all`, `EnqueueTally`). An entry older than 7 days
+is evicted, and the node logs, per recipient and routing hash, how many
+expired unpulled (a WARNING for a distro registered here).
+
+Until 2026-10-30 a new entry was dropped whenever the global limit was
+reached. Subscriptions never expired then (§6 "Renewal and expiry"), the
+buckets of devices long gone held the queue at the limit, and the announce
+flush's re-queue for a web client in use met it: eight #public.general
+posts were lost.
 
 ### Delivery Triggers
 
-1. **Subscriber comes online** — delivery destination announces; node
-   drains deferred queue and sends each blob.
+1. **Subscriber comes online** — its `rfed.delivery` destination announces,
+   and the node sends it its queued channel blobs (`fanout::flush_queued`;
+   distro blobs wait for the pull, §17.3). Each goes down the subscriber's
+   bound `rfed.link` when it has bound that blob's channel, confirmed by the
+   answer as tier 1 above; otherwise as an `rfed.delivery` packet with a
+   receipt, confirmed by its proof. Each stays queued while it is sent, so a
+   pull meanwhile still gets it, until a confirmation deletes it from its
+   bucket or from the page a pull holds (`DeferredQueue::flush_copies`,
+   `confirm`). One no route confirms stays queued, and its subscriber is
+   pushed to collect it (§9) unless a pull already holds it. An announce
+   during the flush does not send again what is still in flight. One that no
+   interface took, or one above the packet MDU with no `rfed.link` bound for
+   its channel, waits for the pull or the next announce, and nobody is
+   pushed: the subscriber has just announced. Until 2026-10-30 the flush
+   drained the blobs, sent packets only, and queued them again when their
+   receipts timed out: a pull before then found nothing (the web client
+   pulls 2 s after its announce), a restart in that window lost them, and
+   the re-queue could meet a full queue (Limits above).
 2. **PULL request** — subscriber explicitly requests pending blobs via
    `/rfed/pull` (or `/channel/pull`, `/distro/pull` on `rfed.link`); one
    page is returned as a msgpack array and deleted once the requester proves
@@ -2771,13 +2836,15 @@ In RFed's queue there are three ways (§7 "Limits"):
 - The queue keeps an entry for 7 days.
 - A device's bucket holds at most its per-subscriber limit (256 by default),
   shared with its channel posts, and the oldest entry is evicted first.
-- The whole queue holds at most 4096 entries. When it is full, a new entry,
-  C included, is dropped, and the hand-off logs a WARNING naming the device
+- The whole queue holds at most 4096 entries. When it is full, a new entry
+  evicts the oldest entry of the fullest bucket, which can be a device's C.
+  A new entry, C included, is dropped only when every queued entry is in a
+  page a pull holds, and the hand-off then logs a WARNING naming the device
   and D (`EnqueueOutcome::RefusedGlobalLimit`, `handoff.rs`).
 
 When C is lost on the sending device, no sibling learns the change. A device
-that is offline for longer than 7 days, whose bucket overflows, or whose C met
-a full queue does not learn it either. A device that is reachable but is
+that is offline for longer than 7 days, whose bucket overflows, or whose C a
+full queue evicted or dropped does not learn it either. A device that is reachable but is
 neither opened nor woken for anything for 7 days loses, in the same way, a C
 that did not wake it (§17.13); the node logs that expiry per device. Neither
 does a device that imports D

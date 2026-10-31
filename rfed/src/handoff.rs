@@ -25,7 +25,7 @@ use reticulum_rust::{hexrep, log, LOG_NOTICE, LOG_WARNING};
 use crate::deferred_queue::{DeferredQueue, EnqueueOutcome};
 use crate::notify::rns::RelayStack;
 use crate::notify::{dispatch_notify_via, NotifyRegistration, NotifyRegistry};
-use crate::stream_registry::{tie_receipt, PushOutcome};
+use crate::stream_registry::{tie_receipt, OnProved, PushOutcome};
 
 /// What the proof of an `rfed.delivery` packet (the channel fan-out's
 /// packet, and the announce flush of queued channel blobs) decides.
@@ -52,23 +52,28 @@ pub enum PacketProof {
 pub const DELIVERY_PACKET_PROOF: PacketProof = PacketProof::Required;
 
 /// Tie an `rfed.delivery` packet's receipt to its verdict under `mode`.
-/// `Required`: delivered on the proof, `hand_off` on the receipt timeout.
-/// `Observed`: sent once either way, and the proof or its absence is logged
-/// only.
+/// `Required`: delivered on the proof, which runs `on_proved` (on time or
+/// late), and `hand_off` on the receipt timeout. `Observed`: sent once and
+/// counted delivered, so `on_proved` runs at once, and the proof or its
+/// absence is logged only.
 pub fn await_packet_proof(
     receipt: &PacketReceipt,
     label: String,
     mode: PacketProof,
+    on_proved: Option<OnProved>,
     hand_off: Arc<dyn Fn() + Send + Sync>,
 ) {
     match mode {
         PacketProof::Required => {
-            let outcome = PushOutcome::new(label, Some(hand_off));
+            let outcome = PushOutcome::new_with_proved(label, on_proved, Some(hand_off));
             outcome.receipt_pending();
             tie_receipt(receipt, &outcome);
             outcome.dispatch_done();
         }
         PacketProof::Observed => {
+            if let Some(hook) = on_proved {
+                std::thread::spawn(move || hook());
+            }
             // One verdict per packet: a proof after the timeout is not logged twice.
             let concluded = Arc::new(AtomicBool::new(false));
             let (proved_label, proved_done) = (label.clone(), Arc::clone(&concluded));
@@ -209,6 +214,9 @@ fn wake_message(blob: &[u8], wake_channel: Option<&[u8]>) -> Option<[u8; 32]> {
 /// What a hand-off's attempt to queue its blob came to.
 enum Queueing {
     Done(EnqueueOutcome),
+    /// The blob never left the queue: the announce flush sent a copy of a
+    /// queued entry ([`wake_for_queued`]).
+    Kept,
     /// The deferred queue's mutex is poisoned: nothing was queued.
     Poisoned,
 }
@@ -221,40 +229,58 @@ impl Queueing {
         match self {
             Queueing::Done(outcome) if outcome.queued() => "queued",
             Queueing::Done(_) => "NOT queued: global limit",
+            Queueing::Kept => "queued",
             Queueing::Poisoned => "NOT queued (deferred queue poisoned)",
         }
     }
 
     fn queued(&self) -> bool {
-        matches!(self, Queueing::Done(outcome) if outcome.queued())
-    }
-
-    /// The entry the enqueue evicted to make room, if it evicted one.
-    fn evicted(&self) -> Option<&[u8]> {
         match self {
-            Queueing::Done(EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash }) => Some(evicted_routing_hash),
-            _ => None,
+            Queueing::Done(outcome) => outcome.queued(),
+            Queueing::Kept => true,
+            Queueing::Poisoned => false,
         }
     }
 }
 
-/// Say that queueing `routing_hash`'s blob for `recipient` evicted its
-/// oldest entry, when it did: that entry is lost to the pull (RFed SPEC §7
-/// "Limits"). One NOTICE, naming whose entry and what it was routed to.
+/// Say that queueing `routing_hash`'s blob for `recipient` evicted an
+/// entry, when it did: that entry is lost to the pull (RFed SPEC §7
+/// "Limits"). One NOTICE, naming whose entry it was and what it was routed
+/// to.
 fn log_eviction(recipient: &Unconfirmed, routing_hash: &[u8], queued: &Queueing) {
-    if let Some(evicted) = queued.evicted() {
-        log(
-            format!(
-                "[handoff] {} bucket full: its oldest entry, for {}, evicted to queue one for {}",
-                hexrep(&recipient.wake_key, false),
-                hexrep(evicted, false),
-                hexrep(routing_hash, false),
-            ),
-            LOG_NOTICE,
-            false,
-            false,
-        );
-    }
+    let line = match queued {
+        Queueing::Done(EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash }) => format!(
+            "[handoff] {} bucket full: its oldest entry, for {}, evicted to queue one for {}",
+            hexrep(&recipient.wake_key, false),
+            hexrep(evicted_routing_hash, false),
+            hexrep(routing_hash, false),
+        ),
+        Queueing::Done(EnqueueOutcome::QueuedEvictingFullest { evicted_subscriber, evicted_routing_hash }) => format!(
+            "[handoff] queue full: the oldest entry of the fullest bucket, {}'s for {}, evicted to queue one for {} to {}",
+            hexrep(evicted_subscriber, false),
+            hexrep(evicted_routing_hash, false),
+            hexrep(routing_hash, false),
+            hexrep(&recipient.wake_key, false),
+        ),
+        _ => return,
+    };
+    log(line, LOG_NOTICE, false, false);
+}
+
+/// The hand-off for an entry the announce flush sent from the deferred
+/// queue and no route confirmed: the blob never left the queue
+/// ([`DeferredQueue::flush_copies`]), so only the push is left. Writes the
+/// pinned `[handoff]` line, "queued for pull", as [`defer_then_wake`] does.
+pub fn wake_for_queued(
+    stack: &dyn RelayStack,
+    notify_registry: &Mutex<NotifyRegistry>,
+    recipient: &Unconfirmed,
+    routing_hash: &[u8],
+    blob: &[u8],
+    wake_channel: Option<&[u8]>,
+) -> HandOffOutcome {
+    let message = wake_message(blob, wake_channel);
+    wake_after_queueing(stack, notify_registry, recipient, routing_hash, wake_channel, message.as_ref(), &Queueing::Kept)
 }
 
 /// The push of a hand-off, once its blob is queued (or could not be): wake
@@ -372,7 +398,7 @@ pub fn distro_hand_off(
             let handed = wake_after_queueing(&*stack, &notify_registry, &device, &distro_hash, None, message.as_ref(), &Queueing::Poisoned);
             return HandOffOutcome { pushed_because: Some("deferred queue poisoned".to_string()), ..handed };
         };
-        let un_pulled = un_pulled_after(held, &outcome, &distro_hash);
+        let un_pulled = un_pulled_after(held, &outcome, &device.queue_key, &distro_hash);
         let mut why = Vec::new();
         if un_pulled >= DISTRO_SYNC_UNWOKEN_LIMIT {
             why.push(format!("{un_pulled} un-pulled"));
@@ -424,14 +450,20 @@ pub fn distro_hand_off(
     })
 }
 
-/// The device's queued blobs of `distro_hash` after an enqueue that found
+/// `device`'s queued blobs of `distro_hash` after an enqueue that found
 /// `held` of them: one more if it was queued, one fewer if the entry it
 /// evicted was one of them.
-fn un_pulled_after(held: usize, outcome: &EnqueueOutcome, distro_hash: &[u8]) -> usize {
+fn un_pulled_after(held: usize, outcome: &EnqueueOutcome, device: &[u8], distro_hash: &[u8]) -> usize {
     match outcome {
         EnqueueOutcome::Queued => held + 1,
         EnqueueOutcome::QueuedEvictingOldest { evicted_routing_hash } if evicted_routing_hash == distro_hash => held,
         EnqueueOutcome::QueuedEvictingOldest { .. } => held + 1,
+        EnqueueOutcome::QueuedEvictingFullest { evicted_subscriber, evicted_routing_hash }
+            if evicted_subscriber == device && evicted_routing_hash == distro_hash =>
+        {
+            held
+        }
+        EnqueueOutcome::QueuedEvictingFullest { .. } => held + 1,
         EnqueueOutcome::RefusedGlobalLimit => held,
     }
 }
@@ -786,21 +818,31 @@ mod tests {
         let (sync_lines, sync_wakes, sync_queued) = run(Wake::QueueOnly);
         let (push_lines, push_wakes, push_queued) = run(Wake::Push);
         assert_eq!(sync_wakes, 2);
-        assert_eq!(sync_queued, 1, "the first fills the queue, the second is refused");
+        assert_eq!(sync_queued, 2, "the first fills the queue, the second evicts the oldest filler");
         assert_eq!((sync_wakes, sync_queued), (push_wakes, push_queued));
         assert_eq!(sync_lines.len(), 2);
-        assert!(sync_lines[1].contains(": NOT queued: global limit for pull, woken via 1 of 1"), "{}", sync_lines[1]);
+        assert!(sync_lines[1].contains(": queued for pull, woken via 1 of 1"), "{}", sync_lines[1]);
         assert_eq!(sync_lines, push_lines, "the same hand-off lines, word for word");
     }
 
     /// A refused enqueue is a WARNING and never reads as queued; the device
-    /// is still woken, so it drains what is queued for it.
+    /// is still woken, so it drains what is queued for it. Since 2026-10-30
+    /// the global limit evicts the fullest bucket's oldest entry instead, so
+    /// only a queue whose every entry a pull holds refuses.
     #[test]
     fn a_refused_enqueue_is_a_warning_and_still_wakes() {
         let rig = Rig::new("refused");
         let device = rig.device(0x61);
-        rig.queue.lock().unwrap().global_limit = 2;
-        rig.fill_to(2);
+        {
+            let mut queue = rig.queue.lock().unwrap();
+            queue.global_limit = 2;
+            let puller = vec![0x62; 16];
+            for n in 0..2u8 {
+                queue.enqueue(puller.clone(), vec![0xCC; 16], vec![n], 256);
+            }
+            let (page, _) = queue.take_page(&puller, |_| true, 25, usize::MAX, |_| 1);
+            assert_ne!(page, 0, "a pull holds both");
+        }
         let mark = crate::test_log::mark();
         let handed = rig.hand_off(&[0xD6; 16], b"blob", Wake::Push)(device.clone());
         assert_eq!(rig.wakes(), 1);
@@ -809,6 +851,57 @@ mod tests {
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("[Warning]"), "{}", lines[0]);
         assert!(lines[0].contains(": NOT queued: global limit for pull, woken via 1 of 1"), "{}", lines[0]);
+    }
+
+    /// At the global limit the oldest entry of the fullest bucket goes; the
+    /// hand-off says whose it was and what it was routed to, and its own blob
+    /// is queued.
+    #[test]
+    fn an_eviction_from_the_fullest_bucket_is_a_notice_naming_whose_entry_went() {
+        let rig = Rig::new("evict_fullest");
+        let device = rig.device(0x63);
+        let gone = vec![0x64; 16];
+        let lost = vec![0xC6; 16];
+        let distro = vec![0xD6; 16];
+        {
+            let mut queue = rig.queue.lock().unwrap();
+            queue.global_limit = 2;
+            queue.enqueue(gone.clone(), lost.clone(), b"old-1".to_vec(), 256);
+            queue.enqueue(gone.clone(), lost.clone(), b"old-2".to_vec(), 256);
+        }
+        let mark = crate::test_log::mark();
+        let handed = rig.hand_off(&distro, b"blob", Wake::Push)(device.clone());
+        assert_eq!(handed, HandOffOutcome { queued: true, woken: true, pushed_because: None });
+        let lines = mark.containing("[handoff] ");
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].contains("[Notice]"), "{}", lines[0]);
+        assert!(lines[0].ends_with(&format!(
+            "[handoff] queue full: the oldest entry of the fullest bucket, {}'s for {}, evicted to queue one for {} to {}",
+            hexrep(&gone, false),
+            hexrep(&lost, false),
+            hexrep(&distro, false),
+            hexrep(&device.wake_key, false),
+        )), "{}", lines[0]);
+        assert!(lines[1].contains(": queued for pull, woken via 1 of 1"), "{}", lines[1]);
+        assert_eq!(rig.queue.lock().unwrap().count_matching(&gone, &lost), 1, "one of the two went");
+    }
+
+    /// The 64 bound's count after an eviction from the fullest bucket: one
+    /// of the device's own blobs of the distro out and one in leaves it
+    /// where it was; anyone else's entry, or another routing hash's, does not.
+    #[test]
+    fn un_pulled_counts_an_eviction_from_the_fullest_bucket_only_when_it_was_its_own() {
+        let device = vec![0x01; 16];
+        let other = vec![0x02; 16];
+        let distro = vec![0xD1; 16];
+        let channel = vec![0xC1; 16];
+        let evicting = |subscriber: &[u8], routing: &[u8]| EnqueueOutcome::QueuedEvictingFullest {
+            evicted_subscriber: subscriber.to_vec(),
+            evicted_routing_hash: routing.to_vec(),
+        };
+        assert_eq!(un_pulled_after(5, &evicting(&device, &distro), &device, &distro), 5);
+        assert_eq!(un_pulled_after(5, &evicting(&device, &channel), &device, &distro), 6);
+        assert_eq!(un_pulled_after(5, &evicting(&other, &distro), &device, &distro), 6);
     }
 
     /// An eviction at the per-device limit is said, naming what was lost.
