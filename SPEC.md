@@ -105,8 +105,8 @@ Layer 1 (Reticulum transport — first hop):
 Layer 1' (Reticulum transport — fanout hop, one per subscriber):
     For every subscriber S of channel_hash, RFed pushes
         [ channel_hash(16) | inner_blob ]
-    by the first live route of §7 that takes it (a `/delivery` request
-    on S's bound rfed.link, a DATA packet on S's legacy
+    by the first live route of §7 that takes it (a `/channel/delivery`
+    request on S's bound rfed.link, a DATA packet on S's legacy
     rfed.channel.stream link, a DATA packet to S's rfed.delivery
     destination), and otherwise queues it for S's pull (§7).
     (No stamp on the fanout hop — stamp was already validated at ingest.)
@@ -489,9 +489,11 @@ Two things are genuinely new rather than relocated:
   channel post is `/channel/publish`.
 - **Node → client requests.** After `/channel/stream/open` or
   `/propagation/stream/open` binds the link, the node pushes back over it:
-  `/delivery` (`channel_hash(16) | inner_blob`), `/lxmf/delivery` (packed
-  LXMF), `/notify` (wake map). The client's `msgpack bool` response is the
-  delivery proof. An unanswered channel `/delivery` or distro `/lxmf/delivery`
+  `/channel/delivery` (`channel_hash(16) | inner_blob`; `/delivery` until
+  2026-11-13, still sent to a client that binds without saying it handles
+  the new name, RFed-spec/Link.md), `/lxmf/delivery` (packed LXMF), `/notify`
+  (wake map). The client's `msgpack bool` response is the delivery proof. An
+  unanswered `/channel/delivery` or distro `/lxmf/delivery`
   push moves the blob to the deferred queue, and the client collects it with
   `/channel/pull` or `/distro/pull`. An unanswered `/lxmf/delivery` of a
   directly-addressed message is not deferred: the message stays in the
@@ -906,7 +908,7 @@ disk (`deferred_delivery.sqlite3`, one row per blob, in queue order).
 Channel and distro fan-out try the subscriber's live routes in order, and
 stop at the first one that takes the push:
 
-1. **`rfed.link`** — a `/delivery` (channel) or `/lxmf/delivery` (distro)
+1. **`rfed.link`** — a `/channel/delivery` (channel) or `/lxmf/delivery` (distro)
    request on the subscriber's bound link. The client's `msgpack bool`
    response is the proof: `true` confirms the push, and `false` leaves it
    unconfirmed (below).
@@ -1055,7 +1057,7 @@ each in turn:
 
 1. Skip a backup subscription whose owner is still online (§6, §11).
 2. Try the subscriber's live routes in the order of §7 "Live delivery and its
-   proof" — a `/delivery` request on its bound `rfed.link`, a DATA packet on
+   proof" — a `/channel/delivery` request on its bound `rfed.link`, a DATA packet on
    its legacy `rfed.channel.stream` link, a DATA packet to its
    `rfed.delivery` destination — and stop at the first that takes the push.
    The payload is `[ channel_hash(16) | inner_blob ]` on every route.
@@ -1080,7 +1082,7 @@ publish under such a hash is stored and fanned out to no one
 
 ```
 ┌─── Outer Envelope (rfed → subscriber) ───────────────────────────┐
-│  The route of §7: a /delivery request on the subscriber's        │
+│  The route of §7: a /channel/delivery request on the subscriber's│
 │  rfed.link, a DATA packet on its rfed.channel.stream link, or    │
 │  a Single packet to its rfed.delivery (all encrypted)            │
 │  Payload: [ channel_hash(16) | inner_blob ]                      │
@@ -1845,7 +1847,7 @@ Encoded as a msgpack array in the announce `app_data`:
 [
   bin(display_name),                          // 0: UTF-8 node name
   uint(channel_stamp_cost) | nil,             // 1: channel publish PoW cost (nil = disabled); formerly `stamp_cost`
-  uint(1),                                    // 2: protocol version
+  uint(2),                                    // 2: protocol version (1 before the 2026-11-13 revision)
   uint(propagation_stamp_cost) | nil,         // 3: LXMF propagation stamp cost (nil = no propagation node)
   uint(propagation_transfer_limit_kb) | nil   // 4: per-message upload limit, KB of 1000 B (nil = no propagation node)
 ]
@@ -1865,10 +1867,16 @@ below, so a client that uploads on `rfed.link` (RFed-spec/Link.md, "LXMF
 propagation on `rfed.link`") needs no other announce. A reader takes the
 positions it knows and ignores the rest, as rfed's own
 `announce::decode_node_announce` does, and never requires exactly three
-elements. A node that sends three elements (any rfed before this) is read as
-before, and a client gets its propagation stamp cost and limit from its
-`lxmf.propagation` announce instead. The protocol version stays 1: the
-appended positions are found by the array's length.
+elements.
+
+The protocol version (position 2) is **2** from a node that implements the
+2026-11-13 revision: positions 3 and 4, the LXMF propagation paths on
+`rfed.link`, and the channel push named `/channel/delivery` (RFed-spec/Link.md).
+A version-1 node (any rfed before it) sends three elements and has none of
+these: a client keeps its link to that node's `lxmf.propagation` and reads
+that destination's announce, and binds with a three-element
+`/channel/stream/open`. No reader gates on the version today (rfed reads it,
+the apps do not), so the bump breaks none.
 
 RFed's channel-federation destinations are described in §2. `rfed.node`
 carries RFed app_data, and when propagation is enabled `lxmf.propagation`
