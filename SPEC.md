@@ -495,6 +495,15 @@ Two things are genuinely new rather than relocated:
   directly-addressed message is not deferred: the message stays in the
   messagestore and propagation sync finds it. See §7 "Live delivery and its
   proof".
+- **LXMF propagation on the same link** (specified 2026-11-13, not yet
+  implemented). `/propagation/upload` (the LXMF upload as a request,
+  answered `true` or a one-element `LXMPeer.ERROR_*` array after its stamps
+  are validated, never tearing the link down), `/propagation/get` (`/get`) and
+  `/propagation/offer` (`/offer`) carry what a client and a peer do on
+  `lxmf.propagation`, so a client holds one link to a node. The stamp cost and
+  limits still come from the `lxmf.propagation` announce, and
+  `lxmf.propagation` keeps running for canon LXMF clients and nodes.
+  RFed-spec/Link.md, "LXMF propagation on `rfed.link`".
 
 `rfed.link` is additive. Every destination above stays registered, announced,
 and answering, and no deployed client has to move.
