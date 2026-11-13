@@ -483,8 +483,10 @@ Two things are genuinely new rather than relocated:
   request it responds `msgpack [bool, str|nil]` with `too_short`,
   `stamp_too_short`, `stamp_invalid`, `stamp_legacy`, or `store_failed`.
   A publish over the link MDU is still a request — RNS carries it as a request
-  Resource — and is answered the same way. A bare Resource on the link is also
-  ingested, but gets no answer.
+  Resource — and is answered the same way. A bare packet or Resource on the
+  link is still ingested as a publish, with no answer, but is deprecated
+  (2026-11-13): every operation on the link is named by its path, and a
+  channel post is `/channel/publish`.
 - **Node → client requests.** After `/channel/stream/open` or
   `/propagation/stream/open` binds the link, the node pushes back over it:
   `/delivery` (`channel_hash(16) | inner_blob`), `/lxmf/delivery` (packed
@@ -500,9 +502,9 @@ Two things are genuinely new rather than relocated:
   answered `true` or a one-element `LXMPeer.ERROR_*` array after its stamps
   are validated, never tearing the link down), `/propagation/get` (`/get`) and
   `/propagation/offer` (`/offer`) carry what a client and a peer do on
-  `lxmf.propagation`, so a client holds one link to a node. The stamp cost and
-  limits still come from the `lxmf.propagation` announce, and
-  `lxmf.propagation` keeps running for canon LXMF clients and nodes.
+  `lxmf.propagation`, so a client holds one link to a node. The propagation
+  stamp cost and per-message limit are appended to the node's announce (§12),
+  and `lxmf.propagation` keeps running for canon LXMF clients and nodes.
   RFed-spec/Link.md, "LXMF propagation on `rfed.link`".
 
 `rfed.link` is additive. Every destination above stays registered, announced,
@@ -1841,11 +1843,32 @@ Encoded as a msgpack array in the announce `app_data`:
 
 ```
 [
-  bin(display_name),        // UTF-8 node name
-  uint(stamp_cost) | nil,   // PoW cost (nil = disabled)
-  uint(1)                    // protocol version
+  bin(display_name),                          // 0: UTF-8 node name
+  uint(channel_stamp_cost) | nil,             // 1: channel publish PoW cost (nil = disabled); formerly `stamp_cost`
+  uint(1),                                    // 2: protocol version
+  uint(propagation_stamp_cost) | nil,         // 3: LXMF propagation stamp cost (nil = no propagation node)
+  uint(propagation_transfer_limit_kb) | nil   // 4: per-message upload limit, KB of 1000 B (nil = no propagation node)
 ]
 ```
+
+Positions 0–2 are unchanged. Position 1 was named `stamp_cost`: it is the
+channel publish cost, and the old name is deprecated in favour of
+`channel_stamp_cost` (2026-11-13). Its value and place are the same, so a
+reader that knows it as `stamp_cost` reads it correctly. As before, the
+authoritative channel cost is `/rfed/subscribe`'s reply (§3); the announce
+gives it ahead of the first subscribe.
+
+Positions 3 and 4 are appended (specified 2026-11-13, not yet implemented).
+They are the propagation stamp cost and per-message limit of this node's
+`lxmf.propagation`, the same values as in that destination's own announce
+below, so a client that uploads on `rfed.link` (RFed-spec/Link.md, "LXMF
+propagation on `rfed.link`") needs no other announce. A reader takes the
+positions it knows and ignores the rest, as rfed's own
+`announce::decode_node_announce` does, and never requires exactly three
+elements. A node that sends three elements (any rfed before this) is read as
+before, and a client gets its propagation stamp cost and limit from its
+`lxmf.propagation` announce instead. The protocol version stays 1: the
+appended positions are found by the array's length.
 
 RFed's channel-federation destinations are described in §2. `rfed.node`
 carries RFed app_data, and when propagation is enabled `lxmf.propagation`
