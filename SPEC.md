@@ -499,8 +499,8 @@ Two things are genuinely new rather than relocated:
   directly-addressed message is not deferred: the message stays in the
   messagestore and propagation sync finds it. See §7 "Live delivery and its
   proof".
-- **LXMF propagation on the same link** (specified 2026-11-13, not yet
-  implemented). `/propagation/upload` (the LXMF upload as a request,
+- **LXMF propagation on the same link** (2026-11-13; a node without a
+  propagation node has none of these paths). `/propagation/upload` (the LXMF upload as a request,
   answered `true` or a one-element `LXMPeer.ERROR_*` array after its stamps
   are validated, never tearing the link down), `/propagation/get` (`/get`) and
   `/propagation/offer` (`/offer`) carry what a client and a peer do on
@@ -1860,7 +1860,7 @@ reader that knows it as `stamp_cost` reads it correctly. As before, the
 authoritative channel cost is `/rfed/subscribe`'s reply (§3); the announce
 gives it ahead of the first subscribe.
 
-Positions 3 and 4 are appended (specified 2026-11-13, not yet implemented).
+Positions 3 and 4 are appended (2026-11-13).
 They are the propagation stamp cost and per-message limit of this node's
 `lxmf.propagation`, the same values as in that destination's own announce
 below, so a client that uploads on `rfed.link` (RFed-spec/Link.md, "LXMF
@@ -2072,7 +2072,7 @@ this node.  Any caller may issue the request; the payload is ignored.
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `protocol_version` | Integer | Wire-format version (currently `1`). Bump on breaking changes. |
+| `protocol_version` | Integer | Wire-format version, the one the node announces (§12): `2` from the 2026-11-13 revision, `1` before. Bump on breaking changes. |
 | `display_name` | String | Human-readable node name from config. |
 | `subscription` | Boolean | Whether the default policy allows subscription. |
 | `notify` | Boolean | Whether the default policy allows notify registration. |
@@ -2092,7 +2092,7 @@ or feature-specific sub-maps.
 
 ```
 {
-  "protocol_version": 1,
+  "protocol_version": 2,
   "display_name": "my-rfed-node",
   "subscription": true,
   "notify": true,

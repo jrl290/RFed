@@ -733,10 +733,14 @@ fn main() -> Result<(), String> {
     // Extract timing constants before the event loop to avoid repeated locking.
     const BACKUP_TICK_SECS: u64 = 30;
 
-    destinations::enable(Arc::clone(&node))?;
-    eprintln!("[rfed] Federation Node active");
-
     // ── Optional full lxmf.propagation node ─────────────────────────
+    //
+    // Created, enabled and attached BEFORE `destinations::enable`: rfed.link
+    // carries the propagation node's upload, get and offer (RFed-spec/Link.md),
+    // which `enable` wires from the attached node before it registers
+    // rfed.link with Transport, once. Attached after, the node would announce
+    // propagation terms (SPEC §12) that its rfed.link does not take.
+    // `propagation_node_attached_before_enable` holds this order.
     let lxmf_prop_arc: Option<Arc<Mutex<lxmf_propagation::LxmfPropagationNode>>> =
     if lxmf_propagation_enabled {
         let notify_reg = node.lock().map_err(|_| "lock")?.notify_registry.clone();
@@ -779,6 +783,10 @@ fn main() -> Result<(), String> {
     } else {
         None
     };
+
+    destinations::enable(Arc::clone(&node))?;
+    eprintln!("[rfed] Federation Node active");
+
 
     // ── Publish destinations + initial announce ───────────────────────
     //

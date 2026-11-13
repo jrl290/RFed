@@ -59,6 +59,14 @@ pub mod paths {
 
     /// `rfed.propagation.stream` `/rfed/propagation/stream/open`
     pub const PROPAGATION_STREAM_OPEN: &str = "/propagation/stream/open";
+    /// `lxmf.propagation` link DATA packet or Resource — as a request it also
+    /// answers, after validation (RFed-spec/Link.md, "LXMF propagation on
+    /// `rfed.link`").
+    pub const PROPAGATION_UPLOAD: &str = "/propagation/upload";
+    /// `lxmf.propagation` `/get`
+    pub const PROPAGATION_GET: &str = "/propagation/get";
+    /// `lxmf.propagation` `/offer`
+    pub const PROPAGATION_OFFER: &str = "/propagation/offer";
 
     /// `rfed.notify.register` `/rfed/notify/register`
     pub const NOTIFY_REGISTER: &str = "/notify/register";
@@ -80,7 +88,13 @@ pub mod paths {
 
     // ── node → client ────────────────────────────────────────────────
     /// Channel fan-out push. Payload `channel_hash(16) | inner_blob(*)` —
-    /// byte-identical to what `rfed.delivery` receives today.
+    /// byte-identical to what `rfed.delivery` receives today. Pushed on a
+    /// link whose client said it handles it, with the fourth element of its
+    /// `/channel/stream/open` (RFed-spec/Link.md).
+    pub const CHANNEL_DELIVERY: &str = "/channel/delivery";
+    /// The channel push's name until 2026-11-13, deprecated: still pushed on
+    /// a link bound with a three-element `/channel/stream/open`, so clients
+    /// from before the rename keep receiving.
     pub const DELIVERY: &str = "/delivery";
     /// LXMF propagation push. Payload is the packed LXMF message; its own
     /// leading 16 bytes are the recipient's `lxmf.delivery` hash.
@@ -101,8 +115,18 @@ struct LinkSession {
     subscriber_hash: Option<Vec<u8>>,
     /// Channel filter set — replaced wholesale on every stream open.
     channel_hashes: Vec<Vec<u8>>,
+    /// The path channel pushes go out on — set by `/channel/stream/open`
+    /// (`channel_push_path`).
+    channel_push: &'static str,
     /// `lxmf.delivery` hash — set by `/propagation/stream/open`.
     delivery_hash: Option<Vec<u8>>,
+}
+
+/// The path a channel push takes on a link: `/channel/delivery` when the
+/// client's `/channel/stream/open` said it handles it, else the deprecated
+/// `/delivery`, which every client before the 2026-11-13 rename handles.
+pub fn channel_push_path(handles_channel_delivery: bool) -> &'static str {
+    if handles_channel_delivery { paths::CHANNEL_DELIVERY } else { paths::DELIVERY }
 }
 
 /// Does a session bound to `(subscriber, channels)` want this channel push?
@@ -130,6 +154,7 @@ impl LinkSession {
             link,
             subscriber_hash: None,
             channel_hashes: Vec::new(),
+            channel_push: paths::DELIVERY,
             delivery_hash: None,
         }
     }
@@ -161,7 +186,8 @@ pub struct LinkSessionRegistry {
 }
 
 impl LinkSessionRegistry {
-    /// Bind (or rebind) this link's channel filter set.
+    /// Bind (or rebind) this link's channel filter set, and the path its
+    /// channel pushes take (`channel_push_path`).
     ///
     /// Repeat calls are reconfiguration, not an error — the filter set is
     /// replaced, matching `rfed.channel.stream` semantics.
@@ -178,6 +204,7 @@ impl LinkSessionRegistry {
         link: LinkHandle,
         subscriber_hash: Vec<u8>,
         channel_hashes: Vec<Vec<u8>>,
+        channel_push: &'static str,
     ) -> Vec<Vec<u8>> {
         let link_id = link.link_id();
         let replaced = evict_others(&mut self.sessions, &link_id, |session| {
@@ -189,6 +216,7 @@ impl LinkSessionRegistry {
             .or_insert_with(|| LinkSession::new(link));
         entry.subscriber_hash = Some(subscriber_hash);
         entry.channel_hashes = channel_hashes;
+        entry.channel_push = channel_push;
         replaced
     }
 
@@ -230,9 +258,10 @@ impl LinkSessionRegistry {
     }
 
     /// Push a channel blob to every link this subscriber has bound for that
-    /// channel. `payload` is `channel_hash(16) | inner_blob`. `on_acked` runs
-    /// once, on a thread of its own, when the client acknowledges it (the
-    /// announce flush deletes the queued entry it sent).
+    /// channel, on the path each link was bound with (`channel_push_path`).
+    /// `payload` is `channel_hash(16) | inner_blob`. `on_acked` runs once, on
+    /// a thread of its own, when the client acknowledges it (the announce
+    /// flush deletes the queued entry it sent).
     pub fn dispatch_channel(
         &mut self,
         subscriber_hash: &[u8],
@@ -241,15 +270,18 @@ impl LinkSessionRegistry {
         on_failed: Option<Arc<dyn Fn() + Send + Sync>>,
         on_acked: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> StreamDispatchResult {
-        let matches = self.matching(|session| {
-            wants_channel(
-                session.subscriber_hash.as_deref(),
-                &session.channel_hashes,
-                subscriber_hash,
-                channel_hash,
-            )
-        });
-        self.dispatch(matches, paths::DELIVERY, payload, on_failed, on_acked)
+        let matches = self.matching(
+            |session| {
+                wants_channel(
+                    session.subscriber_hash.as_deref(),
+                    &session.channel_hashes,
+                    subscriber_hash,
+                    channel_hash,
+                )
+            },
+            |session| session.channel_push,
+        );
+        self.dispatch(matches, payload, on_failed, on_acked)
     }
 
     /// Push a packed LXMF message to every link bound to `delivery_hash`.
@@ -259,26 +291,29 @@ impl LinkSessionRegistry {
         payload: &[u8],
         on_failed: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> StreamDispatchResult {
-        let matches =
-            self.matching(|session| session.delivery_hash.as_deref() == Some(delivery_hash));
-        self.dispatch(matches, paths::LXMF_DELIVERY, payload, on_failed, None)
+        let matches = self.matching(
+            |session| session.delivery_hash.as_deref() == Some(delivery_hash),
+            |_| paths::LXMF_DELIVERY,
+        );
+        self.dispatch(matches, payload, on_failed, None)
     }
 
-    fn matching<F>(&self, predicate: F) -> Vec<(Vec<u8>, LinkHandle)>
+    /// The sessions `predicate` selects, each with the path its push takes.
+    fn matching<F, P>(&self, predicate: F, path: P) -> Vec<(Vec<u8>, LinkHandle, &'static str)>
     where
         F: Fn(&LinkSession) -> bool,
+        P: Fn(&LinkSession) -> &'static str,
     {
         self.sessions
             .iter()
             .filter(|(_, session)| predicate(session))
-            .map(|(link_id, session)| (link_id.clone(), session.link.clone()))
+            .map(|(link_id, session)| (link_id.clone(), session.link.clone(), path(session)))
             .collect()
     }
 
     fn dispatch(
         &mut self,
-        matches: Vec<(Vec<u8>, LinkHandle)>,
-        path: &str,
+        matches: Vec<(Vec<u8>, LinkHandle, &'static str)>,
         payload: &[u8],
         on_failed: Option<Arc<dyn Fn() + Send + Sync>>,
         on_acked: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -305,7 +340,7 @@ impl LinkSessionRegistry {
         let gated_failure = on_failed.map(once);
         let gated_ack = on_acked.map(once);
 
-        for (link_id, link) in matches {
+        for (link_id, link, path) in matches {
             if !link.is_alive() {
                 stale_links.push(link_id);
                 continue;
@@ -444,7 +479,7 @@ fn push_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{paths, wants_channel};
+    use super::{channel_push_path, paths, wants_channel};
 
     const SUB: &[u8] = b"subscriber-hash!";
     const OTHER_SUB: &[u8] = b"someone-else!!!!";
@@ -528,6 +563,9 @@ mod tests {
             ("channel.pull", paths::CHANNEL_PULL),
             ("channel.stream.open", paths::CHANNEL_STREAM_OPEN),
             ("propagation.stream.open", paths::PROPAGATION_STREAM_OPEN),
+            ("propagation.upload", paths::PROPAGATION_UPLOAD),
+            ("propagation.get", paths::PROPAGATION_GET),
+            ("propagation.offer", paths::PROPAGATION_OFFER),
             ("notify.register", paths::NOTIFY_REGISTER),
             ("notify.unregister", paths::NOTIFY_UNREGISTER),
             ("notify.clear", paths::NOTIFY_CLEAR),
@@ -536,6 +574,7 @@ mod tests {
             ("distro.pull", paths::DISTRO_PULL),
             ("distro.unregister", paths::DISTRO_UNREGISTER),
             ("distro.list", paths::DISTRO_LIST),
+            ("channel.delivery", paths::CHANNEL_DELIVERY),
             ("delivery", paths::DELIVERY),
             ("lxmf.delivery", paths::LXMF_DELIVERY),
             ("notify", paths::NOTIFY),
@@ -565,6 +604,9 @@ mod tests {
             paths::CHANNEL_PULL,
             paths::CHANNEL_STREAM_OPEN,
             paths::PROPAGATION_STREAM_OPEN,
+            paths::PROPAGATION_UPLOAD,
+            paths::PROPAGATION_GET,
+            paths::PROPAGATION_OFFER,
             paths::NOTIFY_REGISTER,
             paths::NOTIFY_UNREGISTER,
             paths::NOTIFY_CLEAR,
@@ -573,6 +615,7 @@ mod tests {
             paths::DISTRO_PULL,
             paths::DISTRO_UNREGISTER,
             paths::DISTRO_LIST,
+            paths::CHANNEL_DELIVERY,
             paths::DELIVERY,
             paths::LXMF_DELIVERY,
             paths::NOTIFY,
@@ -590,6 +633,16 @@ mod tests {
     #[test]
     fn push_paths_discriminate_payload_type() {
         assert_ne!(paths::DELIVERY, paths::LXMF_DELIVERY);
+        assert_ne!(paths::CHANNEL_DELIVERY, paths::LXMF_DELIVERY);
         assert!(paths::LXMF_DELIVERY.starts_with("/lxmf/"));
+    }
+
+    /// RFed-spec/Link.md: a node pushes `/channel/delivery` only to a link
+    /// whose client said it handles it; every other link keeps the
+    /// deprecated `/delivery`, the one name clients before the rename handle.
+    #[test]
+    fn the_channel_push_is_named_by_the_bind() {
+        assert_eq!(channel_push_path(true), "/channel/delivery");
+        assert_eq!(channel_push_path(false), "/delivery");
     }
 }

@@ -61,7 +61,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use app_links::AppLinks;
 use rand::Rng;
 use lxmf_rust::lx_stamper;
-use reticulum_rust::destination::{Destination, DestinationType, ALLOW_ALL};
+use reticulum_rust::destination::{Destination, DestinationType, ProvenAnswer, ALLOW_ALL};
 use reticulum_rust::identity::Identity;
 use reticulum_rust::link::{Link, LinkHandle, MODE_AES256_CBC, RequestReceipt};
 use reticulum_rust::transport::{AnnounceHandler, AnnounceCallback, Transport};
@@ -152,6 +152,7 @@ const ERROR_NO_IDENTITY: u8 = 0xF0;
 const ERROR_NO_ACCESS: u8 = 0xF1;
 const ERROR_INVALID_KEY: u8 = 0xF3;
 const ERROR_INVALID_DATA: u8 = 0xF4;
+const ERROR_INVALID_STAMP: u8 = 0xF5;
 const ERROR_THROTTLED: u8 = 0xF6;
 
 /// LXMRouter.OFFER_ACCEPTED / OFFER_TRANSFERRING / OFFER_VALIDATING: where an
@@ -1050,6 +1051,12 @@ pub struct InboundSyncs {
     /// clients, and closing their links would only make each idle phone
     /// link again every three minutes. An entry goes when its link closes.
     pub sync_links: HashMap<Vec<u8>, SyncLink>,
+    /// The `rfed.link` links a `/propagation/offer` came in on
+    /// (RFed-spec/Link.md), by link id. Unlike `sync_links` they are never
+    /// torn down for being idle: the same link carries the client's channel
+    /// and notify bindings and every other RFed request. `clean_links`
+    /// forgets one once it is closed, with what its offer recorded.
+    pub rfed_links: HashMap<Vec<u8>, LinkHandle>,
 }
 
 /// An inbound sync link (`InboundSyncs::sync_links`).
@@ -1073,6 +1080,7 @@ impl InboundSyncs {
     fn forget_link(&mut self, link_id: &[u8]) {
         self.validated_peer_links.remove(link_id);
         self.sync_links.remove(link_id);
+        self.rfed_links.remove(link_id);
         if self.accepted_offer_links.get(link_id) != Some(&OFFER_VALIDATING) {
             self.accepted_offer_links.remove(link_id);
         }
@@ -1127,6 +1135,16 @@ fn after_offer(inbound: &Mutex<InboundSyncs>, link: &LinkHandle, remote_identity
     forget_link_if_closed(inbound, link);
 }
 
+/// `/propagation/offer` on rfed.link, once its answer is ready, outside the
+/// node lock: what `after_offer` does for an `lxmf.propagation` link, except
+/// that the link is never made a sync link, which `clean_links` would close
+/// once idle. It is remembered so that what the offer recorded is forgotten
+/// when it closes (`InboundSyncs::rfed_links`).
+fn after_offer_on_rfed_link(inbound: &Mutex<InboundSyncs>, link: &LinkHandle) {
+    lock_inbound(inbound).rfed_links.insert(link.link_id(), link.clone());
+    forget_link_if_closed(inbound, link);
+}
+
 /// How a propagation upload reached this node. The reference takes the two
 /// apart: LXMRouter.propagation_packet for a link packet,
 /// LXMRouter.propagation_resource_concluded for a Resource.
@@ -1139,6 +1157,73 @@ pub(crate) enum Upload<'a> {
     /// proved on the link, and whether an offer on that link presented a
     /// valid peering key.
     Resource { sender: Option<&'a Identity>, peering_key_valid: bool, link: &'a LinkHandle },
+    /// A `/propagation/upload` request on rfed.link (RFed-spec/Link.md). One
+    /// larger than the link MDU, which on `lxmf.propagation` would have come
+    /// as a Resource, is held to what a Resource is, with its link's
+    /// identity and peering key; a smaller one is a client's packet. Either
+    /// way it is answered (`Ingested`), and its link is never torn down: it
+    /// carries the client's bindings and every other RFed request.
+    Request {
+        resource_sized: bool,
+        sender: Option<&'a Identity>,
+        peering_key_valid: bool,
+        link: Option<&'a LinkHandle>,
+    },
+}
+
+impl<'a> Upload<'a> {
+    /// Whose batch it is: the identity a Resource's sender proved on its
+    /// link. A packet is a client's PUT and has none
+    /// (LXMRouter.propagation_packet).
+    fn sender(&self) -> Option<&'a Identity> {
+        match self {
+            Upload::Packet => None,
+            Upload::Resource { sender, .. } => *sender,
+            Upload::Request { resource_sized: true, sender, .. } => *sender,
+            Upload::Request { resource_sized: false, .. } => None,
+        }
+    }
+
+    /// Whether a batch of more than one message is refused: it came the way
+    /// a Resource does, and no offer on its link presented a valid peering
+    /// key.
+    fn lacks_peering_key(&self) -> bool {
+        matches!(
+            self,
+            Upload::Resource { peering_key_valid: false, .. }
+                | Upload::Request { resource_sized: true, peering_key_valid: false, .. }
+        )
+    }
+
+    /// The link an identified sender's batch is marked validating on
+    /// (`ValidationMark`): a Resource's, or a Resource-sized request's.
+    fn resource_link_id(&self) -> Option<Vec<u8>> {
+        match self {
+            Upload::Resource { link, .. } => Some(link.link_id()),
+            Upload::Request { resource_sized: true, link: Some(link), .. } => Some(link.link_id()),
+            _ => None,
+        }
+    }
+}
+
+/// What became of an upload (`ingest_propagation_batch`), which
+/// `/propagation/upload` on rfed.link answers. The packet and Resource paths
+/// of `lxmf.propagation` act on it inside ingest, as the reference does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ingested {
+    /// The payload is not `[timebase, [lxmf_data, ...]]`, or carries no
+    /// message: nothing stored.
+    NotAnUpload,
+    /// More than one message, the way a Resource comes, without a valid
+    /// peering key: refused whole, nothing stored.
+    RefusedWithoutPeeringKey,
+    /// Every message was taken through validation: the valid ones are held
+    /// (stored, or already held), `invalid_stamps` were dropped for their
+    /// stamps, and `not_messages` entries were not msgpack bin.
+    Stored { invalid_stamps: usize, not_messages: usize },
+    /// The propagation node's lock was poisoned partway: what was stored
+    /// before it is held, the rest is not.
+    Interrupted,
 }
 
 /// What a Resource's advertisement recorded for its conclusion
@@ -1528,6 +1613,18 @@ impl LxmfPropagationNode {
     /// exactly what it tells its peers.
     pub fn announced_limits_kb(&self) -> (i64, i64) {
         (self.transfer_limit_kb as i64, self.sync_limit_kb as i64)
+    }
+
+    /// The stamp cost and per-message limit this node announces, as the
+    /// rfed.node app_data repeats them for clients that upload on rfed.link
+    /// (SPEC §12): the same numbers `build_app_data` puts in the
+    /// lxmf.propagation announce.
+    pub fn upload_terms(&self) -> crate::announce::PropagationTerms {
+        let (transfer_limit_kb, _) = self.announced_limits_kb();
+        crate::announce::PropagationTerms {
+            stamp_cost: self.stamp_cost,
+            transfer_limit_kb: transfer_limit_kb.max(0) as u64,
+        }
     }
 
     pub fn build_app_data(&self) -> Vec<u8> {
@@ -2052,7 +2149,7 @@ impl LxmfPropagationNode {
                 // A client PUT: no sending peer, as LXMRouter.propagation_packet.
                 let _ = packet;
                 if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                    LxmfPropagationNode::ingest_propagation_batch(&arc, data, Upload::Packet);
+                    let _ = LxmfPropagationNode::ingest_propagation_batch(&arc, data, Upload::Packet);
                 }
             }
         })));
@@ -2223,7 +2320,7 @@ impl LxmfPropagationNode {
                 let sender = recorded.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
                 // NOT under the node lock — see `ingest_propagation_batch`.
                 if let Some(arc) = weak.as_ref().and_then(|w| w.upgrade()) {
-                    LxmfPropagationNode::ingest_propagation_batch(
+                    let _ = LxmfPropagationNode::ingest_propagation_batch(
                         &arc,
                         &data,
                         Upload::Resource {
@@ -2238,6 +2335,163 @@ impl LxmfPropagationNode {
         });
 
         (advertised, concluded)
+    }
+
+    // ── The same operations on rfed.link ─────────────────────────────────────
+    //
+    // RFed-spec/Link.md "LXMF propagation on `rfed.link`": a client holds one
+    // link to an RFed node, and that link also carries what it used to open a
+    // second link to `lxmf.propagation` for. `destinations::wire_propagation_on_link`
+    // registers these three on rfed.link. Each answers what its counterpart
+    // here answers, except that an upload is answered (`Ingested`) and no
+    // error closes the link: it carries the client's bindings and every other
+    // RFed request.
+
+    /// `/propagation/get`: `/get`, byte for byte, by link identity
+    /// (ERROR_NO_IDENTITY for a caller that did not identify).
+    pub(crate) fn get_on_rfed_link(
+        arc: &Arc<Mutex<Self>>,
+        path: &str,
+        data: &[u8],
+        request_id: &[u8],
+        remote_identity: Option<&Identity>,
+        requested_at: f64,
+    ) -> ProvenAnswer {
+        match lock_node(arc, "/propagation/get") {
+            Some(mut node) => ProvenAnswer::Plain(node.handle_get(path, data, request_id, remote_identity, requested_at)),
+            None => {
+                log("[lxmf.prop] /propagation/get: propagation node lock poisoned — no answer", LOG_ERROR, false, false);
+                ProvenAnswer::None
+            }
+        }
+    }
+
+    /// `/propagation/offer`: `/offer`, byte for byte. A valid peering key is
+    /// recorded for the link, as on `lxmf.propagation`, and lets a later
+    /// `/propagation/upload` on it carry more than one message; the link is
+    /// not made a sync link (`after_offer_on_rfed_link`).
+    pub(crate) fn offer_on_rfed_link(
+        arc: &Arc<Mutex<Self>>,
+        path: &str,
+        data: &[u8],
+        request_id: &[u8],
+        remote_identity: Option<&Identity>,
+        link: Option<&LinkHandle>,
+        requested_at: f64,
+    ) -> ProvenAnswer {
+        let (answer, inbound) = match lock_node(arc, "/propagation/offer") {
+            Some(mut node) => (
+                node.handle_offer(path, data, request_id, remote_identity, link, requested_at),
+                node.inbound.clone(),
+            ),
+            None => {
+                log("[lxmf.prop] /propagation/offer: propagation node lock poisoned — no answer", LOG_ERROR, false, false);
+                return ProvenAnswer::None;
+            }
+        };
+        // Outside the node lock: it waits on the link's actor.
+        if let Some(link) = link {
+            after_offer_on_rfed_link(&inbound, link);
+        }
+        ProvenAnswer::Plain(answer)
+    }
+
+    /// `/propagation/upload`: the `propagation_packed` a client uploads to
+    /// `lxmf.propagation` as a packet or a Resource, taken exactly as there
+    /// (`ingest_propagation_batch`), and answered once validated and stored:
+    /// `true` when every message is held, else `[ERROR_INVALID_STAMP]` (the
+    /// valid ones are held), `[ERROR_INVALID_DATA]` (not an upload, or larger
+    /// than the per-sync limit) or `[ERROR_NO_ACCESS]` (refused whole).
+    ///
+    /// An upload larger than the link MDU would have been a Resource there,
+    /// and is held to what a Resource is: the `from_static_only` rule, the
+    /// per-sync limit (applied here, once it has arrived: RNS hands a request
+    /// to its handler only when it is whole, and rfed.link takes requests of
+    /// any size for every path), one message unless an offer on the link
+    /// presented a valid peering key, and the throttle on invalid stamps.
+    /// The MDU is RNS's link MDU, which LXMF's own packet-or-Resource choice
+    /// is made against (`LXMessage.LINK_PACKET_MAX_CONTENT`).
+    pub(crate) fn upload_on_rfed_link(
+        arc: &Arc<Mutex<Self>>,
+        data: &[u8],
+        remote_identity: Option<&Identity>,
+        link: Option<&LinkHandle>,
+    ) -> ProvenAnswer {
+        let resource_sized = data.len() > reticulum_rust::link::MDU;
+        let (inbound, sync_limit_kb, static_only) = {
+            let Some(node) = lock_node(arc, "/propagation/upload") else {
+                log("[lxmf.prop] /propagation/upload: propagation node lock poisoned — no answer", LOG_ERROR, false, false);
+                return ProvenAnswer::None;
+            };
+            let (_, sync_limit_kb) = node.announced_limits_kb();
+            (node.inbound.clone(), sync_limit_kb, node.from_static_only.then(|| node.static_peers.clone()))
+        };
+        let link_str = link.map(|link| hexrep(&link.link_id(), false)).unwrap_or_else(|| "?".into());
+
+        if resource_sized {
+            // LXMRouter.propagation_resource_advertised, `from_static_only`.
+            if let Some(static_peers) = &static_only {
+                let sender = remote_identity.map(propagation_hash);
+                if !sender.as_ref().is_some_and(|hash| static_peers.contains(hash)) {
+                    log(
+                        format!(
+                            "[lxmf.prop] /propagation/upload of {} B on rfed.link {link_str} refused: only static peers may sync here, and {}",
+                            data.len(),
+                            sender.map(|hash| format!("{} is not one", hexrep(&hash, false))).unwrap_or_else(|| "its sender did not identify".into()),
+                        ),
+                        LOG_NOTICE, false, false,
+                    );
+                    return upload_error(ERROR_NO_ACCESS);
+                }
+            }
+            let limit_bytes = sync_limit_kb.max(0) as u64 * 1000;
+            if data.len() as u64 > limit_bytes {
+                log(
+                    format!(
+                        "[lxmf.prop] /propagation/upload of {} B on rfed.link {link_str} refused: over our per-sync limit of {limit_bytes} B ({sync_limit_kb} KB announced)",
+                        data.len(),
+                    ),
+                    LOG_NOTICE, false, false,
+                );
+                return upload_error(ERROR_INVALID_DATA);
+            }
+        }
+
+        let peering_key_valid = match (remote_identity, link) {
+            (Some(_), Some(link)) => lock_inbound(&inbound).validated_peer_links.contains(&link.link_id()),
+            _ => false,
+        };
+        let outcome = Self::ingest_propagation_batch(
+            arc,
+            data,
+            Upload::Request { resource_sized, sender: remote_identity, peering_key_valid, link },
+        );
+        // As when a Resource concludes: the link's accepted offer is done with.
+        if let (true, Some(link)) = (resource_sized, link) {
+            lock_inbound(&inbound).accepted_offer_links.remove(&link.link_id());
+        }
+
+        match outcome {
+            Ingested::Stored { invalid_stamps: 0, not_messages: 0 } => {
+                ProvenAnswer::Plain(encode_value(Value::Boolean(true)))
+            }
+            Ingested::Stored { invalid_stamps, .. } if invalid_stamps > 0 => upload_error(ERROR_INVALID_STAMP),
+            Ingested::Stored { .. } | Ingested::NotAnUpload => {
+                log(
+                    format!("[lxmf.prop] /propagation/upload of {} B on rfed.link {link_str}: not an upload, answered ERROR_INVALID_DATA", data.len()),
+                    LOG_NOTICE, false, false,
+                );
+                upload_error(ERROR_INVALID_DATA)
+            }
+            Ingested::RefusedWithoutPeeringKey => upload_error(ERROR_NO_ACCESS),
+            Ingested::Interrupted => {
+                log(
+                    format!("[lxmf.prop] /propagation/upload on rfed.link {link_str}: propagation node lock poisoned partway — no answer"),
+                    LOG_ERROR, false, false,
+                );
+                ProvenAnswer::None
+            }
+        }
     }
 
     // ── Packet handler (client PUTs) ─────────────────────────────────────────
@@ -2297,15 +2551,14 @@ impl LxmfPropagationNode {
     /// distro messages: one verdict line for each that carried a claim, and
     /// at most one `[distro-sync]` summary line per batch. A claim whose
     /// message was dropped for its stamp is counted there as not checked.
-    pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8], upload: Upload) {
-        let Some(PropagationBatch { entries, messages, claims }) = decode_propagation_batch(data) else { return };
-        let sender = match &upload {
-            Upload::Resource { sender, .. } => *sender,
-            Upload::Packet => None,
+    pub(crate) fn ingest_propagation_batch(arc: &Arc<Mutex<Self>>, data: &[u8], upload: Upload) -> Ingested {
+        let Some(PropagationBatch { entries, messages, claims }) = decode_propagation_batch(data) else {
+            return Ingested::NotAnUpload;
         };
+        let sender = upload.sender();
 
         let (min_cost, delivery, from_peer, inbound) = {
-            let Some(node) = lock_node(arc, "ingest (setup)") else { return };
+            let Some(node) = lock_node(arc, "ingest (setup)") else { return Ingested::Interrupted };
             (
                 node.stamp_cost.saturating_sub(node.stamp_flexibility),
                 node.delivery_handles(),
@@ -2324,30 +2577,35 @@ impl LxmfPropagationNode {
         };
 
         // The reference counts the entries of `data[1]` as they came.
-        if let Upload::Resource { peering_key_valid: false, link, .. } = &upload {
-            if entries > 1 {
-                link.teardown();
-                log(
-                    format!("[lxmf.prop] received {entries} propagation messages from {origin} without valid peering key presentation: refused, link torn down"),
-                    LOG_WARNING, false, false,
-                );
-                log(
-                    "[lxmf.prop] clients and peers without a valid peering key can only deliver 1 message per transfer",
-                    LOG_WARNING, false, false,
-                );
-                return;
-            }
+        if entries > 1 && upload.lacks_peering_key() {
+            let outcome = match &upload {
+                Upload::Resource { link, .. } => {
+                    link.teardown();
+                    "refused, link torn down"
+                }
+                // rfed.link: answered, and the link kept (`Upload::Request`).
+                _ => "refused (answered ERROR_NO_ACCESS on rfed.link)",
+            };
+            log(
+                format!("[lxmf.prop] received {entries} propagation messages from {origin} without valid peering key presentation: {outcome}"),
+                LOG_WARNING, false, false,
+            );
+            log(
+                "[lxmf.prop] clients and peers without a valid peering key can only deliver 1 message per transfer",
+                LOG_WARNING, false, false,
+            );
+            return Ingested::RefusedWithoutPeeringKey;
         }
         if messages.is_empty() {
-            return;
+            return Ingested::NotAnUpload;
         }
 
         // Validate PN (Propagation Node) stamps on all messages. Stamps below
         // `min_cost` are rejected; only validated messages proceed.
         let validated = {
-            let _validating = match (&upload, sender) {
-                (Upload::Resource { link, .. }, Some(identity)) => {
-                    Some(ValidationMark::new(inbound.clone(), propagation_hash(identity), link.link_id()))
+            let _validating = match (upload.resource_link_id(), sender) {
+                (Some(link_id), Some(identity)) => {
+                    Some(ValidationMark::new(inbound.clone(), propagation_hash(identity), link_id))
                 }
                 _ => None,
             };
@@ -2411,7 +2669,7 @@ impl LxmfPropagationNode {
                     }
                     stored
                 }
-                None => return,
+                None => return Ingested::Interrupted,
             };
             if !was_stored {
                 // Its recipient was pushed or woken for it when it was
@@ -2451,22 +2709,26 @@ impl LxmfPropagationNode {
         );
 
         if invalid_stamps > 0 {
-            if let Upload::Resource { sender, link, .. } = &upload {
+            // A Resource's link is torn down, as the reference does. A
+            // request's on rfed.link is not: it is answered
+            // ERROR_INVALID_STAMP instead (`Upload::Request`).
+            if let Upload::Resource { link, .. } = &upload {
                 link.teardown();
-                if let Some(identity) = sender {
-                    lock_inbound(&inbound)
-                        .throttled_peers
-                        .insert(propagation_hash(identity), now() + PN_STAMP_THROTTLE_SECS);
-                    log(
-                        format!(
-                            "[lxmf.prop] propagation transfer from {origin} contained {invalid_stamps} message{} with invalid stamps, throttled for {PN_STAMP_THROTTLE_SECS:.0}s",
-                            if invalid_stamps == 1 { "" } else { "s" },
-                        ),
-                        LOG_NOTICE, false, false,
-                    );
-                }
+            }
+            if let Some(identity) = sender {
+                lock_inbound(&inbound)
+                    .throttled_peers
+                    .insert(propagation_hash(identity), now() + PN_STAMP_THROTTLE_SECS);
+                log(
+                    format!(
+                        "[lxmf.prop] propagation transfer from {origin} contained {invalid_stamps} message{} with invalid stamps, throttled for {PN_STAMP_THROTTLE_SECS:.0}s",
+                        if invalid_stamps == 1 { "" } else { "s" },
+                    ),
+                    LOG_NOTICE, false, false,
+                );
             }
         }
+        Ingested::Stored { invalid_stamps, not_messages: entries - messages.len() }
     }
 
     /// The peer a sync batch came from: the `lxmf.propagation` destination of
@@ -3812,6 +4074,10 @@ impl LxmfPropagationNode {
                 Some(_) => {}
             }
         }
+        // The rfed.link links an offer came in on are never closed here for
+        // being idle (`InboundSyncs::rfed_links`); a closed one is forgotten.
+        let rfed_links: Vec<LinkHandle> = lock_inbound(&inbound).rfed_links.values().cloned().collect();
+        gone.extend(rfed_links.iter().filter(|link| !link.is_alive()).map(LinkHandle::link_id));
         if !gone.is_empty() {
             let mut inbound = lock_inbound(&inbound);
             for link_id in &gone {
@@ -6172,6 +6438,13 @@ fn encode_value(value: Value) -> Vec<u8> {
 /// rather than staying silent.
 pub(crate) fn encode_error(code: u8) -> Vec<u8> {
     encode_value(Value::Integer((code as i64).into()))
+}
+
+/// An error answer to `/propagation/upload` on rfed.link: `[code]`, the form
+/// LXMRouter rejects an upload with (`msgpack.packb([LXMPeer.ERROR_...])`),
+/// where `/get` and `/offer` answer the bare code (RFed-spec/Link.md).
+fn upload_error(code: u8) -> ProvenAnswer {
+    ProvenAnswer::Plain(encode_value(Value::Array(vec![Value::Integer((code as i64).into())])))
 }
 
 // ── Simulated time for the unit tests ────────────────────────────────────────
@@ -9160,6 +9433,185 @@ mod tests {
             let lines = mark.containing("carried no data for");
             assert_eq!(lines.len(), 2, "a line for each link torn down, none for the closed one: {lines:?}");
             assert!(lines.iter().all(|line| line.contains(&hexrep(&propagation_hash(&peer), false))), "naming the node: {lines:?}");
+        }
+
+        // ── The same operations on rfed.link (RFed-spec/Link.md) ────────────
+
+        fn answer(answer: ProvenAnswer) -> Value {
+            match answer {
+                ProvenAnswer::Plain(bytes) => read_value(&mut Cursor::new(&bytes)).expect("an msgpack answer"),
+                _ => panic!("a plain answer expected"),
+            }
+        }
+
+        /// `/propagation/upload`'s error answer: `[code]`.
+        fn refused(error: u8) -> Value {
+            Value::Array(vec![code(error)])
+        }
+
+        fn upload(node: &Node, data: &[u8], from: Option<&Identity>, link: &LinkHandle) -> Value {
+            answer(LxmfPropagationNode::upload_on_rfed_link(node, data, from, Some(link)))
+        }
+
+        fn offer_on_rfed_link(node: &Node, from: &Identity, link: &LinkHandle, ids: &[Vec<u8>]) -> Value {
+            let data = encode_value(Value::Array(vec![
+                Value::Binary(vec![0x4B; 32]),
+                Value::Array(ids.iter().cloned().map(Value::Binary).collect()),
+            ]));
+            answer(LxmfPropagationNode::offer_on_rfed_link(node, "/propagation/offer", &data, &[], Some(from), Some(link), now()))
+        }
+
+        /// A `len` B message (`lxmf | stamp`) and its transient id, as `message`.
+        fn message_of(fill: u8, len: usize) -> (Vec<u8>, Vec<u8>) {
+            let mut lxmf = vec![fill; len - lx_stamper::STAMP_SIZE];
+            lxmf[..16].copy_from_slice(&[0x5E; 16]);
+            let id = reticulum_rust::identity::full_hash(&lxmf);
+            ([lxmf, vec![0x33u8; lx_stamper::STAMP_SIZE]].concat(), id)
+        }
+
+        /// The answer comes after validation: `true` when every message is
+        /// held, `[ERROR_INVALID_STAMP]` with the valid ones stored, and
+        /// `[ERROR_INVALID_DATA]` for what is not an upload. No answer ends
+        /// the link, which carries every other RFed request.
+        #[test]
+        fn an_upload_on_rfed_link_is_answered_once_validated() {
+            let node = node("rfed_link_upload");
+            let client = propagation_link(None);
+            let (a, a_id) = message(0x91);
+            assert_eq!(upload(&node, &batch(vec![a.clone()]), None, &client), Value::Boolean(true));
+            assert!(stored(&node, &a_id));
+            assert_eq!(upload(&node, &batch(vec![a]), None, &client), Value::Boolean(true), "already held is held");
+
+            let (b, b_id) = message(0x92);
+            let with_bad_stamp = batch(vec![b, short_message()]);
+            assert!(with_bad_stamp.len() <= reticulum_rust::link::MDU, "a client's packet-sized upload");
+            assert_eq!(upload(&node, &with_bad_stamp, None, &client), refused(ERROR_INVALID_STAMP));
+            assert!(stored(&node, &b_id), "the valid message is stored");
+            assert!(lock_inbound(&inbound(&node)).throttled_peers.is_empty(), "a client's packet throttles nobody");
+
+            assert_eq!(upload(&node, b"not msgpack of an upload", None, &client), refused(ERROR_INVALID_DATA));
+            assert_eq!(upload(&node, &batch(vec![]), None, &client), refused(ERROR_INVALID_DATA), "no message");
+            assert!(!torn_down(&client), "no answer closes the link");
+        }
+
+        /// Larger than the link MDU, an upload would have been a Resource on
+        /// lxmf.propagation, and is held to a Resource's rules: one message
+        /// unless an offer on its link presented a valid peering key, and an
+        /// identified sender's invalid stamp throttles its offers. The link
+        /// is kept either way. Packet-sized, several messages are taken.
+        #[test]
+        fn a_resource_sized_upload_on_rfed_link_is_held_to_the_one_message_rule() {
+            let node = node("rfed_link_one_message");
+            let peer = Identity::new(true);
+            let link = propagation_link(Some(&peer));
+            let (a, a_id) = message(0x93);
+            let (b, b_id) = message(0x94);
+            let two = batch(vec![a, b]);
+            assert!(two.len() > reticulum_rust::link::MDU);
+
+            let mark = crate::test_log::mark();
+            assert_eq!(upload(&node, &two, Some(&peer), &link), refused(ERROR_NO_ACCESS));
+            assert!(!stored(&node, &a_id) && !stored(&node, &b_id), "refused whole");
+            assert!(!torn_down(&link), "the link is kept");
+            assert_eq!(mark.containing("answered ERROR_NO_ACCESS on rfed.link").len(), 1);
+
+            assert_eq!(offer_on_rfed_link(&node, &peer, &link, &[a_id.clone(), b_id.clone()]), Value::Boolean(true));
+            assert_eq!(upload(&node, &two, Some(&peer), &link), Value::Boolean(true), "after a valid key on the link");
+            assert!(stored(&node, &a_id) && stored(&node, &b_id));
+
+            let (big, big_id) = message_of(0x95, 600);
+            let client = propagation_link(None);
+            assert_eq!(upload(&node, &batch(vec![big]), None, &client), Value::Boolean(true), "a client's one large message");
+            assert!(stored(&node, &big_id));
+
+            let (c, c_id) = message_of(0x96, 150);
+            let (d, d_id) = message_of(0x97, 150);
+            let small_two = batch(vec![c, d]);
+            assert!(small_two.len() <= reticulum_rust::link::MDU);
+            assert_eq!(upload(&node, &small_two, None, &client), Value::Boolean(true), "a packet's worth needs no key");
+            assert!(stored(&node, &c_id) && stored(&node, &d_id));
+
+            let (e, _) = message_of(0x98, 600);
+            assert_eq!(upload(&node, &batch(vec![e, short_message()]), Some(&peer), &link), refused(ERROR_INVALID_STAMP));
+            assert!(lock_inbound(&inbound(&node)).throttled_peers.contains_key(&propagation_hash(&peer)), "its offers are throttled");
+            assert!(!torn_down(&link), "and its link is kept");
+        }
+
+        /// What a Resource is refused at its advertisement on lxmf.propagation
+        /// is refused here once it has arrived: larger than the per-sync
+        /// limit, or from a sender that is not a static peer of a node that
+        /// syncs with its static peers only.
+        #[test]
+        fn a_resource_sized_upload_on_rfed_link_is_held_to_the_inbound_limits() {
+            let node = node("rfed_link_limits");
+            let peer = Identity::new(true);
+            let link = propagation_link(Some(&peer));
+            let (big, big_id) = message_of(0x99, 600);
+            node.lock().unwrap().sync_limit_kb = 0.5;
+            assert_eq!(upload(&node, &batch(vec![big.clone()]), Some(&peer), &link), refused(ERROR_INVALID_DATA));
+            assert!(!stored(&node, &big_id));
+
+            {
+                let mut g = node.lock().unwrap();
+                g.sync_limit_kb = 10240.0;
+                g.from_static_only = true;
+            }
+            assert_eq!(upload(&node, &batch(vec![big.clone()]), Some(&peer), &link), refused(ERROR_NO_ACCESS));
+            assert!(!stored(&node, &big_id));
+            let (small, small_id) = message(0x9A);
+            assert_eq!(upload(&node, &batch(vec![small]), None, &link), Value::Boolean(true), "a packet's worth is a client's");
+            assert!(stored(&node, &small_id));
+
+            node.lock().unwrap().static_peers.push(propagation_hash(&peer));
+            assert_eq!(upload(&node, &batch(vec![big]), Some(&peer), &link), Value::Boolean(true), "a static peer's");
+            assert!(stored(&node, &big_id));
+            assert!(!torn_down(&link));
+        }
+
+        /// `/propagation/get` answers what `/get` answers, by link identity.
+        #[test]
+        fn get_on_rfed_link_is_get() {
+            let node = node("rfed_link_get");
+            let list = encode_value(Value::Array(vec![Value::Nil, Value::Nil]));
+            assert_eq!(
+                answer(LxmfPropagationNode::get_on_rfed_link(&node, "/propagation/get", &list, &[], None, now())),
+                code(ERROR_NO_IDENTITY),
+            );
+            let me = Identity::new(true);
+            let direct = node.lock().unwrap().handle_get(GET_PATH, &list, &[], Some(&me), now());
+            match LxmfPropagationNode::get_on_rfed_link(&node, "/propagation/get", &list, &[], Some(&me), now()) {
+                ProvenAnswer::Plain(bytes) => assert_eq!(bytes, direct),
+                _ => panic!("a plain answer expected"),
+            }
+        }
+
+        /// An offer on rfed.link records its key for that link, as `/offer`
+        /// does, but never makes the link a sync link: `clean_links` closes
+        /// those once idle, and rfed.link carries the client's bindings. A
+        /// closed one is forgotten, with what its offer recorded.
+        #[test]
+        fn an_offer_on_rfed_link_never_makes_a_sync_link() {
+            let node = node("rfed_link_offer");
+            let state = inbound(&node);
+            let peer = Identity::new(true);
+            let ids = [message(0xA1).1];
+            let idle = propagation_link_idle(Some(&peer), P_LINK_MAX_INACTIVITY_SECS + 5);
+            let closing = propagation_link(Some(&peer));
+            for link in [&idle, &closing] {
+                assert_eq!(offer_on_rfed_link(&node, &peer, link, &ids), Value::Boolean(true));
+                assert!(lock_inbound(&state).validated_peer_links.contains(&link.link_id()));
+            }
+            assert!(lock_inbound(&state).sync_links.is_empty(), "not a sync link");
+            assert_eq!(lock_inbound(&state).rfed_links.len(), 2);
+
+            closing.teardown();
+            wait_until("the closed link's actor to end", || torn_down(&closing));
+            node.lock().unwrap().last_links_clean = now() - LINKS_CLEAN_INTERVAL_SECS;
+            LxmfPropagationNode::clean_links(&node);
+            assert!(idle.is_alive(), "never torn down for being idle");
+            assert!(lock_inbound(&state).validated_peer_links.contains(&idle.link_id()));
+            assert!(!lock_inbound(&state).validated_peer_links.contains(&closing.link_id()), "a closed one is forgotten");
+            assert!(!lock_inbound(&state).rfed_links.contains_key(&closing.link_id()));
         }
     }
 

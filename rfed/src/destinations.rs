@@ -81,7 +81,36 @@ fn verify_signed_payload(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), Str
         rmpv::Value::Array(a) if a.len() == 3 => a,
         _ => return Err(format!("expected fixarray-3, got {:?}", top)),
     };
+    verify_signed_elements(&arr)
+}
 
+/// `/channel/stream/open` on rfed.link: the signed payload of
+/// `verify_signed_payload`, or the same with a fourth element, the protocol
+/// version of a client that handles the channel push `/channel/delivery`
+/// (RFed-spec/Link.md: `[value, bin(64 pubkey), bin(64 signature), 2]`; the
+/// signature covers `value` alone). Returns the verified triple and whether
+/// the client handles `/channel/delivery`. Only this path takes four
+/// elements: a client sends the fourth only to a node that announces version
+/// 2, because every other signed path, and every rfed before 2026-11-13,
+/// refuses it.
+fn verify_channel_stream_bind(data: &[u8]) -> Result<((Vec<u8>, Vec<u8>, Vec<u8>), bool), String> {
+    let mut cur = Cursor::new(data);
+    let top = rmpv::decode::read_value(&mut cur)
+        .map_err(|e| format!("msgpack decode: {e}"))?;
+    let arr = match top {
+        rmpv::Value::Array(a) if a.len() == 3 || a.len() == 4 => a,
+        _ => return Err(format!("expected fixarray-3 or -4, got {:?}", top)),
+    };
+    let handles_channel_delivery = match arr.get(3) {
+        None => false,
+        Some(rmpv::Value::Integer(version)) if version.as_u64().is_some_and(|v| v >= 2) => true,
+        Some(other) => return Err(format!("payload[3] is not a protocol version of 2 or more: {:?}", other)),
+    };
+    Ok((verify_signed_elements(&arr[..3])?, handles_channel_delivery))
+}
+
+/// The checks of `verify_signed_payload` on its three decoded elements.
+fn verify_signed_elements(arr: &[rmpv::Value]) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
     let value: Vec<u8> = match &arr[0] {
         rmpv::Value::Binary(b) => b.clone(),
         rmpv::Value::String(s) => s.as_bytes().to_vec(),
@@ -1190,13 +1219,20 @@ impl FedNode {
         })
     }
 
-    /// The node app_data (display name + channel stamp policy) carried by
-    /// rfed.node, rfed.link and the channel SEND destinations.
+    /// The node app_data (display name, channel stamp policy, and the
+    /// propagation node's upload terms; SPEC §12) carried by rfed.node,
+    /// rfed.link and the channel SEND destinations.
     fn node_app_data(&self) -> Vec<u8> {
         // Treat stamp_cost=0 as disabled (same as None) to avoid accidental
         // stamp-tail stripping when operators mean "no PoW required".
-        let announce_stamp_cost = self.config.default_policy.stamp_cost.filter(|c| *c > 0);
-        announce::encode_node_announce(&self.config.display_name, announce_stamp_cost)
+        let channel_stamp_cost = self.config.default_policy.stamp_cost.filter(|c| *c > 0);
+        // The values the lxmf.propagation announce carries, so a client that
+        // uploads on rfed.link needs no other announce (RFed-spec/Link.md).
+        let propagation = self
+            .lxmf_propagation
+            .as_ref()
+            .and_then(|prop| prop.lock().ok().map(|node| node.upload_terms()));
+        announce::encode_node_announce(&self.config.display_name, channel_stamp_cost, propagation)
     }
 
     /// The owned destination behind `which`; `None` for the propagation
@@ -2428,6 +2464,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
     wire_notify_destination(&node)?;
     wire_stream_destinations(&node)?;
     wire_distro_destination(&node)?;
+    wire_propagation_on_link(&node)?;
 
     // rfed.link collects handlers from every wire_* function above, so it is
     // registered exactly once, here, after the last of them has run.
@@ -2515,7 +2552,7 @@ pub fn enable(node: Arc<Mutex<FedNode>>) -> Result<(), String> {
         receive_path_responses: false,
         callback: Arc::new(move |dest_hash, _identity, app_data, _ann_hash, _is_path| {
             let ann = announce::decode_node_announce(app_data);
-            let peering_cost = ann.as_ref().and_then(|a| a.stamp_cost);
+            let peering_cost = ann.as_ref().and_then(|a| a.channel_stamp_cost);
             if let Some(arc) = node_weak.upgrade() {
                 if let Ok(guard) = arc.lock() {
                     // Never sync with ourselves — skip our own announce.
@@ -2886,10 +2923,11 @@ fn backup_push_response(node: &Arc<Mutex<FedNode>>, data: &[u8]) -> Vec<u8> {
 fn capabilities(cfg: &NodeConfig) -> Vec<(rmpv::Value, rmpv::Value)> {
     let mut caps: Vec<(rmpv::Value, rmpv::Value)> = Vec::new();
 
-    // Protocol version — bump when wire formats change.
+    // Protocol version — the one the node announces (SPEC §12); bump when
+    // wire formats change.
     caps.push((
         rmpv::Value::String("protocol_version".into()),
-        rmpv::Value::Integer(1.into()),
+        rmpv::Value::Integer(announce::PROTOCOL_VERSION.into()),
     ));
 
     // Node display name.
@@ -3758,7 +3796,17 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             None => return encode_ok_reason(false, Some("no_link")),
         };
 
-        let (value_bytes, subscriber_hash, _pubkey) = match verify_signed_payload(data) {
+        let on_rfed_link = path == link_paths::CHANNEL_STREAM_OPEN;
+
+        // On rfed.link the bind may say the client handles the channel push
+        // `/channel/delivery` (RFed-spec/Link.md). The legacy destination
+        // pushes link DATA, which has no path, and keeps the three elements.
+        let verified = if path == link_paths::CHANNEL_STREAM_OPEN {
+            verify_channel_stream_bind(data)
+        } else {
+            verify_signed_payload(data).map(|triple| (triple, false))
+        };
+        let ((value_bytes, subscriber_hash, _pubkey), handles_channel_delivery) = match verified {
             Ok(v) => v,
             Err(e) => {
                 log(format!("[rfed] channel.stream/open: {e}"), LOG_WARNING, false, false);
@@ -3778,8 +3826,6 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                 return encode_ok_reason(false, Some("bad_channel_config"));
             }
         };
-
-        let on_rfed_link = path == link_paths::CHANNEL_STREAM_OPEN;
 
         let (subscriptions, stream_registry, link_registry) = match channel_stream_node.lock() {
             Ok(guard) => (
@@ -3805,6 +3851,7 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
             return encode_ok_reason(false, Some("not_subscribed"));
         }
 
+        let channel_push = crate::link_session::channel_push_path(handles_channel_delivery);
         if on_rfed_link {
             match link_registry.lock() {
                 Ok(mut registry) => {
@@ -3812,6 +3859,7 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
                         link.clone(),
                         subscriber_hash.clone(),
                         channel_hashes.clone(),
+                        channel_push,
                     );
                     for old in replaced {
                         log(
@@ -3848,11 +3896,12 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
         log(
             format!(
-                "[rfed] {} configured subscriber={} channels={} link={}",
+                "[rfed] {} configured subscriber={} channels={} link={}{}",
                 path,
                 hexrep(&subscriber_hash, false),
                 channel_hashes.len(),
                 hexrep(&link.link_id(), false),
+                if on_rfed_link { format!(" push={channel_push}") } else { String::new() },
             ),
             LOG_NOTICE,
             false,
@@ -4003,6 +4052,70 @@ fn wire_stream_destinations(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
 
     Transport::register_destination(guard.channel_stream_dest.clone());
     Transport::register_destination(guard.propagation_stream_dest.clone());
+    Ok(())
+}
+
+// ── LXMF propagation on rfed.link ────────────────────────────────────────────
+
+/// RFed-spec/Link.md "LXMF propagation on `rfed.link`": `/propagation/upload`,
+/// `/propagation/get` and `/propagation/offer`, answered by the attached
+/// propagation node (`LxmfPropagationNode::upload_on_rfed_link` and the
+/// others), so a client holds one link to this node. A node without a
+/// propagation node has none of these paths and announces no propagation
+/// terms (SPEC §12).
+///
+/// The propagation node is attached to `FedNode` before `enable()` runs
+/// (main.rs; `propagation_node_attached_before_enable` holds it there): these
+/// paths are wired from it, and rfed.link is registered with Transport once,
+/// after every wire_* step. Attached any later, the node would announce terms
+/// that its rfed.link does not take.
+fn wire_propagation_on_link(node: &Arc<Mutex<FedNode>>) -> Result<(), String> {
+    let mut guard = node.lock().map_err(|_| "FedNode lock poisoned")?;
+    let Some(prop) = guard.lxmf_propagation.as_ref().map(Arc::downgrade) else {
+        log(
+            "[rfed] rfed.link: no lxmf.propagation node attached — /propagation/upload, /propagation/get and /propagation/offer are not carried".to_string(),
+            LOG_NOTICE, false, false,
+        );
+        return Ok(());
+    };
+
+    let upload_prop = prop.clone();
+    let upload_cb = Arc::new(move |_path: &str, data: &[u8], _req_id: &[u8],
+                                   caller: Option<&Identity>, link: Option<&LinkHandle>,
+                                   _requested_at: f64| -> ProvenAnswer {
+        match upload_prop.upgrade() {
+            Some(prop) => LxmfPropagationNode::upload_on_rfed_link(&prop, data, caller, link),
+            None => ProvenAnswer::None,
+        }
+    });
+    let get_prop = prop.clone();
+    let get_cb = Arc::new(move |path: &str, data: &[u8], req_id: &[u8],
+                                caller: Option<&Identity>, _link: Option<&LinkHandle>,
+                                requested_at: f64| -> ProvenAnswer {
+        match get_prop.upgrade() {
+            Some(prop) => LxmfPropagationNode::get_on_rfed_link(&prop, path, data, req_id, caller, requested_at),
+            None => ProvenAnswer::None,
+        }
+    });
+    let offer_prop = prop;
+    let offer_cb = Arc::new(move |path: &str, data: &[u8], req_id: &[u8],
+                                  caller: Option<&Identity>, link: Option<&LinkHandle>,
+                                  requested_at: f64| -> ProvenAnswer {
+        match offer_prop.upgrade() {
+            Some(prop) => LxmfPropagationNode::offer_on_rfed_link(&prop, path, data, req_id, caller, link, requested_at),
+            None => ProvenAnswer::None,
+        }
+    });
+
+    guard.link_dest.register_proven_request_handler(
+        link_paths::PROPAGATION_UPLOAD.to_string(), upload_cb, ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_proven_request_handler(
+        link_paths::PROPAGATION_GET.to_string(), get_cb, ALLOW_ALL, None, false,
+    )?;
+    guard.link_dest.register_proven_request_handler(
+        link_paths::PROPAGATION_OFFER.to_string(), offer_cb, ALLOW_ALL, None, false,
+    )?;
     Ok(())
 }
 
@@ -4783,6 +4896,9 @@ mod link_destination_tests {
             ("CHANNEL_PULL", paths::CHANNEL_PULL),
             ("CHANNEL_STREAM_OPEN", paths::CHANNEL_STREAM_OPEN),
             ("PROPAGATION_STREAM_OPEN", paths::PROPAGATION_STREAM_OPEN),
+            ("PROPAGATION_UPLOAD", paths::PROPAGATION_UPLOAD),
+            ("PROPAGATION_GET", paths::PROPAGATION_GET),
+            ("PROPAGATION_OFFER", paths::PROPAGATION_OFFER),
             ("NOTIFY_REGISTER", paths::NOTIFY_REGISTER),
             ("NOTIFY_UNREGISTER", paths::NOTIFY_UNREGISTER),
             ("NOTIFY_CLEAR", paths::NOTIFY_CLEAR),
@@ -4800,12 +4916,33 @@ mod link_destination_tests {
         }
     }
 
+    /// rfed.link carries the propagation node's upload, get and offer, wired
+    /// in `enable()` from the node attached to `FedNode`
+    /// (`wire_propagation_on_link`). Attached after `enable()`, the node
+    /// would announce propagation terms (SPEC §12) for paths its rfed.link
+    /// never answers.
+    #[test]
+    fn propagation_node_attached_before_enable() {
+        let main = include_str!("main.rs");
+        let attached = main
+            .find(".lxmf_propagation = Some(")
+            .expect("main.rs attaches the propagation node");
+        let enabled = main
+            .find("destinations::enable(")
+            .expect("main.rs runs destinations::enable");
+        assert!(
+            attached < enabled,
+            "main.rs must attach the lxmf.propagation node before destinations::enable(), \
+             which wires /propagation/* on rfed.link from it"
+        );
+    }
+
     /// The push paths are node → client. Registering one as an inbound handler
     /// would mean the node answers its own push path, which is never right.
     #[test]
     fn push_paths_are_not_wired_as_inbound_handlers() {
         let source = destinations_source();
-        for name in ["DELIVERY", "LXMF_DELIVERY", "NOTIFY"] {
+        for name in ["CHANNEL_DELIVERY", "DELIVERY", "LXMF_DELIVERY", "NOTIFY"] {
             assert!(
                 !source.contains(&format!("link_paths::{name}.to_string()")),
                 "link_paths::{name} is a node → client push path and must not be \
@@ -6595,5 +6732,57 @@ mod capabilities_tests {
             assert_eq!(flag(&caps, "distro"), Some(rmpv::Value::Boolean(true)), "the existing keys stay");
             let _ = std::fs::remove_dir_all(&cfg.config_dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod channel_stream_bind_tests {
+    use super::*;
+
+    fn bind(identity: &Identity, value: &[u8], version: Option<rmpv::Value>) -> Vec<u8> {
+        let mut items = vec![
+            rmpv::Value::Binary(value.to_vec()),
+            rmpv::Value::Binary(identity.get_public_key().unwrap()),
+            rmpv::Value::Binary(identity.sign(value)),
+        ];
+        items.extend(version);
+        let mut out = Vec::new();
+        rmpv::encode::write_value(&mut out, &rmpv::Value::Array(items)).unwrap();
+        out
+    }
+
+    /// RFed-spec/Link.md: a client that handles `/channel/delivery` binds
+    /// with a fourth element, the protocol version 2; three elements get the
+    /// deprecated `/delivery`. The signature covers the value alone.
+    #[test]
+    fn a_fourth_element_says_the_client_handles_channel_delivery() {
+        let me = Identity::new(true);
+        let value = b"channel filters";
+        let ((verified, subscriber, _), handles) =
+            verify_channel_stream_bind(&bind(&me, value, Some(rmpv::Value::Integer(2.into())))).unwrap();
+        assert_eq!(verified, value.to_vec());
+        assert_eq!(Some(subscriber), me.hash.clone());
+        assert!(handles);
+
+        let (_, handles) = verify_channel_stream_bind(&bind(&me, value, None)).unwrap();
+        assert!(!handles, "three elements: /delivery");
+
+        assert!(verify_channel_stream_bind(&bind(&me, value, Some(rmpv::Value::Integer(1.into())))).is_err());
+        assert!(verify_channel_stream_bind(&bind(&me, value, Some(rmpv::Value::String("2".into())))).is_err());
+
+        let mut forged = bind(&me, value, Some(rmpv::Value::Integer(2.into())));
+        let last = forged.len() - 2;
+        forged[last] ^= 0x01;
+        assert!(verify_channel_stream_bind(&forged).is_err(), "the signature is still checked");
+    }
+
+    /// Only `/channel/stream/open` on rfed.link takes the fourth element:
+    /// every other signed request keeps exactly three, as every rfed before
+    /// the revision does.
+    #[test]
+    fn every_other_signed_request_takes_three_elements() {
+        let me = Identity::new(true);
+        assert!(verify_signed_payload(&bind(&me, b"value", None)).is_ok());
+        assert!(verify_signed_payload(&bind(&me, b"value", Some(rmpv::Value::Integer(2.into())))).is_err());
     }
 }
