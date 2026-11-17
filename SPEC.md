@@ -2198,6 +2198,9 @@ whose app had died, but whose path rfed still held, lost the message.
 
 All three use `DestinationType::Single`.
 
+A device cut off from RFed also holds `rfed.distro.handover`, under the
+distro's own identity; RFed never does (§17.15).
+
 ### 17.5 Registration Protocol
 
 The distro owner proves possession of the distro private key by signing the
@@ -2296,6 +2299,10 @@ anyway to encrypt to the address; nothing is queried, and a contact link
 (`lxma://hash:pubkey`) carries a key, not this fact. `lxmf_rust::distro::
 announce_payload` always writes the flag; `lxmf_rust::lxmf::
 distro_from_app_data` reads it.
+
+A device that cannot reach RFed is not reached at the distro's address
+either: a sender that implements §17.15 hands the message to that device's
+hand-over address, a separate address under RFed's name.
 
 ### 17.11 Sent-message sync
 
@@ -3928,7 +3935,8 @@ and RFed delivers a proven upload without a wake (James, 2026-10-10; both
 kinds, the membership message included; the group sync added the same day,
 when James decided §17.14). The proof and RFed's handling name no kind, so the
 third kind changed nothing at RFed: it is checked, fanned out and queued
-exactly as the other two (§17.14 "RFed").
+exactly as the other two (§17.14 "RFed"). A §17.15 hand-over upload carries
+the same proof and changes nothing at RFed either.
 
 **The upload.** The proof travels in the client upload to `lxmf.propagation`
 that carries the message, as a third element of the envelope (with it, the
@@ -4567,6 +4575,120 @@ to D in RFed's BlobStore and deferred queues, as every distro blob does.
 | Android | Retichat-android (release-0.1.11, held for it) | not started |
 | Web | Retichat-js (off main 6d0cf8b) | not started |
 | RFed | none needed (above) | — |
+
+### 17.15 A distro device cut off from RFed
+
+A device that cannot reach RFed can still be handed its distro's mail
+directly, over the mesh, by a sender that implements this section (James,
+2026-11-17). No device holds the distro's `lxmf.delivery` address for this.
+The device holds a **hand-over address** under RFed's name, made from the
+distro's key, and the sender hands it the same sealed message it gives RFed.
+LXMF is used as it is; everything here is RFed's. An app that does not
+implement this section, Sideband for one, reaches a cut-off distro through
+RFed only, as before (James, the same day: "They can adopt RFed protocols if
+they want").
+
+**Why not the distro's own address.** Stock LXMF 1.1.1 and RNS 1.5.2 rule it
+out:
+
+- An LXMF router holds one delivery address
+  (`LXMRouter.register_delivery_identity` refuses a second) and always turns
+  ratchets on for it; there is no switch.
+- RNS answers a path request for an address registered on the device with an
+  announce, ratchet included. A sender keeps a ratchet it heard for 30 days
+  and encrypts everything for the address with it, propagated messages, and so
+  RFed's copies, included: the distro's other devices could not open that
+  sender's mail. A later announce without a ratchet does not clear it.
+- Neither LXMF nor RNS has a documented way to stop a router or release an
+  address before the program exits.
+
+So no device ever holds a distro's `lxmf.delivery` address (§17.10).
+
+**The hand-over address.**
+
+| Destination | Identity | Aspects | Request path | Held by |
+|---|---|---|---|---|
+| `rfed.distro.handover` | the distro's, D | `["distro", "handover"]` | `/distro/handover` | a device of D, never RFed |
+
+It is `DestinationType::Single` and never has ratchets. Its announce
+`app_data` is `msgpack [ bool rfed ]`: `false` while the device cannot reach
+RFed, `true` once it can. It carries no name (DESIGN_PRINCIPLES §9) and names
+no device. Only a holder of D's key can sign the announce or prove a link to
+the address, so a sender knows it is dealing with a device of D.
+
+**On the device.**
+
+- *Cut off* means the device's link to its RFed node failed to come up or
+  closed: an event, never slowness.
+- When it is cut off, the device registers the hand-over address with RNS as
+  an incoming destination (once; RNS then keeps it until the app restarts),
+  sets its default `app_data` to `[false]` (`Destination.set_default_app_data`,
+  so RNS's answers to path requests say the same) and announces it. It
+  announces again whenever an interface comes up while it is still cut off.
+- When its link to RFed next comes up, it sets `[true]` and announces once.
+- While it holds the address it accepts `/distro/handover`. The request data
+  is `msgpack bin sealed`, where `sealed` is
+  `D_hash(16) | D.encrypt(packed[16:])` (§17.13), with no stamp. The device
+  opens it with `lxmf_rust::distro::unwrap_blob`, as a blob from RFed
+  (§17.3), and answers `msgpack true` when it holds the message afterwards
+  (newly or already), or `msgpack false` when the blob is for another distro
+  or does not open. The device keeps one copy of a message that reaches it
+  twice: the hand-over and RFed carry one LXMF message, with one message id.
+- It uploads each message it accepted by hand-over to RFed, so the distro's
+  other devices get it: `sealed` unchanged, with a new stamp and timebase and
+  a §17.13 sync proof, so RFed fans it out without a wake and does nothing if
+  it already holds it. The device makes the proof when it accepts the message
+  and keeps `sealed` and `sig` with the entry, as §17.13's sending device
+  does. The upload goes at once when its link to RFed is up; otherwise after
+  the pull that the next coming-up starts, and only if neither that pull nor
+  a live delivery has brought the message from RFed (DESIGN_PRINCIPLES §5).
+- **Open (2026-11-17), James's decision:** an upload the node does not prove.
+  DESIGN_PRINCIPLES §3 lets a device upload again, at the next coming-up, only
+  the three kinds it owes its distro (§17.13). Until James adds this fourth
+  kind, an unproved hand-over upload is reported and not sent again.
+
+**On the sender.**
+
+- The sender derives D's hand-over address from D's identity, which it holds
+  from the distro announce (§17.10), and acts only on announces of that
+  address.
+- While the latest `app_data` it holds for the address is `[false]`, it hands
+  the address each message for D that it sends; when it hears `[false]`, it
+  also hands over each message for D still waiting to reach RFed that it has
+  not handed over before. A hand-over is one `/distro/handover` request on a
+  link to the address, carrying `sealed`, the `lxmf_data` LXMF builds for
+  propagation without its stamp (LXMF `LXMessage.pack`). When the sender can
+  reach RFed, it also sends the message to RFed as before. Both carry the same
+  sealed bytes, so their `transient_id` and LXMF message id are the same.
+- A hand-over that fails (the link does not come up or closes, the request
+  fails, or the answer is `false`) is reported and not repeated
+  (DESIGN_PRINCIPLES §3). The sender then hands nothing more to that address
+  until it hears `[false]` again. The message's way through RFed is
+  unchanged: it goes when the sender can reach RFed.
+- Timing follows DESIGN_PRINCIPLES §1: the hand-over is decided by its own
+  events, and on a high-speed connection the 5-second rule applies. The link
+  is classified by the round trip it measured on coming up, as a link to RFed
+  is.
+
+**Several devices.** Every device of D derives the same hand-over address.
+When more than one holds it, RNS routes to the one whose announce is newest,
+and each device uploads what it accepted. A device that is back on RFed and is
+handed a message uploads it at once.
+
+**What it reveals.** Anyone can derive the hand-over address from D's public
+key and ask for a path to it, so a device that holds it can be found on the
+mesh until the app restarts; once the device is back on RFed, the answers say
+`[true]`. Nothing names the device: listeners learn only that a device of D
+is, or was, cut off there.
+
+#### Implementation index
+
+| Part | Where | Status (2026-11-17) |
+|---|---|---|
+| Spec | this section; pointers in §17.4 and §17.10; DESIGN_PRINCIPLES.md §3 (the fourth owed kind, awaiting James) | written 2026-11-17 on branch `distro-handover`, not merged |
+| Shared Rust | reused as they are: `lxmf_rust::distro::unwrap_blob`; `sealed_upload` with a claim over `sync_signed_bytes` (§17.13). Nothing new goes into the LXMF port | — |
+| Device and sender | app-links and the apps (Retichat-js as a sender only) | not started |
+| RFed | none needed: it relays the announce like any other, and the upload is §17.13's | — |
 
 ### 17.9 Distro Identity Transfer
 
