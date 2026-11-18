@@ -4650,13 +4650,19 @@ of its address's name, so a sender rebuilds the address from `random` and D's
 identity (RNS `Destination.hash`) and accepts the announce only when the two
 match.
 
-The lookup address is never announced. RNS answers a path request for it from
-a device that holds it, or from a relay that has kept such an answer, with the
-device's default `app_data` (`Destination.set_default_app_data`):
-`msgpack [ str random, ... ]`, the offline addresses of D the device knows to be
-offline, its own first, then those of siblings it has heard announce that they
-are offline since it last went offline. Once the device is back, it is
-`msgpack []`.
+The lookup address is announced with the offline address while the device is
+offline, and only then (below; James, 2026-11-18). Its `app_data`, in that
+announce and in RNS's answers to a path request for it, is the device's default
+`app_data` (`Destination.set_default_app_data`): `msgpack [ str random, ... ]`,
+the offline addresses of D the device knows to be offline, its own first, then
+those of siblings it has heard announce that they are offline since it last went
+offline. Once the device is back, it is `msgpack []`. RNS answers a path request
+for the lookup address from a device that holds it, or from a relay that has
+kept its announce or an answer. Every offline device of D announces the same
+lookup address, so they share its announce allowance on each relay (above):
+when many of D's devices go offline or meet a mesh within an hour, a relay drops
+some of these announces, and each device's own offline-address announce and the
+sender's ask still carry the news.
 
 **Going offline.**
 
@@ -4681,13 +4687,21 @@ are offline since it last went offline. Once the device is back, it is
 - When it first goes offline in a run of the app, the device registers both
   addresses with RNS as incoming destinations; RNS keeps them until the app
   restarts.
-- It announces its offline address on each of its mesh connections when it
-  goes offline, and on a mesh connection that comes up while it is offline. It
-  never announces on a timer.
+- It announces its offline address, and its lookup address with it, on each of
+  its mesh connections when it goes offline, and on a mesh connection that
+  comes up while it is offline. It never announces on a timer. A relay that
+  heard the lookup's announce keeps its answer and gives it to a sender that
+  asks, whatever the mode of the interface the ask came in on, and even while it
+  holds back a new connection's searches for unknown addresses: stock RNS 1.5.2
+  answers a path it knows before it decides whether to search (`Transport`
+  `path_request`, `DISCOVER_PATHS_FOR`, ingress control). Without that announce
+  a relay in the default mode passed the ask on to nobody, and one that had just
+  seen the sender connect held it back (the M5 device test, 2026-11-18).
 - It is **back** once it reaches RFed again or its toggle is turned off. It
   then announces its offline address once on each of its mesh connections,
   saying it is back, sets the lookup address's `app_data` to `msgpack []`, and
-  announces nothing more until it next goes offline. That announce counts only
+  announces nothing more until it next goes offline; the lookup address is not
+  announced once the device is back. That announce counts only
   against the device's own address. RNS still answers for both addresses until
   the app restarts.
 
@@ -4735,9 +4749,16 @@ are offline since it last went offline. Once the device is back, it is
 
 **On the sender.**
 
-- A sender learns an offline address of D from its announce or from a lookup
-  answer, and keeps it, since a device's offline address does not change. It
-  holds D's identity from the distro announce (§17.10).
+- A sender learns an offline address of D from its announce, from an announce
+  of D's lookup address, or from a lookup answer, and keeps it, since a device's
+  offline address does not change. It holds D's identity from the distro
+  announce (§17.10).
+- A sender whose app drops announces it has not asked for (the Retichat apps
+  do) **watches** D: it lets through the announces of D's lookup address and of
+  every offline address of D it keeps (Reticulum-rust `Transport::watch_announce`),
+  for each distro it knows, at start, at each send to D, and when it keeps a new
+  address. It then hears a device of D go offline when that device announces,
+  not only when the sender next asks (James, 2026-11-18).
 - An address the sender keeps is **live** from when its announce, or an answer
   to a path request for it, says `back` is `false`, or a lookup answer names
   it, until an announce or answer says `back` is `true` or a send to it fails
@@ -4754,10 +4775,14 @@ are offline since it last went offline. Once the device is back, it is
   `/distro/direct` request on a link to the address. When the sender can reach
   RFed, it also sends the message to RFed as before. Every copy carries the
   same sealed bytes, so their `transient_id` and LXMF message id are the same,
-  and one stamp serves them all.
+  and one stamp serves them all. A message the sender sent direct first and then
+  through propagation, when the direct attempt did not get through (a
+  fall-back), is copied the same way, from the message it sends through
+  propagation.
 - When it sends to D and has heard nothing from D's offline addresses since one
   of its mesh connections last came up, it asks, over its mesh connections
-  only, once per distro each time one of them comes up. It sends an RNS path
+  only, once per distro each time one of them comes up: for a device whose
+  announce it missed. It sends an RNS path
   request for each offline address of D it keeps, whose answer says whether
   that device is offline, and one for D's lookup address, whose answer names
   the offline devices that device knows. A relay that has kept an answer
