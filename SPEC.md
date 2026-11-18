@@ -4798,7 +4798,8 @@ address.
 |---|---|---|
 | Spec | this section; pointers in §17.4, §17.10, §17.12 and §17.13; DESIGN_PRINCIPLES.md §3, where this upload is the fourth kind a device owes its distro (James, 2026-11-17) | written 2026-11-17 on branch `distro-direct`, not merged |
 | Shared Rust | reused as they are: `lxmf_rust::distro::unwrap_blob`; `sealed_upload` with a claim over `sync_signed_bytes` (§17.13). Nothing new goes into the LXMF port | — |
-| Device and sender | app-links: incoming addresses with ratchets that take single packets proved on the application's word, answer a request and announce on chosen connections, which it has none of today. Retichat-android and Retichat-ios: the offline toggle, the kept random part, the offline state, both addresses, the owed upload, fan-out and lookup. Retichat-js: sender only, to offline addresses it hears announced | not started |
+| app-links | held addresses (`AppLinks::hold_address`, `set_held_app_data`, `announce_held`): incoming addresses, with ratchets or not, that take single packets proved on the host's word and answer requests, announced only on the interfaces the host names. The host's handler runs on a thread of its own and app-links proves the packet once it says yes: the outcome of RNS `PROVE_APP`, without holding Reticulum's inbound processing. For the sender, `send_packet_to` (one packet, proof asked for) and `request_once` (one request on a link of its own) | built 2026-11-17 on branch `distro-offline`, not merged; `tests/interop/held_address_run.sh` passes 8 of 8 against RNS 1.5.2 |
+| Device and sender | Retichat-android and Retichat-ios: the offline toggle, the kept random part, the offline state, both addresses, the owed upload, fan-out and lookup. Retichat-js: sender only, to offline addresses it hears announced | not started |
 | RFed | none needed: RFed holds neither address, and the upload is §17.13's | — |
 
 ### 17.9 Distro Identity Transfer
