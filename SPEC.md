@@ -2198,8 +2198,9 @@ whose app had died, but whose path rfed still held, lost the message.
 
 All three use `DestinationType::Single`.
 
-A device cut off from RFed also holds `rfed.distro.direct`, under the
-distro's own identity; RFed never does (§17.15).
+An offline device (§17.15) also holds `rfed.distro.direct` and an address
+of its own, `rfed.distro.direct.<random>`, both under the distro's own
+identity; RFed holds neither.
 
 ### 17.5 Registration Protocol
 
@@ -2300,10 +2301,9 @@ anyway to encrypt to the address; nothing is queried, and a contact link
 announce_payload` always writes the flag; `lxmf_rust::lxmf::
 distro_from_app_data` reads it.
 
-A device that cannot reach RFed is not reached at the distro's address
-either: a sender that implements §17.15 also sends the message to the
-distro's direct address, a separate address under RFed's name that only a
-cut-off device holds.
+A device that is offline is not reached at the distro's address either:
+a sender that implements §17.15 also sends the message to that device's own
+offline address, under RFed's name.
 
 ### 17.11 Sent-message sync
 
@@ -4578,17 +4578,22 @@ to D in RFed's BlobStore and deferred queues, as every distro blob does.
 | Web | Retichat-js (off main 6d0cf8b) | not started |
 | RFed | none needed (above) | — |
 
-### 17.15 A distro device cut off from RFed
+### 17.15 Offline use of a distro address
 
-A device that cannot reach RFed can still be sent its distro's mail direct,
-over the mesh, by a sender that implements this section (James,
+A distro device that is out of network range can still be sent its distro's
+mail directly, over a mesh, by a sender that implements this section (James,
 2026-11-17). No device holds the distro's `lxmf.delivery` address for this.
-The device holds a **direct address** under RFed's name, made from the
-distro's key, and the sender sends it the same sealed message it gives RFed.
-LXMF is used as it is; everything here is RFed's. An app that does not
-implement this section, Sideband for one, reaches a cut-off distro through
-RFed only, as before (James, the same day: "They can adopt RFed protocols if
-they want").
+Each such device holds an **offline address** of its own under RFed's name,
+made with the distro's key, and the sender sends it the same sealed message it
+gives RFed. LXMF is used as it is; everything here is RFed's. An app that does
+not implement this section, Sideband for one, reaches the distro through RFed
+only, as before (James, the same day: "They can adopt RFed protocols if they
+want").
+
+This section does not hide which devices belong to a distro. Anyone who sees an
+offline address announced can tell which distro it belongs to (James, the same
+day: "forget about anonymity that isn't inherent in ordinary LXMF"; "People who
+want anonymity should use direct addresses").
 
 **Why not the distro's own address.** Stock LXMF 1.1.1 and RNS 1.5.2 rule it
 out:
@@ -4606,92 +4611,150 @@ out:
 
 So no device ever holds a distro's `lxmf.delivery` address (§17.10).
 
-**The direct address.**
+**The two addresses.**
 
 | Destination | Identity | Aspects | Request path | Held by |
 |---|---|---|---|---|
-| `rfed.distro.direct` | the distro's, D | `["distro", "direct"]` | `/distro/direct` | a device of D, never RFed |
+| `rfed.distro.direct.<random>`, the device's offline address | the distro's, D | `["distro", "direct", <random>]` | `/distro/direct` | one offline device of D, never RFed |
+| `rfed.distro.direct`, the lookup address | the distro's, D | `["distro", "direct"]` | none: it accepts no links (RNS `Destination.accepts_links(False)`) | every offline device of D, never RFed |
 
-It is `DestinationType::Single` and never has ratchets. Its announce
-`app_data` is `msgpack [ bool rfed ]`: `false` while the device cannot reach
-RFed, `true` once it can. It carries no name (DESIGN_PRINCIPLES §9) and names
-no device. Only a holder of D's key can sign the announce or prove a link to
-the address, so a sender knows it is dealing with a device of D. The name is
-James's (2026-11-17). A direct send here is a request to this address, not
-LXMF's DIRECT method.
+Both are `DestinationType::Single` and have no ratchets: a message reaches an
+offline address over a link, which has keys of its own. `<random>` is 16
+lowercase hex characters from 8 random bytes, made when the device first goes
+offline in a run of the app. Neither address carries a name
+(DESIGN_PRINCIPLES §9).
 
-**On the device.**
+Each device has its own offline address because Reticulum keeps one route per
+address. With one address shared by several devices, each relay sends to
+whichever device it heard from last, and a message could be carried away from
+the device that needs it (James: "The per device addresses keep messages
+needed at an offline address from being rerouted to a different offline
+address"). Reticulum's relays also limit announces per address (stock RNS
+1.5.2, on every transport node: about one an hour, with five extra), so each
+device counts only against its own.
 
-- *Cut off* means the device's link to its RFed node failed to come up or
-  closed: an event, never slowness.
-- When it is cut off, the device registers the direct address with RNS as an
-  incoming destination (once; RNS then keeps it until the app restarts), sets
-  its default `app_data` to `[false]` (`Destination.set_default_app_data`, so
-  RNS's answers to path requests say the same) and announces it. It announces
-  again whenever an interface comes up while it is still cut off.
-- When its link to RFed next comes up, it sets `[true]` and announces once.
-- While it holds the address it accepts `/distro/direct`. The request data is
-  `msgpack bin sealed`, where `sealed` is
-  `D_hash(16) | D.encrypt(packed[16:])` (§17.13), with no stamp. The device
-  opens it with `lxmf_rust::distro::unwrap_blob`, as a blob from RFed
-  (§17.3), and answers `msgpack true` when it holds the message afterwards
-  (newly or already), or `msgpack false` when the blob is for another distro
-  or does not open. The device keeps one copy of a message that reaches it
-  twice: the direct send and RFed carry one LXMF message, with one message
-  id.
-- It uploads to RFed each message it accepted at the direct address, so the
-  distro's other devices get it: `sealed` unchanged, with a new stamp and
-  timebase and a §17.13 sync proof, so RFed fans it out without a wake and
-  does nothing if it already holds it. The device makes the proof when it
-  accepts the message and keeps `sealed` and `sig` with the entry, as §17.13's
-  sending device does. The upload goes at once when its link to RFed is up;
-  otherwise after the pull that the next coming-up starts, and only if neither
-  that pull nor a live delivery has brought the message from RFed
-  (DESIGN_PRINCIPLES §5).
-- The device owes that upload to its distro as it owes a §17.11 sent copy,
-  and every rule §17.11 gives the sent copy applies to it (James, 2026-11-17:
-  "like sent copies"; DESIGN_PRINCIPLES §3). It keeps the entry until the
-  node proves it. An upload that is not proved goes again when the link to
-  RFed next comes up, an event and never a timer, in the same order as
-  above: after that coming-up's pull, and not if RFed has delivered the
-  message by then. Each message is owed on its own, under its own id. Giving
-  up D does not drop it: `sealed` and `sig` are already made, so it is still
-  uploaded on later comings-up.
+An offline address's announce `app_data` is `msgpack [ str random ]`. An
+announce carries only a hash of its address's name, so a sender rebuilds the
+address from `random` and D's identity (RNS `Destination.hash`) and accepts the
+announce only when the two match. The lookup address is never announced. RNS
+answers a path request for it from a device that holds it, or from a relay
+that has kept such an answer, with the device's default `app_data`
+(`Destination.set_default_app_data`): `msgpack [ str random, ... ]`, the
+offline addresses of D the device knows, its own first, then those of
+siblings it has heard announced since it last went offline. Once the device is
+back, it is `msgpack []`.
+
+**Going offline.**
+
+- A device takes part only while its **offline toggle** is on: a setting on
+  each device, off by default, for offline use of the distro address (James:
+  for "when people know they will be outside of network range"). It may stay
+  on (James: "The toggle doesn't prevent users from just keeping their device
+  in Offline mode all the time"), so nothing here relies on it being rare.
+- A device with the toggle on is **offline** while it cannot reach its RFed
+  node and none of its internet connections is up. A **mesh connection** is an
+  interface to a radio mesh, an RTNode or an RNode; every other interface is an
+  internet connection. Losing RFed alone never makes a device offline while an
+  internet connection is up (James: "it cannot be triggered by RFed disconnect
+  alone. The interface connected to RFed must go down to trigger the
+  announce"), so an outage at RFed changes nothing for devices on the internet.
+  A device with no internet connection, one that reaches RFed through an
+  RTNode, is offline when it cannot reach RFed.
+- *Cannot reach RFed* means the device's link to its RFed node failed to come
+  up or closed: an event, never slowness. A device that holds no link to RFed,
+  on a slow route, tries to reach RFed when a mesh connection comes up and
+  decides from that attempt.
+- When it first goes offline in a run of the app, the device registers both
+  addresses with RNS as incoming destinations; RNS keeps them until the app
+  restarts.
+- It announces its offline address on each of its mesh connections when it
+  goes offline, and on a mesh connection that comes up while it is offline. It
+  never announces on a timer, and it announces nothing when it is back.
+- It is **back** once it reaches RFed again or its toggle is turned off. It
+  stops announcing at once and sets the lookup address's `app_data` to
+  `msgpack []`. RNS still answers for both addresses until the app restarts.
+
+**Taking a message.**
+
+- The device accepts `/distro/direct` on its offline address, offline or back.
+  The request data is `msgpack [ bin sealed, bin stamp ]`. `sealed` is
+  `D_hash(16) | D.encrypt(packed[16:])` (§17.13), and `stamp` is the stamp the
+  sender made for RFed over the message's transient id, `full_hash(sealed)`.
+- It checks the stamp as RFed checks an upload's stamp, against its own RFed
+  node's stamp cost, and opens `sealed` with `lxmf_rust::distro::unwrap_blob`,
+  as a blob from RFed (§17.3). It answers `msgpack [ bool held, bool back ]`.
+  `held` is `true` when it holds the message afterwards, newly or already, and
+  `false` when the stamp is missing or too weak, the blob is for another
+  distro, or it does not open; `back` says whether the device is back. It
+  keeps one copy of a message that reaches it more than once, from several
+  senders or from RFed: they carry one LXMF message, with one message id.
+- It uploads each message it took to RFed, so the distro's other devices get
+  it: `sealed` and `stamp` unchanged, with a new timebase and a §17.13 sync
+  proof, so RFed fans it out without a wake and does nothing if it already
+  holds it. If its node's stamp cost has risen above the sender's stamp by
+  then, the device makes its own stamp, as for its sent copies. It makes the
+  proof when it takes the message and keeps `sealed`, `stamp` and `sig` with
+  the entry, as §17.13's sending device does. The upload goes at once when the
+  device can reach RFed; otherwise after the pull that the next coming-up
+  starts, and only if neither that pull nor a live delivery has brought the
+  message (DESIGN_PRINCIPLES §5).
+- The device owes that upload as it owes a §17.11 sent copy, and every rule
+  §17.11 gives the sent copy applies to it (James, 2026-11-17: "like sent
+  copies"; DESIGN_PRINCIPLES §3). It keeps the entry until the node proves it.
+  An upload that is not proved goes again when the link to RFed next comes up,
+  an event and never a timer, in the same order as above. Each message is owed
+  on its own, under its own id. Giving up D does not drop it: `sealed`,
+  `stamp` and `sig` are already made, so it is still uploaded on later
+  comings-up.
+- A device hears its siblings' offline addresses announced, since they are not
+  its own, and its lookup answer lists those it has heard since it last went
+  offline.
 
 **On the sender.**
 
-- The sender derives D's direct address from D's identity, which it holds
-  from the distro announce (§17.10), and acts only on announces of that
+- A sender knows an offline address of D when it has heard it announced or a
+  lookup answer has named it. It holds D's identity from the distro announce
+  (§17.10).
+- When it sends a message to D, it also sends it to each offline address of D
+  it knows: a fan-out (James: "Maybe we should even have the sender be able to
+  fan out to several if needed"). Each send is one `/distro/direct` request on
+  a link to that address, carrying `sealed`, the `lxmf_data` LXMF builds for
+  propagation without its stamp (LXMF `LXMessage.pack`), and the stamp the
+  sender makes for RFed. When the sender can reach RFed, it also sends the
+  message to RFed as before. Every copy carries the same sealed bytes, so their
+  `transient_id` and LXMF message id are the same, and one stamp serves them
+  all.
+- When it sends to D and knows no offline address of D that it has heard or
+  been named since one of its mesh connections last came up, it asks for D's
+  lookup address: an RNS path request, over its mesh connections only, once
+  per distro each time one of them comes up. A relay that has kept an answer
+  replies from it, or a device that holds the address replies itself. Answers
+  to path requests are not rate-limited (stock RNS 1.5.2). Before sending to an
+  address an answer names, the sender requests a path to it, as to any
   address.
-- While the latest `app_data` it holds for the address is `[false]`, each
-  message the sender sends to D also goes to the address. When it hears
-  `[false]`, each message for D still waiting to reach RFed that has not gone
-  to the address before goes there too. A direct send is one `/distro/direct`
-  request on a link to the address, carrying `sealed`, the `lxmf_data` LXMF
-  builds for propagation without its stamp (LXMF `LXMessage.pack`). When the
-  sender can reach RFed, it also sends the message to RFed as before. Both
-  carry the same sealed bytes, so their `transient_id` and LXMF message id are
-  the same.
-- A direct send that fails (the link does not come up or closes, the request
-  fails, or the answer is `false`) is reported and not repeated
-  (DESIGN_PRINCIPLES §3). The sender then sends nothing more to that address
-  until it hears `[false]` again. The message's way through RFed is
-  unchanged: it goes when the sender can reach RFed.
-- Timing follows DESIGN_PRINCIPLES §1: the direct send is decided by its own
-  events, and on a high-speed connection the 5-second rule applies. The link
-  is classified by the round trip it measured on coming up, as a link to RFed
-  is.
+- When it learns an offline address of D, it also sends there each message for
+  D still waiting to reach RFed, and each message it sent to D after asking,
+  that has not gone to that address.
+- A send that fails (the link does not come up or closes, the request fails,
+  or the answer's `held` is `false`) is reported and not repeated
+  (DESIGN_PRINCIPLES §3), and the sender drops that address. A send answered
+  with `back` is delivered, and the sender drops that address too. It sends to
+  a dropped address again only after hearing it announced, or a lookup answer
+  naming it, again. The message's way through RFed is unchanged: it goes when
+  the sender can reach RFed.
+- Timing follows DESIGN_PRINCIPLES §1: each send is decided by its own events,
+  and on a high-speed connection the 5-second rule applies. A link is
+  classified by the round trip it measured on coming up, as a link to RFed is.
 
-**Several devices.** Every device of D derives the same direct address. When
-more than one holds it, RNS routes to the one whose announce is newest, and
-each device uploads what it accepted. A device that is back on RFed and
-accepts a message at the direct address uploads it at once.
+**Several devices.** Every offline device of D has its own address, route and
+announce count, so several can be offline at once, in one place or in several,
+without crowding each other out. A sender reaches each one it knows. Each
+device uploads what it took, and RFed keeps one copy.
 
-**What it reveals.** Anyone can derive the direct address from D's public key
-and ask for a path to it, so a device that holds it can be found on the mesh
-until the app restarts; once the device is back on RFed, the answers say
-`[true]`. Nothing names the device: listeners learn only that a device of D
-is, or was, cut off there.
+**What it reveals.** Anyone who sees an offline address announced, or asks for
+D's lookup address, learns that a device of D is offline at that point of the
+mesh, and which offline devices belong to one distro. That is accepted
+(above): the section hides nothing beyond what ordinary LXMF hides.
 
 #### Implementation index
 
@@ -4699,8 +4762,8 @@ is, or was, cut off there.
 |---|---|---|
 | Spec | this section; pointers in §17.4, §17.10, §17.12 and §17.13; DESIGN_PRINCIPLES.md §3, where this upload is the fourth kind a device owes its distro (James, 2026-11-17) | written 2026-11-17 on branch `distro-direct`, not merged |
 | Shared Rust | reused as they are: `lxmf_rust::distro::unwrap_blob`; `sealed_upload` with a claim over `sync_signed_bytes` (§17.13). Nothing new goes into the LXMF port | — |
-| Device and sender | app-links and the apps (Retichat-js as a sender only) | not started |
-| RFed | none needed: it relays the announce like any other, and the upload is §17.13's | — |
+| Device and sender | app-links: incoming addresses that answer a request and announce on chosen connections, which it has none of today. Retichat-android and Retichat-ios: the offline toggle, the offline state, both addresses, the owed upload, fan-out and lookup. Retichat-js: sender only, to offline addresses it hears announced | not started |
+| RFed | none needed: RFed holds neither address, and the upload is §17.13's | — |
 
 ### 17.9 Distro Identity Transfer
 
